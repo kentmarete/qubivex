@@ -1,0 +1,8 @@
+# Tests may unwrap; production code may not (RUST_GUIDELINES §1).
+allow-unwrap-in-tests = true
+allow-expect-in-tests = true
+
+# Only bounded channels and queues (RUST_GUIDELINES §4).
+disallowed-methods = [
+    { path = "std::sync::mpsc::channel", reason = "unbounded; use std::sync::mpsc::sync_channel" },
+]

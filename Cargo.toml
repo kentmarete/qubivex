@@ -1,0 +1,51 @@
+[workspace]
+resolver = "3"
+members = ["crates/qubivex-core", "apps/cli", "xtask"]
+default-members = ["crates/qubivex-core", "apps/cli", "xtask"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+license = "Apache-2.0"
+repository = "https://github.com/kentmarete/qubivex"
+publish = false
+
+[workspace.dependencies]
+# Internal crates.
+qubivex-core = { path = "crates/qubivex-core", version = "0.1.0" }
+
+# Third-party versions are declared here once (ADR-001); members use `{ workspace = true }`.
+# Requirements stay at the oldest version we need. Exact versions live in Cargo.lock,
+# which resolver 3 fills with the newest releases compatible with `rust-version`.
+clap = { version = "4.5", features = ["derive"] }
+proptest = "1.6"
+serde = { version = "1.0.219", features = ["derive"] }
+serde_json = "1.0.140"
+thiserror = "2.0.12"
+
+[workspace.lints.rust]
+# Opted out per crate with #![allow(unsafe_code)] in backend-cpu, expert-stream and
+# backend-{cuda,vulkan,metal} only (RUST_GUIDELINES §3).
+unsafe_code = "deny"
+unsafe_op_in_unsafe_fn = "deny"
+missing_docs = "warn"
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(loom)'] }
+
+[workspace.lints.clippy]
+correctness = { level = "deny", priority = -1 }
+suspicious = { level = "deny", priority = -1 }
+style = { level = "warn", priority = -1 }
+complexity = { level = "warn", priority = -1 }
+perf = { level = "warn", priority = -1 }
+unwrap_used = "deny"
+undocumented_unsafe_blocks = "deny"
+missing_safety_doc = "deny"
+cast_possible_truncation = "warn"
+float_cmp = "deny"
+
+[profile.release]
+lto = "fat"
+codegen-units = 1
+# The server catches per-request panics at the gateway boundary (ADR-001).
+panic = "unwind"
