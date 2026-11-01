@@ -1,0 +1,20 @@
+[package]
+name = "qubivex-core"
+description = "Core identifiers, dtypes, shapes, errors and configuration types for QUBIVEX"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+serde = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+proptest = { workspace = true }
+serde_json = { workspace = true }
+
+[lints]
+workspace = true
