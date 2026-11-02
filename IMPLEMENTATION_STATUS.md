@@ -217,7 +217,12 @@ The `miri` and `loom` jobs arrive with the first unsafe or concurrent code (Phas
   | + in-pool forward | 18.6–21.3 tok/s, about 1.7× overall |
 
   Short runs read lower, because the first tokens load experts from disk on demand.
-- Next candidates: one parallel region per layer for all of a token's experts (fewer, larger regions); a faster lossless Q4_K kernel (about 20 GB/s today, compute-bound); a benchmark against Colibri `olmoe` (MIGRATION_PLAN §4, which needs your OK to run Colibri's engine).
+- **Done: benchmark against Colibri `olmoe`** (`docs/performance/COLIBRI-OLMOE-BENCHMARK.md`): same GGUF, prompt, 160 tokens, 5 threads, warm, every expert resident.
+  - QUBIVEX (lossless): **20.7–21.0 tok/s**.
+  - Colibri default (lossy integer dot): 17.4–17.8 tok/s.
+  - Colibri lossless (`GQ_EXACT=1`): 3.0 tok/s.
+  - QUBIVEX's 160 tokens are **identical** to Colibri's lossless tokens. Colibri's default drifts after 86 tokens.
+- Next candidates: one parallel region per layer for all of a token's experts; a faster lossless Q4_K kernel (about 20 GB/s, compute-bound); AVX2 kernels for Linux; streaming benchmarks with small, cold expert caches.
 - Then: fused AVX2 kernels for Linux x86-64. Rosetta on this Mac reports no AVX2, so they can only be verified by CI's bitwise tests on Linux runners.
 - Hand-written NEON and AVX2 kernels reproducing the portable bits, a spinning thread pool for decode, and `gemm`-crate prefill (ADR-002). Then a benchmark against Colibri `olmoe` on the same machine (MIGRATION_PLAN §4).
 - Today: about 11 tok/s decode on OLMoE-1B-7B Q4_K_M (M3 Pro, every expert resident, portable kernels). A cold first prompt is slower because it reads experts from disk.
