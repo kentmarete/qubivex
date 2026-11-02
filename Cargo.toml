@@ -24,6 +24,8 @@ qubivex-hardware = { path = "crates/qubivex-hardware", version = "0.1.0" }
 # which resolver 3 fills with the newest releases compatible with `rust-version`.
 clap = { version = "4.5", features = ["derive"] }
 proptest = "1.6"
+# Safe syscall wrappers (statvfs, O_DIRECT, F_NOCACHE, fadvise), so qubivex-hardware needs no unsafe.
+rustix = { version = "1.1", default-features = false, features = ["fs", "std"] }
 serde = { version = "1.0.219", features = ["derive"] }
 serde_json = "1.0.140"
 thiserror = "2.0.12"

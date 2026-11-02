@@ -58,3 +58,40 @@ fn system_json_is_valid_json() {
     assert!(v["profile"]["cpu"]["arch"].is_string());
     assert!(v["snapshot"]["ram_available"].is_object());
 }
+
+#[test]
+fn doctor_without_a_check_is_an_error() {
+    let out = qubivex().arg("doctor").output().unwrap();
+    assert_eq!(out.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&out.stderr).contains("pass --storage"));
+}
+
+#[cfg(unix)]
+#[test]
+fn doctor_storage_json() {
+    let dir = std::env::temp_dir().join(format!("qubivex-cli-doctor-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let out = qubivex()
+        .args([
+            "doctor",
+            "--storage",
+            "--size-mib",
+            "64",
+            "--json",
+            "--path",
+        ])
+        .arg(&dir)
+        .output()
+        .unwrap();
+    let leftover = std::fs::read_dir(&dir).unwrap().count();
+    std::fs::remove_dir_all(&dir).unwrap();
+    assert_eq!(leftover, 0);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    if out.status.success() {
+        let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+        assert!(v["seq_read_bps"].as_f64().unwrap() > 0.0);
+    } else {
+        // A runner without 1 GiB headroom free must say so.
+        assert!(stderr.contains("free space"), "{stderr}");
+    }
+}
