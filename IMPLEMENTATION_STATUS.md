@@ -3,6 +3,12 @@
 Last updated: 2026-11-03
 
 ## Current phase
+**Phase 4: CPU inference prototype, in progress (step 1 of 5 done: kernels).**
+The plan has five steps: (1) compute interface and CPU kernels; (2) tokenizer and chat
+templates; (3) a minimal expert store; (4) the `transformer_moe` forward pass, KV
+cache, sampling and `qubivex run`; (5) numerical exit tests against `transformers`
+and an independent f64 reference.
+
 **Phase 3: model metadata and registry, done.** Containers, manifest, registry,
 `transformer_moe`, validation, discovery, import and `qubivex models
 list|inspect|import|architectures` are done, with three committed tiny fixtures. The
@@ -101,6 +107,22 @@ The `miri` and `loom` jobs arrive with the first unsafe or concurrent code (Phas
   - Largest expert 4,079,616 bytes: two Q4_K 1024×2048 matrices plus a Q6_K 2048×1024 one.
 - The env-gated `real_files` tests pass on the file and the model directory.
 
+### Phase 4, step 1: `qubivex-compute` and `qubivex-backend-cpu`
+- `qubivex-compute`:
+  - `WeightView` is a validated `rows × cols` view of stored weights; its byte length equals `DType::storage_bytes` and row slicing is checked.
+  - `ComputeBackend` has `matmul` (`s` activation rows) and `dequant_row`, in host-memory form. Device buffers join it with the first GPU backend.
+- `qubivex-backend-cpu` covers f32, f16, bf16, Q8_0, Q4_K and Q6_K (every dtype in the OLMoE Q4_K_M GGUF and the fixtures).
+  - Each row is dequantized exactly, as `ggml-quants.c` evaluates it, then dotted with f32 activations using the one fixed reduction shape: 64 lanes, chunks in `k` order, a defined tail in lanes `0..rem`, and a fixed halving tree.
+  - Work is split across output rows only, on rayon.
+  - On x86-64 the same source is also compiled with `avx2,fma` and selected at run time. That one feature-gated call is the crate's only `unsafe`.
+  - Hand-written NEON and AVX2 kernels, the spinning thread pool and `gemm`-crate prefill (ADR-002) are a later, measured optimisation that must reproduce these bits.
+- Tests:
+  - f16 to f32 conversion is checked exhaustively over all 65,536 values.
+  - Q8_0, Q4_K and Q6_K dequantization matches **gguf-py bit for bit** (`fixtures/oracle/ggml_dequant.json`).
+  - For all six dtypes, including a 32-column tail, batched equals one-at-a-time, 1, 3 and 7 threads give identical bits, portable equals dispatched, and results match an f64 reference to within 1e-6 relative.
+- Oracle environment: `~/.qubivex/oracle` with torch 2.15.0, transformers 5.22.1, safetensors 0.8.0 and gguf 0.19.0, outside the repository; see `fixtures/oracle/README.md`. Generated reference files are committed, and tests never need Python.
+- `rayon` is a new workspace dependency.
+
 ## Remaining in Phase 2
 - Check `qubivex system` and `qubivex doctor --storage` output on a real Linux host.
 - Caching `StorageMeasurement` per device waits for a state directory (config work, Phase 3 or later).
@@ -132,7 +154,7 @@ Development moved to an **Apple M3 Pro (arm64, 18 GB RAM, macOS)** with about 37
 - ~~**B3** Git repository~~: resolved (`origin` = `github.com/kentmarete/qubivex`).
 
 ## Test results (2026-11-02, M3 Pro, Rust 1.99.1 and 1.85)
-- `cargo test --workspace`: 92 passed, 0 failed (2026-11-03). Earlier: 91 passed on Rust 1.99.1 and 1.85. Breakdown: core 22 (including a proptest over untrusted dims); hardware 24 (including live smoke and storage tests); model 23 (including proptests over corrupted containers and the committed fixtures); CLI 14; xtask 9. The env-gated `real_files` tests are skipped without `QUBIVEX_REAL_MODEL_*`.
+- `cargo test --workspace`: 98 passed, 0 failed on Rust 1.99.1 and 1.85 (2026-11-03, Phase 4 step 1). Before that: 92. Earlier: 91 passed on Rust 1.99.1 and 1.85. Breakdown: core 22 (including a proptest over untrusted dims); hardware 24 (including live smoke and storage tests); model 23 (including proptests over corrupted containers and the committed fixtures); CLI 14; xtask 9. The env-gated `real_files` tests are skipped without `QUBIVEX_REAL_MODEL_*`.
 - Cross-checks: `cargo clippy -D warnings` and `cargo +1.85 check` for `x86_64-unknown-linux-gnu` and `x86_64-apple-darwin`.
 - `cargo clippy --workspace --all-targets -- -D warnings`: clean.
 - `cargo fmt --check`, `cargo doc` (`-D warnings`), `cargo deny check` and `cargo xtask check`: clean.

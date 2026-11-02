@@ -1,0 +1,202 @@
+//! The CPU compute backend.
+//!
+//! Kernels are lossless (f32 activations times the exact dequantized weights) and
+//! deterministic: work is split across output rows only, never across the reduction,
+//! and every dot product uses the one fixed reduction shape in [`reduce`]. The bits
+//! of an output therefore depend only on its weight row and activation row, never on
+//! the batch size, the thread count or the instruction set used (ADR-002).
+//!
+//! Supported dtypes: f32, f16, bf16, Q8_0, Q4_K and Q6_K.
+//!
+//! On x86-64 the same portable source is also compiled with `avx2,fma` and selected
+//! at run time; `f32::mul_add` is correctly rounded either way, so both give the
+//! same bits. Hand-written NEON and AVX2 kernels come later, as a measured
+//! optimisation that must reproduce these bits.
+
+// The only unsafe code is the call into the `avx2,fma`-compiled copy of the portable
+// kernel after run-time feature detection (RUST_GUIDELINES §3: this crate may opt in).
+#![allow(unsafe_code)]
+
+pub mod formats;
+pub mod reduce;
+
+use qubivex_compute::{ComputeBackend, ComputeError, WeightView};
+use qubivex_core::DType;
+use rayon::prelude::*;
+
+/// Output rows per parallel task.
+const ROWS_PER_TASK: usize = 16;
+
+/// A row-block kernel: `(weights, activations, s, first row, out, scratch row)`.
+type RowsKernel = fn(&WeightView<'_>, &[f32], usize, usize, &mut [f32], &mut [f32]);
+
+/// The CPU backend. Parallel work runs on the current rayon pool.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct CpuBackend;
+
+impl CpuBackend {
+    /// A CPU backend.
+    #[must_use]
+    pub const fn new() -> Self {
+        Self
+    }
+}
+
+fn check(w: &WeightView<'_>, op: &'static str) -> Result<(), ComputeError> {
+    if formats::supported(w.dtype()) {
+        Ok(())
+    } else {
+        Err(ComputeError::Unsupported {
+            backend: "cpu",
+            op,
+            dtype: w.dtype(),
+        })
+    }
+}
+
+/// Computes rows `r0 .. r0 + out.len() / s` into `out` (row-major, `s` values per row):
+/// dequantize the row once, then one dot product per activation row.
+#[inline(always)]
+fn rows_portable(
+    w: &WeightView<'_>,
+    xs: &[f32],
+    s: usize,
+    r0: usize,
+    out: &mut [f32],
+    buf: &mut [f32],
+) {
+    let k = w.cols();
+    for (j, o) in out.chunks_exact_mut(s).enumerate() {
+        formats::dequant_row(w.dtype(), w.row(r0 + j), buf);
+        for (t, y) in o.iter_mut().enumerate() {
+            *y = reduce::dot(buf, &xs[t * k..(t + 1) * k]);
+        }
+    }
+}
+
+/// The same code compiled with AVX2 and hardware FMA.
+///
+/// # Safety
+/// The CPU must support `avx2` and `fma`.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn rows_avx2(
+    w: &WeightView<'_>,
+    xs: &[f32],
+    s: usize,
+    r0: usize,
+    out: &mut [f32],
+    buf: &mut [f32],
+) {
+    rows_portable(w, xs, s, r0, out, buf);
+}
+
+fn rows(w: &WeightView<'_>, xs: &[f32], s: usize, r0: usize, out: &mut [f32], buf: &mut [f32]) {
+    #[cfg(target_arch = "x86_64")]
+    if std::arch::is_x86_feature_detected!("avx2") && std::arch::is_x86_feature_detected!("fma") {
+        // SAFETY: both target features were detected on this CPU just above.
+        unsafe { rows_avx2(w, xs, s, r0, out, buf) };
+        return;
+    }
+    rows_portable(w, xs, s, r0, out, buf);
+}
+
+/// `rows` without run-time dispatch, for tests that compare the two paths.
+#[doc(hidden)]
+pub fn matmul_portable(
+    w: &WeightView<'_>,
+    xs: &[f32],
+    s: usize,
+    ys: &mut [f32],
+) -> Result<(), ComputeError> {
+    matmul_with(w, xs, s, ys, rows_portable)
+}
+
+fn matmul_with(
+    w: &WeightView<'_>,
+    xs: &[f32],
+    s: usize,
+    ys: &mut [f32],
+    kernel: RowsKernel,
+) -> Result<(), ComputeError> {
+    check(w, "matmul")?;
+    let (n, k) = (w.rows(), w.cols());
+    if xs.len() != s * k || ys.len() != s * n {
+        return Err(ComputeError::Shape {
+            op: "matmul",
+            detail: format!(
+                "{s} activation rows of {k} and {s} output rows of {n} need {} and {} values, got {} and {}",
+                s * k,
+                s * n,
+                xs.len(),
+                ys.len()
+            ),
+        });
+    }
+    if s == 0 || n == 0 {
+        return Ok(());
+    }
+    // Rows are independent: compute them row-major (n × s), then transpose for s > 1.
+    let run = |yt: &mut [f32]| {
+        yt.par_chunks_mut(ROWS_PER_TASK * s)
+            .enumerate()
+            .for_each_init(
+                || vec![0f32; k],
+                |buf, (i, out)| kernel(w, xs, s, i * ROWS_PER_TASK, out, buf),
+            );
+    };
+    if s == 1 {
+        run(ys);
+    } else {
+        let mut yt = vec![0f32; n * s];
+        run(&mut yt);
+        ys.par_chunks_mut(n).enumerate().for_each(|(t, yrow)| {
+            for (r, y) in yrow.iter_mut().enumerate() {
+                *y = yt[r * s + t];
+            }
+        });
+    }
+    Ok(())
+}
+
+impl ComputeBackend for CpuBackend {
+    fn name(&self) -> &'static str {
+        "cpu"
+    }
+
+    fn supports(&self, dtype: DType) -> bool {
+        formats::supported(dtype)
+    }
+
+    fn matmul(
+        &self,
+        w: &WeightView<'_>,
+        xs: &[f32],
+        s: usize,
+        ys: &mut [f32],
+    ) -> Result<(), ComputeError> {
+        matmul_with(w, xs, s, ys, rows)
+    }
+
+    fn dequant_row(
+        &self,
+        w: &WeightView<'_>,
+        r: usize,
+        out: &mut [f32],
+    ) -> Result<(), ComputeError> {
+        check(w, "dequant_row")?;
+        if r >= w.rows() || out.len() != w.cols() {
+            return Err(ComputeError::Shape {
+                op: "dequant_row",
+                detail: format!(
+                    "row {r} of {} into {} values (cols {})",
+                    w.rows(),
+                    out.len(),
+                    w.cols()
+                ),
+            });
+        }
+        formats::dequant_row(w.dtype(), w.row(r), out);
+        Ok(())
+    }
+}
