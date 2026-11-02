@@ -27,10 +27,38 @@ thread_local! {
 
 /// Own kernel: per head, fixed-order scores, max, exp-sum and V accumulation.
 pub fn own(a: &AttnData, out: &mut [f32]) {
+    out.par_chunks_mut(a.d).enumerate().for_each(|(h, o)| head(a, h, o));
+}
+
+/// Raw output pointer shared across pool workers that write disjoint heads.
+#[derive(Clone, Copy)]
+struct OutPtr(*mut f32);
+// SAFETY: each worker writes only its own heads' `d`-float slices, and the pool joins
+// before the borrow of `out` ends.
+unsafe impl Send for OutPtr {}
+unsafe impl Sync for OutPtr {}
+
+/// Same kernel as [`own`] on the persistent spinning pool the GEMV uses (no rayon dispatch).
+pub fn own_pool(a: &AttnData, out: &mut [f32]) {
+    let d = a.d;
+    assert_eq!(out.len(), a.h * d);
+    let o = OutPtr(out.as_mut_ptr());
+    candle_core::utils::barrier_pool().execute_chunked(a.h, |heads| {
+        #[allow(clippy::redundant_locals)]
+        let o = o;
+        for h in heads {
+            // SAFETY: h < a.h, so the slice is in bounds; each head goes to exactly one worker.
+            let oh = unsafe { std::slice::from_raw_parts_mut(o.0.add(h * d), d) };
+            head(a, h, oh);
+        }
+    });
+}
+
+fn head(a: &AttnData, h: usize, o: &mut [f32]) {
     let (d, t) = (a.d, a.t);
     #[allow(clippy::cast_precision_loss)]
     let scale = 1.0 / (d as f32).sqrt();
-    out.par_chunks_mut(d).enumerate().for_each(|(h, o)| {
+    {
         let q = &a.q[h * d..(h + 1) * d];
         let kh = &a.k[h * t * d..(h + 1) * t * d];
         let vh = &a.v[h * t * d..(h + 1) * t * d];
@@ -58,7 +86,7 @@ pub fn own(a: &AttnData, out: &mut [f32]) {
                 *ov *= inv;
             }
         });
-    });
+    }
 }
 
 pub struct CandleAttn {

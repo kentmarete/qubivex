@@ -5,8 +5,8 @@ Last updated: 2026-11-02
 ## Current phase
 **Phase 1: Rust foundation, in progress.** The workspace, `qubivex-core`, the CLI
 skeleton, the repository checks and CI are done. The ADR-002 tensor-engine spike
-has run against Candle (`docs/performance/ADR-002-SPIKE.md`). The Colibri baseline
-that the decision rule needs is still outstanding.
+has run against Candle and against Colibri `0a5504a1` (`docs/performance/ADR-002-SPIKE.md`).
+ADR-002 is Accepted: hybrid, without Candle.
 
 ## Completed
 | Phase | Deliverables |
@@ -40,10 +40,11 @@ The `miri` and `loom` jobs arrive with the first unsafe or concurrent code (Phas
 - Candle's quantized path is lossy (Q8 activations, about 4e-3 relative error) and fast. Own lossless f32 and bf16 GEMV reach memory bandwidth. int8, Q8_0 and Q4_K reach 60%, 51% and 20% of it.
 - Prefill via dequantize plus the `gemm` crate matches Candle. Accelerate is about 3× on macOS.
 - Everything is bitwise deterministic across 1–11 threads.
-- Preliminary choice: hybrid without Candle (ADR-002).
+- Colibri baseline (`colibri-baseline/colibri_bench.c`, identical inputs via `dump`): every lossless own kernel is ≥ 90% of Colibri's lossless equivalent at 1 and 11 threads. f32 and bf16 are at per-core parity. Q8_0 and Q4_K are about 10× Colibri's exact path. Attention passes only on the spinning pool (rayon gives 88%). Colibri's fast GGUF path is lossy by default.
+- Decision: hybrid without Candle (ADR-002 Accepted).
 
 ## Remaining in Phase 1
-- ADR-002: the Colibri baseline at `0a5504a1` on the same shapes and machine (≥ 90% rule). Building Colibri (third-party code) needs confirmation. Then decide whether more lossless Q4_K and int8 work is needed, and measure AVX2 on Linux x86-64.
+- ADR-002 follow-ups (not blocking): an AVX2 measurement on Linux x86-64 against Colibri, and optional lossless Q4_K speed-up (24% of STREAM today).
 - Move ADR-001 to Accepted after review.
 
 ## Environment change (supersedes MIGRATION_PLAN §2)

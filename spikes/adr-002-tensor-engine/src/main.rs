@@ -23,7 +23,65 @@ const DET_THREADS: [usize; 4] = [1, 2, 4, 11];
 fn main() {
     match std::env::args().nth(1).as_deref() {
         Some("det") => det_child(),
+        Some("dump") => dump(&std::env::args().nth(2).expect("dump <dir>")),
+        Some("attn") => attn_bench(),
         _ => bench(),
+    }
+}
+
+/// Attention decode only (own kernel), for repeated A/B runs against the Colibri harness.
+fn attn_bench() {
+    for t in [1024, 4096] {
+        let a = attn_data(16, 128, t, 300 + t as u64);
+        let mut out = vec![0f32; 16 * 128];
+        let ns = time_ns(|_| attn::own(&a, &mut out), 10, Duration::from_millis(400));
+        println!("| {t} | own (rayon) | {:.1} | {:.1} |", ns / 1e3, a.kv_bytes() as f64 / ns);
+        let ns = time_ns(|_| attn::own_pool(&a, &mut out), 10, Duration::from_millis(400));
+        println!("| {t} | own (spinning pool) | {:.1} | {:.1} |", ns / 1e3, a.kv_bytes() as f64 / ns);
+    }
+}
+
+fn write_raw<T: Copy>(path: &std::path::Path, v: &[T]) {
+    // SAFETY: T is a plain-old-data numeric type (f32/f64/i8/u8); we only read its bytes.
+    let b = unsafe { std::slice::from_raw_parts(v.as_ptr().cast::<u8>(), std::mem::size_of_val(v)) };
+    std::fs::write(path, b).expect("write dump file");
+}
+
+/// Write the exact inputs and f64 references the benchmarks use, so an external
+/// engine (the Colibri baseline harness) runs on identical bytes.
+///
+/// Per shape `n{n}_k{k}`: `w_f32`, `w_i8`, `s_i8`, `w_q8_0`, `w_q4_k`, `x_s{s}`,
+/// `ref_{fmt}_s{s}` (f64, the reference token rows concatenated, n each).
+/// Attention: `attn_t{t}_{q,k,v}` (f32) and `attn_t{t}_ref` (f64).
+fn dump(dir: &str) {
+    use adr_002_tensor_engine::formats::I8RowMat;
+    let d = std::path::Path::new(dir);
+    std::fs::create_dir_all(d).expect("mkdir");
+    for (si, &(_, n, k)) in SHAPES.iter().enumerate() {
+        let src = Source::new(n, k, 100 + si as u64);
+        let p = |name: &str| d.join(format!("n{n}_k{k}_{name}"));
+        write_raw(&p("w_f32"), &src.f32.w);
+        let i8m = I8RowMat::from_f32(&src.f32);
+        write_raw(&p("w_i8"), &i8m.q);
+        write_raw(&p("s_i8"), &i8m.scale);
+        write_raw(&p("w_q8_0"), &src.q8_0);
+        write_raw(&p("w_q4_k"), &src.q4k);
+        for &s in &SEQS {
+            let xs = activations(s, k, 200 + s as u64);
+            write_raw(&p(&format!("x_s{s}")), &xs);
+            let toks: Vec<usize> = if s == 1 { vec![0] } else { vec![0, 37, s - 1] };
+            for fmt in Fmt::ALL {
+                let refs: Vec<f64> = reference(src.own(fmt).as_ref(), &xs, &toks).concat();
+                write_raw(&p(&format!("ref_{}_s{s}", fmt.label())), &refs);
+            }
+        }
+    }
+    for t in [1024usize, 4096] {
+        let a = attn_data(16, 128, t, 300 + t as u64);
+        write_raw(&d.join(format!("attn_t{t}_q")), &a.q);
+        write_raw(&d.join(format!("attn_t{t}_k")), &a.k);
+        write_raw(&d.join(format!("attn_t{t}_v")), &a.v);
+        write_raw(&d.join(format!("attn_t{t}_ref")), &attn::reference(&a));
     }
 }
 

@@ -201,5 +201,8 @@ mod tests {
         let mut out = vec![0f32; 4 * 128];
         attn::own(&a, &mut out);
         assert!(rel_err(&out, &attn::reference(&a)) < 1e-5);
+        let mut pooled = vec![0f32; 4 * 128];
+        attn::own_pool(&a, &mut pooled);
+        assert_eq!(bits_hash(&out), bits_hash(&pooled), "pool and rayon attention must match bitwise");
     }
 }
