@@ -79,7 +79,9 @@ fn allowed_deps(krate: &str) -> Option<Vec<&'static str>> {
             "qubivex-backend-cpu",
         ],
         a if APPS.contains(&a) => return Some(vec![]), // handled in `is_allowed`
-        "xtask" => vec![],
+        // Repository tooling: reads model containers to generate fixtures. Nothing
+        // depends on xtask, so this edge cannot leak into product crates.
+        "xtask" => vec!["qubivex-core", "qubivex-model"],
         _ => return None,
     };
     v.sort_unstable();

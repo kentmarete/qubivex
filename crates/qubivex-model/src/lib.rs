@@ -5,7 +5,9 @@
 //!   which parses its config and describes every tensor it needs as a
 //!   [`TensorSchema`] of roles and shapes (ADR-003). [`arch::TransformerMoe`] is
 //!   the first architecture.
-//! - [`ModelMetadata::load`] cross-checks manifest, config and tensor headers.
+//! - [`ModelMetadata::load`] cross-checks manifest, config and tensor headers;
+//!   [`discover`] and [`find`] locate model directories; [`import`] writes a
+//!   manifest for a checkpoint by finding the layout that validates.
 //!
 //! Weight containers:
 //!
@@ -20,8 +22,10 @@
 //! are looked up through `general.architecture` ([`GgufMetadata::arch_value`]).
 
 pub mod arch;
+mod discover;
 mod error;
 pub mod gguf;
+mod import;
 mod index;
 pub mod manifest;
 mod metadata;
@@ -29,8 +33,10 @@ mod registry;
 pub mod safetensors;
 pub mod write;
 
+pub use discover::{Discovered, discover, find};
 pub use error::ModelError;
 pub use gguf::{GgufHeader, GgufMetadata, GgufValue};
+pub use import::{ImportOptions, Imported, import};
 pub use index::{RawTensor, TensorEntry, TensorIndex, WeightFile, WeightFormat};
 pub use manifest::Manifest;
 pub use metadata::{ByteSummary, MANIFEST_FILE, ModelMetadata};

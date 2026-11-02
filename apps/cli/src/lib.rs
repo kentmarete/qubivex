@@ -1,9 +1,10 @@
 //! The `qubivex` command-line interface.
 //!
 //! Subcommands arrive with the phases that implement them (MIGRATION_PLAN §3):
-//! `system` and `doctor` (Phase 2); `models`, `plan`, `run` and `serve` later.
+//! `system` and `doctor` (Phase 2), `models` (Phase 3); `plan`, `run` and `serve` later.
 
 mod doctor;
+mod models;
 mod system;
 
 use std::ffi::OsString;
@@ -47,6 +48,60 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
+    /// List, inspect and import models.
+    Models {
+        #[command(subcommand)]
+        command: ModelsCommand,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum ModelsCommand {
+    /// List the models in the model directories.
+    List {
+        /// A model directory to scan (repeatable). Default: $QUBIVEX_MODELS_DIRS, else ~/.qubivex/models.
+        #[arg(long = "dir")]
+        dirs: Vec<PathBuf>,
+        /// Print JSON instead of text.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Show a model's dimensions, bytes, files and tensors.
+    Inspect {
+        /// A model id, or a model directory.
+        model: String,
+        /// A model directory to search for the id (repeatable).
+        #[arg(long = "dir")]
+        dirs: Vec<PathBuf>,
+        /// Print JSON instead of text.
+        #[arg(long)]
+        json: bool,
+        /// List every tensor with its dtype, shape and role.
+        #[arg(long)]
+        tensors: bool,
+    },
+    /// Write a manifest for a checkpoint directory or a .gguf file.
+    Import {
+        /// The checkpoint directory, or a .gguf file.
+        path: PathBuf,
+        /// Model id (default: from the directory or file name).
+        #[arg(long)]
+        id: Option<String>,
+        /// Display name.
+        #[arg(long)]
+        name: Option<String>,
+        /// A config value the checkpoint does not record, as KEY=VALUE (repeatable).
+        #[arg(long = "set")]
+        set: Vec<String>,
+        /// Write manifest.json next to the weights instead of printing it.
+        #[arg(long)]
+        write: bool,
+        /// Replace an existing manifest.json.
+        #[arg(long)]
+        force: bool,
+    },
+    /// List the architectures this build supports.
+    Architectures,
 }
 
 /// An error and its chain of causes, `: `-separated.
@@ -128,6 +183,31 @@ fn execute(cmd: &Command) -> Result<(), String> {
             }
             emit(&doctor::storage(path, *size_mib, *json)?)
         }
+        Command::Models { command } => emit(&match command {
+            ModelsCommand::List { dirs, json } => models::list(dirs, *json)?,
+            ModelsCommand::Inspect {
+                model,
+                dirs,
+                json,
+                tensors,
+            } => models::inspect(model, dirs, *json, *tensors)?,
+            ModelsCommand::Import {
+                path,
+                id,
+                name,
+                set,
+                write,
+                force,
+            } => models::import_cmd(&models::ImportArgs {
+                path,
+                id: id.clone(),
+                name: name.clone(),
+                set,
+                write: *write,
+                force: *force,
+            })?,
+            ModelsCommand::Architectures => models::architectures(),
+        }),
     }
 }
 

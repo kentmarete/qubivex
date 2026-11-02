@@ -2,9 +2,12 @@
 //!
 //! - `check-deps`: enforces the crate dependency direction (QUBIVEX_DESIGN §3.1).
 //! - `check-model-names`: rejects model-name literals in shared code (design invariant 3).
-//! - `check`: runs both.
+//! - `gen-fixtures`: writes the tiny model fixtures under `fixtures/models/`.
+//! - `check-fixtures`: fails if the committed fixtures differ from the generator.
+//! - `check`: runs the three checks.
 
 mod deps;
+mod fixtures;
 mod model_names;
 
 use std::path::{Path, PathBuf};
@@ -16,8 +19,15 @@ fn main() -> ExitCode {
     let result = match cmd.as_str() {
         "check-deps" => check_deps(&root),
         "check-model-names" => check_model_names(&root),
-        "check" => check_deps(&root).and_then(|()| check_model_names(&root)),
-        _ => Err("usage: cargo xtask <check | check-deps | check-model-names>".to_owned()),
+        "gen-fixtures" => fixtures::write_fixtures(&root),
+        "check-fixtures" => fixtures::check_fixtures(&root),
+        "check" => check_deps(&root)
+            .and_then(|()| check_model_names(&root))
+            .and_then(|()| fixtures::check_fixtures(&root)),
+        _ => Err(
+            "usage: cargo xtask <check | check-deps | check-model-names | check-fixtures | gen-fixtures>"
+                .to_owned(),
+        ),
     };
     match result {
         Ok(()) => ExitCode::SUCCESS,

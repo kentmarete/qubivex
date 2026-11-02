@@ -53,52 +53,21 @@ impl ModelMetadata {
     /// every missing, misshapen and unexpected tensor at once.
     pub fn load(dir: &Path, registry: &ArchitectureRegistry) -> Result<Self, ModelError> {
         let manifest = Manifest::load(&dir.join(MANIFEST_FILE))?;
-        let mut tensors = TensorIndex::new();
-        for s in &manifest.weights.shards {
-            let path = dir.join(&s.path);
-            match manifest.weights.format {
-                ManifestFormat::Safetensors => {
-                    tensors.add_safetensors(&path)?;
-                }
-                ManifestFormat::Gguf => tensors.add_gguf(&path)?,
-            }
-            let actual = tensors.files().last().map_or(0, |f| f.size);
-            if let Some(want) = s.size {
-                if want != actual {
-                    return Err(ModelError::Manifest {
-                        path: dir.join(MANIFEST_FILE),
-                        detail: format!(
-                            "shard {:?} is {actual} bytes, the manifest says {want}",
-                            s.path
-                        ),
-                    });
-                }
-            }
-        }
-        let hf_config = match manifest.weights.format {
-            ManifestFormat::Gguf => None,
-            ManifestFormat::Safetensors => {
-                let p = dir.join(manifest.weights.config.as_deref().unwrap_or("config.json"));
-                let text = read_small(&p, MAX_CONFIG_BYTES)?;
-                let v: serde_json::Value = serde_json::from_str(&text)
-                    .map_err(|e| ModelError::Config(format!("{}: {e}", p.display())))?;
-                if !v.is_object() {
-                    return Err(ModelError::Config(format!(
-                        "{}: not a JSON object",
-                        p.display()
-                    )));
-                }
-                Some(v)
-            }
-        };
-        let factory = registry.resolve(&manifest.architecture)?;
-        let config = factory.parse_config(&ConfigSource {
-            manifest: &manifest,
-            hf_config: hf_config.as_ref(),
-            gguf: tensors.gguf_metadata(),
-        })?;
-        let schema = factory.tensor_schema(&config)?;
-        let roles = validate(&manifest, &schema, &tensors)?;
+        Self::load_with(dir, manifest, registry)
+    }
+
+    /// Like [`ModelMetadata::load`], with a manifest that is not (yet) on disk.
+    ///
+    /// # Errors
+    /// As [`ModelMetadata::load`].
+    pub fn load_with(
+        dir: &Path,
+        manifest: Manifest,
+        registry: &ArchitectureRegistry,
+    ) -> Result<Self, ModelError> {
+        let tensors = index_files(dir, &manifest)?;
+        let hf_config = read_config(dir, &manifest)?;
+        let (config, roles) = check(&manifest, &tensors, hf_config.as_ref(), registry)?;
         Ok(Self {
             dir: dir.to_owned(),
             manifest,
@@ -139,6 +108,72 @@ impl ModelMetadata {
         s.largest_expert = per_expert.values().copied().max().unwrap_or(0);
         s
     }
+}
+
+/// Indexes the manifest's shards, checking stated sizes.
+pub(crate) fn index_files(dir: &Path, manifest: &Manifest) -> Result<TensorIndex, ModelError> {
+    let mut tensors = TensorIndex::new();
+    for s in &manifest.weights.shards {
+        let path = dir.join(&s.path);
+        match manifest.weights.format {
+            ManifestFormat::Safetensors => {
+                tensors.add_safetensors(&path)?;
+            }
+            ManifestFormat::Gguf => tensors.add_gguf(&path)?,
+        }
+        let actual = tensors.files().last().map_or(0, |f| f.size);
+        if let Some(want) = s.size {
+            if want != actual {
+                return Err(ModelError::Manifest {
+                    path: dir.join(MANIFEST_FILE),
+                    detail: format!(
+                        "shard {:?} is {actual} bytes, the manifest says {want}",
+                        s.path
+                    ),
+                });
+            }
+        }
+    }
+    Ok(tensors)
+}
+
+/// `config.json` for a SafeTensors model; `None` for GGUF.
+pub(crate) fn read_config(
+    dir: &Path,
+    manifest: &Manifest,
+) -> Result<Option<serde_json::Value>, ModelError> {
+    if manifest.weights.format == ManifestFormat::Gguf {
+        return Ok(None);
+    }
+    let p = dir.join(manifest.weights.config.as_deref().unwrap_or("config.json"));
+    let text = read_small(&p, MAX_CONFIG_BYTES)?;
+    let v: serde_json::Value = serde_json::from_str(&text)
+        .map_err(|e| ModelError::Config(format!("{}: {e}", p.display())))?;
+    if !v.is_object() {
+        return Err(ModelError::Config(format!(
+            "{}: not a JSON object",
+            p.display()
+        )));
+    }
+    Ok(Some(v))
+}
+
+/// Parses the config and validates the tensors against the architecture's schema.
+pub(crate) fn check(
+    manifest: &Manifest,
+    tensors: &TensorIndex,
+    hf_config: Option<&serde_json::Value>,
+    registry: &ArchitectureRegistry,
+) -> Result<(ArchConfig, BTreeMap<String, TensorRole>), ModelError> {
+    let factory = registry.resolve(&manifest.architecture)?;
+    let config = factory.parse_config(&ConfigSource {
+        manifest,
+        hf_config,
+        gguf: tensors.gguf_metadata(),
+    })?;
+    let schema = factory.tensor_schema(&config)?;
+    let roles = validate(manifest, &schema, tensors)?;
+    Ok((config, roles))
 }
 
 fn validate(

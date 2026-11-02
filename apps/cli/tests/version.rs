@@ -95,3 +95,86 @@ fn doctor_storage_json() {
         assert!(stderr.contains("free space"), "{stderr}");
     }
 }
+
+fn fixtures() -> std::path::PathBuf {
+    std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/models")
+}
+
+#[test]
+fn models_list_and_inspect_fixtures() {
+    let out = qubivex()
+        .args(["models", "list", "--dir"])
+        .arg(fixtures())
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let t = String::from_utf8(out.stdout).unwrap();
+    for id in ["olmoe-tiny ", "olmoe-tiny-gguf ", "qwen3-moe-tiny "] {
+        assert!(
+            t.lines().any(|l| l.starts_with(id) && l.ends_with("ok")),
+            "{id}: {t}"
+        );
+    }
+    let out = qubivex()
+        .args([
+            "models",
+            "inspect",
+            "qwen3-moe-tiny",
+            "--json",
+            "--tensors",
+            "--dir",
+        ])
+        .arg(fixtures())
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(v["config"]["head_dim"], 32);
+    assert_eq!(v["config"]["qk_norm"], "per_head");
+    let roles: Vec<&str> = v["tensors"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|t| t["role"]["role"].as_str())
+        .collect();
+    assert!(roles.contains(&"routed_expert_stack"));
+    let out = qubivex()
+        .args(["models", "inspect", "missing-model", "--dir"])
+        .arg(fixtures())
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(1));
+}
+
+#[test]
+fn models_import_prints_a_manifest() {
+    let out = qubivex()
+        .args(["models", "import", "--set", "norm_topk_prob=false"])
+        .arg(fixtures().join("olmoe-tiny-gguf/olmoe-tiny-q8_0.gguf"))
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(v["architecture"]["config"]["tensor_names"], "gguf");
+    assert_eq!(v["model"]["id"], "olmoe-tiny-q8_0");
+    // --write refuses to replace an existing manifest without --force.
+    let out = qubivex()
+        .args(["models", "import", "--write"])
+        .arg(fixtures().join("olmoe-tiny"))
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&out.stderr).contains("--force"));
+}

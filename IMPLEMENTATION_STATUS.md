@@ -3,10 +3,15 @@
 Last updated: 2026-11-02
 
 ## Current phase
-**Phase 2: hardware detection, nearly done.** `qubivex-hardware`, `qubivex system
-[--json]` and `qubivex doctor --storage` are done and tested on recorded Linux and macOS
-fixtures, and live on macOS. Remaining: seeing both commands' output on a real Linux
-host (CI runs only the live tests there).
+**Phase 3: model metadata and registry, nearly done.** Containers, manifest, registry,
+`transformer_moe`, validation, discovery, import and `qubivex models
+list|inspect|import|architectures` are done, with three committed tiny fixtures.
+Remaining exit check: the real OLMoE GGUF, which is a ~4 GB download.
+
+Phase 2 (hardware detection) is done: `qubivex-hardware`, `qubivex system [--json]`
+and `qubivex doctor --storage`. They are tested on recorded Linux and macOS fixtures and
+live on macOS. Remaining: seeing both commands' output on a real Linux host (CI runs
+only the live tests there).
 
 Phase 1 exit criteria are met (clean workspace; ADR-002 Accepted: hybrid, without
 Candle). ADR-001 still awaits your review.
@@ -74,6 +79,21 @@ The `miri` and `loom` jobs arrive with the first unsafe or concurrent code (Phas
 - **Extensibility check.** The two `transformers` tiny checkpoints load through the same code with only manifest differences: OLMoE-style (`hf_fused`, full q/k-norm) and Qwen3-MoE-style (`hf_fused` with a router-name override, per-head q/k-norm). Every tensor has a role.
 - **Deviations.** Dimensions are never in the manifest, only in config or GGUF; ADR-004 permits them as cross-checked duplicates, but v1 has no such fields. Facts the checkpoint omits (q/k-norm, GGUF top-K renormalisation) are in `architecture.config` / `overrides.config`, for `models import` (step 3) to infer.
 
+### `qubivex-model` and CLI (Phase 3, step 3 of 3: discovery, import, fixtures)
+- `discover(roots)`: each root and its subdirectories that hold `manifest.json`, loaded and validated. `find(id|dir)` reports ambiguous ids.
+- `import(dir|file.gguf)` finds shards (`model.safetensors.index.json`, `*.safetensors`, or one `.gguf`). It tries each layout preset (plus the alternative router name) and each q/k-norm mode against the real tensors, and keeps the first that validates. Config errors are reported directly, and if nothing validates it reports the closest candidate's problems. `--set KEY=VALUE` supplies values the checkpoint lacks. It records shard sizes and the dominant dtype.
+- CLI: `qubivex models list [--dir]... [--json]`, `inspect <id|dir> [--json] [--tensors]`, `import <path> [--id] [--name] [--set]... [--write [--force]]`, and `architectures`. Model dirs come from `--dir`, else `$QUBIVEX_MODELS_DIRS`, else `~/.qubivex/models`.
+- Fixtures in `fixtures/models/` (~900 KB), from `cargo xtask gen-fixtures`. They are deterministic, and `cargo xtask check` regenerates them and fails on drift. Manifests come from the importer.
+  - `olmoe-tiny`: per-expert `hf` layout, full q/k-norm.
+  - `olmoe-tiny-gguf`: the same weights as GGUF Q8_0/F32 with `olmoe.*` keys and `--set norm_topk_prob=false`.
+  - `qwen3-moe-tiny`: `hf_fused`, per-head q/k-norm, `head_dim` ≠ hidden/heads.
+- The importer also recognised the `transformers` tiny checkpoints (downloaded, not committed) with no hand-written manifest.
+- **Deviation from MIGRATION_PLAN §3.** Fixtures are written by our own writer, with configs that mirror the released checkpoints' keys, not by pinned `transformers` scripts. There is no Python ML stack here, and the `transformers` tiny models are 13–39 MB. Numerical oracles for these fixtures (Phase 4) will still need a reference implementation.
+- `xtask` may now depend on `qubivex-core` and `qubivex-model`, for the generator. Nothing depends on `xtask`.
+
+## Remaining in Phase 3
+- Exit check on the real OLMoE GGUF: `models import`, `list` and `inspect`.
+
 ## Remaining in Phase 2
 - Check `qubivex system` and `qubivex doctor --storage` output on a real Linux host.
 - Caching `StorageMeasurement` per device waits for a state directory (config work, Phase 3 or later).
@@ -105,7 +125,7 @@ Development moved to an **Apple M3 Pro (arm64, 18 GB RAM, macOS)** with about 37
 - ~~**B3** Git repository~~: resolved (`origin` = `github.com/kentmarete/qubivex`).
 
 ## Test results (2026-11-02, M3 Pro, Rust 1.99.1 and 1.85)
-- `cargo test --workspace`: 65 passed, 0 failed (core 22, including a proptest over untrusted dims; hardware 18 unit + 6 fixture, including live smoke and storage tests; CLI 10; xtask 9).
+- `cargo test --workspace`: 91 passed, 0 failed, on Rust 1.99.1 and 1.85. Breakdown: core 22 (including a proptest over untrusted dims); hardware 24 (including live smoke and storage tests); model 23 (including proptests over corrupted containers and the committed fixtures); CLI 13; xtask 9. The env-gated `real_files` tests are skipped without `QUBIVEX_REAL_MODEL_*`.
 - Cross-checks: `cargo clippy -D warnings` and `cargo +1.85 check` for `x86_64-unknown-linux-gnu` and `x86_64-apple-darwin`.
 - `cargo clippy --workspace --all-targets -- -D warnings`: clean.
 - `cargo fmt --check`, `cargo doc` (`-D warnings`), `cargo deny check` and `cargo xtask check`: clean.
