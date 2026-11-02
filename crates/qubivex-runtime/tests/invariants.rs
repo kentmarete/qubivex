@@ -21,6 +21,7 @@ fn engine(id: &str, cache: Option<u64>) -> Engine {
         EngineOptions {
             expert_cache_bytes: cache,
             max_context: Some(256),
+            ..EngineOptions::default()
         },
     )
     .unwrap()

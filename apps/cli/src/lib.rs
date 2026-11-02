@@ -82,6 +82,9 @@ enum Command {
         /// Context limit in tokens (default: the model's).
         #[arg(long)]
         context: Option<usize>,
+        /// Compute threads (default: the CPU's performance cores).
+        #[arg(long)]
+        threads: Option<usize>,
         /// Do not print timing and cache statistics.
         #[arg(long)]
         quiet: bool,
@@ -232,6 +235,7 @@ fn execute(cmd: &Command) -> Result<(), String> {
             seed,
             expert_cache_mb,
             context,
+            threads,
             quiet,
         } => run::run(&run::RunArgs {
             model,
@@ -246,6 +250,7 @@ fn execute(cmd: &Command) -> Result<(), String> {
             },
             expert_cache_mb: *expert_cache_mb,
             context: *context,
+            threads: *threads,
             quiet: *quiet,
         }),
         Command::Models { command } => emit(&match command {

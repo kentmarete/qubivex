@@ -50,7 +50,7 @@ pub enum ArchError {
 }
 
 /// The resident weights, by tensor name.
-pub trait DenseWeights {
+pub trait DenseWeights: Sync {
     /// The weight as a `rows × cols` view (a 1-D tensor is `1 × n`).
     ///
     /// # Errors
@@ -70,7 +70,7 @@ pub struct ExpertWeights<'a> {
 }
 
 /// Routed experts, lent one at a time.
-pub trait ExpertProvider {
+pub trait ExpertProvider: Sync {
     /// Calls `f` with the expert's weights while they are held.
     ///
     /// # Errors
@@ -118,8 +118,8 @@ pub struct TraceEvent<'a> {
     pub experts: &'a [u32],
 }
 
-/// A trace callback.
-pub type Tracer<'t> = &'t mut dyn FnMut(TraceEvent<'_>);
+/// A trace callback. `Send`, because the forward pass may run on a worker thread.
+pub type Tracer<'t> = &'t mut (dyn FnMut(TraceEvent<'_>) + Send);
 
 /// Where a forward pass gets its weights and kernels.
 #[derive(Clone, Copy)]

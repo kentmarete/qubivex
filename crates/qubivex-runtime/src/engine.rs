@@ -24,6 +24,19 @@ pub struct EngineOptions {
     pub expert_cache_bytes: Option<u64>,
     /// Context limit. `None`: the model's maximum (or 4096 if it states none).
     pub max_context: Option<usize>,
+    /// Compute threads. `None`: the CPU's compute team (its fastest cores: efficiency
+    /// cores slow a team that meets at every matmul), else every logical CPU.
+    pub threads: Option<usize>,
+}
+
+/// The default thread count: the compute team, else every logical CPU.
+fn default_threads() -> usize {
+    let cpu = qubivex_hardware::probe_cpu(&qubivex_hardware::Host::live());
+    cpu.performance_cores()
+        .known()
+        .and_then(|&n| usize::try_from(n).ok())
+        .filter(|&n| n > 0)
+        .unwrap_or_else(|| std::thread::available_parallelism().map_or(1, std::num::NonZero::get))
 }
 
 struct Tensor {
@@ -132,6 +145,9 @@ pub struct Engine {
     tokenizer: Tokenizer,
     backend: CpuBackend,
     max_context: usize,
+    /// The forward pass runs inside this pool, so every matmul starts on a worker that
+    /// joins the work instead of a caller blocked on a condition variable.
+    pool: rayon::ThreadPool,
 }
 
 impl std::fmt::Debug for Engine {
@@ -231,7 +247,19 @@ impl Engine {
             .or(meta.config.dims.max_context)
             .and_then(|c| usize::try_from(c).ok())
             .unwrap_or(4096);
+        let threads = opts
+            .threads
+            .filter(|&t| t > 0)
+            .unwrap_or_else(default_threads);
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(threads)
+            .thread_name(|i| format!("qubivex-compute-{i}"))
+            .build()
+            .map_err(|e| {
+                RuntimeError::Model(format!("cannot start {threads} compute threads: {e}"))
+            })?;
         Ok(Self {
+            pool,
             max_context: opts.max_context.map_or(model_ctx, |c| c.min(model_ctx)),
             meta,
             dense,
@@ -241,6 +269,12 @@ impl Engine {
             tokenizer,
             backend,
         })
+    }
+
+    /// Compute threads in use.
+    #[must_use]
+    pub fn threads(&self) -> usize {
+        self.pool.current_num_threads()
     }
 
     /// The model metadata.
@@ -293,7 +327,9 @@ impl Engine {
             experts: &provider,
             backend: &self.backend,
         };
-        Ok(self.model.forward(tokens, cache, src, logits, trace)?)
+        Ok(self
+            .pool
+            .install(|| self.model.forward(tokens, cache, src, logits, trace))?)
     }
 
     /// Generates up to `max_new` tokens after `prompt`, calling `on_token` for each;

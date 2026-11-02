@@ -23,8 +23,8 @@ are validated before any byte is used, and results are bitwise reproducible.
 
 > **Status: early development.** QUBIVEX now generates text on CPU (`qubivex run`), with
 > experts streamed through a cache of any size; the output is identical whatever the
-> cache holds. It is a prototype: portable kernels (about 11 tok/s decode for
-> OLMoE-1B-7B Q4_K_M on an Apple M3 Pro), no GPU, no server yet. See
+> cache holds. It is a prototype: about 20 tok/s decode for OLMoE-1B-7B Q4_K_M on
+> an Apple M3 Pro (NEON kernels, lossless), no GPU, no server yet. See
 > [Roadmap](#roadmap) and [`IMPLEMENTATION_STATUS.md`](IMPLEMENTATION_STATUS.md).
 
 ---
@@ -227,6 +227,7 @@ generation speed and expert-cache counters to standard error.
 | `--temperature T`, `--top-p P`, `--seed S` | Sampling. Temperature 0 (the default) is greedy; the same seed gives the same text |
 | `--expert-cache-mb N` | Expert cache size (default: every expert resident). Smaller caches stream experts from disk and never change the output |
 | `--context N` | Context limit in tokens (default: the model's) |
+| `--threads N` | Compute threads (default: the CPU's performance cores) |
 | `--quiet` | Do not print the statistics line |
 | `--dir DIR` | Model directories to search for the id (as for `models list`) |
  Commands exit with 0 on success, 1 on a runtime error,

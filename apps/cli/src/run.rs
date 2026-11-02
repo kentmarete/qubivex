@@ -21,6 +21,7 @@ pub(crate) struct RunArgs<'a> {
     pub(crate) sampling: Sampling,
     pub(crate) expert_cache_mb: Option<u64>,
     pub(crate) context: Option<usize>,
+    pub(crate) threads: Option<usize>,
     pub(crate) quiet: bool,
 }
 
@@ -35,6 +36,7 @@ pub(crate) fn run(a: &RunArgs<'_>) -> Result<(), String> {
     let opts = EngineOptions {
         expert_cache_bytes: a.expert_cache_mb.map(|mb| mb.saturating_mul(1 << 20)),
         max_context: a.context,
+        threads: a.threads,
     };
     let engine = Engine::load(meta, opts).map_err(|e| chain(&e))?;
     let load = t0.elapsed();
@@ -90,9 +92,10 @@ pub(crate) fn run(a: &RunArgs<'_>) -> Result<(), String> {
         #[allow(clippy::cast_precision_loss)]
         let prefill = prompt.len() as f64 / ttft.max(1e-9);
         eprintln!(
-            "\n[{} prompt tokens, {} generated | load {:.2}s | prefill {:.1} tok/s | decode {:.2} tok/s | experts: cache {}, {} hits, {} loads ({}), {} evictions]",
+            "\n[{} prompt tokens, {} generated | {} threads | load {:.2}s | prefill {:.1} tok/s | decode {:.2} tok/s | experts: cache {}, {} hits, {} loads ({}), {} evictions]",
             prompt.len(),
             generated.len(),
+            engine.threads(),
             load.as_secs_f64(),
             prefill,
             decode,

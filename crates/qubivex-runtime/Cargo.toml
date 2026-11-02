@@ -14,8 +14,10 @@ qubivex-backend-cpu = { workspace = true }
 qubivex-compute = { workspace = true }
 qubivex-core = { workspace = true }
 qubivex-expert-stream = { workspace = true }
+qubivex-hardware = { workspace = true }
 qubivex-model = { workspace = true }
 qubivex-tokenizer = { workspace = true }
+rayon = { workspace = true }
 thiserror = { workspace = true }
 
 [dev-dependencies]
