@@ -23,8 +23,10 @@ are validated before any byte is used, and results are bitwise reproducible.
 
 > **Status: early development.** QUBIVEX now generates text on CPU (`qubivex run`), with
 > experts streamed through a cache of any size; the output is identical whatever the
-> cache holds. It is a prototype: about 20 tok/s decode for OLMoE-1B-7B Q4_K_M on
-> an Apple M3 Pro (NEON kernels, lossless), no GPU, no server yet. See
+> cache holds. It is a prototype: about 21 tok/s decode for OLMoE-1B-7B Q4_K_M on
+> an Apple M3 Pro, lossless. That is faster than Colibri's default lossy kernels on the
+> same machine, with output identical to Colibri's lossless path
+> ([benchmark](docs/performance/COLIBRI-OLMOE-BENCHMARK.md)). No GPU, no server yet. See
 > [Roadmap](#roadmap) and [`IMPLEMENTATION_STATUS.md`](IMPLEMENTATION_STATUS.md).
 
 ---
@@ -484,6 +486,7 @@ Architectural changes go through an ADR in [`docs/decisions/`](docs/decisions).
 | [`COLIBRI_ANALYSIS.md`](docs/architecture/COLIBRI_ANALYSIS.md) | What QUBIVEX keeps, and changes, from Colibri |
 | [`docs/decisions/`](docs/decisions) | ADR-001 to ADR-008: workspace, compute, registry, manifest, planner, streaming, backends, cache |
 | [`ADR-002-SPIKE.md`](docs/performance/ADR-002-SPIKE.md) | Kernel benchmarks against Candle and Colibri |
+| [`COLIBRI-OLMOE-BENCHMARK.md`](docs/performance/COLIBRI-OLMOE-BENCHMARK.md) | End-to-end decode against Colibri `olmoe` on OLMoE-1B-7B Q4_K_M |
 | [`manifest.schema.json`](docs/model-support/manifest.schema.json) | Manifest JSON Schema |
 | [`IMPLEMENTATION_STATUS.md`](IMPLEMENTATION_STATUS.md) | What is done, deviations, test results |
 
