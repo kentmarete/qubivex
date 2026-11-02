@@ -1,0 +1,5 @@
+Filesystem     1024-blocks      Used Available Capacity Mounted on
+overlay          960302804 412345678 499123456      46% /
+/dev/nvme0n1p2   960302804 412345678 499123456      46% /models
+fileserver:/export/data 7811705856 3905852928 3905852928 50% /data
+shm                  65536         0     65536       0% /dev/shm

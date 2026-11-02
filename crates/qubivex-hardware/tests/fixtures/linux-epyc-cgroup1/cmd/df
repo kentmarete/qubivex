@@ -1,0 +1,3 @@
+Filesystem     1024-blocks      Used Available Capacity Mounted on
+/dev/sda2        1921724676 500000000 1323999999      28% /
+/dev/nvme0n1     3750000000 1000000000 2750000000     27% /mnt/my models

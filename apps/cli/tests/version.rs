@@ -32,3 +32,29 @@ fn unknown_argument_is_a_usage_error() {
     let out = qubivex().arg("--frobnicate").output().unwrap();
     assert_eq!(out.status.code(), Some(2));
 }
+
+#[test]
+fn system_prints_a_profile() {
+    let out = qubivex().arg("system").output().unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let text = String::from_utf8(out.stdout).unwrap();
+    assert!(text.starts_with("OS "), "{text}");
+    assert!(text.contains("\nCPU "), "{text}");
+}
+
+#[test]
+fn system_json_is_valid_json() {
+    let out = qubivex().args(["system", "--json"]).output().unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert!(v["profile"]["cpu"]["arch"].is_string());
+    assert!(v["snapshot"]["ram_available"].is_object());
+}

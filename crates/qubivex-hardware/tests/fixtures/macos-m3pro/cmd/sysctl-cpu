@@ -1,0 +1,10 @@
+machdep.cpu.brand_string: Apple M3 Pro
+hw.physicalcpu: 11
+hw.logicalcpu: 11
+hw.nperflevels: 2
+hw.perflevel0.name: Performance
+hw.perflevel0.physicalcpu: 5
+hw.perflevel0.logicalcpu: 5
+hw.perflevel1.name: Efficiency
+hw.perflevel1.physicalcpu: 6
+hw.perflevel1.logicalcpu: 6

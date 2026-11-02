@@ -1,0 +1,4 @@
+25 1 8:2 / / rw,relatime shared:1 - ext4 /dev/sda2 rw,errors=remount-ro
+26 25 0:22 / /sys rw,nosuid shared:7 - sysfs sysfs rw
+40 25 259:0 / /mnt/my\040models rw,noatime shared:30 - xfs /dev/nvme0n1 rw
+41 25 8:1 / /boot/efi rw,relatime shared:31 - vfat /dev/sda1 rw

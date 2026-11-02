@@ -1,0 +1,8 @@
+612 520 0:52 / / rw,relatime master:301 - overlay overlay rw,lowerdir=/var/lib/docker/l/A,upperdir=/var/lib/docker/B/diff
+613 612 0:55 / /proc rw,nosuid,nodev,noexec,relatime - proc proc rw
+614 612 0:56 / /dev rw,nosuid - tmpfs tmpfs rw,size=65536k,mode=755
+620 612 0:60 / /sys/fs/cgroup ro,nosuid,nodev,noexec,relatime - cgroup2 cgroup rw
+621 612 259:2 /var/lib/docker/containers/abc/hosts /etc/hosts rw,relatime - ext4 /dev/nvme0n1p2 rw
+622 612 259:2 /srv/models /models rw,relatime - ext4 /dev/nvme0n1p2 rw
+623 612 0:70 / /data rw,relatime - nfs4 fileserver:/export/data rw,vers=4.2
+624 614 0:61 / /dev/shm rw,nosuid,nodev,noexec,relatime - tmpfs shm rw,size=65536k
