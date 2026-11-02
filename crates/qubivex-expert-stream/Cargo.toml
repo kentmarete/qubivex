@@ -1,0 +1,19 @@
+[package]
+name = "qubivex-expert-stream"
+description = "Expert store for QUBIVEX: leases, LRU eviction, in-flight load dedup"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+qubivex-core = { workspace = true }
+thiserror = { workspace = true }
+
+[target.'cfg(loom)'.dependencies]
+loom = { workspace = true }
+
+[lints]
+workspace = true

@@ -3,7 +3,7 @@
 Last updated: 2026-11-03
 
 ## Current phase
-**Phase 4: CPU inference prototype, in progress (steps 1–2 of 5 done: kernels, tokenizer).**
+**Phase 4: CPU inference prototype, in progress (steps 1–3 of 5 done: kernels, tokenizer, expert store).**
 The plan has five steps: (1) compute interface and CPU kernels; (2) tokenizer and chat
 templates; (3) a minimal expert store; (4) the `transformer_moe` forward pass, KV
 cache, sampling and `qubivex run`; (5) numerical exit tests against `transformers`
@@ -137,6 +137,23 @@ The `miri` and `loom` jobs arrive with the first unsafe or concurrent code (Phas
   - `deny.toml` ignores RUSTSEC-2024-0436: `paste` is unmaintained, a compile-time macro used by `tokenizers`, with no vulnerability.
   - The model-name guard accepts a single line marked `model-name-ok: <reason>`, used once, for the GGUF format identifier `"olmo"`.
 
+### Phase 4, step 3: `qubivex-expert-stream` (minimal) and expert extents
+- `ExpertStore` (ADR-006, Phase 4 form):
+  - Synchronous `acquire` returns a `Lease` that releases on drop and is not `Clone`.
+  - The capacity is in bytes, and the least-recently-used unleased experts are evicted first; expert sizes differ by layer in Q4_K_M.
+  - Loads run outside the lock. In-flight dedup: a second caller waits on a condvar for the first caller's load.
+  - When everything resident is leased it returns `Full` instead of waiting, so one generating thread cannot deadlock itself. `TooLarge` covers an expert bigger than the whole capacity.
+  - Stats: hits, loads, dedup waits, evictions and bytes read.
+  - Expert bytes are `Arc<[u8]>`, so the store has no `unsafe`. Slabs, I/O threads, `O_DIRECT` and prefetch belong to Phase 6.
+- **Loom.** Mutex, condvar and atomics come from `loom::sync` under `cfg(loom)`. The model checks (dedup loads once; eviction never takes a leased expert) explore 35 and 18 interleavings. A planted dedup bug (a loading slot treated as a miss) makes them fail. New CI job: `loom (expert store)`.
+- `qubivex-runtime::ModelExpertSource` builds each expert's byte extents from the tensor roles: per-expert tensors, or the `e`-th slice of a stacked tensor, with parts in a fixed order. It records each part's dtype and shape and reads with `pread`.
+- Tests:
+  - Capacity sweep on synthetic experts: every capacity returns identical bytes, and all-resident loads each expert once.
+  - LRU order, `Full`, `TooLarge` and load-error recovery.
+  - 8 threads × 300 acquires stay within the capacity.
+  - For all three fixtures, at three capacities, every expert read through the store is byte-identical to its tensors.
+  - On the real OLMoE GGUF (env-gated), all 1,024 experts are located and read correctly through a 4-expert store that evicts.
+
 ## Remaining in Phase 2
 - Check `qubivex system` and `qubivex doctor --storage` output on a real Linux host.
 - Caching `StorageMeasurement` per device waits for a state directory (config work, Phase 3 or later).
@@ -168,7 +185,7 @@ Development moved to an **Apple M3 Pro (arm64, 18 GB RAM, macOS)** with about 37
 - ~~**B3** Git repository~~: resolved (`origin` = `github.com/kentmarete/qubivex`).
 
 ## Test results (2026-11-02, M3 Pro, Rust 1.99.1 and 1.85)
-- `cargo test --workspace`: 103 passed, 0 failed on Rust 1.99.1 and 1.85 (2026-11-03, Phase 4 step 2). After step 1: 98; Phase 3: 92. Earlier: 91 passed on Rust 1.99.1 and 1.85. Breakdown: core 22 (including a proptest over untrusted dims); hardware 24 (including live smoke and storage tests); model 23 (including proptests over corrupted containers and the committed fixtures); CLI 14; xtask 9. The env-gated `real_files` tests are skipped without `QUBIVEX_REAL_MODEL_*`.
+- `cargo test --workspace`: 110 passed, 0 failed on Rust 1.99.1 and 1.85 (2026-11-03, Phase 4 step 3). After step 2: 103; step 1: 98; Phase 3: 92. Loom: 2 model checks (`RUSTFLAGS="--cfg loom"`). Earlier: 91 passed on Rust 1.99.1 and 1.85. Breakdown: core 22 (including a proptest over untrusted dims); hardware 24 (including live smoke and storage tests); model 23 (including proptests over corrupted containers and the committed fixtures); CLI 14; xtask 9. The env-gated `real_files` tests are skipped without `QUBIVEX_REAL_MODEL_*`.
 - Cross-checks: `cargo clippy -D warnings` and `cargo +1.85 check` for `x86_64-unknown-linux-gnu` and `x86_64-apple-darwin`.
 - `cargo clippy --workspace --all-targets -- -D warnings`: clean.
 - `cargo fmt --check`, `cargo doc` (`-D warnings`), `cargo deny check` and `cargo xtask check`: clean.

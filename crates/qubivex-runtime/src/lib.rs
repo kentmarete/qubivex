@@ -2,8 +2,12 @@
 //!
 //! Phase 4 builds it up step by step. So far: the tokenizer of a model
 //! ([`load_tokenizer`]), from `tokenizer.json` or from the vocabulary embedded in a
-//! GGUF file.
+//! GGUF file; and the routed experts as byte extents ([`ModelExpertSource`]) for the
+//! expert store.
 
+mod experts;
+
+pub use experts::{ExpertLayout, ModelExpertSource, PartLayout};
 use qubivex_model::manifest::TokenizerSection;
 use qubivex_model::{GgufMetadata, GgufValue, ModelMetadata};
 use qubivex_tokenizer::{GgufVocab, Tokenizer, TokenizerError};
