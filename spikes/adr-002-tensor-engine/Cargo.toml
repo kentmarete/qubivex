@@ -1,0 +1,29 @@
+[package]
+name = "adr-002-tensor-engine"
+version = "0.0.0"
+edition = "2024"
+publish = false
+license = "Apache-2.0"
+description = "ADR-002 spike: Candle against own kernels on expert-FFN shapes (not a workspace crate)"
+
+# Standalone on purpose: the spike's dependencies (Candle) must not enter the
+# product workspace's lock file or cargo-deny scope until ADR-002 decides.
+[workspace]
+
+[dependencies]
+candle-core = "0.11.1"
+candle-nn = "0.11.1"
+gemm = "0.19"
+half = "2"
+rayon = "1"
+rand = "0.9"
+rand_chacha = "0.9"
+
+[profile.release]
+lto = "fat"
+codegen-units = 1
+debug = 1
+
+[features]
+# Apple Accelerate (AMX) for Candle's f32 matmul, to see Candle's best macOS case.
+accelerate = ["candle-core/accelerate", "candle-nn/accelerate"]

@@ -1,6 +1,6 @@
 # ADR-002: Hybrid compute; the tensor engine is chosen by a benchmark spike
 
-- Status: Proposed. **The decision is pending the Phase 1 spike.**
+- Status: Proposed. **Spike run (2026-11-02); the decision is pending the Colibri baseline.**
 - Date: 2026-11-01
 
 ## Context
@@ -33,3 +33,21 @@ dependencies. Whatever is chosen stays behind `ComputeBackend`, so it can be rep
 
 ## Consequences
 The decision is recorded with the spike data in `docs/performance/`.
+
+## Spike results (2026-11-02, partial)
+Full data and caveats: [`docs/performance/ADR-002-SPIKE.md`](../performance/ADR-002-SPIKE.md).
+
+- Candle's fast quantized CPU path is lossy. It quantizes activations to Q8 (relative
+  error about 4e-3, against about 1e-7 lossless), the equivalent of Colibri's opt-in
+  `IDOT`. Candle has no lossless quantized CPU matmul. Its dense f32 S=1 path runs at
+  43% of memory bandwidth, and its bf16 path is slow and lossy.
+- Own lossless kernels: f32 and bf16 GEMV reach memory bandwidth. int8, Q8_0 and Q4_K
+  reach 60%, 51% and 20% (compute-bound on the integer widening, with NEON).
+  Attention decode is 2–5× faster than Candle's.
+- Prefill: dequantize to f32, then the `gemm` crate, matches Candle's f32 GEMM.
+  Accelerate is about 3× faster on macOS.
+- Every own and Candle case is bitwise deterministic across 1–11 threads.
+
+**Preliminary choice: option 3 (hybrid) without Candle.** Own kernels on the decode hot
+path, and own dequantize plus the `gemm` crate for prefill, with Accelerate as an
+additive macOS feature. The ≥ 90%-of-Colibri rule is still unchecked.

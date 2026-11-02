@@ -2,6 +2,9 @@
 resolver = "3"
 members = ["crates/qubivex-core", "apps/cli", "xtask"]
 default-members = ["crates/qubivex-core", "apps/cli", "xtask"]
+# Spikes are standalone packages with their own lock files (their dependencies are not
+# product dependencies until an ADR accepts them).
+exclude = ["spikes"]
 
 [workspace.package]
 version = "0.1.0"

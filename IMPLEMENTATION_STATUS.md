@@ -4,8 +4,9 @@ Last updated: 2026-11-02
 
 ## Current phase
 **Phase 1: Rust foundation, in progress.** The workspace, `qubivex-core`, the CLI
-skeleton, the repository checks and CI are done. The ADR-002 tensor-engine
-benchmark spike has not started.
+skeleton, the repository checks and CI are done. The ADR-002 tensor-engine spike
+has run against Candle (`docs/performance/ADR-002-SPIKE.md`). The Colibri baseline
+that the decision rule needs is still outstanding.
 
 ## Completed
 | Phase | Deliverables |
@@ -34,8 +35,15 @@ Colibri reference point: `JustVugg/colibri` @ `0a5504a1` (2.1.0), Apache-2.0.
 
 The `miri` and `loom` jobs arrive with the first unsafe or concurrent code (Phase 4), as planned. There is no feature-powerset job yet because no crate has features.
 
+### ADR-002 spike (`spikes/adr-002-tensor-engine`, standalone, not a workspace member)
+- Own kernels: a fixed 64-lane reduction shape, NEON twins tested bitwise against portable twins, and lossless f32 activations.
+- Candle's quantized path is lossy (Q8 activations, about 4e-3 relative error) and fast. Own lossless f32 and bf16 GEMV reach memory bandwidth. int8, Q8_0 and Q4_K reach 60%, 51% and 20% of it.
+- Prefill via dequantize plus the `gemm` crate matches Candle. Accelerate is about 3× on macOS.
+- Everything is bitwise deterministic across 1–11 threads.
+- Preliminary choice: hybrid without Candle (ADR-002).
+
 ## Remaining in Phase 1
-- ADR-002 spike: tensor-engine benchmark on expert shapes (2048×1024, 1024×2048) at S=1 and S=128 (Candle against own kernels; f32, bf16, int8 row-scaled, Q4_K, Q8_0). It needs Colibri's kernels for the ≥ 90% throughput rule, so building Colibri (third-party code) needs confirmation.
+- ADR-002: the Colibri baseline at `0a5504a1` on the same shapes and machine (≥ 90% rule). Building Colibri (third-party code) needs confirmation. Then decide whether more lossless Q4_K and int8 work is needed, and measure AVX2 on Linux x86-64.
 - Move ADR-001 to Accepted after review.
 
 ## Environment change (supersedes MIGRATION_PLAN §2)
@@ -67,7 +75,7 @@ Development moved to an **Apple M3 Pro (arm64, 18 GB RAM, macOS)** with about 37
 - `cargo +1.85 check/test --workspace --all-targets`: clean.
 
 ## Benchmark results
-None yet (ADR-002 spike pending).
+ADR-002 spike, M3 Pro: [`docs/performance/ADR-002-SPIKE.md`](docs/performance/ADR-002-SPIKE.md).
 
 ## Architectural decisions
-ADR-001 … ADR-008, all Proposed. ADR-001 is implemented as written. ADR-002 is pending the spike.
+ADR-001 … ADR-008, all Proposed. ADR-001 is implemented as written. ADR-002 has spike data and a preliminary choice (hybrid without Candle), pending the Colibri baseline.
