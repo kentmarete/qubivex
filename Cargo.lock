@@ -277,6 +277,7 @@ dependencies = [
  "clap",
  "qubivex-core",
  "qubivex-hardware",
+ "qubivex-model",
  "serde",
  "serde_json",
 ]
@@ -297,6 +298,17 @@ version = "0.1.0"
 dependencies = [
  "qubivex-core",
  "rustix",
+ "serde",
+ "serde_json",
+ "thiserror",
+]
+
+[[package]]
+name = "qubivex-model"
+version = "0.1.0"
+dependencies = [
+ "proptest",
+ "qubivex-core",
  "serde",
  "serde_json",
  "thiserror",
@@ -563,6 +575,8 @@ checksum = "f17a85883d4e6d00e8a97c586de764dabcc06133f7f1d55dce5cdc070ad7fe59"
 name = "xtask"
 version = "0.1.0"
 dependencies = [
+ "qubivex-core",
+ "qubivex-model",
  "serde",
  "serde_json",
 ]

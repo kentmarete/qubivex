@@ -26,6 +26,21 @@ pub struct Shape {
 
 const _: () = assert!(size_of::<Shape>() == 72);
 
+/// Serialized as the dims array, outermost first.
+impl serde::Serialize for Shape {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        self.dims().serialize(s)
+    }
+}
+
+/// Deserialized from a dims array; more than [`MAX_RANK`] dims is an error.
+impl<'de> serde::Deserialize<'de> for Shape {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        let dims = Vec::<u64>::deserialize(d)?;
+        Self::new(&dims).map_err(serde::de::Error::custom)
+    }
+}
+
 impl Shape {
     /// A rank-0 (scalar) shape.
     pub const SCALAR: Self = Self {

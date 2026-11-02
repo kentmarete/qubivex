@@ -1,0 +1,33 @@
+{
+  "architecture": {
+    "config": {
+      "qk_norm": "full",
+      "tensor_names": "gguf"
+    },
+    "id": "transformer_moe",
+    "version": "1.0.0"
+  },
+  "model": {
+    "id": "olmoe-tiny-gguf",
+    "name": "Tiny OLMoE-style fixture, GGUF Q8_0"
+  },
+  "overrides": {
+    "config": {
+      "norm_topk_prob": false
+    }
+  },
+  "quantization": "q8_0",
+  "schema_version": "1.0.0",
+  "tokenizer": {
+    "kind": "gguf"
+  },
+  "weights": {
+    "format": "gguf",
+    "shards": [
+      {
+        "path": "olmoe-tiny-q8_0.gguf",
+        "size": 182720
+      }
+    ]
+  }
+}
