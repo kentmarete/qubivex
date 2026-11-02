@@ -200,6 +200,25 @@ The `miri` and `loom` jobs arrive with the first unsafe or concurrent code (Phas
 - Not possible here: a `transformers` run of the full 7B model, which needs 14–28 GB to dequantize on an 18 GB machine. The real-model check is the Colibri token match plus the cache invariance.
 
 ## Phase 4 follow-ups (performance, measured)
+- **Done: fused NEON kernels** (`qubivex-backend-cpu/src/neon.rs`) for Q4_K, Q6_K, Q8_0 and bf16, used for single-token matmuls (decode) on aarch64.
+  - They reproduce the portable bits exactly: the same dequantized values (separate multiply and subtract), the same lane per element, the same chunk order, the same halving tree. The existing batched-versus-single tests compare them directly, across all dtypes and tails.
+  - No `#[target_feature]` (NEON is baseline on aarch64). Each kernel is an `unsafe fn` with a single `unsafe` body, and lengths are asserted; this builds on Rust 1.85 (MSRV) and current Rust.
+  - Measured on the M3 Pro, OLMoE shapes, warm, 11 threads. Q4_K expert gate/up: 146 → about 80–115 µs. Q6_K expert down: 246 → about 72–86 µs. Q6_K head (50304×2048): 8.1 → 2.0 ms. **Decode: about 11 → 14–18 tok/s.** Real-model output and the cache-invariance test are unchanged.
+- **Done: the forward pass runs inside the engine's own rayon pool** (`Engine` owns a `ThreadPool`; `forward` runs under `install`).
+  - The `sample` profiler showed the main thread calling each matmul from outside the pool. That is rayon's cold path: inject the job and block on a condvar, about 465 times per token, with the caller idle.
+  - Default threads: the compute team from `qubivex-hardware::probe_cpu` (5 performance cores on the M3 Pro). Decode scaling stops at 5 threads; the efficiency cores add nothing. `qubivex run --threads N` overrides it.
+  - `DenseWeights` and `ExpertProvider` are now `Sync`, and `Tracer` is `Send`.
+- **Measured steady-state decode** (OLMoE-1B-7B Q4_K_M, M3 Pro, 160 tokens, every expert resident, same prompt):
+
+  | Build | Decode |
+  |---|---|
+  | portable kernels (Phase 4) | 12.0–12.4 tok/s |
+  | + NEON kernels | 18.6–19.3 tok/s |
+  | + in-pool forward | 18.6–21.3 tok/s, about 1.7× overall |
+
+  Short runs read lower, because the first tokens load experts from disk on demand.
+- Next candidates: one parallel region per layer for all of a token's experts (fewer, larger regions); a faster lossless Q4_K kernel (about 20 GB/s today, compute-bound); a benchmark against Colibri `olmoe` (MIGRATION_PLAN §4, which needs your OK to run Colibri's engine).
+- Then: fused AVX2 kernels for Linux x86-64. Rosetta on this Mac reports no AVX2, so they can only be verified by CI's bitwise tests on Linux runners.
 - Hand-written NEON and AVX2 kernels reproducing the portable bits, a spinning thread pool for decode, and `gemm`-crate prefill (ADR-002). Then a benchmark against Colibri `olmoe` on the same machine (MIGRATION_PLAN §4).
 - Today: about 11 tok/s decode on OLMoE-1B-7B Q4_K_M (M3 Pro, every expert resident, portable kernels). A cold first prompt is slower because it reads experts from disk.
 

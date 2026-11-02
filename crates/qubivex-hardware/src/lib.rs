@@ -59,6 +59,12 @@ pub struct HardwareProfile {
     pub os: OperatingSystem,
 }
 
+/// Probes only the CPU (cheap: no GPU or storage probes).
+#[must_use]
+pub fn probe_cpu(host: &Host) -> CpuInfo {
+    cpu::probe(host)
+}
+
 /// Probes `host`. Never fails: whatever cannot be determined is [`Probed::Unknown`].
 #[must_use]
 pub fn probe(host: &Host) -> HardwareProfile {

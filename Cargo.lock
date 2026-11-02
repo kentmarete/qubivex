@@ -724,8 +724,10 @@ dependencies = [
  "qubivex-compute",
  "qubivex-core",
  "qubivex-expert-stream",
+ "qubivex-hardware",
  "qubivex-model",
  "qubivex-tokenizer",
+ "rayon",
  "serde_json",
  "thiserror",
 ]

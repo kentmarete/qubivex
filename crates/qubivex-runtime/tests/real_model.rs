@@ -22,6 +22,7 @@ fn engine(dir: &str, cache_mib: Option<u64>) -> Engine {
         EngineOptions {
             expert_cache_bytes: cache_mib.map(|m| m << 20),
             max_context: Some(64),
+            ..EngineOptions::default()
         },
     )
     .unwrap()
