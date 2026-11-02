@@ -64,20 +64,9 @@ pub(crate) fn detect_simd() -> Vec<String> {
         macro_rules! x86 {
             ($($f:tt),*) => { $( if std::arch::is_x86_feature_detected!($f) { v.push($f); } )* };
         }
-        x86!(
-            "sse4.1",
-            "sse4.2",
-            "avx",
-            "avx2",
-            "fma",
-            "f16c",
-            "avx512f",
-            "avx512bw",
-            "avx512vl",
-            "avx512vnni",
-            "avx512bf16",
-            "avxvnni"
-        );
+        // AVX-512 and AVX-VNNI detection is stable only from Rust 1.89; MSRV is 1.85.
+        // Add them here when the MSRV moves (they matter for the Phase 4 x86 kernels).
+        x86!("sse4.1", "sse4.2", "avx", "avx2", "fma", "f16c");
     }
     #[cfg(target_arch = "aarch64")]
     {

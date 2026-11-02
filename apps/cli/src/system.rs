@@ -134,8 +134,10 @@ fn gpu(d: &GpuDevice) -> String {
     }
     if d.unified_memory {
         parts.push("unified memory".to_owned());
+    } else if let Probed::Known(b) = d.memory {
+        parts.push(format!("{b} memory"));
     } else {
-        parts.push(format!("{} memory", bytes(&d.memory)));
+        parts.push("memory size unknown".to_owned());
     }
     if let Probed::Known(v) = &d.driver {
         parts.push(format!("driver {v}"));
