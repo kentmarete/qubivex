@@ -332,7 +332,7 @@ with softmax or sigmoid routing and optional top-K renormalisation.
 
 | Model family | Status |
 |---|---|
-| OLMoE (for example `allenai/OLMoE-1B-7B-0125-Instruct`) | Supported by configuration in per-expert SafeTensors, stacked SafeTensors and GGUF layouts. Tested on tiny checkpoints; the full-size GGUF check is in progress |
+| OLMoE (for example `allenai/OLMoE-1B-7B-0125-Instruct`) | Supported by configuration in per-expert SafeTensors, stacked SafeTensors and GGUF layouts. Validated on tiny checkpoints and on the full-size Q4_K_M GGUF |
 | Qwen3-MoE (for example `Qwen/Qwen3-30B-A3B`) | Supported by configuration in per-expert and stacked SafeTensors layouts. Tested on tiny checkpoints; not yet on a full-size one |
 | Shared-expert or partly dense MoE (Qwen2-MoE, DeepSeek, GLM) | Refused with a clear message for now |
 | Attention biases, non-SiLU activations, RoPE scaling (YaRN and similar) | Refused with a clear message for now |
@@ -368,7 +368,7 @@ These invariants are enforced by tests and CI
 |---|---|---|
 | 1 | Rust workspace, core types, CI. ADR-002 tensor-engine decision: own kernels plus the `gemm` crate, no Candle | Done |
 | 2 | Hardware detection, `qubivex system`, `qubivex doctor --storage` | Done |
-| 3 | Model containers, manifest, architecture registry, validation, `qubivex models` | Done (real-checkpoint check in progress) |
+| 3 | Model containers, manifest, architecture registry, validation, `qubivex models` | Done (checked on the real OLMoE-1B-7B Q4_K_M GGUF) |
 | 4 | CPU inference prototype: kernels, tokenizer, a minimal expert store, greedy generation matching the reference | Next |
 | 5 | Memory planner: fits the model to RAM, VRAM and cgroup limits | Planned |
 | 6 | Full expert streaming: tiered cache, I/O pool, packed expert files | Planned |

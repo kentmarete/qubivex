@@ -278,7 +278,7 @@ pub(crate) fn import_cmd(a: &ImportArgs<'_>) -> Result<String, String> {
         opts.set.insert(k, v);
     }
     let reg = ArchitectureRegistry::with_builtins();
-    let imp = import(a.path, &opts, &reg).map_err(|e| chain(&e))?;
+    let imp = import(a.path, &opts, &reg).map_err(|e| with_set_hint(&chain(&e)))?;
     let mut text = serde_json::to_string_pretty(&imp.manifest).map_err(|e| e.to_string())?;
     text.push('\n');
     for w in &imp.warnings {
@@ -302,6 +302,23 @@ pub(crate) fn import_cmd(a: &ImportArgs<'_>) -> Result<String, String> {
     ))
 }
 
+/// At import time there is no manifest yet: point "set overrides.config.KEY" at `--set`.
+fn with_set_hint(msg: &str) -> String {
+    let Some((_, rest)) = msg.split_once("overrides.config.") else {
+        return msg.to_owned();
+    };
+    let key: String = rest
+        .chars()
+        .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+        .collect();
+    if key.is_empty() {
+        return msg.to_owned();
+    }
+    format!(
+        "{msg}\n  hint: pass --set {key}=VALUE, with the value from the model's original config.json"
+    )
+}
+
 pub(crate) fn architectures() -> String {
     let mut o: Vec<String> = ArchitectureRegistry::with_builtins()
         .list_supported()
@@ -315,6 +332,13 @@ pub(crate) fn architectures() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn set_hint_names_the_key() {
+        let m = "config: GGUF metadata has no <architecture>.expert_weights_norm; set overrides.config.norm_topk_prob in the manifest";
+        assert!(with_set_hint(m).ends_with("hint: pass --set norm_topk_prob=VALUE, with the value from the model's original config.json"));
+        assert_eq!(with_set_hint("other error"), "other error");
+    }
 
     #[test]
     fn set_values() {
