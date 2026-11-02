@@ -1,0 +1,21 @@
+[package]
+name = "qubivex-tokenizer"
+description = "Tokenizers for QUBIVEX: Hugging Face tokenizer.json, GGUF-embedded vocabularies, sandboxed chat templates"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+minijinja = { workspace = true }
+minijinja-contrib = { workspace = true }
+qubivex-core = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokenizers = { workspace = true }
+
+[lints]
+workspace = true

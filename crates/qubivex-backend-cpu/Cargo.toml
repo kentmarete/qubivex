@@ -1,0 +1,21 @@
+[package]
+name = "qubivex-backend-cpu"
+description = "CPU compute backend for QUBIVEX: deterministic lossless kernels for f32, f16, bf16 and GGML blocks"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+qubivex-compute = { workspace = true }
+qubivex-core = { workspace = true }
+rayon = { workspace = true }
+
+[dev-dependencies]
+proptest = { workspace = true }
+serde_json = { workspace = true }
+
+[lints]
+workspace = true

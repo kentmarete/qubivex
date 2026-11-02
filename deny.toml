@@ -6,6 +6,12 @@ all-features = true
 [advisories]
 version = 2
 yanked = "deny"
+# Each ignored advisory names the crate, why it is acceptable, and when to revisit.
+ignore = [
+    # `paste` is unmaintained (no vulnerability). It is a compile-time macro used by
+    # `tokenizers`; nothing of it runs in QUBIVEX. Revisit when `tokenizers` drops it.
+    { id = "RUSTSEC-2024-0436", reason = "unmaintained compile-time macro via tokenizers; no vulnerability" },
+]
 
 [licenses]
 version = 2

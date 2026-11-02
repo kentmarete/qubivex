@@ -3,6 +3,17 @@
 Last updated: 2026-11-03
 
 ## Current phase
+**Phase 4: CPU inference prototype, done.** `qubivex run` generates correct text on CPU from the real OLMoE GGUF, and every numerical test passes:
+- against `transformers` the worst relative error is ≤ 7.2e-7, with identical experts and greedy tokens;
+- against an independent f64 reference it is ≤ 3.3e-7;
+- the expert-cache sweep gives bit-identical logits on the fixtures and the real model.
+
+**Next: Phase 5, the memory planner.** A measured performance step (SIMD kernels, spinning thread pool, `gemm` prefill, a Colibri benchmark) can come before or alongside it.
+The plan has five steps: (1) compute interface and CPU kernels; (2) tokenizer and chat
+templates; (3) a minimal expert store; (4) the `transformer_moe` forward pass, KV
+cache, sampling and `qubivex run`; (5) numerical exit tests against `transformers`
+and an independent f64 reference.
+
 **Phase 3: model metadata and registry, done.** Containers, manifest, registry,
 `transformer_moe`, validation, discovery, import and `qubivex models
 list|inspect|import|architectures` are done, with three committed tiny fixtures. The
@@ -101,6 +112,97 @@ The `miri` and `loom` jobs arrive with the first unsafe or concurrent code (Phas
   - Largest expert 4,079,616 bytes: two Q4_K 1024×2048 matrices plus a Q6_K 2048×1024 one.
 - The env-gated `real_files` tests pass on the file and the model directory.
 
+### Phase 4, step 1: `qubivex-compute` and `qubivex-backend-cpu`
+- `qubivex-compute`:
+  - `WeightView` is a validated `rows × cols` view of stored weights; its byte length equals `DType::storage_bytes` and row slicing is checked.
+  - `ComputeBackend` has `matmul` (`s` activation rows) and `dequant_row`, in host-memory form. Device buffers join it with the first GPU backend.
+- `qubivex-backend-cpu` covers f32, f16, bf16, Q8_0, Q4_K and Q6_K (every dtype in the OLMoE Q4_K_M GGUF and the fixtures).
+  - Each row is dequantized exactly, as `ggml-quants.c` evaluates it, then dotted with f32 activations using the one fixed reduction shape: 64 lanes, chunks in `k` order, a defined tail in lanes `0..rem`, and a fixed halving tree.
+  - Work is split across output rows only, on rayon.
+  - On x86-64 the same source is also compiled with `avx2,fma` and selected at run time. That one feature-gated call is the crate's only `unsafe`.
+  - Hand-written NEON and AVX2 kernels, the spinning thread pool and `gemm`-crate prefill (ADR-002) are a later, measured optimisation that must reproduce these bits.
+- Tests:
+  - f16 to f32 conversion is checked exhaustively over all 65,536 values.
+  - Q8_0, Q4_K and Q6_K dequantization matches **gguf-py bit for bit** (`fixtures/oracle/ggml_dequant.json`).
+  - For all six dtypes, including a 32-column tail, batched equals one-at-a-time, 1, 3 and 7 threads give identical bits, portable equals dispatched, and results match an f64 reference to within 1e-6 relative.
+- Oracle environment: `~/.qubivex/oracle` with torch 2.15.0, transformers 5.22.1, safetensors 0.8.0 and gguf 0.19.0, outside the repository; see `fixtures/oracle/README.md`. Generated reference files are committed, and tests never need Python.
+- `rayon` is a new workspace dependency.
+
+### Phase 4, step 2: `qubivex-tokenizer` and a minimal `qubivex-runtime`
+- `qubivex-tokenizer` wraps Hugging Face `tokenizers` 0.23.2. It is pure Rust: `fancy-regex` instead of Oniguruma (C), and no esaxx C++ code.
+  - `from_hf_dir` reads `tokenizer.json`, special tokens and the chat template from `tokenizer_config.json`, and EOS ids from `generation_config.json` / `config.json`. File sizes are capped.
+  - `from_gguf` rebuilds a byte-level BPE from `tokenizer.ggml.*`. Token types map to the official flags: control → special and not normalized; user-defined → added and normalized; unused → vocabulary only.
+  - Only GGUF pre-tokenizer types verified against an official `tokenizer.json` are accepted (`olmo` with NFC; `gpt-2` and `default` without). Anything else is refused with "supply tokenizer.json".
+  - `apply_chat_template` runs MiniJinja 3 in a sandbox: no loader (no `include`), a fuel limit, `trim_blocks`/`lstrip_blocks` as `transformers` sets them, Python string methods (`minijinja-contrib` pycompat), and `raise_exception`.
+  - `StreamDecoder` holds back incomplete UTF-8 when decoding token by token.
+- `qubivex-runtime` (new): `load_tokenizer(&ModelMetadata)` and `gguf_vocab`. The tokenizer crate may depend only on `core`, so the runtime converts GGUF metadata to plain data.
+- **Verified against `transformers` 5.22.1** (`fixtures/oracle/olmoe_tokenizer.json`, from the official OLMoE-1B-7B-0125-Instruct `tokenizer.json`). The corpus covers 17 strings: NFC/NFD accents, runs of spaces (the user-defined tokens), special-token text, emoji, CJK, code, numbers, CRLF and contractions. Both QUBIVEX's tokenizer rebuilt from the real GGUF and the official `tokenizer.json` loaded by QUBIVEX produce identical ids and decoded text. The chat template renders the identical string with identical ids, and EOS is 50279. These are env-gated tests (`QUBIVEX_OLMOE_GGUF_DIR`, `QUBIVEX_OLMOE_TOKENIZER_JSON`).
+- Fixtures now share one byte-level BPE tokenizer (256 GPT-2 byte symbols, no merges, EOS = byte 1, a chat template) in both `tokenizer.json` and GGUF form, so the SafeTensors and GGUF fixtures tokenize identically.
+- **Policy changes for review:**
+  - `deny.toml` ignores RUSTSEC-2024-0436: `paste` is unmaintained, a compile-time macro used by `tokenizers`, with no vulnerability.
+  - The model-name guard accepts a single line marked `model-name-ok: <reason>`, used once, for the GGUF format identifier `"olmo"`.
+
+### Phase 4, step 3: `qubivex-expert-stream` (minimal) and expert extents
+- `ExpertStore` (ADR-006, Phase 4 form):
+  - Synchronous `acquire` returns a `Lease` that releases on drop and is not `Clone`.
+  - The capacity is in bytes, and the least-recently-used unleased experts are evicted first; expert sizes differ by layer in Q4_K_M.
+  - Loads run outside the lock. In-flight dedup: a second caller waits on a condvar for the first caller's load.
+  - When everything resident is leased it returns `Full` instead of waiting, so one generating thread cannot deadlock itself. `TooLarge` covers an expert bigger than the whole capacity.
+  - Stats: hits, loads, dedup waits, evictions and bytes read.
+  - Expert bytes are `Arc<[u8]>`, so the store has no `unsafe`. Slabs, I/O threads, `O_DIRECT` and prefetch belong to Phase 6.
+- **Loom.** Mutex, condvar and atomics come from `loom::sync` under `cfg(loom)`. The model checks (dedup loads once; eviction never takes a leased expert) explore 35 and 18 interleavings. A planted dedup bug (a loading slot treated as a miss) makes them fail. New CI job: `loom (expert store)`.
+- `qubivex-runtime::ModelExpertSource` builds each expert's byte extents from the tensor roles: per-expert tensors, or the `e`-th slice of a stacked tensor, with parts in a fixed order. It records each part's dtype and shape and reads with `pread`.
+- Tests:
+  - Capacity sweep on synthetic experts: every capacity returns identical bytes, and all-resident loads each expert once.
+  - LRU order, `Full`, `TooLarge` and load-error recovery.
+  - 8 threads × 300 acquires stay within the capacity.
+  - For all three fixtures, at three capacities, every expert read through the store is byte-identical to its tensors.
+  - On the real OLMoE GGUF (env-gated), all 1,024 experts are located and read correctly through a 4-expert store that evicts.
+
+### Phase 4, step 4: `qubivex-arch`, the engine, `qubivex run`
+- `qubivex-arch` runs the `transformer_moe` forward pass:
+  - embedding;
+  - per layer: RMSNorm (f64 mean), Q/K/V, optional `clip_qkv`, q/k-norm (`full` or `per_head`), NeoX RoPE (inv_freq as `transformers` computes it), causal GQA attention against the KV cache, the output projection and the residual;
+  - then RMSNorm, router softmax and top-K (ties to the lower id), optional renormalisation, SwiGLU experts, a combination **in router rank order**, and the residual;
+  - final norm and head (tied or untied).
+- Weights arrive only through `DenseWeights` (resident) and `ExpertProvider` (one expert at a time). The arch crate knows neither files nor the cache.
+- Every computation has one fixed order per token, so **a batched prefill is bit-identical to feeding tokens one at a time**.
+- A trace hook exposes embedding, attention, router logits, routing weights, MoE output, hidden states and logits for the numerical tests.
+- `qubivex-runtime::Engine`:
+  - resident tensors are read into memory in their stored dtype;
+  - the expert store is the `ExpertProvider`, with a stacked gate-up split into gate and up rows;
+  - the KV cache is f32;
+  - `generate` does greedy decoding, or temperature + top-p with a seeded xorshift RNG;
+  - EOS ids come from the tokenizer.
+- `qubivex run --model <id|dir> --prompt … [--chat] [--max-tokens] [--temperature] [--top-p] [--seed] [--expert-cache-mb] [--context] [--quiet]` streams text and prints prefill/decode tok/s and expert-cache counters.
+- **Real model (OLMoE-1B-7B-0125-Instruct Q4_K_M, M3 Pro):**
+  - "The capital of France is" → " Paris.\n\nThe official language of France is French." These are exactly the 12 tokens of Colibri's `ref_olmoe_real.json`, which Colibri produced from int8 weights.
+  - The output is identical with every expert resident, with a 512 MiB cache and with a 64 MiB cache (about 16 of 1,024 experts; 1,837 loads, 1,821 evictions).
+  - A chat prompt gives a coherent answer at about 11 tok/s decode with the portable kernels.
+- Tests on all three fixtures:
+  - batched prefill is bit-identical to token-by-token;
+  - an expert-cache sweep (1, 2 and 5 experts, all resident) gives bit-identical logits and greedy tokens, with the 1-expert cache evicting;
+  - seeded sampling is reproducible;
+  - errors (token out of range, context full, empty prompt) are reported;
+  - `qubivex run` works on a fixture, with and without `--chat`.
+
+### Phase 4, step 5: numerical exit tests
+- **`transformers` 5.22.1 / torch 2.15.0, f32** (`fixtures/oracle/forward.json`; the loader asserts that every weight was loaded and none newly initialized):
+  - checked at every layer and position: attention output, router logits, routing weights, MoE output and layer output, plus the final logits;
+  - worst relative error: **4.6e-7** (OLMoE-style fixture) and **7.2e-7** (Qwen3-MoE-style fixture), against a 1e-5 bound;
+  - selected experts identical at every layer and token, and 12 greedy tokens identical.
+- **Independent f64 reference** (`tests/reference.rs`: a deliberately naive second implementation sharing only config parsing and the gguf-py-verified dequantizers):
+  - worst logits error **2.1e-7 / 2.2e-7 / 3.3e-7** on all three fixtures, including the GGUF Q8_0 one that `transformers` cannot load;
+  - expert selections identical.
+- **Real model** (env-gated `tests/real_model.rs`):
+  - greedy tokens equal Colibri's 12 reference tokens with every expert resident, at 256 MiB and at 32 MiB;
+  - logits bit-identical across the three capacities.
+- Not possible here: a `transformers` run of the full 7B model, which needs 14–28 GB to dequantize on an 18 GB machine. The real-model check is the Colibri token match plus the cache invariance.
+
+## Phase 4 follow-ups (performance, measured)
+- Hand-written NEON and AVX2 kernels reproducing the portable bits, a spinning thread pool for decode, and `gemm`-crate prefill (ADR-002). Then a benchmark against Colibri `olmoe` on the same machine (MIGRATION_PLAN §4).
+- Today: about 11 tok/s decode on OLMoE-1B-7B Q4_K_M (M3 Pro, every expert resident, portable kernels). A cold first prompt is slower because it reads experts from disk.
+
 ## Remaining in Phase 2
 - Check `qubivex system` and `qubivex doctor --storage` output on a real Linux host.
 - Caching `StorageMeasurement` per device waits for a state directory (config work, Phase 3 or later).
@@ -132,7 +234,7 @@ Development moved to an **Apple M3 Pro (arm64, 18 GB RAM, macOS)** with about 37
 - ~~**B3** Git repository~~: resolved (`origin` = `github.com/kentmarete/qubivex`).
 
 ## Test results (2026-11-02, M3 Pro, Rust 1.99.1 and 1.85)
-- `cargo test --workspace`: 92 passed, 0 failed (2026-11-03). Earlier: 91 passed on Rust 1.99.1 and 1.85. Breakdown: core 22 (including a proptest over untrusted dims); hardware 24 (including live smoke and storage tests); model 23 (including proptests over corrupted containers and the committed fixtures); CLI 14; xtask 9. The env-gated `real_files` tests are skipped without `QUBIVEX_REAL_MODEL_*`.
+- `cargo test --workspace`: 123 passed, 0 failed on Rust 1.99.1 and 1.85 (2026-11-03, Phase 4 done). After step 4: 120; step 3: 110. Loom: 2 model checks. Env-gated real-model tests: tokenizer (3), expert extents (1) and generation with cache invariance (1), all passing. After step 2: 103; step 1: 98; Phase 3: 92. Loom: 2 model checks (`RUSTFLAGS="--cfg loom"`). Earlier: 91 passed on Rust 1.99.1 and 1.85. Breakdown: core 22 (including a proptest over untrusted dims); hardware 24 (including live smoke and storage tests); model 23 (including proptests over corrupted containers and the committed fixtures); CLI 14; xtask 9. The env-gated `real_files` tests are skipped without `QUBIVEX_REAL_MODEL_*`.
 - Cross-checks: `cargo clippy -D warnings` and `cargo +1.85 check` for `x86_64-unknown-linux-gnu` and `x86_64-apple-darwin`.
 - `cargo clippy --workspace --all-targets -- -D warnings`: clean.
 - `cargo fmt --check`, `cargo doc` (`-D warnings`), `cargo deny check` and `cargo xtask check`: clean.

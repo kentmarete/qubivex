@@ -1,10 +1,12 @@
 //! The `qubivex` command-line interface.
 //!
 //! Subcommands arrive with the phases that implement them (MIGRATION_PLAN §3):
-//! `system` and `doctor` (Phase 2), `models` (Phase 3); `plan`, `run` and `serve` later.
+//! `system` and `doctor` (Phase 2), `models` (Phase 3), `run` (Phase 4); `plan` and
+//! `serve` later.
 
 mod doctor;
 mod models;
+mod run;
 mod system;
 
 use std::ffi::OsString;
@@ -47,6 +49,42 @@ enum Command {
         /// Print JSON instead of text.
         #[arg(long)]
         json: bool,
+    },
+    /// Generate text with a model (CPU).
+    Run {
+        /// A model id, or a model directory.
+        #[arg(long)]
+        model: String,
+        /// A model directory to search for the id (repeatable).
+        #[arg(long = "dir")]
+        dirs: Vec<PathBuf>,
+        /// The prompt.
+        #[arg(long)]
+        prompt: String,
+        /// Wrap the prompt as a user message with the model's chat template.
+        #[arg(long)]
+        chat: bool,
+        /// Most tokens to generate.
+        #[arg(long, default_value_t = 128)]
+        max_tokens: usize,
+        /// Sampling temperature; 0 is greedy.
+        #[arg(long, default_value_t = 0.0)]
+        temperature: f32,
+        /// Nucleus sampling mass.
+        #[arg(long, default_value_t = 1.0)]
+        top_p: f32,
+        /// Random seed for sampling.
+        #[arg(long, default_value_t = 0)]
+        seed: u64,
+        /// Expert cache size in MiB (default: every expert resident).
+        #[arg(long)]
+        expert_cache_mb: Option<u64>,
+        /// Context limit in tokens (default: the model's).
+        #[arg(long)]
+        context: Option<usize>,
+        /// Do not print timing and cache statistics.
+        #[arg(long)]
+        quiet: bool,
     },
     /// List, inspect and import models.
     Models {
@@ -183,6 +221,33 @@ fn execute(cmd: &Command) -> Result<(), String> {
             }
             emit(&doctor::storage(path, *size_mib, *json)?)
         }
+        Command::Run {
+            model,
+            dirs,
+            prompt,
+            chat,
+            max_tokens,
+            temperature,
+            top_p,
+            seed,
+            expert_cache_mb,
+            context,
+            quiet,
+        } => run::run(&run::RunArgs {
+            model,
+            dirs,
+            prompt,
+            chat: *chat,
+            max_tokens: *max_tokens,
+            sampling: qubivex_runtime::Sampling {
+                temperature: *temperature,
+                top_p: *top_p,
+                seed: *seed,
+            },
+            expert_cache_mb: *expert_cache_mb,
+            context: *context,
+            quiet: *quiet,
+        }),
         Command::Models { command } => emit(&match command {
             ModelsCommand::List { dirs, json } => models::list(dirs, *json)?,
             ModelsCommand::Inspect {
