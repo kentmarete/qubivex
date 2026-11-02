@@ -53,6 +53,32 @@ pub enum ModelError {
         second: PathBuf,
     },
 
+    /// A manifest is malformed or inconsistent with the files.
+    #[error("{}: {detail}", path.display())]
+    Manifest {
+        /// The manifest.
+        path: PathBuf,
+        /// What is wrong.
+        detail: String,
+    },
+
+    /// The architecture config is missing values, malformed or unsupported.
+    #[error("config: {0}")]
+    Config(String),
+
+    /// The architecture is unknown, already registered, or the version is incompatible.
+    #[error("{0}")]
+    Registry(String),
+
+    /// The weight files do not match what the architecture config requires.
+    #[error("model {model:?} failed validation ({} problem(s)): {}", problems.len(), ModelError::listed(problems))]
+    Validation {
+        /// Model id.
+        model: String,
+        /// Every problem found.
+        problems: Vec<String>,
+    },
+
     /// A size or shape computation failed.
     #[error(transparent)]
     Core(#[from] CoreError),

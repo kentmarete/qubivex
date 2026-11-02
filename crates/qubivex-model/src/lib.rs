@@ -1,6 +1,13 @@
 //! Model files, metadata and the architecture registry (QUBIVEX_DESIGN §4.3).
 //!
-//! This first part reads weight containers:
+//! - [`Manifest`] (schema v1, ADR-004) names the files and the architecture.
+//! - [`ArchitectureRegistry`] maps an architecture id to an [`ArchitectureFactory`],
+//!   which parses its config and describes every tensor it needs as a
+//!   [`TensorSchema`] of roles and shapes (ADR-003). [`arch::TransformerMoe`] is
+//!   the first architecture.
+//! - [`ModelMetadata::load`] cross-checks manifest, config and tensor headers.
+//!
+//! Weight containers:
 //!
 //! - [`safetensors`] and [`gguf`] parse headers as untrusted input. Every count,
 //!   string, offset and size is bounded and checked against the real file length,
@@ -12,13 +19,23 @@
 //! No code here knows a model family by name: GGUF keys specific to an architecture
 //! are looked up through `general.architecture` ([`GgufMetadata::arch_value`]).
 
+pub mod arch;
 mod error;
 pub mod gguf;
 mod index;
+pub mod manifest;
+mod metadata;
+mod registry;
 pub mod safetensors;
 pub mod write;
 
 pub use error::ModelError;
 pub use gguf::{GgufHeader, GgufMetadata, GgufValue};
 pub use index::{RawTensor, TensorEntry, TensorIndex, WeightFile, WeightFormat};
+pub use manifest::Manifest;
+pub use metadata::{ByteSummary, MANIFEST_FILE, ModelMetadata};
+pub use registry::{
+    ArchConfig, ArchDescriptor, ArchitectureFactory, ArchitectureRegistry, AttentionPart,
+    ConfigSource, ExpertPart, ModelDims, TensorRole, TensorSchema, TensorSpec,
+};
 pub use safetensors::SafetensorsHeader;
