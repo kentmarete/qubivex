@@ -18,6 +18,8 @@
 #![allow(unsafe_code)]
 
 pub mod formats;
+#[cfg(target_arch = "aarch64")]
+mod neon;
 pub mod reduce;
 
 use qubivex_compute::{ComputeBackend, ComputeError, WeightView};
@@ -91,7 +93,35 @@ unsafe fn rows_avx2(
     rows_portable(w, xs, s, r0, out, buf);
 }
 
+/// A fused row dot: `(row bytes, activations) -> dot product`.
+#[cfg(target_arch = "aarch64")]
+type RowDot = fn(&[u8], &[f32]) -> f32;
+
+/// A fused row dot for `dtype`, if this CPU has one.
+#[cfg(target_arch = "aarch64")]
+fn fused(dtype: DType) -> Option<RowDot> {
+    use qubivex_core::GgmlType;
+    match dtype {
+        DType::Ggml(GgmlType::Q4_K) => Some(neon::q4_k),
+        DType::Ggml(GgmlType::Q6_K) => Some(neon::q6_k),
+        DType::Ggml(GgmlType::Q8_0) => Some(neon::q8_0),
+        DType::BF16 => Some(neon::bf16),
+        _ => None,
+    }
+}
+
 fn rows(w: &WeightView<'_>, xs: &[f32], s: usize, r0: usize, out: &mut [f32], buf: &mut [f32]) {
+    // One activation row (decode): fuse dequantization into the dot, without the
+    // scratch row. The bits equal the portable path's (see `neon`).
+    #[cfg(target_arch = "aarch64")]
+    if s == 1 {
+        if let Some(dot) = fused(w.dtype()) {
+            for (j, y) in out.iter_mut().enumerate() {
+                *y = dot(w.row(r0 + j), xs);
+            }
+            return;
+        }
+    }
     #[cfg(target_arch = "x86_64")]
     if std::arch::is_x86_feature_detected!("avx2") && std::arch::is_x86_feature_detected!("fma") {
         // SAFETY: both target features were detected on this CPU just above.

@@ -200,6 +200,12 @@ The `miri` and `loom` jobs arrive with the first unsafe or concurrent code (Phas
 - Not possible here: a `transformers` run of the full 7B model, which needs 14–28 GB to dequantize on an 18 GB machine. The real-model check is the Colibri token match plus the cache invariance.
 
 ## Phase 4 follow-ups (performance, measured)
+- **Done: fused NEON kernels** (`qubivex-backend-cpu/src/neon.rs`) for Q4_K, Q6_K, Q8_0 and bf16, used for single-token matmuls (decode) on aarch64.
+  - They reproduce the portable bits exactly: the same dequantized values (separate multiply and subtract), the same lane per element, the same chunk order, the same halving tree. The existing batched-versus-single tests compare them directly, across all dtypes and tails.
+  - No `#[target_feature]` (NEON is baseline on aarch64). Each kernel is an `unsafe fn` with a single `unsafe` body, and lengths are asserted; this builds on Rust 1.85 (MSRV) and current Rust.
+  - Measured on the M3 Pro, OLMoE shapes, warm, 11 threads. Q4_K expert gate/up: 146 → about 80–115 µs. Q6_K expert down: 246 → about 72–86 µs. Q6_K head (50304×2048): 8.1 → 2.0 ms. **Decode: about 11 → 14–18 tok/s.** Real-model output and the cache-invariance test are unchanged.
+- Next: dispatch overhead. Each of the ~465 matmuls per decode token pays rayon's wake-up cost (about 25 µs, measured in ADR-002), roughly 12 ms per token. Options: a spinning pool for decode, or one parallel region per layer for all of a token's experts.
+- Then: fused AVX2 kernels for Linux x86-64. Rosetta on this Mac reports no AVX2, so they can only be verified by CI's bitwise tests on Linux runners.
 - Hand-written NEON and AVX2 kernels reproducing the portable bits, a spinning thread pool for decode, and `gemm`-crate prefill (ADR-002). Then a benchmark against Colibri `olmoe` on the same machine (MIGRATION_PLAN §4).
 - Today: about 11 tok/s decode on OLMoE-1B-7B Q4_K_M (M3 Pro, every expert resident, portable kernels). A cold first prompt is slower because it reads experts from disk.
 
