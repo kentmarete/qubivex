@@ -1,7 +1,10 @@
 [workspace]
 resolver = "3"
-members = ["crates/qubivex-core", "apps/cli", "xtask"]
-default-members = ["crates/qubivex-core", "apps/cli", "xtask"]
+members = ["crates/qubivex-core", "crates/qubivex-hardware", "apps/cli", "xtask"]
+default-members = ["crates/qubivex-core", "crates/qubivex-hardware", "apps/cli", "xtask"]
+# Spikes are standalone packages with their own lock files (their dependencies are not
+# product dependencies until an ADR accepts them).
+exclude = ["spikes"]
 
 [workspace.package]
 version = "0.1.0"
@@ -14,6 +17,7 @@ publish = false
 [workspace.dependencies]
 # Internal crates.
 qubivex-core = { path = "crates/qubivex-core", version = "0.1.0" }
+qubivex-hardware = { path = "crates/qubivex-hardware", version = "0.1.0" }
 
 # Third-party versions are declared here once (ADR-001); members use `{ workspace = true }`.
 # Requirements stay at the oldest version we need. Exact versions live in Cargo.lock,

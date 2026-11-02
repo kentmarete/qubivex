@@ -1,0 +1,10 @@
+processor	: 0
+vendor_id	: GenuineIntel
+cpu family	: 6
+model		: 191
+model name	: 13th Gen Intel(R) Core(TM) i5-13500
+flags		: fpu sse4_2 avx2 fma
+
+processor	: 1
+vendor_id	: GenuineIntel
+model name	: 13th Gen Intel(R) Core(TM) i5-13500

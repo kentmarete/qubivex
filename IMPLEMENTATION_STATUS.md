@@ -3,15 +3,20 @@
 Last updated: 2026-11-02
 
 ## Current phase
-**Phase 1: Rust foundation, in progress.** The workspace, `qubivex-core`, the CLI
-skeleton, the repository checks and CI are done. The ADR-002 tensor-engine
-benchmark spike has not started.
+**Phase 2: hardware detection, in progress.** `qubivex-hardware` and `qubivex system
+[--json]` are done and tested on recorded Linux and macOS fixtures. Remaining: the
+optional `qubivex doctor --storage` read benchmark, and seeing `qubivex system` on a
+real Linux host (CI runs only the live smoke test there).
+
+Phase 1 exit criteria are met (clean workspace; ADR-002 Accepted: hybrid, without
+Candle). ADR-001 still awaits your review.
 
 ## Completed
 | Phase | Deliverables |
 |---|---|
 | 0 | `docs/architecture/COLIBRI_ANALYSIS.md`, `QUBIVEX_DESIGN.md`, `MIGRATION_PLAN.md`, `IMPROVEMENTS_EVALUATION.md`, `docs/decisions/ADR-001` … `ADR-008`, `docs/development/RUST_GUIDELINES.md` |
-| 1 (partial) | Cargo workspace (edition 2024, resolver 3, MSRV 1.85, ADR-001 workspace lints, `profile.release`), `clippy.toml`, `deny.toml`; `qubivex-core`; `apps/cli` (`qubivex --version`); `xtask` (`check-deps`, `check-model-names`); `.github/workflows/ci.yml` |
+| 1 | Cargo workspace (edition 2024, resolver 3, MSRV 1.85, ADR-001 workspace lints, `profile.release`), `clippy.toml`, `deny.toml`; `qubivex-core`; `apps/cli` (`qubivex --version`); `xtask` (`check-deps`, `check-model-names`); `.github/workflows/ci.yml`; ADR-002 spike and Colibri baseline |
+| 2 (partial) | `qubivex-hardware` (profile, snapshots, fixtures), `qubivex system [--json]` |
 
 Colibri reference point: `JustVugg/colibri` @ `0a5504a1` (2.1.0), Apache-2.0.
 
@@ -34,8 +39,29 @@ Colibri reference point: `JustVugg/colibri` @ `0a5504a1` (2.1.0), Apache-2.0.
 
 The `miri` and `loom` jobs arrive with the first unsafe or concurrent code (Phase 4), as planned. There is no feature-powerset job yet because no crate has features.
 
+### ADR-002 spike (`spikes/adr-002-tensor-engine`, standalone, not a workspace member)
+- Own kernels: a fixed 64-lane reduction shape, NEON twins tested bitwise against portable twins, and lossless f32 activations.
+- Candle's quantized path is lossy (Q8 activations, about 4e-3 relative error) and fast. Own lossless f32 and bf16 GEMV reach memory bandwidth. int8, Q8_0 and Q4_K reach 60%, 51% and 20% of it.
+- Prefill via dequantize plus the `gemm` crate matches Candle. Accelerate is about 3× on macOS.
+- Everything is bitwise deterministic across 1–11 threads.
+- Colibri baseline (`colibri-baseline/colibri_bench.c`, identical inputs via `dump`): every lossless own kernel is ≥ 90% of Colibri's lossless equivalent at 1 and 11 threads. f32 and bf16 are at per-core parity. Q8_0 and Q4_K are about 10× Colibri's exact path. Attention passes only on the spinning pool (rayon gives 88%). Colibri's fast GGUF path is lossy by default.
+- Decision: hybrid without Candle (ADR-002 Accepted).
+
+### `qubivex-hardware` (Phase 2)
+- `HardwareProfile` (probed once): CPU (vendor, model, logical and physical cores, **core tiers** fastest first, run-time SIMD set, NUMA nodes), memory (total and **cgroup limit**), GPUs per backend (CUDA, Vulkan, Metal: devices or "unavailable: reason"), storage (mount, fs, SSD/HDD/network, capacity, free), OS.
+- `ResourceSnapshot` via `ResourceProbe` / `SystemProbe`: available RAM capped by the cgroup's room, and process RSS.
+- Every value is `Probed::Known` or `Probed::Unknown(reason)`. A cgroup outside the namespace is unknown, not unlimited.
+- Ported from Colibri: the cgroup v2/v1 walk (`compat.h`: room = limit − (usage − file cache), tightest ancestor), macOS available = free + inactive + speculative + purgeable pages (`setup_hw.py`), P-core teams (`omp_tune.h`: every tier but the slowest; Linux `cpu_core`/`cpu_atom`), child-process GPU probes with timeouts.
+- No `unsafe`. Every helper program (`sysctl`, `vm_stat`, `ps`, `mount`, `df`, `diskutil`, `system_profiler`, `nvidia-smi`, `vulkaninfo`) runs in a child process with a timeout, with output drained on threads. Probes read through `Host`, so `Host::fixture` replays recorded `/proc`, `/sys` and command outputs.
+- Fixtures: a hybrid i5-13500 in a cgroup-v2 container with NVIDIA, an EPYC with 2 NUMA nodes, cgroup v1 and an HDD root, an arm big.LITTLE with a cgroup outside its namespace, and a recorded M3 Pro.
+- **Deviations from QUBIVEX_DESIGN §4.2.** `vram_available` is a `Vec<DeviceMemory>`, not a `HashMap`, so it serializes. CUDA is probed with `nvidia-smi` (NVML's CLI), not an in-process driver call. A macOS snapshot spawns `vm_stat` and `ps` (a few ms) because the crate has no FFI.
+
+## Remaining in Phase 2
+- Optional `qubivex doctor --storage` (sequential and random 4 MB reads, O_DIRECT / F_NOCACHE gain) producing `StorageMeasurement`.
+- Check `qubivex system` output on a real Linux host.
+
 ## Remaining in Phase 1
-- ADR-002 spike: tensor-engine benchmark on expert shapes (2048×1024, 1024×2048) at S=1 and S=128 (Candle against own kernels; f32, bf16, int8 row-scaled, Q4_K, Q8_0). It needs Colibri's kernels for the ≥ 90% throughput rule, so building Colibri (third-party code) needs confirmation.
+- ADR-002 follow-ups (not blocking): an AVX2 measurement on Linux x86-64 against Colibri, and optional lossless Q4_K speed-up (24% of STREAM today).
 - Move ADR-001 to Accepted after review.
 
 ## Environment change (supersedes MIGRATION_PLAN §2)
@@ -61,13 +87,13 @@ Development moved to an **Apple M3 Pro (arm64, 18 GB RAM, macOS)** with about 37
 - ~~**B3** Git repository~~: resolved (`origin` = `github.com/kentmarete/qubivex`).
 
 ## Test results (2026-11-02, M3 Pro, Rust 1.99.1 and 1.85)
-- `cargo test --workspace`: 35 passed, 0 failed (core 22, including a proptest over untrusted dims; CLI 4; xtask 9).
+- `cargo test --workspace`: 61 passed, 0 failed (core 22, including a proptest over untrusted dims; hardware 16 unit + 6 fixture, including a live smoke test; CLI 8; xtask 9).
 - `cargo clippy --workspace --all-targets -- -D warnings`: clean.
 - `cargo fmt --check`, `cargo doc` (`-D warnings`), `cargo deny check` and `cargo xtask check`: clean.
 - `cargo +1.85 check/test --workspace --all-targets`: clean.
 
 ## Benchmark results
-None yet (ADR-002 spike pending).
+ADR-002 spike, M3 Pro: [`docs/performance/ADR-002-SPIKE.md`](docs/performance/ADR-002-SPIKE.md).
 
 ## Architectural decisions
-ADR-001 … ADR-008, all Proposed. ADR-001 is implemented as written. ADR-002 is pending the spike.
+ADR-001 … ADR-008, all Proposed. ADR-001 is implemented as written. ADR-002 has spike data and a preliminary choice (hybrid without Candle), pending the Colibri baseline.

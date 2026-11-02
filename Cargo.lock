@@ -276,6 +276,9 @@ version = "0.1.0"
 dependencies = [
  "clap",
  "qubivex-core",
+ "qubivex-hardware",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]
@@ -283,6 +286,16 @@ name = "qubivex-core"
 version = "0.1.0"
 dependencies = [
  "proptest",
+ "serde",
+ "serde_json",
+ "thiserror",
+]
+
+[[package]]
+name = "qubivex-hardware"
+version = "0.1.0"
+dependencies = [
+ "qubivex-core",
  "serde",
  "serde_json",
  "thiserror",
