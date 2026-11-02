@@ -11,6 +11,9 @@
 //! code: macOS facts come from `sysctl`, `vm_stat`, `mount`, `df`, `diskutil` and
 //! `system_profiler`, as Colibri's `setup_hw.py` reads them.
 //!
+//! [`measure_storage`] (`qubivex doctor --storage`) measures one filesystem's read
+//! rate and 4 MiB latency, with and without the page cache.
+//!
 //! Probes read through a [`Host`], so they run unchanged against a recorded
 //! fixture tree ([`Host::fixture`]).
 
@@ -24,6 +27,8 @@ mod parse;
 mod probed;
 mod snapshot;
 mod storage;
+#[cfg(unix)]
+mod storage_bench;
 
 use serde::{Deserialize, Serialize};
 
@@ -36,6 +41,8 @@ pub use os::OperatingSystem;
 pub use probed::Probed;
 pub use snapshot::{DeviceMemory, ResourceProbe, ResourceSnapshot, SystemProbe};
 pub use storage::{StorageInfo, StorageKind};
+#[cfg(unix)]
+pub use storage_bench::{CacheBypass, StorageBenchOptions, StorageMeasurement, measure_storage};
 
 /// Static hardware facts, probed once and cached by the caller.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

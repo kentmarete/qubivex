@@ -296,6 +296,7 @@ name = "qubivex-hardware"
 version = "0.1.0"
 dependencies = [
  "qubivex-core",
+ "rustix",
  "serde",
  "serde_json",
  "thiserror",

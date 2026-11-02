@@ -3,10 +3,10 @@
 Last updated: 2026-11-02
 
 ## Current phase
-**Phase 2: hardware detection, in progress.** `qubivex-hardware` and `qubivex system
-[--json]` are done and tested on recorded Linux and macOS fixtures. Remaining: the
-optional `qubivex doctor --storage` read benchmark, and seeing `qubivex system` on a
-real Linux host (CI runs only the live smoke test there).
+**Phase 2: hardware detection, nearly done.** `qubivex-hardware`, `qubivex system
+[--json]` and `qubivex doctor --storage` are done and tested on recorded Linux and macOS
+fixtures, and live on macOS. Remaining: seeing both commands' output on a real Linux
+host (CI runs only the live tests there).
 
 Phase 1 exit criteria are met (clean workspace; ADR-002 Accepted: hybrid, without
 Candle). ADR-001 still awaits your review.
@@ -16,7 +16,7 @@ Candle). ADR-001 still awaits your review.
 |---|---|
 | 0 | `docs/architecture/COLIBRI_ANALYSIS.md`, `QUBIVEX_DESIGN.md`, `MIGRATION_PLAN.md`, `IMPROVEMENTS_EVALUATION.md`, `docs/decisions/ADR-001` … `ADR-008`, `docs/development/RUST_GUIDELINES.md` |
 | 1 | Cargo workspace (edition 2024, resolver 3, MSRV 1.85, ADR-001 workspace lints, `profile.release`), `clippy.toml`, `deny.toml`; `qubivex-core`; `apps/cli` (`qubivex --version`); `xtask` (`check-deps`, `check-model-names`); `.github/workflows/ci.yml`; ADR-002 spike and Colibri baseline |
-| 2 (partial) | `qubivex-hardware` (profile, snapshots, fixtures), `qubivex system [--json]` |
+| 2 (partial) | `qubivex-hardware` (profile, snapshots, fixtures, storage measurement), `qubivex system [--json]`, `qubivex doctor --storage` |
 
 Colibri reference point: `JustVugg/colibri` @ `0a5504a1` (2.1.0), Apache-2.0.
 
@@ -56,9 +56,11 @@ The `miri` and `loom` jobs arrive with the first unsafe or concurrent code (Phas
 - Fixtures: a hybrid i5-13500 in a cgroup-v2 container with NVIDIA, an EPYC with 2 NUMA nodes, cgroup v1 and an HDD root, an arm big.LITTLE with a cgroup outside its namespace, and a recorded M3 Pro.
 - **Deviations from QUBIVEX_DESIGN §4.2.** `vram_available` is a `Vec<DeviceMemory>`, not a `HashMap`, so it serializes. CUDA is probed with `nvidia-smi` (NVML's CLI), not an in-process driver call. A macOS snapshot spawns `vm_stat` and `ps` (a few ms) because the crate has no FFI.
 
+- `measure_storage` / `qubivex doctor --storage [--path DIR] [--size-mib N] [--json]`: writes an incompressible scratch file (refuses without size + 1 GiB free), then measures an uncached sequential read (`O_DIRECT` / `F_NOCACHE`, 8 MiB requests), random 4 MiB uncached reads (median, p90), and a buffered cold read (Linux `fadvise(DONTNEED)`, macOS `F_NOCACHE` writes). The scratch file is removed on every path. It uses `rustix` (safe syscall wrappers) instead of `unsafe` FFI. On this M3 Pro: 5.7 GB/s uncached, 6.1–6.6 GB/s buffered cold, 0.83 ms per random 4 MiB read, and direct I/O at 0.87–0.93× buffered.
+
 ## Remaining in Phase 2
-- Optional `qubivex doctor --storage` (sequential and random 4 MB reads, O_DIRECT / F_NOCACHE gain) producing `StorageMeasurement`.
-- Check `qubivex system` output on a real Linux host.
+- Check `qubivex system` and `qubivex doctor --storage` output on a real Linux host.
+- Caching `StorageMeasurement` per device waits for a state directory (config work, Phase 3 or later).
 
 ## Remaining in Phase 1
 - ADR-002 follow-ups (not blocking): an AVX2 measurement on Linux x86-64 against Colibri, and optional lossless Q4_K speed-up (24% of STREAM today).
@@ -87,7 +89,8 @@ Development moved to an **Apple M3 Pro (arm64, 18 GB RAM, macOS)** with about 37
 - ~~**B3** Git repository~~: resolved (`origin` = `github.com/kentmarete/qubivex`).
 
 ## Test results (2026-11-02, M3 Pro, Rust 1.99.1 and 1.85)
-- `cargo test --workspace`: 61 passed, 0 failed (core 22, including a proptest over untrusted dims; hardware 16 unit + 6 fixture, including a live smoke test; CLI 8; xtask 9).
+- `cargo test --workspace`: 65 passed, 0 failed (core 22, including a proptest over untrusted dims; hardware 18 unit + 6 fixture, including live smoke and storage tests; CLI 10; xtask 9).
+- Cross-checks: `cargo clippy -D warnings` and `cargo +1.85 check` for `x86_64-unknown-linux-gnu` and `x86_64-apple-darwin`.
 - `cargo clippy --workspace --all-targets -- -D warnings`: clean.
 - `cargo fmt --check`, `cargo doc` (`-D warnings`), `cargo deny check` and `cargo xtask check`: clean.
 - `cargo +1.85 check/test --workspace --all-targets`: clean.
