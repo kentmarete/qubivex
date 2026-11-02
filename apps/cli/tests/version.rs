@@ -186,3 +186,53 @@ fn models_import_prints_a_manifest() {
     assert_eq!(out.status.code(), Some(1));
     assert!(String::from_utf8_lossy(&out.stderr).contains("--force"));
 }
+
+#[test]
+fn run_generates_on_a_fixture() {
+    let out = qubivex()
+        .args([
+            "run",
+            "--model",
+            "olmoe-tiny-gguf",
+            "--prompt",
+            "hi",
+            "--max-tokens",
+            "4",
+            "--dir",
+        ])
+        .arg(fixtures())
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(String::from_utf8_lossy(&out.stdout).starts_with("hi"));
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        err.contains("prompt tokens") && err.contains("experts:"),
+        "{err}"
+    );
+    let chat = qubivex()
+        .args([
+            "run",
+            "--model",
+            "olmoe-tiny",
+            "--chat",
+            "--prompt",
+            "hi",
+            "--max-tokens",
+            "2",
+            "--quiet",
+            "--dir",
+        ])
+        .arg(fixtures())
+        .output()
+        .unwrap();
+    assert!(
+        chat.status.success(),
+        "{}",
+        String::from_utf8_lossy(&chat.stderr)
+    );
+}

@@ -21,9 +21,10 @@ approach works. QUBIVEX's aim is to make it safe, model-agnostic and maintainabl
 models are described by manifests rather than per-family engines, untrusted model files
 are validated before any byte is used, and results are bitwise reproducible.
 
-> **Status: early development.** QUBIVEX cannot generate text yet. Today it detects
-> hardware, measures storage, and reads, validates and describes MoE checkpoints
-> (SafeTensors and GGUF). The CPU inference prototype is the next phase. See
+> **Status: early development.** QUBIVEX now generates text on CPU (`qubivex run`), with
+> experts streamed through a cache of any size; the output is identical whatever the
+> cache holds. It is a prototype: portable kernels (about 11 tok/s decode for
+> OLMoE-1B-7B Q4_K_M on an Apple M3 Pro), no GPU, no server yet. See
 > [Roadmap](#roadmap) and [`IMPLEMENTATION_STATUS.md`](IMPLEMENTATION_STATUS.md).
 
 ---
@@ -88,10 +89,12 @@ What QUBIVEX adds over a straight port:
 | Storage | Sequential read throughput with and without the page cache (`O_DIRECT` / `F_NOCACHE`), random 4 MiB read latency (about one expert) |
 | Model files | SafeTensors (single or sharded) and GGUF v2/v3 readers, hardened against malformed and malicious headers |
 | Models | Manifest v1, architecture registry, the `transformer_moe` architecture, full cross-validation of manifest, config and tensors, discovery, automatic manifest import |
-| CLI | `qubivex system`, `qubivex doctor --storage`, `qubivex models list / inspect / import / architectures` |
+| Inference | CPU forward pass for `transformer_moe` (OLMoE, Qwen3-MoE): lossless kernels for f32, f16, bf16, Q8_0, Q4_K and Q6_K; an expert cache of any size with leases and LRU eviction; KV cache; greedy, temperature and top-p sampling; chat templates |
+| Tokenizers | Hugging Face `tokenizer.json`, or rebuilt from a GGUF file's vocabulary (verified identical to the official tokenizer) |
+| CLI | `qubivex run`, `qubivex system`, `qubivex doctor --storage`, `qubivex models list / inspect / import / architectures` |
 
-Not yet: tokenisation, inference, the expert cache, GPU kernels and the HTTP server. See
-the [Roadmap](#roadmap).
+Not yet: optimised SIMD kernels, the memory planner, prefetching, GPU backends and the
+HTTP server. See the [Roadmap](#roadmap).
 
 ## Installation
 
@@ -192,9 +195,41 @@ Config   {...}
    qubivex models inspect olmoe-1b-7b-0125-instruct
    ```
 
+4. Generate:
+
+   ```sh
+   qubivex run --model olmoe-1b-7b-0125-instruct --prompt "The capital of France is" --max-tokens 12
+   ```
+
+   ```text
+   The capital of France is Paris.
+
+   The official language of France is French.
+   ```
+
+   Add `--chat` to wrap the prompt in the model's chat template, and
+   `--expert-cache-mb 64` to stream experts through a small cache. The text stays the
+   same; only the speed changes.
+
 ## Command reference
 
-Every command accepts `--help`. Commands exit with 0 on success, 1 on a runtime error,
+Every command accepts `--help`.
+
+### `qubivex run --model <ID|DIR> --prompt TEXT [options]`
+
+Generates text on the CPU, streaming it to standard output, then prints prompt and
+generation speed and expert-cache counters to standard error.
+
+| Option | Meaning |
+|---|---|
+| `--chat` | Wrap the prompt as a user message with the model's chat template |
+| `--max-tokens N` | Most tokens to generate (default 128); generation also stops at end-of-sequence |
+| `--temperature T`, `--top-p P`, `--seed S` | Sampling. Temperature 0 (the default) is greedy; the same seed gives the same text |
+| `--expert-cache-mb N` | Expert cache size (default: every expert resident). Smaller caches stream experts from disk and never change the output |
+| `--context N` | Context limit in tokens (default: the model's) |
+| `--quiet` | Do not print the statistics line |
+| `--dir DIR` | Model directories to search for the id (as for `models list`) |
+ Commands exit with 0 on success, 1 on a runtime error,
 and 2 on a usage error.
 
 ### `qubivex system [--json]`
@@ -373,7 +408,7 @@ These invariants are enforced by tests and CI
 | 1 | Rust workspace, core types, CI. ADR-002 tensor-engine decision: own kernels plus the `gemm` crate, no Candle | Done |
 | 2 | Hardware detection, `qubivex system`, `qubivex doctor --storage` | Done |
 | 3 | Model containers, manifest, architecture registry, validation, `qubivex models` | Done (checked on the real OLMoE-1B-7B Q4_K_M GGUF) |
-| 4 | CPU inference prototype: kernels, tokenizer, a minimal expert store, greedy generation matching the reference | Next |
+| 4 | CPU inference prototype: kernels, tokenizer, a minimal expert store, generation | In progress: generates correct text; numerical exit tests next |
 | 5 | Memory planner: fits the model to RAM, VRAM and cgroup limits | Planned |
 | 6 | Full expert streaming: tiered cache, I/O pool, packed expert files | Planned |
 | 7 | Predictive expert prefetching | Planned |

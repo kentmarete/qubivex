@@ -9,6 +9,9 @@ repository.workspace = true
 publish.workspace = true
 
 [dependencies]
+qubivex-arch = { workspace = true }
+qubivex-backend-cpu = { workspace = true }
+qubivex-compute = { workspace = true }
 qubivex-core = { workspace = true }
 qubivex-expert-stream = { workspace = true }
 qubivex-model = { workspace = true }

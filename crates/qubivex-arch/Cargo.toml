@@ -1,0 +1,18 @@
+[package]
+name = "qubivex-arch"
+description = "Model components and architectures for QUBIVEX: the transformer_moe forward pass"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+qubivex-compute = { workspace = true }
+qubivex-core = { workspace = true }
+qubivex-model = { workspace = true }
+thiserror = { workspace = true }
+
+[lints]
+workspace = true

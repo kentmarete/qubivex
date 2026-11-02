@@ -632,6 +632,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "qubivex-arch"
+version = "0.1.0"
+dependencies = [
+ "qubivex-compute",
+ "qubivex-core",
+ "qubivex-model",
+ "thiserror",
+]
+
+[[package]]
 name = "qubivex-backend-cpu"
 version = "0.1.0"
 dependencies = [
@@ -650,6 +660,8 @@ dependencies = [
  "qubivex-core",
  "qubivex-hardware",
  "qubivex-model",
+ "qubivex-runtime",
+ "qubivex-tokenizer",
  "serde",
  "serde_json",
 ]
@@ -707,6 +719,9 @@ dependencies = [
 name = "qubivex-runtime"
 version = "0.1.0"
 dependencies = [
+ "qubivex-arch",
+ "qubivex-backend-cpu",
+ "qubivex-compute",
  "qubivex-core",
  "qubivex-expert-stream",
  "qubivex-model",

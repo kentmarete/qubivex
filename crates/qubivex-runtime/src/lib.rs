@@ -5,8 +5,10 @@
 //! GGUF file; and the routed experts as byte extents ([`ModelExpertSource`]) for the
 //! expert store.
 
+mod engine;
 mod experts;
 
+pub use engine::{Engine, EngineOptions, Sampling};
 pub use experts::{ExpertLayout, ModelExpertSource, PartLayout};
 use qubivex_model::manifest::TokenizerSection;
 use qubivex_model::{GgufMetadata, GgufValue, ModelMetadata};
@@ -23,6 +25,9 @@ pub enum RuntimeError {
     /// The model's files lack something the runtime needs.
     #[error("{0}")]
     Model(String),
+    /// The forward pass failed.
+    #[error(transparent)]
+    Arch(#[from] qubivex_arch::ArchError),
 }
 
 /// The tokenizer named by the model's manifest.

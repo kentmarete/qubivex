@@ -3,7 +3,7 @@
 Last updated: 2026-11-03
 
 ## Current phase
-**Phase 4: CPU inference prototype, in progress (steps 1–3 of 5 done: kernels, tokenizer, expert store).**
+**Phase 4: CPU inference prototype, in progress (steps 1–4 of 5 done: kernels, tokenizer, expert store, forward pass and `qubivex run`).** QUBIVEX generates correct text on CPU from the real OLMoE GGUF.
 The plan has five steps: (1) compute interface and CPU kernels; (2) tokenizer and chat
 templates; (3) a minimal expert store; (4) the `transformer_moe` forward pass, KV
 cache, sampling and `qubivex run`; (5) numerical exit tests against `transformers`
@@ -154,6 +154,36 @@ The `miri` and `loom` jobs arrive with the first unsafe or concurrent code (Phas
   - For all three fixtures, at three capacities, every expert read through the store is byte-identical to its tensors.
   - On the real OLMoE GGUF (env-gated), all 1,024 experts are located and read correctly through a 4-expert store that evicts.
 
+### Phase 4, step 4: `qubivex-arch`, the engine, `qubivex run`
+- `qubivex-arch` runs the `transformer_moe` forward pass:
+  - embedding;
+  - per layer: RMSNorm (f64 mean), Q/K/V, optional `clip_qkv`, q/k-norm (`full` or `per_head`), NeoX RoPE (inv_freq as `transformers` computes it), causal GQA attention against the KV cache, the output projection and the residual;
+  - then RMSNorm, router softmax and top-K (ties to the lower id), optional renormalisation, SwiGLU experts, a combination **in router rank order**, and the residual;
+  - final norm and head (tied or untied).
+- Weights arrive only through `DenseWeights` (resident) and `ExpertProvider` (one expert at a time). The arch crate knows neither files nor the cache.
+- Every computation has one fixed order per token, so **a batched prefill is bit-identical to feeding tokens one at a time**.
+- A trace hook exposes embedding, attention, router logits, routing weights, MoE output, hidden states and logits for the numerical tests.
+- `qubivex-runtime::Engine`:
+  - resident tensors are read into memory in their stored dtype;
+  - the expert store is the `ExpertProvider`, with a stacked gate-up split into gate and up rows;
+  - the KV cache is f32;
+  - `generate` does greedy decoding, or temperature + top-p with a seeded xorshift RNG;
+  - EOS ids come from the tokenizer.
+- `qubivex run --model <id|dir> --prompt … [--chat] [--max-tokens] [--temperature] [--top-p] [--seed] [--expert-cache-mb] [--context] [--quiet]` streams text and prints prefill/decode tok/s and expert-cache counters.
+- **Real model (OLMoE-1B-7B-0125-Instruct Q4_K_M, M3 Pro):**
+  - "The capital of France is" → " Paris.\n\nThe official language of France is French." These are exactly the 12 tokens of Colibri's `ref_olmoe_real.json`, which Colibri produced from int8 weights.
+  - The output is identical with every expert resident, with a 512 MiB cache and with a 64 MiB cache (about 16 of 1,024 experts; 1,837 loads, 1,821 evictions).
+  - A chat prompt gives a coherent answer at about 11 tok/s decode with the portable kernels.
+- Tests on all three fixtures:
+  - batched prefill is bit-identical to token-by-token;
+  - an expert-cache sweep (1, 2 and 5 experts, all resident) gives bit-identical logits and greedy tokens, with the 1-expert cache evicting;
+  - seeded sampling is reproducible;
+  - errors (token out of range, context full, empty prompt) are reported;
+  - `qubivex run` works on a fixture, with and without `--chat`.
+
+## Remaining in Phase 4
+- Step 5: numerical exit tests against `transformers` (f32 per-layer router logits, routing, attention and expert outputs, and logits on the tiny fixtures) and against an independent f64 Rust reference; the real-model check against `transformers` if it can load the GGUF.
+
 ## Remaining in Phase 2
 - Check `qubivex system` and `qubivex doctor --storage` output on a real Linux host.
 - Caching `StorageMeasurement` per device waits for a state directory (config work, Phase 3 or later).
@@ -185,7 +215,7 @@ Development moved to an **Apple M3 Pro (arm64, 18 GB RAM, macOS)** with about 37
 - ~~**B3** Git repository~~: resolved (`origin` = `github.com/kentmarete/qubivex`).
 
 ## Test results (2026-11-02, M3 Pro, Rust 1.99.1 and 1.85)
-- `cargo test --workspace`: 110 passed, 0 failed on Rust 1.99.1 and 1.85 (2026-11-03, Phase 4 step 3). After step 2: 103; step 1: 98; Phase 3: 92. Loom: 2 model checks (`RUSTFLAGS="--cfg loom"`). Earlier: 91 passed on Rust 1.99.1 and 1.85. Breakdown: core 22 (including a proptest over untrusted dims); hardware 24 (including live smoke and storage tests); model 23 (including proptests over corrupted containers and the committed fixtures); CLI 14; xtask 9. The env-gated `real_files` tests are skipped without `QUBIVEX_REAL_MODEL_*`.
+- `cargo test --workspace`: 120 passed, 0 failed on Rust 1.99.1 and 1.85 (2026-11-03, Phase 4 step 4). After step 3: 110. After step 2: 103; step 1: 98; Phase 3: 92. Loom: 2 model checks (`RUSTFLAGS="--cfg loom"`). Earlier: 91 passed on Rust 1.99.1 and 1.85. Breakdown: core 22 (including a proptest over untrusted dims); hardware 24 (including live smoke and storage tests); model 23 (including proptests over corrupted containers and the committed fixtures); CLI 14; xtask 9. The env-gated `real_files` tests are skipped without `QUBIVEX_REAL_MODEL_*`.
 - Cross-checks: `cargo clippy -D warnings` and `cargo +1.85 check` for `x86_64-unknown-linux-gnu` and `x86_64-apple-darwin`.
 - `cargo clippy --workspace --all-targets -- -D warnings`: clean.
 - `cargo fmt --check`, `cargo doc` (`-D warnings`), `cargo deny check` and `cargo xtask check`: clean.

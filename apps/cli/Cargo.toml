@@ -17,6 +17,8 @@ clap = { workspace = true }
 qubivex-core = { workspace = true }
 qubivex-hardware = { workspace = true }
 qubivex-model = { workspace = true }
+qubivex-runtime = { workspace = true }
+qubivex-tokenizer = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 
