@@ -84,7 +84,7 @@ pub trait ExpertProvider {
 }
 
 /// Points of the forward pass that can be observed (numerical tests).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum TracePoint {
     /// Token embedding.
     Embedding,

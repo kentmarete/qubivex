@@ -3,7 +3,12 @@
 Last updated: 2026-11-03
 
 ## Current phase
-**Phase 4: CPU inference prototype, in progress (steps 1–4 of 5 done: kernels, tokenizer, expert store, forward pass and `qubivex run`).** QUBIVEX generates correct text on CPU from the real OLMoE GGUF.
+**Phase 4: CPU inference prototype, done.** `qubivex run` generates correct text on CPU from the real OLMoE GGUF, and every numerical test passes:
+- against `transformers` the worst relative error is ≤ 7.2e-7, with identical experts and greedy tokens;
+- against an independent f64 reference it is ≤ 3.3e-7;
+- the expert-cache sweep gives bit-identical logits on the fixtures and the real model.
+
+**Next: Phase 5, the memory planner.** A measured performance step (SIMD kernels, spinning thread pool, `gemm` prefill, a Colibri benchmark) can come before or alongside it.
 The plan has five steps: (1) compute interface and CPU kernels; (2) tokenizer and chat
 templates; (3) a minimal expert store; (4) the `transformer_moe` forward pass, KV
 cache, sampling and `qubivex run`; (5) numerical exit tests against `transformers`
@@ -181,8 +186,22 @@ The `miri` and `loom` jobs arrive with the first unsafe or concurrent code (Phas
   - errors (token out of range, context full, empty prompt) are reported;
   - `qubivex run` works on a fixture, with and without `--chat`.
 
-## Remaining in Phase 4
-- Step 5: numerical exit tests against `transformers` (f32 per-layer router logits, routing, attention and expert outputs, and logits on the tiny fixtures) and against an independent f64 Rust reference; the real-model check against `transformers` if it can load the GGUF.
+### Phase 4, step 5: numerical exit tests
+- **`transformers` 5.22.1 / torch 2.15.0, f32** (`fixtures/oracle/forward.json`; the loader asserts that every weight was loaded and none newly initialized):
+  - checked at every layer and position: attention output, router logits, routing weights, MoE output and layer output, plus the final logits;
+  - worst relative error: **4.6e-7** (OLMoE-style fixture) and **7.2e-7** (Qwen3-MoE-style fixture), against a 1e-5 bound;
+  - selected experts identical at every layer and token, and 12 greedy tokens identical.
+- **Independent f64 reference** (`tests/reference.rs`: a deliberately naive second implementation sharing only config parsing and the gguf-py-verified dequantizers):
+  - worst logits error **2.1e-7 / 2.2e-7 / 3.3e-7** on all three fixtures, including the GGUF Q8_0 one that `transformers` cannot load;
+  - expert selections identical.
+- **Real model** (env-gated `tests/real_model.rs`):
+  - greedy tokens equal Colibri's 12 reference tokens with every expert resident, at 256 MiB and at 32 MiB;
+  - logits bit-identical across the three capacities.
+- Not possible here: a `transformers` run of the full 7B model, which needs 14–28 GB to dequantize on an 18 GB machine. The real-model check is the Colibri token match plus the cache invariance.
+
+## Phase 4 follow-ups (performance, measured)
+- Hand-written NEON and AVX2 kernels reproducing the portable bits, a spinning thread pool for decode, and `gemm`-crate prefill (ADR-002). Then a benchmark against Colibri `olmoe` on the same machine (MIGRATION_PLAN §4).
+- Today: about 11 tok/s decode on OLMoE-1B-7B Q4_K_M (M3 Pro, every expert resident, portable kernels). A cold first prompt is slower because it reads experts from disk.
 
 ## Remaining in Phase 2
 - Check `qubivex system` and `qubivex doctor --storage` output on a real Linux host.
@@ -215,7 +234,7 @@ Development moved to an **Apple M3 Pro (arm64, 18 GB RAM, macOS)** with about 37
 - ~~**B3** Git repository~~: resolved (`origin` = `github.com/kentmarete/qubivex`).
 
 ## Test results (2026-11-02, M3 Pro, Rust 1.99.1 and 1.85)
-- `cargo test --workspace`: 120 passed, 0 failed on Rust 1.99.1 and 1.85 (2026-11-03, Phase 4 step 4). After step 3: 110. After step 2: 103; step 1: 98; Phase 3: 92. Loom: 2 model checks (`RUSTFLAGS="--cfg loom"`). Earlier: 91 passed on Rust 1.99.1 and 1.85. Breakdown: core 22 (including a proptest over untrusted dims); hardware 24 (including live smoke and storage tests); model 23 (including proptests over corrupted containers and the committed fixtures); CLI 14; xtask 9. The env-gated `real_files` tests are skipped without `QUBIVEX_REAL_MODEL_*`.
+- `cargo test --workspace`: 123 passed, 0 failed on Rust 1.99.1 and 1.85 (2026-11-03, Phase 4 done). After step 4: 120; step 3: 110. Loom: 2 model checks. Env-gated real-model tests: tokenizer (3), expert extents (1) and generation with cache invariance (1), all passing. After step 2: 103; step 1: 98; Phase 3: 92. Loom: 2 model checks (`RUSTFLAGS="--cfg loom"`). Earlier: 91 passed on Rust 1.99.1 and 1.85. Breakdown: core 22 (including a proptest over untrusted dims); hardware 24 (including live smoke and storage tests); model 23 (including proptests over corrupted containers and the committed fixtures); CLI 14; xtask 9. The env-gated `real_files` tests are skipped without `QUBIVEX_REAL_MODEL_*`.
 - Cross-checks: `cargo clippy -D warnings` and `cargo +1.85 check` for `x86_64-unknown-linux-gnu` and `x86_64-apple-darwin`.
 - `cargo clippy --workspace --all-targets -- -D warnings`: clean.
 - `cargo fmt --check`, `cargo doc` (`-D warnings`), `cargo deny check` and `cargo xtask check`: clean.
