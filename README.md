@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="docs/assets/qubivex-logo.png" alt="QUBIVEX logo" width="480">
+</p>
+
 # QUBIVEX
 
 **Run large Mixture-of-Experts (MoE) language models on ordinary hardware by streaming
