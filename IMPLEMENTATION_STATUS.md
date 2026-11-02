@@ -1,12 +1,13 @@
 # QUBIVEX Implementation Status
 
-Last updated: 2026-11-02
+Last updated: 2026-11-03
 
 ## Current phase
-**Phase 3: model metadata and registry, nearly done.** Containers, manifest, registry,
+**Phase 3: model metadata and registry, done.** Containers, manifest, registry,
 `transformer_moe`, validation, discovery, import and `qubivex models
-list|inspect|import|architectures` are done, with three committed tiny fixtures.
-Remaining exit check: the real OLMoE GGUF, which is a ~4 GB download.
+list|inspect|import|architectures` are done, with three committed tiny fixtures. The
+exit check passed on the real OLMoE-1B-7B-0125-Instruct Q4_K_M GGUF. **Next: Phase 4,
+the CPU inference prototype.**
 
 Phase 2 (hardware detection) is done: `qubivex-hardware`, `qubivex system [--json]`
 and `qubivex doctor --storage`. They are tested on recorded Linux and macOS fixtures and
@@ -91,8 +92,14 @@ The `miri` and `loom` jobs arrive with the first unsafe or concurrent code (Phas
 - **Deviation from MIGRATION_PLAN §3.** Fixtures are written by our own writer, with configs that mirror the released checkpoints' keys, not by pinned `transformers` scripts. There is no Python ML stack here, and the `transformers` tiny models are 13–39 MB. Numerical oracles for these fixtures (Phase 4) will still need a reference implementation.
 - `xtask` may now depend on `qubivex-core` and `qubivex-model`, for the generator. Nothing depends on `xtask`.
 
-## Remaining in Phase 3
-- Exit check on the real OLMoE GGUF: `models import`, `list` and `inspect`.
+### Phase 3 exit check (2026-11-03): real OLMoE GGUF
+- `allenai/OLMoE-1B-7B-0125-Instruct-GGUF`, file `OLMoE-1B-7B-0125-Instruct-Q4_K_M.gguf`: 4,213,512,192 bytes, sha256 `4ddc0e53…c684f`, matching the published LFS object. Stored at `~/.qubivex/models/olmoe-1b-7b-0125-instruct/`.
+- `qubivex models import … --set norm_topk_prob=false --write` found the layout (`gguf`, `qk_norm: full`) from headers alone, in 0.02 s. Without `--set`, it names the missing value; the CLI now adds a `--set KEY=VALUE` hint.
+- `models list` and `inspect` show 16 layers, hidden 2048, vocab 50304, 64 experts (top 8) and context 4096, matching the published config.
+  - 195 tensors, every one with a role: 3.63 GiB routed experts, 296.62 MiB dense.
+  - Dtypes: q4_k 2.99 GiB, q6_k 946.85 MiB, f32 8.51 MiB.
+  - Largest expert 4,079,616 bytes: two Q4_K 1024×2048 matrices plus a Q6_K 2048×1024 one.
+- The env-gated `real_files` tests pass on the file and the model directory.
 
 ## Remaining in Phase 2
 - Check `qubivex system` and `qubivex doctor --storage` output on a real Linux host.
@@ -125,7 +132,7 @@ Development moved to an **Apple M3 Pro (arm64, 18 GB RAM, macOS)** with about 37
 - ~~**B3** Git repository~~: resolved (`origin` = `github.com/kentmarete/qubivex`).
 
 ## Test results (2026-11-02, M3 Pro, Rust 1.99.1 and 1.85)
-- `cargo test --workspace`: 91 passed, 0 failed, on Rust 1.99.1 and 1.85. Breakdown: core 22 (including a proptest over untrusted dims); hardware 24 (including live smoke and storage tests); model 23 (including proptests over corrupted containers and the committed fixtures); CLI 13; xtask 9. The env-gated `real_files` tests are skipped without `QUBIVEX_REAL_MODEL_*`.
+- `cargo test --workspace`: 92 passed, 0 failed (2026-11-03). Earlier: 91 passed on Rust 1.99.1 and 1.85. Breakdown: core 22 (including a proptest over untrusted dims); hardware 24 (including live smoke and storage tests); model 23 (including proptests over corrupted containers and the committed fixtures); CLI 14; xtask 9. The env-gated `real_files` tests are skipped without `QUBIVEX_REAL_MODEL_*`.
 - Cross-checks: `cargo clippy -D warnings` and `cargo +1.85 check` for `x86_64-unknown-linux-gnu` and `x86_64-apple-darwin`.
 - `cargo clippy --workspace --all-targets -- -D warnings`: clean.
 - `cargo fmt --check`, `cargo doc` (`-D warnings`), `cargo deny check` and `cargo xtask check`: clean.

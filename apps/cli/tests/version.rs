@@ -169,6 +169,14 @@ fn models_import_prints_a_manifest() {
     let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
     assert_eq!(v["architecture"]["config"]["tensor_names"], "gguf");
     assert_eq!(v["model"]["id"], "olmoe-tiny-q8_0");
+    // Without --set, the error says which --set to pass.
+    let out = qubivex()
+        .args(["models", "import"])
+        .arg(fixtures().join("olmoe-tiny-gguf/olmoe-tiny-q8_0.gguf"))
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&out.stderr).contains("--set norm_topk_prob=VALUE"));
     // --write refuses to replace an existing manifest without --force.
     let out = qubivex()
         .args(["models", "import", "--write"])
