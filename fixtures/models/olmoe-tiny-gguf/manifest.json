@@ -26,7 +26,7 @@
     "shards": [
       {
         "path": "olmoe-tiny-q8_0.gguf",
-        "size": 182720
+        "size": 183584
       }
     ]
   }

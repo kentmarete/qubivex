@@ -1,7 +1,7 @@
 [workspace]
 resolver = "3"
-members = ["crates/qubivex-core", "crates/qubivex-hardware", "crates/qubivex-model", "crates/qubivex-compute", "crates/qubivex-backend-cpu", "apps/cli", "xtask"]
-default-members = ["crates/qubivex-core", "crates/qubivex-hardware", "crates/qubivex-model", "crates/qubivex-compute", "crates/qubivex-backend-cpu", "apps/cli", "xtask"]
+members = ["crates/qubivex-core", "crates/qubivex-hardware", "crates/qubivex-model", "crates/qubivex-compute", "crates/qubivex-backend-cpu", "crates/qubivex-tokenizer", "crates/qubivex-runtime", "apps/cli", "xtask"]
+default-members = ["crates/qubivex-core", "crates/qubivex-hardware", "crates/qubivex-model", "crates/qubivex-compute", "crates/qubivex-backend-cpu", "crates/qubivex-tokenizer", "crates/qubivex-runtime", "apps/cli", "xtask"]
 # Spikes are standalone packages with their own lock files (their dependencies are not
 # product dependencies until an ADR accepts them).
 exclude = ["spikes"]
@@ -21,13 +21,19 @@ qubivex-hardware = { path = "crates/qubivex-hardware", version = "0.1.0" }
 qubivex-model = { path = "crates/qubivex-model", version = "0.1.0" }
 qubivex-compute = { path = "crates/qubivex-compute", version = "0.1.0" }
 qubivex-backend-cpu = { path = "crates/qubivex-backend-cpu", version = "0.1.0" }
+qubivex-tokenizer = { path = "crates/qubivex-tokenizer", version = "0.1.0" }
+qubivex-runtime = { path = "crates/qubivex-runtime", version = "0.1.0" }
 
 # Third-party versions are declared here once (ADR-001); members use `{ workspace = true }`.
 # Requirements stay at the oldest version we need. Exact versions live in Cargo.lock,
 # which resolver 3 fills with the newest releases compatible with `rust-version`.
 clap = { version = "4.5", features = ["derive"] }
+minijinja = { version = "3.0", default-features = false, features = ["builtins", "fuel", "serde"] }
+minijinja-contrib = { version = "3.0", features = ["pycompat"] }
 proptest = "1.6"
 rayon = "1.10"
+# Pure Rust: no Oniguruma (C) or esaxx C++ code.
+tokenizers = { version = "0.23.2", default-features = false, features = ["fancy-regex"] }
 # Safe syscall wrappers (statvfs, O_DIRECT, F_NOCACHE, fadvise), so qubivex-hardware needs no unsafe.
 rustix = { version = "1.1", default-features = false, features = ["fs", "std"] }
 serde = { version = "1.0.219", features = ["derive"] }

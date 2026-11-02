@@ -102,19 +102,66 @@ fn bf16_bytes(v: &[f32]) -> Vec<u8> {
     v.iter().flat_map(|&x| bf16(x).to_le_bytes()).collect()
 }
 
+/// GPT-2's byte-to-symbol table: the symbol of byte `b` is at index `b`. A byte-level
+/// BPE with only these 256 tokens and no merges encodes any text, one token per byte.
+fn byte_symbols() -> Vec<String> {
+    let printable = |b: u32| {
+        (0x21..=0x7e).contains(&b) || (0xa1..=0xac).contains(&b) || (0xae..=0xff).contains(&b)
+    };
+    let mut next = 256u32;
+    (0u32..256)
+        .map(|b| {
+            let c = if printable(b) {
+                b
+            } else {
+                next += 1;
+                next - 1
+            };
+            char::from_u32(c).map(String::from).unwrap_or_default()
+        })
+        .collect()
+}
+
+/// The fixtures' chat template (rendered with transformers' trim/lstrip settings).
+const CHAT_TEMPLATE: &str = "{% for m in messages %}<|{{ m.role }}|>\n{{ m.content }}\n{% endfor %}{% if add_generation_prompt %}<|assistant|>\n{% endif %}";
+
+/// End-of-sequence: byte 0x01 (never produced by ordinary text).
+const EOS_ID: u32 = 1;
+
+/// A byte-level BPE tokenizer.json over [`byte_symbols`], shared by every fixture so
+/// the SafeTensors and GGUF forms of a model tokenize identically.
 fn tokenizer(vocab: u64) -> Value {
-    let v: serde_json::Map<String, Value> =
-        (0..vocab).map(|i| (format!("t{i}"), json!(i))).collect();
+    assert_eq!(vocab, 256, "the fixture tokenizer has one token per byte");
+    let v: serde_json::Map<String, Value> = byte_symbols()
+        .into_iter()
+        .enumerate()
+        .map(|(i, s)| (s, json!(i)))
+        .collect();
+    let byte_level = json!({ "type": "ByteLevel", "add_prefix_space": false, "trim_offsets": true, "use_regex": true });
     json!({
         "version": "1.0",
         "truncation": null,
         "padding": null,
         "added_tokens": [],
         "normalizer": null,
-        "pre_tokenizer": { "type": "Whitespace" },
+        "pre_tokenizer": byte_level,
         "post_processor": null,
-        "decoder": null,
-        "model": { "type": "WordLevel", "vocab": v, "unk_token": "t0" }
+        "decoder": byte_level,
+        "model": {
+            "type": "BPE", "dropout": null, "unk_token": null, "continuing_subword_prefix": null,
+            "end_of_word_suffix": null, "fuse_unk": false, "byte_fallback": false, "ignore_merges": false,
+            "vocab": v, "merges": []
+        }
+    })
+}
+
+fn tokenizer_config() -> Value {
+    json!({
+        "add_bos_token": false,
+        "add_eos_token": false,
+        "bos_token": null,
+        "eos_token": byte_symbols()[EOS_ID as usize],
+        "chat_template": CHAT_TEMPLATE
     })
 }
 
@@ -275,11 +322,8 @@ fn weight_files() -> BTreeMap<&'static str, BTreeMap<String, Vec<u8>>> {
                 data: b,
             })
             .collect();
-        let tokens = GgufValue::Array(
-            (0..vocab)
-                .map(|i| GgufValue::String(format!("t{i}")))
-                .collect(),
-        );
+        let tokens = GgufValue::Array(byte_symbols().into_iter().map(GgufValue::String).collect());
+        let token_types = GgufValue::Array((0..vocab).map(|_| GgufValue::I32(1)).collect());
         let meta = [
             ("general.architecture", GgufValue::String("olmoe".into())),
             (
@@ -300,7 +344,15 @@ fn weight_files() -> BTreeMap<&'static str, BTreeMap<String, Vec<u8>>> {
             ("olmoe.expert_count", GgufValue::U32(8)),
             ("olmoe.expert_used_count", GgufValue::U32(2)),
             ("tokenizer.ggml.model", GgufValue::String("gpt2".into())),
+            ("tokenizer.ggml.pre", GgufValue::String("gpt-2".into())),
             ("tokenizer.ggml.tokens", tokens),
+            ("tokenizer.ggml.token_type", token_types),
+            ("tokenizer.ggml.merges", GgufValue::Array(Vec::new())),
+            ("tokenizer.ggml.eos_token_id", GgufValue::U32(EOS_ID)),
+            (
+                "tokenizer.chat_template",
+                GgufValue::String(CHAT_TEMPLATE.into()),
+            ),
         ];
         let mut files = BTreeMap::new();
         files.insert("olmoe-tiny-q8_0.gguf".to_owned(), write::gguf(&meta, &td));
@@ -375,6 +427,10 @@ fn safetensors_files(t: &[T], cfg: &Value, vocab: u64) -> BTreeMap<String, Vec<u
     );
     files.insert("config.json".to_owned(), pretty(cfg));
     files.insert("tokenizer.json".to_owned(), pretty(&tokenizer(vocab)));
+    files.insert(
+        "tokenizer_config.json".to_owned(),
+        pretty(&tokenizer_config()),
+    );
     files
 }
 

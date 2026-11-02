@@ -1,0 +1,21 @@
+[package]
+name = "qubivex-runtime"
+description = "QUBIVEX runtime: model loading, tokenizer, generation"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+qubivex-core = { workspace = true }
+qubivex-model = { workspace = true }
+qubivex-tokenizer = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+serde_json = { workspace = true }
+
+[lints]
+workspace = true

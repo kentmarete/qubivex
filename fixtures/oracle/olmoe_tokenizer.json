@@ -1,0 +1,432 @@
+{
+ "generator": "fixtures/oracle/olmoe_tokenizer.py",
+ "transformers": "5.22.1",
+ "source": "allenai/OLMoE-1B-7B-0125-Instruct tokenizer.json",
+ "cases": [
+  {
+   "text": "Hello world, how are you?",
+   "ids": [
+    12092,
+    1533,
+    13,
+    849,
+    403,
+    368,
+    32
+   ],
+   "decoded": "Hello world, how are you?"
+  },
+  {
+   "text": "The quick brown fox jumps over the lazy dog.",
+   "ids": [
+    510,
+    3158,
+    8516,
+    30013,
+    27287,
+    689,
+    253,
+    22658,
+    4370,
+    15
+   ],
+   "decoded": "The quick brown fox jumps over the lazy dog."
+  },
+  {
+   "text": "  leading spaces and trailing   ",
+   "ids": [
+    50276,
+    16378,
+    8470,
+    285,
+    28417,
+    50275
+   ],
+   "decoded": "  leading spaces and trailing   "
+  },
+  {
+   "text": "runs of spaces:  a       b                        c                              d",
+   "ids": [
+    83,
+    4539,
+    273,
+    8470,
+    27,
+    50276,
+    66,
+    50271,
+    67,
+    50254,
+    68,
+    50254,
+    50272,
+    69
+   ],
+   "decoded": "runs of spaces:  a       b                        c                              d"
+  },
+  {
+   "text": "tabs\tand\nnewlines\n\n\nand\r\nCRLF",
+   "ids": [
+    33754,
+    186,
+    395,
+    187,
+    1826,
+    8737,
+    535,
+    187,
+    395,
+    190,
+    187,
+    1311,
+    19546
+   ],
+   "decoded": "tabs\tand\nnewlines\n\n\nand\r\nCRLF"
+  },
+  {
+   "text": "café vs café (precomposed vs combining accent)",
+   "ids": [
+    68,
+    2320,
+    860,
+    4632,
+    36241,
+    313,
+    3456,
+    681,
+    7334,
+    4632,
+    16248,
+    22713,
+    10
+   ],
+   "decoded": "café vs café (precomposed vs combining accent)"
+  },
+  {
+   "text": "naïve résumé façade jalapeño über straße",
+   "ids": [
+    2072,
+    30180,
+    9568,
+    2204,
+    860,
+    40881,
+    796,
+    480,
+    267,
+    2259,
+    21000,
+    20150,
+    3405,
+    44366
+   ],
+   "decoded": "naïve résumé façade jalapeño über straße"
+  },
+  {
+   "text": "数字: 一二三, 日本語のテキスト, 한국어 텍스트",
+   "ids": [
+    15531,
+    30886,
+    27,
+    209,
+    9850,
+    34744,
+    36168,
+    13,
+    209,
+    49868,
+    19119,
+    241,
+    3917,
+    28656,
+    33548,
+    38206,
+    13,
+    209,
+    39742,
+    166,
+    115,
+    244,
+    39907,
+    25811,
+    216,
+    224,
+    33057,
+    99,
+    169,
+    221,
+    118
+   ],
+   "decoded": "数字: 一二三, 日本語のテキスト, 한국어 텍스트"
+  },
+  {
+   "text": "emoji 🙂👍🏽🇰🇪 and symbols © ™ ∑ ∞ → ←",
+   "ids": [
+    43208,
+    8020,
+    42908,
+    14931,
+    228,
+    224,
+    14931,
+    226,
+    123,
+    14931,
+    218,
+    110,
+    14931,
+    218,
+    105,
+    285,
+    14217,
+    20919,
+    3384,
+    215,
+    97,
+    13246,
+    228,
+    13246,
+    241,
+    19167,
+    26473,
+    227
+   ],
+   "decoded": "emoji 🙂👍🏽🇰🇪 and symbols © ™ ∑ ∞ → ←"
+  },
+  {
+   "text": "def f(x):\n    return x ** 2  # square\n",
+   "ids": [
+    1545,
+    269,
+    9,
+    89,
+    2262,
+    187,
+    50274,
+    2309,
+    1269,
+    1401,
+    374,
+    50276,
+    4,
+    6278,
+    187
+   ],
+   "decoded": "def f(x):\n    return x ** 2  # square\n"
+  },
+  {
+   "text": "3.14159 2026-11-03 1,000,000 0x1F 1e-6 -42",
+   "ids": [
+    20,
+    15,
+    1047,
+    17220,
+    1384,
+    1731,
+    14,
+    883,
+    14,
+    2941,
+    337,
+    13,
+    933,
+    13,
+    933,
+    470,
+    89,
+    18,
+    39,
+    337,
+    70,
+    14,
+    23,
+    428,
+    2945
+   ],
+   "decoded": "3.14159 2026-11-03 1,000,000 0x1F 1e-6 -42"
+  },
+  {
+   "text": "<|endoftext|> special inside text <|padding|>",
+   "ids": [
+    0,
+    2714,
+    3304,
+    2505,
+    209,
+    1
+   ],
+   "decoded": "<|endoftext|> special inside text <|padding|>"
+  },
+  {
+   "text": "|||IP_ADDRESS||| and |||EMAIL_ADDRESS||| and |||PHONE_NUMBER|||",
+   "ids": [
+    50279,
+    285,
+    209,
+    50277,
+    285,
+    209,
+    50278
+   ],
+   "decoded": "|||IP_ADDRESS||| and |||EMAIL_ADDRESS||| and |||PHONE_NUMBER|||"
+  },
+  {
+   "text": "<|user|>\nWhat is a mixture of experts?\n<|assistant|>\n",
+   "ids": [
+    29,
+    93,
+    4537,
+    49651,
+    187,
+    1276,
+    310,
+    247,
+    7802,
+    273,
+    10071,
+    32,
+    187,
+    29,
+    93,
+    515,
+    5567,
+    49651,
+    187
+   ],
+   "decoded": "<|user|>\nWhat is a mixture of experts?\n<|assistant|>\n"
+  },
+  {
+   "text": "",
+   "ids": [],
+   "decoded": ""
+  },
+  {
+   "text": "a",
+   "ids": [
+    66
+   ],
+   "decoded": "a"
+  },
+  {
+   "text": "'s 't 're 've 'm 'll 'd contractions: don't, I'm, we'll",
+   "ids": [
+    434,
+    686,
+    85,
+    686,
+    250,
+    686,
+    306,
+    686,
+    78,
+    686,
+    620,
+    686,
+    69,
+    41465,
+    27,
+    1053,
+    626,
+    13,
+    309,
+    1353,
+    13,
+    359,
+    1833
+   ],
+   "decoded": "'s 't 're 've 'm 'll 'd contractions: don't, I'm, we'll"
+  }
+ ],
+ "chat": {
+  "messages": [
+   {
+    "role": "system",
+    "content": "You are a helpful assistant."
+   },
+   {
+    "role": "user",
+    "content": "What is a mixture-of-experts model?"
+   },
+   {
+    "role": "assistant",
+    "content": "A model that routes each token to a few experts."
+   },
+   {
+    "role": "user",
+    "content": "Why does that save memory bandwidth?"
+   }
+  ],
+  "add_generation_prompt": true,
+  "rendered": "|||IP_ADDRESS|||<|system|>\nYou are a helpful assistant.\n<|user|>\nWhat is a mixture-of-experts model?\n<|assistant|>\nA model that routes each token to a few experts.|||IP_ADDRESS|||\n<|user|>\nWhy does that save memory bandwidth?\n<|assistant|>\n",
+  "ids": [
+   50279,
+   29,
+   93,
+   10394,
+   49651,
+   187,
+   1394,
+   403,
+   247,
+   9371,
+   13372,
+   15,
+   187,
+   29,
+   93,
+   4537,
+   49651,
+   187,
+   1276,
+   310,
+   247,
+   7802,
+   14,
+   1171,
+   14,
+   16217,
+   1641,
+   1566,
+   32,
+   187,
+   29,
+   93,
+   515,
+   5567,
+   49651,
+   187,
+   34,
+   1566,
+   326,
+   15050,
+   1016,
+   10669,
+   281,
+   247,
+   1643,
+   10071,
+   15,
+   50279,
+   187,
+   29,
+   93,
+   4537,
+   49651,
+   187,
+   4967,
+   1057,
+   326,
+   5321,
+   3541,
+   16992,
+   32,
+   187,
+   29,
+   93,
+   515,
+   5567,
+   49651,
+   187
+  ]
+ }
+}

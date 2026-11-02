@@ -3,7 +3,7 @@
 Last updated: 2026-11-03
 
 ## Current phase
-**Phase 4: CPU inference prototype, in progress (step 1 of 5 done: kernels).**
+**Phase 4: CPU inference prototype, in progress (steps 1–2 of 5 done: kernels, tokenizer).**
 The plan has five steps: (1) compute interface and CPU kernels; (2) tokenizer and chat
 templates; (3) a minimal expert store; (4) the `transformer_moe` forward pass, KV
 cache, sampling and `qubivex run`; (5) numerical exit tests against `transformers`
@@ -123,6 +123,20 @@ The `miri` and `loom` jobs arrive with the first unsafe or concurrent code (Phas
 - Oracle environment: `~/.qubivex/oracle` with torch 2.15.0, transformers 5.22.1, safetensors 0.8.0 and gguf 0.19.0, outside the repository; see `fixtures/oracle/README.md`. Generated reference files are committed, and tests never need Python.
 - `rayon` is a new workspace dependency.
 
+### Phase 4, step 2: `qubivex-tokenizer` and a minimal `qubivex-runtime`
+- `qubivex-tokenizer` wraps Hugging Face `tokenizers` 0.23.2. It is pure Rust: `fancy-regex` instead of Oniguruma (C), and no esaxx C++ code.
+  - `from_hf_dir` reads `tokenizer.json`, special tokens and the chat template from `tokenizer_config.json`, and EOS ids from `generation_config.json` / `config.json`. File sizes are capped.
+  - `from_gguf` rebuilds a byte-level BPE from `tokenizer.ggml.*`. Token types map to the official flags: control → special and not normalized; user-defined → added and normalized; unused → vocabulary only.
+  - Only GGUF pre-tokenizer types verified against an official `tokenizer.json` are accepted (`olmo` with NFC; `gpt-2` and `default` without). Anything else is refused with "supply tokenizer.json".
+  - `apply_chat_template` runs MiniJinja 3 in a sandbox: no loader (no `include`), a fuel limit, `trim_blocks`/`lstrip_blocks` as `transformers` sets them, Python string methods (`minijinja-contrib` pycompat), and `raise_exception`.
+  - `StreamDecoder` holds back incomplete UTF-8 when decoding token by token.
+- `qubivex-runtime` (new): `load_tokenizer(&ModelMetadata)` and `gguf_vocab`. The tokenizer crate may depend only on `core`, so the runtime converts GGUF metadata to plain data.
+- **Verified against `transformers` 5.22.1** (`fixtures/oracle/olmoe_tokenizer.json`, from the official OLMoE-1B-7B-0125-Instruct `tokenizer.json`). The corpus covers 17 strings: NFC/NFD accents, runs of spaces (the user-defined tokens), special-token text, emoji, CJK, code, numbers, CRLF and contractions. Both QUBIVEX's tokenizer rebuilt from the real GGUF and the official `tokenizer.json` loaded by QUBIVEX produce identical ids and decoded text. The chat template renders the identical string with identical ids, and EOS is 50279. These are env-gated tests (`QUBIVEX_OLMOE_GGUF_DIR`, `QUBIVEX_OLMOE_TOKENIZER_JSON`).
+- Fixtures now share one byte-level BPE tokenizer (256 GPT-2 byte symbols, no merges, EOS = byte 1, a chat template) in both `tokenizer.json` and GGUF form, so the SafeTensors and GGUF fixtures tokenize identically.
+- **Policy changes for review:**
+  - `deny.toml` ignores RUSTSEC-2024-0436: `paste` is unmaintained, a compile-time macro used by `tokenizers`, with no vulnerability.
+  - The model-name guard accepts a single line marked `model-name-ok: <reason>`, used once, for the GGUF format identifier `"olmo"`.
+
 ## Remaining in Phase 2
 - Check `qubivex system` and `qubivex doctor --storage` output on a real Linux host.
 - Caching `StorageMeasurement` per device waits for a state directory (config work, Phase 3 or later).
@@ -154,7 +168,7 @@ Development moved to an **Apple M3 Pro (arm64, 18 GB RAM, macOS)** with about 37
 - ~~**B3** Git repository~~: resolved (`origin` = `github.com/kentmarete/qubivex`).
 
 ## Test results (2026-11-02, M3 Pro, Rust 1.99.1 and 1.85)
-- `cargo test --workspace`: 98 passed, 0 failed on Rust 1.99.1 and 1.85 (2026-11-03, Phase 4 step 1). Before that: 92. Earlier: 91 passed on Rust 1.99.1 and 1.85. Breakdown: core 22 (including a proptest over untrusted dims); hardware 24 (including live smoke and storage tests); model 23 (including proptests over corrupted containers and the committed fixtures); CLI 14; xtask 9. The env-gated `real_files` tests are skipped without `QUBIVEX_REAL_MODEL_*`.
+- `cargo test --workspace`: 103 passed, 0 failed on Rust 1.99.1 and 1.85 (2026-11-03, Phase 4 step 2). After step 1: 98; Phase 3: 92. Earlier: 91 passed on Rust 1.99.1 and 1.85. Breakdown: core 22 (including a proptest over untrusted dims); hardware 24 (including live smoke and storage tests); model 23 (including proptests over corrupted containers and the committed fixtures); CLI 14; xtask 9. The env-gated `real_files` tests are skipped without `QUBIVEX_REAL_MODEL_*`.
 - Cross-checks: `cargo clippy -D warnings` and `cargo +1.85 check` for `x86_64-unknown-linux-gnu` and `x86_64-apple-darwin`.
 - `cargo clippy --workspace --all-targets -- -D warnings`: clean.
 - `cargo fmt --check`, `cargo doc` (`-D warnings`), `cargo deny check` and `cargo xtask check`: clean.

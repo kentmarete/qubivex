@@ -2,7 +2,9 @@
 //!
 //! Scans `crates/` and `apps/` for identifiers or words that start with a known model
 //! family name. Paths under a `tests`, `fixtures` or `benches` directory are exempt,
-//! as are `models/`, `docs/` and `xtask/`, which this scan does not visit.
+//! as are `models/`, `docs/` and `xtask/`, which this scan does not visit. A single
+//! line may be exempted with `model-name-ok: <reason>` when the name is a file-format
+//! identifier rather than a model-specific branch.
 
 use std::fs;
 use std::io;
@@ -71,6 +73,13 @@ fn collect(dir: &Path, out: &mut Vec<PathBuf>) -> io::Result<()> {
 /// from their start. So `OlmoeConfig`, `qwen3_moe` and `"deepseek-v2"` all match.
 /// A name inside a camel-case identifier (`ExpertGlmFoo`) does not.
 fn find_model_name(line: &str) -> Option<&str> {
+    // An explicit, reviewable exemption for format identifiers that happen to be model
+    // names (for example GGUF's `tokenizer.ggml.pre` values). A reason is required.
+    if let Some((_, reason)) = line.split_once("model-name-ok:") {
+        if !reason.trim().is_empty() {
+            return None;
+        }
+    }
     line.split(|c: char| !c.is_ascii_alphanumeric())
         .filter(|t| !t.is_empty())
         .find(|t| {
@@ -86,6 +95,15 @@ mod tests {
     #[test]
     fn finds_names_in_identifiers_and_strings() {
         assert_eq!(find_model_name("struct OlmoeConfig {"), Some("OlmoeConfig"));
+        // Exempt only with a stated reason.
+        assert_eq!(
+            find_model_name(r#""olmo" => x, // model-name-ok: GGUF format id"#),
+            None
+        );
+        assert_eq!(
+            find_model_name(r#""olmo" => x, // model-name-ok:"#),
+            Some("olmo")
+        );
         assert_eq!(find_model_name(r#"if arch == "qwen3_moe""#), Some("qwen3"));
         assert_eq!(find_model_name("// DeepSeek-V2 uses MLA"), Some("DeepSeek"));
         assert_eq!(find_model_name("let glm4 = 1;"), Some("glm4"));
