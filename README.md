@@ -175,6 +175,14 @@ Config   {...}
    curl -LO https://huggingface.co/allenai/OLMoE-1B-7B-0125-Instruct-GGUF/resolve/main/OLMoE-1B-7B-0125-Instruct-Q4_K_M.gguf
    ```
 
+   The file is about 4.2 GB, so have about 5 GB free. If the download is interrupted,
+   resume it with `curl -C - -LO <same URL>`. The full-precision SafeTensors checkpoint
+   is about 14 GB.
+
+   The model can live anywhere. `~/.qubivex/models` is only the default search
+   directory. Elsewhere, add `--dir /path/to/models` to `models` and `run` commands,
+   or pass the model's own folder as `--model /path/to/folder`.
+
 2. Let QUBIVEX write a manifest. It detects the tensor layout by validating each
    candidate against the real tensors:
 
@@ -212,6 +220,9 @@ Config   {...}
    Add `--chat` to wrap the prompt in the model's chat template, and
    `--expert-cache-mb 64` to stream experts through a small cache. The text stays the
    same; only the speed changes.
+
+   The first run is slower, because it reads the experts from disk; later runs find
+   them in the operating system's page cache.
 
 ## Command reference
 
