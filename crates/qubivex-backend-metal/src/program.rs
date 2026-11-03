@@ -17,7 +17,9 @@ use crate::device::{Arg, Buffer, Recorder, bytes_of};
 
 /// The forward-pass kernels, after the six matmul kernels in the pipeline list.
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
-pub(crate) const OP_KERNELS: [&str; 12] = [
+pub(crate) const OP_KERNELS: [&str; 14] = [
+    "gather_rows",
+    "scatter_rows",
     "exp_in_place",
     "rms_norm",
     "rope",
@@ -167,7 +169,6 @@ struct KvParams {
     kv_heads: u32,
     d: u32,
     p0: u32,
-    stride: u32,
 }
 
 #[repr(C)]
@@ -179,8 +180,15 @@ struct AttnParams {
     d: u32,
     p0: u32,
     span: u32,
-    stride: u32,
+    kv_heads: u32,
     scale: f32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct RowsParams {
+    h: u32,
+    n: u32,
 }
 
 #[repr(C)]
@@ -204,7 +212,8 @@ pub struct AttentionShape {
     pub head_dim: usize,
     /// The first token's position; token `t` attends to positions `0..=p0 + t`.
     pub p0: usize,
-    /// Positions the cache holds per KV head (its capacity).
+    /// Positions the cache holds (its capacity). Caches are position-major:
+    /// `[position][kv_head][head_dim]`.
     pub capacity: usize,
 }
 
@@ -523,9 +532,9 @@ impl Batch<'_, '_> {
         self.elementwise("swiglu", &[g, u], n, 0.0)
     }
 
-    /// Appends `a.tokens` tokens of keys or values (`src`, token-major
-    /// `[t][kv_head][d]`) to `cache` (`[kv_head][position][d]`, `a.capacity`
-    /// positions per head) at positions `a.p0..`.
+    /// Appends `a.tokens` tokens of keys or values (`src`, `[t][kv_head][d]`) to
+    /// `cache` (`[position][kv_head][d]`, `a.capacity` positions) at positions
+    /// `a.p0..`.
     ///
     /// # Errors
     /// [`ComputeError::Shape`] if a span is too short or the positions overrun the
@@ -564,8 +573,8 @@ impl Batch<'_, '_> {
             kv_heads: u32_of(a.kv_heads, "kv_store")?,
             d: u32_of(a.head_dim, "kv_store")?,
             p0: u32_of(a.p0, "kv_store")?,
-            stride: u32_of(a.capacity * a.head_dim, "kv_store")?,
         };
+        u32_of(a.capacity * per_token, "kv_store")?;
         u32_of(n, "kv_store")?;
         #[cfg(target_os = "macos")]
         {
@@ -630,7 +639,7 @@ impl Batch<'_, '_> {
             d: u32_of(a.head_dim, "attention")?,
             p0: u32_of(a.p0, "attention")?,
             span: u32_of(span, "attention")?,
-            stride: u32_of(a.capacity * a.head_dim, "attention")?,
+            kv_heads: u32_of(a.kv_heads, "attention")?,
             scale,
         };
         u32_of(a.tokens * a.heads * span, "attention")?;
@@ -653,6 +662,85 @@ impl Batch<'_, '_> {
                 op("attn_values"),
                 &[scores.arg(), v.arg(), out.arg(), Arg::Bytes(&pb)],
                 [(a.heads * a.head_dim).div_ceil(64), a.tokens, 1],
+                [64, 1, 1],
+            );
+        }
+        #[cfg(not(target_os = "macos"))]
+        let _ = p;
+        Ok(())
+    }
+
+    /// `dst[j] = src[rows[j]]` for each of `rows` (rows of `h` values).
+    ///
+    /// # Errors
+    /// [`ComputeError::Shape`] if a span is too short or an index is out of range, or
+    /// more than 1024 rows are given (they are passed inline).
+    pub fn gather_rows(
+        &mut self,
+        dst: &Span<'_>,
+        src: &Span<'_>,
+        rows: &[u32],
+        h: usize,
+    ) -> Result<(), ComputeError> {
+        self.rows_op("gather_rows", dst, src, rows, h, src)
+    }
+
+    /// `dst[rows[j]] = src[j]` for each of `rows` (distinct; rows of `h` values).
+    ///
+    /// # Errors
+    /// As [`Batch::gather_rows`].
+    pub fn scatter_rows(
+        &mut self,
+        dst: &Span<'_>,
+        src: &Span<'_>,
+        rows: &[u32],
+        h: usize,
+    ) -> Result<(), ComputeError> {
+        self.rows_op("scatter_rows", dst, src, rows, h, dst)
+    }
+
+    /// Shared checks of the row copies: `indexed` is the operand the indices address.
+    fn rows_op(
+        &mut self,
+        name: &'static str,
+        dst: &Span<'_>,
+        src: &Span<'_>,
+        rows: &[u32],
+        h: usize,
+        indexed: &Span<'_>,
+    ) -> Result<(), ComputeError> {
+        /// `setBytes` takes at most 4 KiB.
+        const MAX_ROWS: usize = 1024;
+        if rows.len() > MAX_ROWS {
+            return Err(shape(
+                name,
+                format!("{} rows exceed {MAX_ROWS}", rows.len()),
+            ));
+        }
+        let max = rows.iter().copied().max().map_or(0, |m| m as usize + 1);
+        need(name, "indexed operand", indexed, max * h)?;
+        let direct = if core::ptr::eq(indexed, src) {
+            dst
+        } else {
+            src
+        };
+        need(name, "operand", direct, rows.len() * h)?;
+        if rows.is_empty() || h == 0 {
+            return Ok(());
+        }
+        let p = RowsParams {
+            h: u32_of(h, name)?,
+            n: u32_of(rows.len(), name)?,
+        };
+        u32_of(max * h, name)?;
+        #[cfg(target_os = "macos")]
+        {
+            let pb = bytes_of(&p);
+            let ib: Vec<u8> = rows.iter().flat_map(|r| r.to_le_bytes()).collect();
+            self.rec.dispatch(
+                op(name),
+                &[dst.arg(), src.arg(), Arg::Bytes(&ib), Arg::Bytes(&pb)],
+                [h.div_ceil(64), rows.len(), 1],
                 [64, 1, 1],
             );
         }

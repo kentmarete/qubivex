@@ -22,7 +22,7 @@ use qubivex_model::ArchConfig;
 use qubivex_model::arch::{MoeConfig, QkNorm, RouterScoring};
 use thiserror::Error;
 
-use crate::ops::{Rope, attend, rms_norm, softmax, swiglu};
+use crate::ops::{Rope, attend, rms_norm, route, swiglu};
 
 /// Errors of a forward pass.
 #[derive(Debug, Error)]
@@ -194,14 +194,33 @@ pub enum Logits {
     All,
 }
 
+/// A device backend's keys and values for a cache (see [`KvCache::device_mut`]).
+pub type DeviceKv = Box<dyn std::any::Any + Send + Sync>;
+
 /// Keys and values of past positions, per layer and KV head.
-#[derive(Clone, Debug)]
+///
+/// The CPU forward pass keeps them in host vectors. A device forward pass (Phase 8)
+/// keeps them in its own buffers, in [`KvCache::device_mut`], and advances the
+/// position count with [`KvCache::advance`]; one cache is only ever used by one of the
+/// two, since an engine's placement is fixed at load.
 pub struct KvCache {
     /// `[layer][kv_head]` → `len × head_dim`.
     k: Vec<Vec<Vec<f32>>>,
     v: Vec<Vec<Vec<f32>>>,
     len: usize,
     max: usize,
+    device: Option<DeviceKv>,
+    device_bytes: u64,
+}
+
+impl std::fmt::Debug for KvCache {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("KvCache")
+            .field("len", &self.len)
+            .field("max", &self.max)
+            .field("device", &self.device.is_some())
+            .finish_non_exhaustive()
+    }
 }
 
 impl KvCache {
@@ -217,7 +236,8 @@ impl KvCache {
         if r < max { r } else { max }
     }
 
-    /// Bytes allocated for keys and values (f32), including reserved positions.
+    /// Bytes allocated for keys and values (f32), including reserved positions, on the
+    /// host and (as reported with [`KvCache::set_device_bytes`]) on a device.
     #[must_use]
     pub fn allocated_bytes(&self) -> u64 {
         self.k
@@ -225,7 +245,34 @@ impl KvCache {
             .chain(&self.v)
             .flatten()
             .map(|h| h.capacity() as u64 * 4)
-            .sum()
+            .sum::<u64>()
+            + self.device_bytes
+    }
+
+    /// A device forward pass's keys and values for this cache.
+    pub fn device_mut(&mut self) -> &mut Option<DeviceKv> {
+        &mut self.device
+    }
+
+    /// Records the bytes a device forward pass has allocated for this cache.
+    pub const fn set_device_bytes(&mut self, bytes: u64) {
+        self.device_bytes = bytes;
+    }
+
+    /// Counts `s` more positions as filled, for a device forward pass that stored
+    /// their keys and values itself.
+    ///
+    /// # Errors
+    /// [`ArchError::Input`] if the context would overflow.
+    pub fn advance(&mut self, s: usize) -> Result<(), ArchError> {
+        if self.len + s > self.max {
+            return Err(ArchError::Input(format!(
+                "context full: {} positions + {s} new > {}",
+                self.len, self.max
+            )));
+        }
+        self.len += s;
+        Ok(())
     }
 
     /// Positions filled.
@@ -287,7 +334,9 @@ fn usize_of(v: u64) -> Result<usize, ArchError> {
         .map_err(|_| ArchError::Input(format!("dimension {v} does not fit in memory")))
 }
 
-fn layer_name(pattern: &str, l: u32) -> String {
+/// A per-layer tensor name: `pattern` with `{L}` replaced by `l`.
+#[must_use]
+pub fn layer_name(pattern: &str, l: u32) -> String {
     pattern.replace("{L}", &l.to_string())
 }
 
@@ -407,6 +456,8 @@ impl TransformerMoeModel {
             v: empty(),
             len: 0,
             max: max_positions,
+            device: None,
+            device_bytes: 0,
         }
     }
 
@@ -610,16 +661,7 @@ impl TransformerMoeModel {
             for t in 0..s {
                 let logits_t = &router[t * ne..(t + 1) * ne];
                 emit(TracePoint::RouterLogits, Some(li), t, logits_t, &[]);
-                let mut p = logits_t.to_vec();
-                softmax(&mut p);
-                let mut idx: Vec<u32> = (0..u32::try_from(ne).unwrap_or(u32::MAX)).collect();
-                idx.sort_by(|a, b| p[*b as usize].total_cmp(&p[*a as usize]).then(a.cmp(b)));
-                idx.truncate(k_top);
-                let mut w: Vec<f32> = idx.iter().map(|&e| p[e as usize]).collect();
-                if c.norm_topk_prob {
-                    let sum: f32 = w.iter().sum();
-                    w.iter_mut().for_each(|x| *x /= sum);
-                }
+                let (idx, w) = route(logits_t, k_top, c.norm_topk_prob);
                 emit(TracePoint::RoutingWeights, Some(li), t, &w, &idx);
                 picks.push((idx, w));
             }

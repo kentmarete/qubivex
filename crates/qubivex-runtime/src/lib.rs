@@ -7,6 +7,7 @@
 
 mod engine;
 mod experts;
+mod metal_forward;
 mod placement;
 
 pub use engine::{

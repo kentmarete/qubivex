@@ -447,10 +447,10 @@ struct KvParams {
     uint kv_heads;
     uint d;         // head dim
     uint p0;        // first position
-    uint stride;    // floats per KV head in the cache (capacity × d)
 };
 
-// Appends `s` tokens' keys (token-major, `[t][g][d]`) to a cache laid out `[g][pos][d]`.
+// Appends `s` tokens' keys or values (`[t][g][d]`) to a position-major cache
+// (`[pos][g][d]`): one contiguous copy.
 kernel void kv_store(device float *cache [[buffer(0)]],
                      device const float *src [[buffer(1)]],
                      constant KvParams &p [[buffer(2)]],
@@ -459,10 +459,7 @@ kernel void kv_store(device float *cache [[buffer(0)]],
     if (gid >= p.s * per_token) {
         return;
     }
-    uint t = gid / per_token;
-    uint g = (gid % per_token) / p.d;
-    uint i = gid % p.d;
-    cache[ulong(g) * p.stride + ulong(p.p0 + t) * p.d + i] = src[gid];
+    cache[ulong(p.p0) * per_token + gid] = src[gid];
 }
 
 struct AttnParams {
@@ -472,7 +469,7 @@ struct AttnParams {
     uint d;
     uint p0;        // first token's position
     uint span;      // p0 + s: score slots per (token, head)
-    uint stride;    // cache floats per KV head
+    uint kv_heads;  // the cache is `[pos][kv_head][d]`
     float scale;    // 1 / sqrt(d)
 };
 
@@ -490,7 +487,7 @@ kernel void attn_scores(device const float *q [[buffer(0)]],
         return;
     }
     device const float *qh = q + (ulong(t) * p.heads + h) * p.d;
-    device const float *kh = kc + ulong(h / p.group) * p.stride + ulong(j) * p.d;
+    device const float *kh = kc + (ulong(j) * p.kv_heads + h / p.group) * p.d;
     float acc = 0.0f;
     for (uint i = 0; i < p.d; i++) {
         acc = fma(qh[i], kh[i], acc);
@@ -539,11 +536,12 @@ kernel void attn_values(device const float *scores [[buffer(0)]],
     uint h = hi / p.d;
     uint i = hi % p.d;
     device const float *sc = scores + (ulong(t) * p.heads + h) * p.span;
-    device const float *vh = vc + ulong(h / p.group) * p.stride + i;
+    device const float *vh = vc + ulong(h / p.group) * p.d + i;
+    ulong pos_stride = ulong(p.kv_heads) * p.d;
     uint n = p.p0 + t + 1;
     float o = 0.0f;
     for (uint j = 0; j < n; j++) {
-        o = fma(sc[j], vh[ulong(j) * p.d], o);
+        o = fma(sc[j], vh[ulong(j) * pos_stride], o);
     }
     out[ulong(t) * p.heads * p.d + hi] = o;
 }
@@ -581,4 +579,33 @@ kernel void exp_in_place(device float *x [[buffer(0)]],
         return;
     }
     x[gid] = qexp(x[gid]);
+}
+
+struct RowsParams {
+    uint h;     // row length
+    uint n;     // rows
+};
+
+// dst[j] = src[idx[j]] for n rows of h floats.
+kernel void gather_rows(device float *dst [[buffer(0)]],
+                        device const float *src [[buffer(1)]],
+                        constant uint *idx [[buffer(2)]],
+                        constant RowsParams &p [[buffer(3)]],
+                        uint2 gid [[thread_position_in_grid]]) {
+    if (gid.x >= p.h || gid.y >= p.n) {
+        return;
+    }
+    dst[ulong(gid.y) * p.h + gid.x] = src[ulong(idx[gid.y]) * p.h + gid.x];
+}
+
+// dst[idx[j]] = src[j] for n rows of h floats (the indices are distinct).
+kernel void scatter_rows(device float *dst [[buffer(0)]],
+                         device const float *src [[buffer(1)]],
+                         constant uint *idx [[buffer(2)]],
+                         constant RowsParams &p [[buffer(3)]],
+                         uint2 gid [[thread_position_in_grid]]) {
+    if (gid.x >= p.h || gid.y >= p.n) {
+        return;
+    }
+    dst[ulong(idx[gid.y]) * p.h + gid.x] = src[ulong(gid.y) * p.h + gid.x];
 }

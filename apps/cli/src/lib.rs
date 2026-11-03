@@ -310,8 +310,9 @@ pub(crate) struct DeviceArgs {
     /// Apple GPU, the rest on the CPU). Output bits are the same on both.
     #[arg(long, default_value = "cpu")]
     backend: String,
-    /// With --backend metal: the dense matmuls on the GPU, comma-separated from
-    /// attention, router and head (default: head).
+    /// With --backend metal: what runs on the GPU, comma-separated from attention,
+    /// router and head (those dense matmuls; default: head), or layers (whole layers,
+    /// experts included, one submission per layer).
     #[arg(long)]
     metal_ops: Option<String>,
 }
@@ -333,15 +334,17 @@ impl DeviceArgs {
             attention: false,
             router: false,
             head: false,
+            layers: false,
         };
         for item in list.split(',').map(str::trim).filter(|i| !i.is_empty()) {
             match item {
                 "attention" => ops.attention = true,
                 "router" => ops.router = true,
                 "head" => ops.head = true,
+                "layers" => ops.layers = true,
                 other => {
                     return Err(format!(
-                        "unknown --metal-ops item {other:?}; use attention, router or head"
+                        "unknown --metal-ops item {other:?}; use attention, router, head or layers"
                     ));
                 }
             }

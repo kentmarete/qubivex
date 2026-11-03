@@ -316,3 +316,39 @@ fn moe_combine_matches() {
     }
     same_bits("moe_combine", &got, &want);
 }
+
+#[test]
+fn gather_and_scatter_rows() {
+    let Some(be) = backend() else { return };
+    let mut rng = Rng(29);
+    let h = 70;
+    let src = rng.vec(6 * h, 1.0);
+    let rows = [4u32, 0, 5];
+    let (ds, dg, dd) = (
+        be.vec_from(&src).unwrap(),
+        be.vec(3 * h).unwrap(),
+        be.vec(6 * h).unwrap(),
+    );
+    be.submit(|b| {
+        b.gather_rows(&dg.all(), &ds.all(), &rows, h)?;
+        b.scatter_rows(&dd.all(), &dg.all(), &rows, h)
+    })
+    .unwrap();
+    let (mut g, mut d) = (vec![0f32; 3 * h], vec![0f32; 6 * h]);
+    be.read(&dg.all(), &mut g).unwrap();
+    be.read(&dd.all(), &mut d).unwrap();
+    for (j, &r) in rows.iter().enumerate() {
+        let r = r as usize;
+        same_bits("gather", &g[j * h..(j + 1) * h], &src[r * h..(r + 1) * h]);
+        same_bits("scatter", &d[r * h..(r + 1) * h], &src[r * h..(r + 1) * h]);
+    }
+    assert!(
+        d[h..4 * h].iter().all(|v| *v == 0.0),
+        "untouched rows stay zero"
+    );
+    // Out-of-range indices are refused before anything is recorded.
+    assert!(
+        be.submit(|b| b.gather_rows(&dg.all(), &ds.all(), &[6], h))
+            .is_err()
+    );
+}

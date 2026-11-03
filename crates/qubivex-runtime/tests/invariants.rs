@@ -464,6 +464,11 @@ fn metal_placement_never_changes_bits() {
         attention: true,
         router: true,
         head: true,
+        layers: false,
+    };
+    let layers = MetalOps {
+        layers: true,
+        ..MetalOps::default()
     };
     let placements = [
         MetalOps::default(),
@@ -471,13 +476,16 @@ fn metal_placement_never_changes_bits() {
             attention: true,
             router: false,
             head: false,
+            layers: false,
         },
         MetalOps {
             attention: false,
             router: true,
             head: false,
+            layers: false,
         },
         all,
+        layers,
     ];
     for id in IDS {
         let meta =
@@ -518,9 +526,79 @@ fn metal_placement_never_changes_bits() {
                 .generate(PROMPT, 12, Sampling::default(), |_| true)
                 .unwrap();
             assert_eq!(toks, want_toks, "{id} {}: tokens", ops.describe());
-            if ops == all {
+            if ops == all || ops == layers {
                 assert!(p.tensors > 0, "{id}: something was placed");
             }
         }
     }
+}
+
+/// Phase 8 slice 3: the whole-layer Metal pass gives the CPU's bits when experts run in
+/// waves (a pool of one slot per layer, so a prompt batch needs many waves), when the
+/// device KV cache grows past a chunk, and when decode steps follow a prompt.
+#[test]
+fn metal_layers_match_the_cpu_in_waves_and_across_kv_growth() {
+    use qubivex_runtime::{BackendKind, MetalOps};
+    match qubivex_backend_metal::MetalBackend::new() {
+        Err(qubivex_backend_metal::MetalError::Unavailable(e)) => {
+            eprintln!("skipping: {e}");
+            return;
+        }
+        Err(e) => panic!("{e}"),
+        Ok(_) => {}
+    }
+    for id in IDS {
+        let meta =
+            || ModelMetadata::load(&dir(id), &ArchitectureRegistry::with_builtins()).unwrap();
+        // The smallest cache that still holds one expert per layer.
+        let one_slot = Engine::load(meta(), EngineOptions::default())
+            .unwrap()
+            .expert_pools()
+            .iter()
+            .map(|p| p.slot_bytes)
+            .sum::<u64>();
+        let opts = EngineOptions {
+            max_context: Some(600),
+            expert_cache_bytes: Some(one_slot),
+            ..EngineOptions::default()
+        };
+        let cpu = Engine::load(meta(), opts).unwrap();
+        let gpu = Engine::load(
+            meta(),
+            EngineOptions {
+                backend: BackendKind::Metal,
+                metal_ops: MetalOps {
+                    layers: true,
+                    ..MetalOps::default()
+                },
+                ..opts
+            },
+        )
+        .unwrap();
+        assert!(gpu.expert_pools().iter().all(|p| p.slots == 1), "{id}");
+        let (mut cc, mut gc) = (cpu.new_cache(), gpu.new_cache());
+        let want = bits(&cpu.forward(PROMPT, &mut cc, Logits::All, None).unwrap());
+        let got = bits(&gpu.forward(PROMPT, &mut gc, Logits::All, None).unwrap());
+        assert_eq!(got, want, "{id}: prompt logits in waves");
+        // Greedy decode across the 256-position chunk boundary, step by step.
+        let mut next = PROMPT[PROMPT.len() - 1];
+        for step in 0..300 {
+            let a = cpu.forward(&[next], &mut cc, Logits::Last, None).unwrap();
+            let b = gpu.forward(&[next], &mut gc, Logits::Last, None).unwrap();
+            assert_eq!(bits(&b), bits(&a), "{id}: step {step}");
+            next = argmax(&a);
+        }
+        assert_eq!(gc.len(), cc.len());
+        assert!(gc.allocated_bytes() > 0, "{id}: device KV is accounted");
+    }
+}
+
+fn argmax(v: &[f32]) -> u32 {
+    let mut best = 0;
+    for (i, x) in v.iter().enumerate() {
+        if *x > v[best] {
+            best = i;
+        }
+    }
+    u32::try_from(best).unwrap()
 }

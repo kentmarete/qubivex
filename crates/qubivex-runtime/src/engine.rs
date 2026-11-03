@@ -27,8 +27,10 @@ use qubivex_memory::{
 use qubivex_model::{ExpertPart, ModelMetadata, TensorRole};
 use qubivex_tokenizer::Tokenizer;
 
+use crate::metal_forward::MetalForward;
 use crate::placement::{BackendKind, MetalOps, Placed, PlacementReport};
 use crate::{ExpertIo, IoPath, ModelExpertSource, RuntimeError, load_tokenizer};
+use qubivex_backend_metal::MetalBackend;
 
 /// How to load a model.
 #[derive(Clone, Copy, Debug, Default)]
@@ -202,49 +204,57 @@ impl StoreProvider<'_> {
 }
 
 impl StoreProvider<'_> {
-    /// An expert's matrices inside its leased bytes.
     fn weights<'b>(
         &self,
         layer: LayerIdx,
         expert: ExpertIdx,
         bytes: &'b [u8],
     ) -> Result<ExpertWeights<'b>, ArchError> {
-        let err = |detail: String| ArchError::Expert {
-            layer: layer.0,
-            expert: expert.0,
-            detail,
-        };
-        let layout = self
-            .source
-            .layout(layer, expert)
-            .ok_or_else(|| err("no such expert".into()))?;
-        let view = |p: ExpertPart| -> Result<Option<WeightView<'b>>, ArchError> {
-            layout
-                .part(p)
-                .map(|l| {
-                    WeightView::new(l.dtype, l.rows, l.cols, &bytes[l.offset..l.offset + l.len])
-                        .map_err(ArchError::from)
-                })
-                .transpose()
-        };
-        let down = view(ExpertPart::Down)?.ok_or_else(|| err("no down projection".into()))?;
-        let (gate, up) = match (
-            view(ExpertPart::Gate)?,
-            view(ExpertPart::Up)?,
-            view(ExpertPart::GateUp)?,
-        ) {
-            (Some(g), Some(u), None) => (g, u),
-            (None, None, Some(gu)) => {
-                let ffn = gu.rows() / 2;
-                (gu.rows_slice(0, ffn)?, gu.rows_slice(ffn, ffn)?)
-            }
-            _ => return Err(err("expected gate and up, or a stacked gate-up".into())),
-        };
-        Ok(ExpertWeights { gate, up, down })
+        expert_weights(self.source, layer, expert, bytes)
     }
 }
 
-fn store_err(layer: LayerIdx, expert: ExpertIdx, e: &StoreError) -> ArchError {
+/// An expert's matrices inside its leased bytes.
+pub(crate) fn expert_weights<'b>(
+    source: &ModelExpertSource,
+    layer: LayerIdx,
+    expert: ExpertIdx,
+    bytes: &'b [u8],
+) -> Result<ExpertWeights<'b>, ArchError> {
+    let err = |detail: String| ArchError::Expert {
+        layer: layer.0,
+        expert: expert.0,
+        detail,
+    };
+    let layout = source
+        .layout(layer, expert)
+        .ok_or_else(|| err("no such expert".into()))?;
+    let view = |p: ExpertPart| -> Result<Option<WeightView<'b>>, ArchError> {
+        layout
+            .part(p)
+            .map(|l| {
+                WeightView::new(l.dtype, l.rows, l.cols, &bytes[l.offset..l.offset + l.len])
+                    .map_err(ArchError::from)
+            })
+            .transpose()
+    };
+    let down = view(ExpertPart::Down)?.ok_or_else(|| err("no down projection".into()))?;
+    let (gate, up) = match (
+        view(ExpertPart::Gate)?,
+        view(ExpertPart::Up)?,
+        view(ExpertPart::GateUp)?,
+    ) {
+        (Some(g), Some(u), None) => (g, u),
+        (None, None, Some(gu)) => {
+            let ffn = gu.rows() / 2;
+            (gu.rows_slice(0, ffn)?, gu.rows_slice(ffn, ffn)?)
+        }
+        _ => return Err(err("expected gate and up, or a stacked gate-up".into())),
+    };
+    Ok(ExpertWeights { gate, up, down })
+}
+
+pub(crate) fn store_err(layer: LayerIdx, expert: ExpertIdx, e: &StoreError) -> ArchError {
     ArchError::Expert {
         layer: layer.0,
         expert: expert.0,
@@ -431,6 +441,8 @@ pub struct Engine {
     pool: rayon::ThreadPool,
     /// `None`: prefetch is off.
     predictor: Option<Mutex<Predictor>>,
+    /// The whole-layer Metal pass, with `MetalOps::layers`.
+    gpu: Option<MetalForward>,
 }
 
 impl std::fmt::Debug for Engine {
@@ -537,8 +549,18 @@ impl Engine {
             tensors,
         };
         let model = TransformerMoeModel::new(&meta.config, &dense, &Placed::cpu())?;
+        // The whole-layer pass is built once the context limit is known (below).
+        let mut layers_on = None;
         let backend = match opts.backend {
             BackendKind::Cpu => Placed::cpu(),
+            BackendKind::Metal if opts.metal_ops.layers => {
+                let be = MetalBackend::new().map_err(|e| metal_err(&e))?;
+                let host = be
+                    .map_host(Arc::clone(&dense.arena))
+                    .map_err(|e| metal_err(&e))?;
+                layers_on = Some((be, host));
+                Placed::cpu()
+            }
             BackendKind::Metal => {
                 let weights = model
                     .dense_matmuls()
@@ -570,6 +592,16 @@ impl Engine {
                 let ctx = usize::try_from(plan.context).unwrap_or(model_ctx);
                 (Some(plan), capacity, ctx)
             }
+        };
+        let (backend, gpu) = match layers_on {
+            Some((be, host)) => {
+                let g = MetalForward::new(be, host, model.config(), &dense, max_context)
+                    .map_err(|e| metal_err(&e))?;
+                let (tensors, bytes) = g.placed();
+                let p = Placed::layers(g.device(), tensors, bytes, opts.metal_ops);
+                (p, Some(g))
+            }
+            None => (backend, None),
         };
         let layers = footprint.layers;
         let io_threads = opts.io_threads.unwrap_or(DEFAULT_IO_THREADS);
@@ -623,6 +655,7 @@ impl Engine {
             })
         });
         Ok(Self {
+            gpu,
             predictor,
             pressure,
             _watcher: watcher,
@@ -837,6 +870,24 @@ impl Engine {
             p.pending = None;
             p.issued = None;
         }
+        if let Some(g) = &self.gpu {
+            if trace.is_some() {
+                return Err(RuntimeError::Model(
+                    "tracing needs the CPU forward pass (not --metal-ops layers)".into(),
+                ));
+            }
+            self.fit_room(cache, tokens.len())?;
+            let out = g.forward(
+                tokens,
+                cache,
+                &self.dense,
+                &self.store,
+                &self.source,
+                logits,
+            )?;
+            self.account(cache);
+            return Ok(out);
+        }
         let provider = StoreProvider {
             store: &self.store,
             source: &self.source,
@@ -900,6 +951,10 @@ impl Engine {
             let _ = self.store.cancel_prefetch(None);
         }
     }
+}
+
+fn metal_err(e: &dyn std::fmt::Display) -> RuntimeError {
+    RuntimeError::Model(format!("cannot place on Metal: {e}"))
 }
 
 /// Plans memory with the dense weights resident: available RAM is measured now

@@ -50,6 +50,9 @@ pub struct MetalOps {
     pub router: bool,
     /// The output head.
     pub head: bool,
+    /// Whole layers: every dense weight, the norms, attention and the routed experts,
+    /// one submission per layer (ADR-011 amendment 2). Implies the other three.
+    pub layers: bool,
 }
 
 impl Default for MetalOps {
@@ -58,6 +61,7 @@ impl Default for MetalOps {
             attention: false,
             router: false,
             head: true,
+            layers: false,
         }
     }
 }
@@ -66,16 +70,21 @@ impl MetalOps {
     /// Whether matmuls of `kind` are selected.
     #[must_use]
     pub const fn selects(self, kind: DenseMatmul) -> bool {
-        match kind {
-            DenseMatmul::Attention => self.attention,
-            DenseMatmul::Router => self.router,
-            DenseMatmul::Head => self.head,
-        }
+        self.layers
+            || match kind {
+                DenseMatmul::Attention => self.attention,
+                DenseMatmul::Router => self.router,
+                DenseMatmul::Head => self.head,
+            }
     }
 
-    /// The selected kinds, comma-separated (`head`, `attention,router,head`, or `none`).
+    /// The selected kinds, comma-separated (`head`, `attention,router,head`, `layers`
+    /// or `none`).
     #[must_use]
     pub fn describe(self) -> String {
+        if self.layers {
+            return "layers".to_owned();
+        }
         let v: Vec<&str> = [
             (self.attention, "attention"),
             (self.router, "router"),
@@ -147,6 +156,22 @@ impl Placed {
 
     /// The `weights` (views into `arena`) of the selected kinds on Metal, the arena
     /// wrapped in place. Weights whose dtype has no Metal kernel stay on the CPU.
+    /// A Metal report for the whole-layer pass, which places its own weights; every
+    /// matmul this backend is asked for (the embedding lookup) stays on the CPU.
+    pub(crate) fn layers(device: String, tensors: usize, bytes: u64, ops: MetalOps) -> Self {
+        Self {
+            cpu: CpuBackend::new(),
+            metal: None,
+            report: PlacementReport {
+                backend: BackendKind::Metal,
+                device: Some(device),
+                ops: Some(ops),
+                tensors,
+                bytes,
+            },
+        }
+    }
+
     pub(crate) fn metal<'a>(
         arena: &Arc<PageAligned>,
         weights: impl IntoIterator<Item = (DenseMatmul, WeightView<'a>)>,

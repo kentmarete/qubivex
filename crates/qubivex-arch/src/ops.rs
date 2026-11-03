@@ -124,6 +124,23 @@ pub fn softmax(x: &mut [f32]) {
     }
 }
 
+/// Softmax routing of one token: the top `k` experts by probability (ties: the lower
+/// id), in rank order, with their probabilities (renormalised to sum to 1 when `norm`).
+#[must_use]
+pub fn route(logits: &[f32], k: usize, norm: bool) -> (Vec<u32>, Vec<f32>) {
+    let mut p = logits.to_vec();
+    softmax(&mut p);
+    let mut idx: Vec<u32> = (0..u32::try_from(p.len()).unwrap_or(u32::MAX)).collect();
+    idx.sort_by(|a, b| p[*b as usize].total_cmp(&p[*a as usize]).then(a.cmp(b)));
+    idx.truncate(k);
+    let mut w: Vec<f32> = idx.iter().map(|&e| p[e as usize]).collect();
+    if norm {
+        let sum: f32 = w.iter().sum();
+        w.iter_mut().for_each(|x| *x /= sum);
+    }
+    (idx, w)
+}
+
 /// Sequential f32 dot product.
 #[inline]
 fn dot_seq(a: &[f32], b: &[f32]) -> f32 {
