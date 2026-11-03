@@ -15,7 +15,10 @@ use qubivex_backend_cpu::CpuBackend;
 use qubivex_compute::WeightView;
 use qubivex_compute::tensor::Tensor;
 use qubivex_core::{Bytes, ExpertIdx, LayerIdx, Shape};
-use qubivex_expert_stream::{ExpertKey, ExpertStore, Policy, PoolSpec, StoreError, StoreStats};
+use qubivex_expert_stream::predict::{Lookahead, LookaheadConfig};
+use qubivex_expert_stream::{
+    ExpertKey, ExpertStore, Policy, PoolSpec, PrefetchStats, StoreError, StoreStats,
+};
 use qubivex_hardware::{Host, Probed, ResourceProbe, SystemProbe};
 use qubivex_memory::{
     Charge, HostMemory, LayerExperts, MemoryLedger, MemoryPlan, ModelFootprint, Owner, PlanRequest,
@@ -57,6 +60,71 @@ pub struct EngineOptions {
     /// Compute threads. `None`: the CPU's compute team (its fastest cores: efficiency
     /// cores slow a team that meets at every matmul), else every logical CPU.
     pub threads: Option<usize>,
+    /// Router-lookahead prefetch during decode (Phase 7). `None`: off.
+    pub prefetch: Option<PrefetchOptions>,
+}
+
+/// Router-lookahead prefetch settings (Phase 7).
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct PrefetchOptions {
+    /// How predictions are made.
+    pub lookahead: LookaheadConfig,
+    /// The LFRU eviction guard: a prediction may evict a resident expert only if it is
+    /// clearly hotter (ADR-008).
+    pub guard: bool,
+}
+
+/// How well the lookahead predicted routing: every decode layer that had a prediction
+/// compares it with the experts the router chose.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct PredictionStats {
+    /// Layers checked.
+    pub layers: u64,
+    /// Experts predicted, summed over those layers.
+    pub predicted: u64,
+    /// Experts routed, summed over those layers.
+    pub routed: u64,
+    /// Routed experts that were predicted.
+    pub correct: u64,
+}
+
+impl PredictionStats {
+    /// The share of routed experts that were predicted.
+    #[must_use]
+    pub fn recall(&self) -> f64 {
+        ratio(self.correct, self.routed)
+    }
+
+    /// The share of predicted experts that were routed.
+    #[must_use]
+    pub fn precision(&self) -> f64 {
+        ratio(self.correct, self.predicted)
+    }
+}
+
+#[allow(clippy::cast_precision_loss)]
+fn ratio(a: u64, b: u64) -> f64 {
+    if b == 0 { 0.0 } else { a as f64 / b as f64 }
+}
+
+/// Prefetch counters: prediction quality and what the store did with predictions.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct PrefetchReport {
+    /// Prediction quality.
+    pub prediction: PredictionStats,
+    /// Reads issued, hidden, wasted and cancelled.
+    pub store: PrefetchStats,
+}
+
+/// The predictor's state across forward passes.
+struct Predictor {
+    lookahead: Lookahead,
+    guard: bool,
+    /// A prediction made during the previous layer, issued after that layer's demand.
+    pending: Option<(LayerIdx, Vec<ExpertIdx>)>,
+    /// The last prediction issued, checked against the layer's routing.
+    issued: Option<(LayerIdx, Vec<ExpertIdx>)>,
+    stats: PredictionStats,
 }
 
 /// I/O threads when none are requested.
@@ -92,6 +160,34 @@ impl DenseWeights for Dense {
 struct StoreProvider<'a> {
     store: &'a ExpertStore,
     source: &'a ModelExpertSource,
+    /// Set when prefetch is on and memory pressure allows it.
+    predictor: Option<&'a Mutex<Predictor>>,
+}
+
+impl StoreProvider<'_> {
+    /// After `layer`'s demand is queued: checks the prediction made for `layer`, and
+    /// issues the one made for the next layer, so prefetches queue behind demand.
+    fn after_demand(&self, layer: LayerIdx, routed: &[ExpertIdx]) {
+        let Some(p) = self.predictor else { return };
+        let mut p = p.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some((l, ids)) = p.issued.take() {
+            if l == layer {
+                let correct = routed.iter().filter(|e| ids.contains(e)).count();
+                p.stats.layers += 1;
+                p.stats.predicted += ids.len() as u64;
+                p.stats.routed += routed.len() as u64;
+                p.stats.correct += correct as u64;
+            }
+        }
+        if let Some((l, ids)) = p.pending.take() {
+            if l.0 == layer.0 + 1 {
+                let keys: Vec<ExpertKey> = ids.iter().map(|&e| (l, e)).collect();
+                // Advisory: a poisoned store fails the demand that follows anyway.
+                let _ = self.store.prefetch(&keys, p.guard);
+                p.issued = Some((l, ids));
+            }
+        }
+    }
 }
 
 impl StoreProvider<'_> {
@@ -174,6 +270,7 @@ impl ExpertProvider for StoreProvider<'_> {
             .store
             .acquire_many(&keys)
             .map_err(|e| store_err(layer, first, &e))?;
+        self.after_demand(layer, experts);
         for lease in batch {
             let lease = lease.map_err(|e| {
                 let at = match &e {
@@ -186,6 +283,17 @@ impl ExpertProvider for StoreProvider<'_> {
             f(expert, &self.weights(layer, expert, lease.bytes())?)?;
         }
         Ok(())
+    }
+
+    fn wants_lookahead(&self) -> bool {
+        self.predictor.is_some()
+    }
+
+    fn lookahead(&self, layer: LayerIdx, router_logits: &[f32]) {
+        let Some(p) = self.predictor else { return };
+        let mut p = p.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let ids = p.lookahead.predict(layer.0 as usize, router_logits);
+        p.pending = Some((layer, ids));
     }
 }
 
@@ -310,6 +418,8 @@ pub struct Engine {
     /// The forward pass runs inside this pool, so every matmul starts on a worker that
     /// joins the work instead of a caller blocked on a condition variable.
     pool: rayon::ThreadPool,
+    /// `None`: prefetch is off.
+    predictor: Option<Mutex<Predictor>>,
 }
 
 impl std::fmt::Debug for Engine {
@@ -459,7 +569,18 @@ impl Engine {
             .map_err(|e| {
                 RuntimeError::Model(format!("cannot start {threads} compute threads: {e}"))
             })?;
+        let predictor = opts.prefetch.map(|o| {
+            let c = model.config();
+            Mutex::new(Predictor {
+                lookahead: Lookahead::new(o.lookahead, c.layers as usize, c.top_k as usize),
+                guard: o.guard,
+                pending: None,
+                issued: None,
+                stats: PredictionStats::default(),
+            })
+        });
         Ok(Self {
+            predictor,
             pressure,
             _watcher: watcher,
             memory: Memory {
@@ -515,6 +636,24 @@ impl Engine {
     #[must_use]
     pub fn store_stats(&self) -> StoreStats {
         self.store.stats()
+    }
+
+    /// Prefetch counters, if prefetch is on.
+    #[must_use]
+    pub fn prefetch_report(&self) -> Option<PrefetchReport> {
+        self.predictor.as_ref().map(|p| PrefetchReport {
+            prediction: p
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .stats,
+            store: self.store.stats().prefetch,
+        })
+    }
+
+    /// Whether prefetch is on (it still pauses under memory pressure).
+    #[must_use]
+    pub const fn prefetch_enabled(&self) -> bool {
+        self.predictor.is_some()
     }
 
     /// The expert cache capacity in bytes now: the slots of every layer's pool (the
@@ -637,9 +776,22 @@ impl Engine {
         logits: Logits,
         trace: Option<Tracer<'_>>,
     ) -> Result<Vec<f32>, RuntimeError> {
+        // Memory pressure stops prefetch first (ADR-005): drop what is queued.
+        let allowed = self.pressure().is_none_or(|d| d.prefetch);
+        if !allowed && self.predictor.is_some() {
+            let _ = self.store.cancel_prefetch(None);
+        }
+        let predictor = self.predictor.as_ref().filter(|_| allowed);
+        if let Some(p) = predictor {
+            let mut p = p.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            // A prediction never crosses a forward pass: the next one starts at layer 0.
+            p.pending = None;
+            p.issued = None;
+        }
         let provider = StoreProvider {
             store: &self.store,
             source: &self.source,
+            predictor,
         };
         let src = Sources {
             dense: &self.dense,
@@ -686,7 +838,18 @@ impl Engine {
             }
             logits = self.forward(&[next], &mut cache, Logits::Last, None)?;
         }
+        self.end_turn();
         Ok(out)
+    }
+
+    /// Ends a turn: queued prefetches are dropped, since the next request starts
+    /// elsewhere. [`Engine::generate`] calls it; callers driving
+    /// [`Engine::forward`] themselves call it between requests.
+    pub fn end_turn(&self) {
+        if self.predictor.is_some() {
+            // Advisory: a poisoned store fails the next forward pass anyway.
+            let _ = self.store.cancel_prefetch(None);
+        }
     }
 }
 

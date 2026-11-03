@@ -102,6 +102,19 @@ pub(crate) fn run(a: &RunArgs<'_>) -> Result<(), String> {
             st.evictions,
             memory_line(&engine)
         );
+        if let Some(p) = engine.prefetch_report() {
+            let f = p.store;
+            eprintln!(
+                "[prefetch: recall {:.1}%, precision {:.1}% | {} issued, {} ready, {} late, {} wasted, {} cancelled]",
+                p.prediction.recall() * 100.0,
+                p.prediction.precision() * 100.0,
+                f.issued,
+                f.ready,
+                f.late,
+                f.wasted,
+                f.cancelled
+            );
+        }
     }
     Ok(())
 }

@@ -5,8 +5,10 @@
 use std::path::{Path, PathBuf};
 
 use qubivex_arch::Logits;
+use qubivex_arch::{TraceEvent, TracePoint};
+use qubivex_expert_stream::predict::LookaheadConfig;
 use qubivex_model::{ArchitectureRegistry, ModelMetadata};
-use qubivex_runtime::{Engine, EngineOptions, ExpertIo, IoPath, Sampling};
+use qubivex_runtime::{Engine, EngineOptions, ExpertIo, IoPath, PrefetchOptions, Sampling};
 
 fn dir(id: &str) -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -349,4 +351,97 @@ fn pressure_thread_stops_with_the_engine() {
         t.elapsed() < std::time::Duration::from_secs(2),
         "joined promptly"
     );
+}
+
+/// Phase 7 exit test: routing is identical with prediction on and off. The lookahead
+/// only chooses what to read ahead, so the router logits, the chosen experts with
+/// their weights, and the output logits keep every bit, whatever the cache size, the
+/// I/O threads, the guard or the predictor's settings.
+#[test]
+fn prefetch_never_changes_routing_or_bits() {
+    let wide = LookaheadConfig {
+        smooth: 0.0,
+        confidence: 1.0,
+        width: 3,
+    };
+    for id in IDS {
+        let largest = engine(id, None).metadata().bytes().largest_expert;
+        let mut want: Option<Vec<u32>> = None;
+        let mut hidden = 0;
+        for (prefetch, io, cap) in [
+            (None, 4, None),
+            (None, 4, Some(2)),
+            (Some((LookaheadConfig::default(), true)), 4, Some(2)),
+            (Some((LookaheadConfig::default(), false)), 4, Some(2)),
+            (Some((LookaheadConfig::default(), false)), 1, Some(1)),
+            (Some((wide, false)), 8, Some(3)),
+            (Some((wide, true)), 4, None),
+            (Some((LookaheadConfig::default(), false)), 0, Some(2)),
+        ] {
+            let meta =
+                ModelMetadata::load(&dir(id), &ArchitectureRegistry::with_builtins()).unwrap();
+            let e = Engine::load(
+                meta,
+                EngineOptions {
+                    expert_cache_bytes: cap.map(|n: u64| n * largest),
+                    max_context: Some(256),
+                    io_threads: Some(io),
+                    prefetch: prefetch
+                        .map(|(lookahead, guard)| PrefetchOptions { lookahead, guard }),
+                    ..EngineOptions::default()
+                },
+            )
+            .unwrap();
+            let mut seen = Vec::new();
+            let mut tracer = |ev: TraceEvent<'_>| {
+                if matches!(
+                    ev.point,
+                    TracePoint::RouterLogits | TracePoint::RoutingWeights
+                ) {
+                    seen.extend(ev.values.iter().map(|v| v.to_bits()));
+                    seen.extend(ev.experts);
+                }
+            };
+            let mut c = e.new_cache();
+            let mut out = bits(
+                &e.forward(&PROMPT[..4], &mut c, Logits::All, Some(&mut tracer))
+                    .unwrap(),
+            );
+            for &t in &PROMPT[4..] {
+                out.extend(bits(
+                    &e.forward(&[t], &mut c, Logits::Last, Some(&mut tracer))
+                        .unwrap(),
+                ));
+            }
+            e.end_turn();
+            seen.extend(out);
+            let label = format!("{id} prefetch {prefetch:?} io {io} slots {cap:?}");
+            match &want {
+                None => want = Some(seen),
+                Some(w) => assert!(&seen == w, "{label}: routing or logits changed"),
+            }
+            match e.prefetch_report() {
+                None => assert!(prefetch.is_none()),
+                Some(r) => {
+                    // Every decode layer after the first had a prediction.
+                    let layers = e.metadata().config.dims.layers;
+                    assert_eq!(r.prediction.layers, u64::from(layers - 1) * 10, "{label}");
+                    assert!(r.prediction.correct <= r.prediction.routed);
+                    if io == 0 {
+                        assert_eq!(r.store.issued, 0, "{label}: nobody reads ahead");
+                    }
+                    let st = r.store;
+                    assert!(st.ready + st.late <= st.issued, "{label}");
+                    if io > 0 {
+                        assert!(
+                            st.issued + st.present > 0,
+                            "{label}: predictions reach the store"
+                        );
+                        hidden += st.ready + st.late;
+                    }
+                }
+            }
+        }
+        assert!(hidden > 0, "{id}: some prefetched read was used");
+    }
 }

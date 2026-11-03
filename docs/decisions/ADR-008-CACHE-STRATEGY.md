@@ -88,5 +88,76 @@ simulator, like Colibri's `residency_sim.py`).
   from its text summary).
 - **Not built yet (later Phase 6 slices):** I/O worker threads and the priority
   queue, `acquire_many`, extent coalescing, direct I/O and io_uring, multi-drive
-  mirrors; the learned, persisted hot set and pins; the prefetch guard (Phase 7).
+  mirrors; the learned, persisted hot set and pins; the prefetch guard (Phase 7, built:
+  amendment 2).
 
+
+## Amendment 2 (2026-11-03): router-lookahead prefetch and the eviction guard, Phase 7 slice 1
+
+- **Prediction** (`qubivex_expert_stream::predict`, ported from Colibri's
+  `pilot_prefetch`, PILOT=1). During decode only (one token per forward pass), after
+  layer L's attention the forward pass applies layer L+1's MoE norm and router to the
+  hidden state and hands the logits to `ExpertProvider::lookahead`. `Lookahead::predict`
+  blends them with a per-layer moving average (`smooth` 0.3) and takes experts in
+  probability order until the mass reaches `confidence` 0.92, at least top-K and at
+  most top-K × `width` (1). The extra work is one router matmul per layer. Routing
+  never reads these logits.
+- **Issue order.** The provider holds the prediction and issues it right after layer
+  L's `acquire_many`, so the prefetches queue behind that layer's demand misses.
+  `ExpertStore::prefetch(keys, guard)` queues reads at `Priority::Prefetch`, best
+  first. It never waits, never takes a leased or loading slot, and refuses every key
+  without I/O threads.
+- **Victims.** In a full pool a prefetch evicts the policy's victim, **never another
+  expert of the same prediction**. Without that rule, a later candidate evicted an
+  earlier one already resident; at 1 GiB this cost 15 extra reads per token and every
+  gain.
+- **The guard** (`policy::speculation_beats`, LFRU only). A prediction may evict a
+  resident only if `heat << 8 | 255 > v + v/4 + (4 << 8)`, where `v` is the victim's
+  LFRU score. This is Colibri's `pilot_realload` rule: heat against heat, with the 25%
+  hysteresis and a margin of 4 heat. On by default (`--prefetch-guard off` disables it).
+- **Stale speculation.** When layer L's demand arrives, its queued prefetches that are
+  demanded are promoted to `Demand`, and the others are dropped, freeing their slots.
+  A started read always finishes. A demanded expert whose layer is full of prefetches
+  still loading waits for them instead of failing with `Full`. `Engine::end_turn` (and
+  `generate`) drops every queued prefetch. Memory pressure at `Elevated` or above
+  stops prediction and drops the queue (ADR-005).
+- **Metrics.** `StoreStats::prefetch`: issued, present, refused, ready (the read was
+  fully hidden), late (joined while loading), wasted (evicted unused, and its bytes),
+  cancelled, and lead time. `Engine::prefetch_report` adds recall and precision against
+  the router's real choice. `bench` records both under `experts.prefetch`.
+- **Routing is identical with prediction on and off** (Phase 7 exit test,
+  `prefetch_never_changes_routing_or_bits`). On the three fixtures, router logits,
+  chosen experts, routing weights and output logits are bit-identical across prefetch
+  off, guard on and off, width 1 and 3, and 0–8 I/O threads at 1–3 slots and all
+  resident. The real model's 160 tokens match the Phase 6 exit record in every run
+  below.
+- **Measured** (M3 Pro, 5 threads, OLMoE Q4_K_M, 10 + 160 tokens, 1 warm-up + 3 runs,
+  4 I/O threads; prediction recall and precision 79.7% at 8 predicted per layer):
+
+  | Budget | Prefetch | Decode tok/s | Blocked per token | Read per token | Hit rate |
+  |---|---|---|---|---|---|
+  | 1 GiB | off | 19.87 | 8.29 ms | 426 MiB | 10.5% |
+  | 1 GiB | guard on | 20.32 | 4.87 ms | 441 MiB | 18.8% |
+  | 1 GiB | guard off | **20.50** | **3.95 ms** | 438 MiB | 22.6% |
+  | 2 GiB | off | 23.28–23.62 | 0.49 ms | 169 MiB | 64.7% |
+  | 2 GiB | guard on | 23.51 | 0.12 ms | 170 MiB | 65.4% |
+  | 2 GiB | guard off | 23.07 | 0.02 ms | 199 MiB | 67.0% |
+  | 3 GiB | off / guard on / guard off | 25.25 / 25.15 / 24.90 | 0.08 / 0.02 / 0.01 ms | 55 / 55 / 68 MiB | – |
+  | all resident | off / on | 26.03 / 25.85 | 0 | 0 | 100% |
+
+  Records: `docs/performance/baselines/2026-11-03-m3pro-phase7-*.json`.
+- **What it says.** Prefetch meets the exit criterion: at 1 GiB, blocked time falls by
+  41% with the guard and 52% without it. Throughput gains much less (+2–3%), because
+  decode at 1 GiB is limited by read throughput, not latency. 8 I/O threads do no
+  better than 4, and hiding a read does not make the copy cheaper. Prefetch only helps
+  where it adds reads that are almost all used. At 2–3 GiB the pipelined demand path
+  already hides nearly everything. There, without the guard, wasted prefetches add
+  18–23% more reads and cost 1–2%; with the guard the result is within noise.
+- **Defaults.** Prefetch stays **off** (`--prefetch` opts in): its gain is small and
+  limited to tight budgets. When on, the guard is on: it never costs measurably and
+  keeps most of the 1 GiB gain.
+- **Not built yet:** a throttle when the disk is saturated (warm reads never saturated
+  here; it needs cold or slower-disk measurements), lookahead beyond one layer
+  (Colibri PILOT=2/3), and predicting layer 0 of the next token. A cancelled prefetch
+  frees its slab buffer instead of keeping it: 197 allocations over 3 runs with 1 I/O
+  thread, none at 4.

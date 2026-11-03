@@ -103,6 +103,8 @@ enum Command {
         /// Linux), so streaming does not fill the file cache.
         #[arg(long)]
         direct_io: bool,
+        #[command(flatten)]
+        prefetch: PrefetchArgs,
         /// Context limit in tokens (default: the model's).
         #[arg(long)]
         context: Option<usize>,
@@ -166,6 +168,8 @@ enum Command {
         /// Linux), so streaming does not fill the file cache.
         #[arg(long)]
         direct_io: bool,
+        #[command(flatten)]
+        prefetch: PrefetchArgs,
         /// Context limit in tokens (default: the model's).
         #[arg(long)]
         context: Option<usize>,
@@ -290,12 +294,82 @@ pub(crate) struct MemoryOptions {
     cache_policy: qubivex_expert_stream::Policy,
     io_threads: Option<usize>,
     expert_io: qubivex_runtime::ExpertIo,
+    prefetch: Option<qubivex_runtime::PrefetchOptions>,
+}
+
+/// Router-lookahead prefetch (Phase 7), shared by `run` and `bench`.
+#[derive(clap::Args, Clone, Debug)]
+pub(crate) struct PrefetchArgs {
+    /// Read predicted experts ahead during decode: the next layer's router runs early
+    /// on the current hidden state. Routing and output never change.
+    #[arg(long)]
+    prefetch: bool,
+    /// The prefetch eviction guard: on (a prediction evicts a resident expert only if
+    /// clearly hotter) or off.
+    #[arg(long, default_value = "on")]
+    prefetch_guard: String,
+    /// Predict at most top-K × this many experts per layer (default 1).
+    #[arg(long)]
+    prefetch_width: Option<u32>,
+    /// Stop predicting once this probability mass is covered, in (0, 1] (default 0.92).
+    #[arg(long)]
+    prefetch_confidence: Option<f32>,
+    /// Weight of the moving average of earlier predictions, in [0, 1) (default 0.3).
+    #[arg(long)]
+    prefetch_smooth: Option<f32>,
+}
+
+impl PrefetchArgs {
+    fn options(&self) -> Result<Option<qubivex_runtime::PrefetchOptions>, String> {
+        let guard = match self.prefetch_guard.as_str() {
+            "on" => true,
+            "off" => false,
+            other => return Err(format!("unknown --prefetch-guard {other:?}; use on or off")),
+        };
+        if !self.prefetch {
+            return Ok(None);
+        }
+        let mut l = qubivex_expert_stream::predict::LookaheadConfig::default();
+        if let Some(w) = self.prefetch_width {
+            if w == 0 {
+                return Err("--prefetch-width must be at least 1".to_owned());
+            }
+            l.width = w;
+        }
+        if let Some(c) = self.prefetch_confidence {
+            if !(c > 0.0 && c <= 1.0) {
+                return Err(format!("--prefetch-confidence {c} is not in (0, 1]"));
+            }
+            l.confidence = c;
+        }
+        if let Some(sm) = self.prefetch_smooth {
+            if !(0.0..1.0).contains(&sm) {
+                return Err(format!("--prefetch-smooth {sm} is not in [0, 1)"));
+            }
+            l.smooth = sm;
+        }
+        Ok(Some(qubivex_runtime::PrefetchOptions {
+            lookahead: l,
+            guard,
+        }))
+    }
 }
 
 impl MemoryOptions {
     /// The expert pools' replacement policy.
     pub(crate) const fn cache_policy(self) -> qubivex_expert_stream::Policy {
         self.cache_policy
+    }
+
+    /// The same options with these prefetch settings.
+    const fn with_prefetch(mut self, p: Option<qubivex_runtime::PrefetchOptions>) -> Self {
+        self.prefetch = p;
+        self
+    }
+
+    /// Prefetch settings (`None`: off).
+    pub(crate) const fn prefetch(self) -> Option<qubivex_runtime::PrefetchOptions> {
+        self.prefetch
     }
 
     /// Engine options with these memory settings.
@@ -313,6 +387,7 @@ impl MemoryOptions {
             cache_policy: self.cache_policy,
             io_threads: self.io_threads,
             expert_io: self.expert_io,
+            prefetch: self.prefetch,
             ..qubivex_runtime::EngineOptions::default()
         }
     }
@@ -328,6 +403,7 @@ fn memory_options(
     direct_io: bool,
 ) -> Result<MemoryOptions, String> {
     Ok(MemoryOptions {
+        prefetch: None,
         io_threads,
         expert_io: if direct_io {
             qubivex_runtime::ExpertIo::Direct
@@ -428,6 +504,7 @@ fn execute(cmd: &Command) -> Result<(), String> {
             cache_policy,
             io_threads,
             direct_io,
+            prefetch,
             context,
             threads,
             quiet,
@@ -450,7 +527,8 @@ fn execute(cmd: &Command) -> Result<(), String> {
                 cache_policy,
                 *io_threads,
                 *direct_io,
-            )?,
+            )?
+            .with_prefetch(prefetch.options()?),
             context: *context,
             threads: *threads,
             quiet: *quiet,
@@ -471,6 +549,7 @@ fn execute(cmd: &Command) -> Result<(), String> {
             cache_policy,
             io_threads,
             direct_io,
+            prefetch,
             context,
             label,
             reference,
@@ -494,7 +573,8 @@ fn execute(cmd: &Command) -> Result<(), String> {
                 cache_policy,
                 *io_threads,
                 *direct_io,
-            )?,
+            )?
+            .with_prefetch(prefetch.options()?),
             context: *context,
             label: label.as_deref(),
             reference: reference.as_deref(),

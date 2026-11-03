@@ -20,6 +20,16 @@ pub const fn beats(hot: u64, cold: u64) -> bool {
     hot > cold.saturating_add(cold / 4).saturating_add(4)
 }
 
+/// Whether a predicted expert of `heat` may evict a resident expert whose LFRU score is
+/// `victim` (ADR-008's prefetch eviction guard, Colibri's `pilot_realload`). The
+/// prediction scores as if just used, so this is heat against heat with the 25%
+/// hysteresis and a margin of 4 heat: `heat << 8 | 255 > victim + victim/4 + 4 << 8`.
+/// An expert the layer keeps using is not displaced by a guess.
+#[must_use]
+pub fn speculation_beats(heat: u32, victim: u64) -> bool {
+    lfru_score(heat, 0) > victim.saturating_add(victim / 4).saturating_add(4 << 8)
+}
+
 /// Accesses per expert, halved every `window` accesses so that old popularity fades.
 #[derive(Clone, Debug, Default)]
 pub struct Heat {
@@ -75,6 +85,19 @@ mod tests {
         assert!(beats(130, 100));
         assert!(!beats(u64::MAX, u64::MAX - 1), "saturates, no overflow");
         assert!(!beats(u64::MAX, u64::MAX));
+    }
+
+    #[test]
+    fn a_speculation_needs_clearly_more_heat() {
+        // A resident of heat 4, just used: 4 << 8 | 255 = 1279.
+        let victim = lfru_score(4, 0);
+        // 1279 + 319 + 1024 = 2622: heat 10 (2815) wins, heat 9 (2559) does not.
+        assert!(!speculation_beats(9, victim));
+        assert!(speculation_beats(10, victim));
+        // A cold, stale resident (score 0) falls to any prediction with heat 4.
+        assert!(!speculation_beats(3, 0));
+        assert!(speculation_beats(4, 0));
+        assert!(!speculation_beats(u32::MAX, u64::MAX), "saturates");
     }
 
     #[test]

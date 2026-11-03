@@ -132,6 +132,10 @@ struct Config {
     /// Phase 6 slice 3).
     #[serde(default)]
     expert_io: Option<String>,
+    /// Router-lookahead prefetch settings; absent when prefetch is off (and before
+    /// Phase 7).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    prefetch: Option<PrefetchConfig>,
     context: usize,
     prompt: String,
     prompt_tokens: usize,
@@ -244,6 +248,79 @@ struct Experts {
     /// (absent before Phase 6 slice 2).
     #[serde(default)]
     wait_ms_per_token: f64,
+    /// What prefetch did during the measured runs; absent when it is off.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    prefetch: Option<PrefetchRecord>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct PrefetchConfig {
+    guard: bool,
+    smooth: f32,
+    confidence: f32,
+    width: u32,
+}
+
+/// Prefetch counters over the measured runs (Phase 7 metrics).
+#[derive(Debug, Serialize, Deserialize)]
+struct PrefetchRecord {
+    /// Routed experts that were predicted, over decode layers with a prediction.
+    recall: f64,
+    /// Predicted experts that were routed.
+    precision: f64,
+    /// Experts predicted per layer, on average.
+    predicted_per_layer: f64,
+    /// Predicted experts queued for reading.
+    issued: u64,
+    /// Predicted experts already resident or loading.
+    present: u64,
+    /// Not read: no free slot, or the guard kept the resident expert.
+    refused: u64,
+    /// Prefetched experts demanded after their read finished.
+    ready: u64,
+    /// Prefetched experts demanded while still loading.
+    late: u64,
+    /// `(ready + late) / issued`.
+    useful_rate: f64,
+    /// Prefetched experts evicted unused, and their bytes.
+    wasted: u64,
+    wasted_bytes: Bytes,
+    /// Queued prefetches dropped before reading (stale, or at the end of a turn).
+    cancelled: u64,
+    /// Mean time from issue to demand of a used prefetch.
+    lead_ms: f64,
+}
+
+#[allow(clippy::cast_precision_loss)]
+fn prefetch_record(
+    before: qubivex_runtime::PrefetchReport,
+    after: qubivex_runtime::PrefetchReport,
+) -> PrefetchRecord {
+    let (p0, p1) = (before.prediction, after.prediction);
+    let p = qubivex_runtime::PredictionStats {
+        layers: p1.layers - p0.layers,
+        predicted: p1.predicted - p0.predicted,
+        routed: p1.routed - p0.routed,
+        correct: p1.correct - p0.correct,
+    };
+    let (s0, s1) = (before.store, after.store);
+    let d = |f: fn(&qubivex_expert_stream::PrefetchStats) -> u64| f(&s1) - f(&s0);
+    let (issued, ready, late) = (d(|s| s.issued), d(|s| s.ready), d(|s| s.late));
+    PrefetchRecord {
+        recall: p.recall(),
+        precision: p.precision(),
+        predicted_per_layer: p.predicted as f64 / (p.layers as f64).max(1.0),
+        issued,
+        present: d(|s| s.present),
+        refused: d(|s| s.refused),
+        ready,
+        late,
+        useful_rate: (ready + late) as f64 / (issued as f64).max(1.0),
+        wasted: d(|s| s.wasted),
+        wasted_bytes: Bytes(d(|s| s.wasted_bytes)),
+        cancelled: d(|s| s.cancelled),
+        lead_ms: d(|s| s.lead_ns) as f64 / 1e6 / ((ready + late) as f64).max(1.0),
+    }
 }
 
 /// The correctness part of the record.
@@ -310,6 +387,7 @@ fn one_run(engine: &Engine, prompt: &[u32], generated: usize) -> Result<Sample, 
         next = argmax(&logits);
         tokens.push(next);
     }
+    engine.end_turn();
     Ok(Sample {
         prefill,
         steps,
@@ -500,6 +578,7 @@ pub(crate) fn bench(a: &BenchArgs<'_>) -> Result<String, String> {
         peak.sample();
     }
     let before = engine.store_stats();
+    let prefetch_before = engine.prefetch_report();
     if a.routing_trace.is_some() {
         engine.record_routing(true);
     }
@@ -512,6 +591,7 @@ pub(crate) fn bench(a: &BenchArgs<'_>) -> Result<String, String> {
         samples.push(s);
     }
     let after = engine.store_stats();
+    let prefetch_after = engine.prefetch_report();
     if let Some(path) = a.routing_trace {
         let trace = engine.take_routing();
         engine.record_routing(false);
@@ -563,6 +643,12 @@ pub(crate) fn bench(a: &BenchArgs<'_>) -> Result<String, String> {
             cache_policy: Some(format!("{:?}", a.memory.cache_policy())),
             io_threads: Some(engine.io_threads()),
             expert_io: Some(engine.expert_io().name().to_owned()),
+            prefetch: a.memory.prefetch().map(|p| PrefetchConfig {
+                guard: p.guard,
+                smooth: p.lookahead.smooth,
+                confidence: p.lookahead.confidence,
+                width: p.lookahead.width,
+            }),
             context,
             prompt: a.prompt.to_owned(),
             prompt_tokens: prompt.len(),
@@ -610,6 +696,9 @@ pub(crate) fn bench(a: &BenchArgs<'_>) -> Result<String, String> {
             wait_ms_per_token: (after.wait_ns - before.wait_ns) as f64
                 / 1e6
                 / (a.runs * a.decode_tokens).max(1) as f64,
+            prefetch: prefetch_before
+                .zip(prefetch_after)
+                .map(|(b, a)| prefetch_record(b, a)),
         },
         check: Check {
             deterministic: first_divergence.is_none(),
@@ -749,6 +838,25 @@ fn render(r: &Record) -> String {
             .map_or_else(|| "?".to_owned(), |n| n.to_string()),
         r.config.expert_io.as_deref().unwrap_or("buffered")
     );
+    if let Some(p) = &e.prefetch {
+        let _ = writeln!(
+            s,
+            "  prefetch  recall {:.1}%, precision {:.1}% ({:.1} predicted per layer); {} issued, {} present, {} refused; {} ready + {} late = {:.1}% useful, lead {:.2} ms; {} wasted ({}), {} cancelled",
+            p.recall * 100.0,
+            p.precision * 100.0,
+            p.predicted_per_layer,
+            p.issued,
+            p.present,
+            p.refused,
+            p.ready,
+            p.late,
+            p.useful_rate * 100.0,
+            p.lead_ms,
+            p.wasted,
+            p.wasted_bytes,
+            p.cancelled
+        );
+    }
     let k = &r.check;
     let reference = match (k.reference_match, k.reference_divergence) {
         (None, _) => String::new(),
