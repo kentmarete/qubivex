@@ -452,9 +452,13 @@ fn prefetch_never_changes_routing_or_bits() {
 #[test]
 fn metal_placement_never_changes_bits() {
     use qubivex_runtime::{BackendKind, MetalOps};
-    if let Err(e) = qubivex_backend_metal::MetalBackend::new() {
-        eprintln!("skipping: {e}");
-        return;
+    match qubivex_backend_metal::MetalBackend::new() {
+        Err(qubivex_backend_metal::MetalError::Unavailable(e)) => {
+            eprintln!("skipping: {e}");
+            return;
+        }
+        Err(e) => panic!("{e}"),
+        Ok(_) => {}
     }
     let all = MetalOps {
         attention: true,

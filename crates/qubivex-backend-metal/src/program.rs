@@ -349,6 +349,12 @@ impl Batch<'_, '_> {
             if end.is_none_or(|e| e > w.buf.len()) {
                 return Err(shape("matmul", "weights overrun their buffer".into()));
             }
+            if !crate::offset_ok(w.dtype, w.offset) {
+                return Err(shape(
+                    "matmul",
+                    format!("{} weights at unaligned offset {}", w.dtype, w.offset),
+                ));
+            }
             let params = crate::device::Params::new(w.rows, w.cols, s, w.row_bytes)?;
             let pb = bytes_of(&params);
             self.rec.dispatch(
@@ -359,7 +365,11 @@ impl Batch<'_, '_> {
                     ys.arg(),
                     Arg::Bytes(&pb),
                 ],
-                [w.rows.div_ceil(crate::device::ROWS), s, 1],
+                [
+                    w.rows.div_ceil(crate::device::rows_per_group(pipeline)),
+                    s,
+                    1,
+                ],
                 [crate::device::ROWS * crate::device::SIMD_WIDTH, 1, 1],
             );
         }

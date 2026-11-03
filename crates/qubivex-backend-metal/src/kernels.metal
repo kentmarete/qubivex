@@ -56,54 +56,6 @@ static inline float w_q8_0(device const uchar *row, uint j) {
     return q * d;
 }
 
-// GGML get_scale_min_k4.
-static inline uchar2 scale_min_k4(uint j, device const uchar *q) {
-    if (j < 4) {
-        return uchar2(q[j] & 63, q[j + 4] & 63);
-    }
-    return uchar2((q[j + 4] & 0xF) | ((q[j - 4] >> 6) << 4),
-                  (q[j + 4] >> 4) | ((q[j] >> 6) << 4));
-}
-
-// Q4_K: 144-byte blocks of 256; y = (d * sc) * q - (dmin * m).
-static inline float w_q4_k(device const uchar *row, uint j) {
-    device const uchar *blk = row + 144 * (j / 256);
-    uint i = j % 256;
-    uint g = i / 64;
-    uint w = i % 64;
-    float d = f16_at(blk, 0);
-    float dmin = f16_at(blk, 2);
-    uint sub = 2 * g + (w >= 32 ? 1 : 0);
-    uchar2 sm = scale_min_k4(sub, blk + 4);
-    float d1 = d * float(sm.x);
-    float m1 = dmin * float(sm.y);
-    uchar v = blk[16 + 32 * g + (w % 32)];
-    float q = float(w < 32 ? (v & 0xF) : (v >> 4));
-    return d1 * q - m1;
-}
-
-// Q6_K: 210-byte blocks of 256 (ql 128, qh 64, scales 16 x i8, f16 d);
-// y = (d * scale) * q, q a signed 6-bit value.
-static inline float w_q6_k(device const uchar *row, uint j) {
-    device const uchar *blk = row + 210 * (j / 256);
-    uint i = j % 256;
-    uint half_ = i / 128;
-    uint r = i % 128;
-    uint quarter = r / 32;
-    uint l = r % 32;
-    device const uchar *ql = blk + 64 * half_;
-    device const uchar *qh = blk + 128 + 32 * half_;
-    device const uchar *sc = blk + 192 + 8 * half_;
-    float d = f16_at(blk, 208);
-    uchar low = (quarter & 1) ? ql[l + 32] : ql[l];
-    low = (quarter >= 2) ? (low >> 4) : (low & 0xF);
-    uchar high = (qh[l] >> (2 * quarter)) & 3;
-    float q = float(int(low | (high << 4)) - 32);
-    uint is = l / 16 + 2 * quarter;
-    float s = d * float(as_type<char>(sc[is]));
-    return s * q;
-}
-
 // ---- The shared reduction. ----
 
 // `a` is thread t's sum of lanes t and t + 32 (the w = 32 step). Returns the full sum
@@ -161,8 +113,171 @@ MATMUL_KERNEL(matmul_f32, w_f32)
 MATMUL_KERNEL(matmul_f16, w_f16)
 MATMUL_KERNEL(matmul_bf16, w_bf16)
 MATMUL_KERNEL(matmul_q8_0, w_q8_0)
-MATMUL_KERNEL(matmul_q4_k, w_q4_k)
-MATMUL_KERNEL(matmul_q6_k, w_q6_k)
+// ---- Block-wise K-quant matmuls. ----
+//
+// The same lanes and order as MATMUL_KERNEL, and each weight's value is computed with
+// the CPU's operations (`formats::dequant_row`):
+// - Q4_K (144-byte blocks of 256: f16 d, f16 dmin, 12 scale bytes, 128 nibble bytes):
+//   y = (d * sc) * q - (dmin * m), with (sc, m) from GGML get_scale_min_k4;
+// - Q6_K (210-byte blocks of 256: ql 128, qh 64, 16 x i8 scales, f16 d):
+//   y = (d * scale) * q, q a signed 6-bit value.
+// A 64-element chunk's scales are computed once, and each quant byte is loaded once for
+// both of the thread's lanes. Every K-quant row is a whole number of 256-element blocks
+// (k % 256 == 0), so there is no tail.
+
+// Rows per SIMD group for the K-quant kernels: each activation chunk is loaded once and
+// used for NR rows. Each row keeps its own lanes and order. Must equal `KQ_ROWS` in
+// `device.rs`.
+constant uint NR = 2;
+
+static inline float f16_at_t(device const uchar *b) {
+    return float(as_type<half>(ushort(ushort(b[0]) | (ushort(b[1]) << 8))));
+}
+
+// Byte `i` (0..15) of a 16-byte block header held as a uint4.
+static inline uint hbyte(uint4 h, uint i) {
+    return (h[i / 4] >> (8 * (i % 4))) & 0xFF;
+}
+
+// GGML get_scale_min_k4 on the 12 scale bytes at header bytes 4..15.
+static inline uint2 scale_min_h(uint j, uint4 h) {
+    if (j < 4) {
+        return uint2(hbyte(h, 4 + j) & 63, hbyte(h, 8 + j) & 63);
+    }
+    return uint2((hbyte(h, 8 + j) & 0xF) | ((hbyte(h, j) >> 6) << 4),
+                 (hbyte(h, 8 + j) >> 4) | ((hbyte(h, 4 + j) >> 6) << 4));
+}
+
+// Q4_K, with each block's 16-byte header (d, dmin, 12 scale bytes) loaded once as a
+// uint4: the weights must start 16-byte aligned (the host checks, `offset_ok`).
+kernel void matmul_q4_k(device const uchar *w [[buffer(0)]],
+                        device const float *xs [[buffer(1)]],
+                        device float *ys [[buffer(2)]],
+                        constant Params &p [[buffer(3)]],
+                        uint2 tg [[threadgroup_position_in_grid]],
+                        uint sg [[simdgroup_index_in_threadgroup]],
+                        uint lane [[thread_index_in_simdgroup]]) {
+    uint r0 = (tg.x * ROWS + sg) * NR;
+    uint t = tg.y;
+    if (r0 >= p.n) {
+        return;
+    }
+    uint nr = min(NR, p.n - r0);
+    device const uchar *rows[NR];
+    for (uint i = 0; i < NR; i++) {
+        rows[i] = w + ulong(r0 + min(i, nr - 1)) * p.row_bytes;
+    }
+    device const float *x = xs + ulong(t) * p.k;
+    float a0[NR];
+    float a1[NR];
+    for (uint i = 0; i < NR; i++) {
+        a0[i] = 0.0f;
+        a1[i] = 0.0f;
+    }
+    uint blocks = p.k / 256;
+    for (uint b = 0; b < blocks; b++) {
+        device const float *xb = x + 256 * b;
+        uint4 hd[NR];
+        float d[NR];
+        float dmin[NR];
+        for (uint i = 0; i < NR; i++) {
+            hd[i] = *((device const uint4 *)(rows[i] + 144 * b));
+            d[i] = float(as_type<half>(ushort(hd[i].x & 0xFFFF)));
+            dmin[i] = float(as_type<half>(ushort(hd[i].x >> 16)));
+        }
+        for (uint g = 0; g < 4; g++) {
+            float x0 = xb[64 * g + lane];
+            float x1 = xb[64 * g + 32 + lane];
+            for (uint i = 0; i < NR; i++) {
+                // Lanes 0..31 are sub-block 2g (low nibbles), lanes 32..63 sub-block
+                // 2g + 1 (high nibbles of the same bytes).
+                uint2 sm0 = scale_min_h(2 * g, hd[i]);
+                uint2 sm1 = scale_min_h(2 * g + 1, hd[i]);
+                float d0 = d[i] * float(sm0.x);
+                float m0 = dmin[i] * float(sm0.y);
+                float d1 = d[i] * float(sm1.x);
+                float m1 = dmin[i] * float(sm1.y);
+                uchar v = rows[i][144 * b + 16 + 32 * g + lane];
+                float w0 = d0 * float(v & 0xF) - m0;
+                float w1 = d1 * float(v >> 4) - m1;
+                a0[i] = fma(w0, x0, a0[i]);
+                a1[i] = fma(w1, x1, a1[i]);
+            }
+        }
+    }
+    for (uint i = 0; i < NR; i++) {
+        float y = tree(a0[i] + a1[i]);
+        if (lane == 0 && i < nr) {
+            ys[ulong(t) * p.n + r0 + i] = y;
+        }
+    }
+}
+
+kernel void matmul_q6_k(device const uchar *w [[buffer(0)]],
+                        device const float *xs [[buffer(1)]],
+                        device float *ys [[buffer(2)]],
+                        constant Params &p [[buffer(3)]],
+                        uint2 tg [[threadgroup_position_in_grid]],
+                        uint sg [[simdgroup_index_in_threadgroup]],
+                        uint lane [[thread_index_in_simdgroup]]) {
+    uint r0 = (tg.x * ROWS + sg) * NR;
+    uint t = tg.y;
+    if (r0 >= p.n) {
+        return;
+    }
+    uint nr = min(NR, p.n - r0);
+    device const uchar *rows[NR];
+    for (uint i = 0; i < NR; i++) {
+        rows[i] = w + ulong(r0 + min(i, nr - 1)) * p.row_bytes;
+    }
+    device const float *x = xs + ulong(t) * p.k;
+    float a0[NR];
+    float a1[NR];
+    for (uint i = 0; i < NR; i++) {
+        a0[i] = 0.0f;
+        a1[i] = 0.0f;
+    }
+    uint blocks = p.k / 256;
+    uint is = lane / 16;
+    for (uint b = 0; b < blocks; b++) {
+        device const float *xb = x + 256 * b;
+        for (uint m = 0; m < 4; m++) {
+            float x0 = xb[64 * m + lane];
+            float x1 = xb[64 * m + 32 + lane];
+            // Chunk m: half m / 2; lanes 0..31 are quarter 2(m % 2), lanes 32..63
+            // quarter 2(m % 2) + 1, both at l = lane.
+            uint half_ = m / 2;
+            uint q0 = 2 * (m % 2);
+            for (uint i = 0; i < NR; i++) {
+                device const uchar *blk = rows[i] + 210 * b;
+                float d = f16_at_t(blk + 208);
+                device const uchar *ql = blk + 64 * half_;
+                uchar hb = blk[128 + 32 * half_ + lane];
+                device const uchar *scl = blk + 192 + 8 * half_;
+                float s0 = d * float(as_type<char>(scl[is + 2 * q0]));
+                float s1 = d * float(as_type<char>(scl[is + 2 * (q0 + 1)]));
+                // Quarter q0 (even) reads ql[l], quarter q0 + 1 (odd) ql[l + 32]; both
+                // take the high nibble when the quarter is >= 2.
+                uchar lo0 = ql[lane];
+                uchar lo1 = ql[lane + 32];
+                lo0 = (q0 >= 2) ? (lo0 >> 4) : (lo0 & 0xF);
+                lo1 = (q0 + 1 >= 2) ? (lo1 >> 4) : (lo1 & 0xF);
+                uchar h0 = (hb >> (2 * q0)) & 3;
+                uchar h1 = (hb >> (2 * (q0 + 1))) & 3;
+                float w0 = s0 * float(int(lo0 | (h0 << 4)) - 32);
+                float w1 = s1 * float(int(lo1 | (h1 << 4)) - 32);
+                a0[i] = fma(w0, x0, a0[i]);
+                a1[i] = fma(w1, x1, a1[i]);
+            }
+        }
+    }
+    for (uint i = 0; i < NR; i++) {
+        float y = tree(a0[i] + a1[i]);
+        if (lane == 0 && i < nr) {
+            ys[ulong(t) * p.n + r0 + i] = y;
+        }
+    }
+}
 
 // ---- Forward-pass operations (Phase 8 slice 3). ----
 //

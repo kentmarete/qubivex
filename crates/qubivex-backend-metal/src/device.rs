@@ -24,6 +24,19 @@ use crate::{DeviceInfo, MetalError};
 
 /// Rows per threadgroup; must equal `ROWS` in `kernels.metal`.
 pub(crate) const ROWS: usize = 8;
+/// Rows per SIMD group of the K-quant matmul kernels; must equal `NR` in
+/// `kernels.metal`.
+pub(crate) const KQ_ROWS: usize = 2;
+
+/// Output rows one threadgroup of matmul `pipeline` (a `DTYPES` index) covers.
+pub(crate) fn rows_per_group(pipeline: usize) -> usize {
+    use qubivex_core::{DType, GgmlType};
+    match crate::DTYPES.get(pipeline) {
+        Some(DType::Ggml(GgmlType::Q4_K | GgmlType::Q6_K)) => ROWS * KQ_ROWS,
+        _ => ROWS,
+    }
+}
+
 /// Threads per SIMD group on Apple GPUs; the kernels' reduction assumes it.
 pub(crate) const SIMD_WIDTH: usize = 32;
 
@@ -335,7 +348,7 @@ impl Device {
                 enc.setBytes_length_atIndex(params, core::mem::size_of::<Params>(), 3);
             }
             let groups = MTLSize {
-                width: (op.params.n as usize).div_ceil(ROWS),
+                width: (op.params.n as usize).div_ceil(rows_per_group(op.pipeline)),
                 height: op.params.s as usize,
                 depth: 1,
             };

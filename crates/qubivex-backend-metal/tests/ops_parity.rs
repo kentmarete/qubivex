@@ -34,10 +34,12 @@ impl Rng {
 fn backend() -> Option<MetalBackend> {
     match MetalBackend::new() {
         Ok(b) => Some(b),
-        Err(e) => {
+        // Only a missing device skips; a shader that fails to compile is a failure.
+        Err(qubivex_backend_metal::MetalError::Unavailable(e)) => {
             eprintln!("skipping: {e}");
             None
         }
+        Err(e) => panic!("{e}"),
     }
 }
 
