@@ -842,6 +842,7 @@ dependencies = [
  "qubivex-core",
  "qubivex-expert-stream",
  "qubivex-hardware",
+ "qubivex-memory",
  "qubivex-model",
  "qubivex-tokenizer",
  "rayon",

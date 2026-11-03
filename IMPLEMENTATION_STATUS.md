@@ -19,7 +19,17 @@ Last updated: 2026-11-03
   - Non-uniform per-layer slots; `MemoryLedger` with RAII charges; `qubivex plan <model> [--ram-budget] [--ctx] [--profile] [--sequences] [--json]`.
 - Tests: the fixture footprints agree with the model's byte summary and the architecture's head counts. The admission test keeps the floor. Property tests (2,000 cases each) show plans never exceed their budget at any KV length, refusals are real, and the slot distribution is tight.
 - Real model, M3 Pro: every expert (3.63 GiB) fits beside a 1 GiB full-context KV in a 5.53 GiB budget. At `--ram-budget 2GiB` the cache shrinks from 1.21 GiB to 215 MiB at full context; at 1 GiB the context is shortened to 629 tokens.
-- **Next:** slice 2 adds load-time planning in the engine (measured after the dense load), ledger charges, KV growth shrinking the store, and the ledger-against-RSS test. Slice 3 adds the pressure monitor and the RAM-hog test.
+
+**Phase 5 slice 2 done (2026-11-03): the engine uses the plan.**
+- `Engine::load` plans with the dense weights resident. Before each forward pass, the store's capacity is lowered to make room for the projected KV (`ExpertStore::set_capacity`). The KV grows in 256-position chunks. The ledger is charged for dense, expert-cache and KV bytes.
+- `run` and `bench` gain `--profile`, `--ram-fraction` and `--ram-budget`; `--expert-cache-mb` still fixes the cache. The `run` stats line and the `bench` record show the plan's budget and the ledger.
+- Tests (all pass):
+  - room sharing is bit-identical to all-resident on the three fixtures, with a monotonic capacity that never drops below the floor;
+  - the store shrink test;
+  - the ledger-against-RSS test on the real model: the ledger is 3.90 GiB against 3.75 GiB of RSS growth, and 510 MiB against 441 MiB under a 1 GiB budget.
+- Real model: output is byte-identical (sha1 `dc51dd49`) both all-resident and under `--ram-budget 1GiB`. Decode is unchanged (median step 38.63 ms against the 38.82 ms baseline, and the tokens match the baseline record).
+- Known limit, for Phase 6: under a 1 GiB budget the global LRU gets 0 hits (12.0 tok/s). Per-layer pools and LFRU (ADR-008) fix this.
+- **Next:** slice 3, the pressure monitor (stop prefetch, then shrink the cache, then refuse admission; never kill a request) and the RAM-hog test.
 
 **Phase 4: CPU inference prototype, done.** `qubivex run` generates correct text on CPU from the real OLMoE GGUF, and every numerical test passes:
 - against `transformers` the worst relative error is ≤ 7.2e-7, with identical experts and greedy tokens;

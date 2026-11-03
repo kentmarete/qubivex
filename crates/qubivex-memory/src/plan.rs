@@ -62,10 +62,11 @@ impl Quantity {
 }
 
 /// How much of the machine a model may take.
-#[derive(Clone, Copy, Debug, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Serialize)]
 #[serde(rename_all = "lowercase", tag = "profile", content = "fraction")]
 pub enum Profile {
     /// 0.88 of available RAM: Colibri's measured default.
+    #[default]
     Performance,
     /// 0.75 of available RAM, leaving room for other programs.
     Balanced,

@@ -2,7 +2,7 @@
 
 use std::collections::HashMap;
 use std::fs::File;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use qubivex_arch::{
     ArchError, DenseWeights, ExpertProvider, ExpertWeights, KvCache, Logits, Sources, Tracer,
@@ -11,8 +11,12 @@ use qubivex_arch::{
 use qubivex_backend_cpu::CpuBackend;
 use qubivex_compute::WeightView;
 use qubivex_compute::tensor::Tensor;
-use qubivex_core::{ExpertIdx, LayerIdx, Shape};
+use qubivex_core::{Bytes, ExpertIdx, LayerIdx, Shape};
 use qubivex_expert_stream::{ExpertStore, StoreStats};
+use qubivex_hardware::{Host, ResourceProbe, SystemProbe};
+use qubivex_memory::{
+    Charge, HostMemory, MemoryLedger, MemoryPlan, ModelFootprint, Owner, PlanRequest, Profile, Tier,
+};
 use qubivex_model::{ExpertPart, ModelMetadata, TensorRole};
 use qubivex_tokenizer::Tokenizer;
 
@@ -21,10 +25,17 @@ use crate::{ModelExpertSource, RuntimeError, load_tokenizer};
 /// How to load a model.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct EngineOptions {
-    /// Expert cache capacity in bytes. `None`: every expert fits (all resident).
+    /// A fixed expert-cache capacity in bytes, bypassing the memory planner. `None`:
+    /// the planner sizes the cache from available RAM and shrinks it as the KV grows.
     pub expert_cache_bytes: Option<u64>,
-    /// Context limit. `None`: the model's maximum (or 4096 if it states none).
+    /// Context limit. `None`: the model's maximum (or 4096 if it states none), which
+    /// the planner may shorten to what fits.
     pub max_context: Option<usize>,
+    /// The memory profile (ignored with `expert_cache_bytes`).
+    pub profile: Profile,
+    /// An explicit RAM budget in bytes, replacing the profile's (ignored with
+    /// `expert_cache_bytes`).
+    pub ram_budget: Option<u64>,
     /// Compute threads. `None`: the CPU's compute team (its fastest cores: efficiency
     /// cores slow a team that meets at every matmul), else every logical CPU.
     pub threads: Option<usize>,
@@ -130,8 +141,25 @@ impl Default for Sampling {
     }
 }
 
+/// The memory plan and the ledger of what is actually allocated.
+struct Memory {
+    /// `None`: a fixed cache size was requested.
+    plan: Option<MemoryPlan>,
+    ledger: Arc<MemoryLedger>,
+    charges: Mutex<Charges>,
+}
+
+/// Ledger charges the engine holds. The KV charge follows the most recent sequence:
+/// the engine runs one at a time until the scheduler (Phase 9).
+struct Charges {
+    _dense: Charge,
+    experts: Charge,
+    kv: Charge,
+}
+
 /// A model ready to generate.
 pub struct Engine {
+    memory: Memory,
     meta: ModelMetadata,
     dense: Dense,
     source: Arc<ModelExpertSource>,
@@ -174,11 +202,12 @@ fn read_tensor(file: &File, offset: u64, len: usize) -> std::io::Result<Vec<u8>>
 }
 
 impl Engine {
-    /// Loads a validated model: reads the resident tensors, sets up the expert store
-    /// and the tokenizer.
+    /// Loads a validated model: reads the resident tensors, plans memory with them
+    /// resident (ADR-005), sets up the expert store and the tokenizer.
     ///
     /// # Errors
-    /// I/O, tokenizer and architecture errors.
+    /// I/O, tokenizer and architecture errors; [`RuntimeError::Memory`] if the model
+    /// does not fit the budget or available RAM cannot be measured.
     pub fn load(meta: ModelMetadata, opts: EngineOptions) -> Result<Self, RuntimeError> {
         let files = meta
             .tensors
@@ -191,6 +220,7 @@ impl Engine {
             })
             .collect::<Result<Vec<_>, _>>()?;
         let mut tensors = HashMap::new();
+        let mut dense_bytes = 0u64;
         for (name, role) in &meta.roles {
             if matches!(
                 role,
@@ -220,6 +250,7 @@ impl Engine {
             let len = usize::try_from(t.tensor.bytes).map_err(|_| bad(&"is too large"))?;
             let bytes = read_tensor(&files[t.file], t.tensor.offset, len)
                 .map_err(|e| bad(&format!("cannot read: {e}")))?;
+            dense_bytes += bytes.len() as u64;
             let tensor = Tensor::new(desc, bytes).map_err(|e| bad(&e))?;
             tensors.insert(name.clone(), tensor);
         }
@@ -227,17 +258,33 @@ impl Engine {
         let backend = CpuBackend::new();
         let model = TransformerMoeModel::new(&meta.config, &dense, &backend)?;
         let source = Arc::new(ModelExpertSource::new(&meta)?);
-        let capacity = opts
-            .expert_cache_bytes
-            .unwrap_or_else(|| source.total_bytes());
-        let store = ExpertStore::new(source.clone(), capacity);
-        let tokenizer = load_tokenizer(&meta)?;
         let model_ctx = meta
             .manifest
             .context_length
             .or(meta.config.dims.max_context)
             .and_then(|c| usize::try_from(c).ok())
             .unwrap_or(4096);
+        let wanted_ctx = opts.max_context.map(|c| c.min(model_ctx));
+        let (plan, capacity, max_context) = match opts.expert_cache_bytes {
+            Some(c) => (None, c, wanted_ctx.unwrap_or(model_ctx)),
+            None => {
+                let plan = plan_at_load(&meta, &opts, wanted_ctx)?;
+                let capacity = plan
+                    .expert_cache_for(0)
+                    .map_err(|r| RuntimeError::Memory(r.to_string()))?
+                    .0;
+                let ctx = usize::try_from(plan.context).unwrap_or(model_ctx);
+                (Some(plan), capacity, ctx)
+            }
+        };
+        let store = ExpertStore::new(source.clone(), capacity);
+        let ledger = MemoryLedger::new(0);
+        let charges = Charges {
+            _dense: ledger.charge(Tier::Ram, Owner::Dense, Bytes(dense_bytes)),
+            experts: ledger.charge(Tier::Ram, Owner::ExpertCache, Bytes(0)),
+            kv: ledger.charge(Tier::Ram, Owner::Kv, Bytes(0)),
+        };
+        let tokenizer = load_tokenizer(&meta)?;
         let threads = opts
             .threads
             .filter(|&t| t > 0)
@@ -250,8 +297,13 @@ impl Engine {
                 RuntimeError::Model(format!("cannot start {threads} compute threads: {e}"))
             })?;
         Ok(Self {
+            memory: Memory {
+                plan,
+                ledger,
+                charges: Mutex::new(charges),
+            },
             pool,
-            max_context: opts.max_context.map_or(model_ctx, |c| c.min(model_ctx)),
+            max_context,
             meta,
             dense,
             source,
@@ -286,10 +338,50 @@ impl Engine {
         self.store.stats()
     }
 
-    /// The expert cache capacity in bytes.
+    /// The expert cache capacity in bytes now (the planner lowers it as the KV grows).
     #[must_use]
-    pub const fn expert_cache_bytes(&self) -> u64 {
+    pub fn expert_cache_bytes(&self) -> u64 {
         self.store.capacity()
+    }
+
+    /// The memory plan made at load, unless a fixed cache size was requested.
+    #[must_use]
+    pub const fn memory_plan(&self) -> Option<&MemoryPlan> {
+        self.memory.plan.as_ref()
+    }
+
+    /// Bytes actually allocated, per tier and owner.
+    #[must_use]
+    pub const fn ledger(&self) -> &Arc<MemoryLedger> {
+        &self.memory.ledger
+    }
+
+    /// Shrinks the expert cache to leave room for `cache` growing by `tokens`
+    /// (Colibri's `kv_room_fit`), or refuses if that would cross the floor.
+    fn fit_room(&self, cache: &KvCache, tokens: usize) -> Result<(), RuntimeError> {
+        let Some(plan) = &self.memory.plan else {
+            return Ok(());
+        };
+        let projected = KvCache::reserved_for(cache.len() + tokens, cache.capacity());
+        let cap = plan
+            .expert_cache_for(projected as u64)
+            .map_err(|r| RuntimeError::Memory(r.to_string()))?;
+        if cap.0 != self.store.capacity() {
+            self.store
+                .set_capacity(cap.0)
+                .map_err(|e| RuntimeError::Memory(e.to_string()))?;
+        }
+        Ok(())
+    }
+
+    /// Updates the ledger from the store and the KV cache.
+    fn account(&self, cache: &KvCache) {
+        // A poisoned lock means another thread panicked mid-update; the counters are
+        // diagnostics, so skip rather than propagate.
+        if let Ok(mut c) = self.memory.charges.lock() {
+            c.experts.resize(Bytes(self.store.used().unwrap_or(0)));
+            c.kv.resize(Bytes(cache.allocated_bytes()));
+        }
     }
 
     /// A fresh KV cache.
@@ -318,9 +410,12 @@ impl Engine {
             experts: &provider,
             backend: &self.backend,
         };
-        Ok(self
+        self.fit_room(cache, tokens.len())?;
+        let out = self
             .pool
-            .install(|| self.model.forward(tokens, cache, src, logits, trace))?)
+            .install(|| self.model.forward(tokens, cache, src, logits, trace))?;
+        self.account(cache);
+        Ok(out)
     }
 
     /// Generates up to `max_new` tokens after `prompt`, calling `on_token` for each;
@@ -356,6 +451,35 @@ impl Engine {
         }
         Ok(out)
     }
+}
+
+/// Plans memory with the dense weights resident: available RAM is measured now
+/// (Colibri's after-load measurement).
+fn plan_at_load(
+    meta: &ModelMetadata,
+    opts: &EngineOptions,
+    context: Option<usize>,
+) -> Result<MemoryPlan, RuntimeError> {
+    let fp =
+        ModelFootprint::from_metadata(meta).map_err(|e| RuntimeError::Memory(e.to_string()))?;
+    let host = Host::live();
+    let memory = qubivex_hardware::probe_memory(&host);
+    let now = SystemProbe::new(host)
+        .snapshot()
+        .map_err(|e| RuntimeError::Memory(format!("cannot measure available RAM: {e}")))?;
+    let hm = HostMemory {
+        total: memory.effective_total(),
+        available: now.ram_available,
+        dense_resident: true,
+    };
+    let req = PlanRequest {
+        profile: opts.profile,
+        ram_budget: opts.ram_budget.map(Bytes),
+        context: context.map(|c| c as u64),
+        sequences: 1,
+        layer_weights: None,
+    };
+    qubivex_memory::plan(&fp, &hm, &req).map_err(|e| RuntimeError::Memory(e.to_string()))
 }
 
 /// xorshift64*.

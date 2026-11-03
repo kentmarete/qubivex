@@ -160,6 +160,29 @@ pub struct KvCache {
 }
 
 impl KvCache {
+    /// Positions per allocation step. The cache grows by whole chunks (never past its
+    /// context limit) instead of doubling, so what it allocates stays within one chunk
+    /// of what it holds and the memory planner's KV accounting stays close to reality.
+    pub const CHUNK: usize = 256;
+
+    /// The positions a cache of context `max` reserves when it holds `positions`.
+    #[must_use]
+    pub const fn reserved_for(positions: usize, max: usize) -> usize {
+        let r = positions.div_ceil(Self::CHUNK).saturating_mul(Self::CHUNK);
+        if r < max { r } else { max }
+    }
+
+    /// Bytes allocated for keys and values (f32), including reserved positions.
+    #[must_use]
+    pub fn allocated_bytes(&self) -> u64 {
+        self.k
+            .iter()
+            .chain(&self.v)
+            .flatten()
+            .map(|h| h.capacity() as u64 * 4)
+            .sum()
+    }
+
     /// Positions filled.
     #[must_use]
     pub const fn len(&self) -> usize {
@@ -427,6 +450,12 @@ impl TransformerMoeModel {
                         .for_each(|r| rms_norm(r, kn, c.rms_eps));
                 }
                 _ => {}
+            }
+            let reserve = KvCache::reserved_for(p0 + s, cache.max) * d;
+            for h in cache.k[l].iter_mut().chain(cache.v[l].iter_mut()) {
+                if h.capacity() < (p0 + s) * d {
+                    h.reserve_exact(reserve - h.len());
+                }
             }
             for t in 0..s {
                 let pos = p0 + t;

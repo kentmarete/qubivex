@@ -29,6 +29,9 @@ pub enum RuntimeError {
     /// The forward pass failed.
     #[error(transparent)]
     Arch(#[from] qubivex_arch::ArchError),
+    /// The memory plan refuses the model or a context length (ADR-005).
+    #[error("memory: {0}")]
+    Memory(String),
 }
 
 /// The tokenizer named by the model's manifest.

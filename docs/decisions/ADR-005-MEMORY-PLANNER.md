@@ -66,6 +66,33 @@ settled while building it, and the ARCHITECTURE_DECISIONS §2.3 resolution is fo
   (dense, expert cache, KV, activations), charged through RAII `Charge`s. Disk is not
   a tier. Remote storage is out of scope until a user needs it.
 
-Still to build in Phase 5: load-time planning and ledger charges in the engine, KV
-growth shrinking the store, the ledger-against-RSS test on the real model, and the
-pressure monitor with its RAM-hog test.
+## Amendment 2 (2026-11-03): the engine plans at load, Phase 5 slice 2
+
+- **Load-time planning.** `Engine::load` reads the dense weights, measures available
+  RAM with them resident, and plans (Colibri's after-load measurement). The store
+  starts at `expert_cache_for(0)`, and the context is the plan's. `--expert-cache-mb`
+  still fixes the cache and bypasses the planner. Without it, `run` and `bench`
+  accept `--profile`, `--ram-fraction` and `--ram-budget`. A model that does not fit
+  fails to load with the planner's reason.
+- **Room sharing at run time.** Before each forward pass the engine projects the KV
+  after it, lowers the store's capacity to `expert_cache_for(projected)` with
+  `ExpertStore::set_capacity` (LRU eviction of unleased experts), and refuses the pass
+  if it would cross the floor. The engine runs one sequence at a time until the
+  scheduler (Phase 9), so the projection follows the current cache.
+- **The KV grows in 256-position chunks** (capped at the context) instead of doubling.
+  Allocation stays within one chunk of use, and the planner prices whole chunks.
+- **Ledger charges:** dense at load; the expert cache (`store.used()`) and the KV
+  (allocated capacity) after every forward pass. Activation scratch is not charged:
+  it is short-lived and covered by the 0.5 GiB reserve.
+- **Measured on the real model (M3 Pro, 300 tokens).** With every expert resident,
+  the ledger read 3.90 GiB and RSS grew 3.75 GiB. Under a 1 GiB budget the ledger read
+  510 MiB and RSS grew 441 MiB. The ledger is the larger: reserved but untouched KV
+  pages (about 52 MiB) are not resident, and macOS's `ps` excludes compressed pages
+  (this second cause is likely but unverified). The test allows a 256 MiB difference
+  either way.
+- **Known limit, for Phase 6.** With 2–3 slots per layer (1 GiB budget) the global LRU
+  thrashes: 0 hits in 20,971 loads, and decode drops from 20.4 to 12.0 tok/s on a warm
+  page cache. Per-layer slot pools and LFRU (ADR-008) are the fix. The output is still
+  byte-identical.
+
+Still to build in Phase 5: the pressure monitor with its RAM-hog test (slice 3).

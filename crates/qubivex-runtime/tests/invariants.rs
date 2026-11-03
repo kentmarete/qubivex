@@ -133,3 +133,70 @@ fn errors_are_reported() {
     );
     assert!(e.generate(&[], 4, Sampling::default(), |_| true).is_err());
 }
+
+/// A planned engine whose KV takes room back from the expert cache as it grows
+/// (ADR-005) produces the same tokens as one with every expert resident, and the
+/// cache never drops below one slot per layer.
+#[test]
+fn room_sharing_never_changes_bits() {
+    use qubivex_memory::{ACTIVATION_RESERVE, ModelFootprint};
+    for id in IDS {
+        let meta = ModelMetadata::load(&dir(id), &ArchitectureRegistry::with_builtins()).unwrap();
+        let fp = ModelFootprint::from_metadata(&meta).unwrap();
+        let kv = fp.kv_bytes_per_token.0;
+        // Room for the floor, a 512-position KV, and two more slots per layer; the
+        // cache starts above the floor and falls toward it at the second KV chunk.
+        let extra = fp.cache_floor().0 * 2;
+        let budget =
+            fp.dense_bytes().0 + ACTIVATION_RESERVE.0 + fp.cache_floor().0 + 512 * kv + extra;
+        let planned = Engine::load(
+            meta,
+            EngineOptions {
+                ram_budget: Some(budget),
+                ..EngineOptions::default()
+            },
+        )
+        .unwrap();
+        let plan = planned.memory_plan().unwrap();
+        assert!(plan.context >= 512, "{id}: context {}", plan.context);
+        let start = planned.expert_cache_bytes();
+        let mut caps = Vec::new();
+        let mut cache = planned.new_cache();
+        // Every expert resident, a fixed cache, the same context.
+        let meta = ModelMetadata::load(&dir(id), &ArchitectureRegistry::with_builtins()).unwrap();
+        let reference = Engine::load(
+            meta,
+            EngineOptions {
+                expert_cache_bytes: Some(fp.expert_bytes().0),
+                max_context: Some(512),
+                ..EngineOptions::default()
+            },
+        )
+        .unwrap();
+        let mut ref_cache = reference.new_cache();
+        for (i, &t) in PROMPT.iter().cycle().take(300).enumerate() {
+            let a = planned
+                .forward(&[t], &mut cache, Logits::Last, None)
+                .unwrap();
+            let b = reference
+                .forward(&[t], &mut ref_cache, Logits::Last, None)
+                .unwrap();
+            assert_eq!(bits(&a), bits(&b), "{id} position {i}");
+            caps.push(planned.expert_cache_bytes());
+        }
+        let end = *caps.last().unwrap();
+        assert!(end < start, "{id}: the cache shrank ({start} -> {end})");
+        assert!(
+            caps.windows(2).all(|w| w[1] <= w[0]),
+            "{id}: monotonic while the KV grows"
+        );
+        assert!(end >= fp.cache_floor().0, "{id}: never below the floor");
+        // The KV grows in whole chunks: 300 positions reserve 512, as the plan prices.
+        let reserved = qubivex_runtime::KvCache::reserved_for(300, cache.capacity()) as u64;
+        assert_eq!(reserved, 512);
+        assert_eq!(cache.allocated_bytes(), reserved * kv, "{id}");
+        let l = planned.ledger().snapshot(qubivex_memory::Tier::Ram);
+        assert_eq!(l.kv.0, reserved * kv, "{id}: the ledger's KV charge");
+        assert_eq!(l.dense, fp.dense_bytes(), "{id}: the ledger's dense charge");
+    }
+}
