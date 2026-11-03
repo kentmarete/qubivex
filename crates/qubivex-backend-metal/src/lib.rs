@@ -8,10 +8,12 @@
 //!
 //! Supported dtypes: f32, f16, bf16, Q8_0, Q4_K and Q6_K, the same set as the CPU.
 //!
-//! Slice 1 of Phase 8 provides the kernels and their parity tests.
 //! [`MetalBackend`] implements [`ComputeBackend`] by copying host weights into a
-//! shared buffer per call (correct, not fast), and [`MetalWeights`] keeps a matrix
-//! resident on the device. Engine integration and zero-copy weights come next.
+//! shared buffer per call (correct, not fast). The fast path keeps weights on the
+//! device: [`MetalBackend::map_host`] wraps a page-aligned host region in place
+//! (unified memory, no copy; ADR-011 §4), [`MetalHost::weights`] names a matrix inside
+//! it, and [`MetalBackend::matmul_many_resident`] runs a batch of matmuls in one
+//! command buffer (ADR-011 §2).
 //!
 //! On targets other than macOS the crate builds, and [`MetalBackend::new`] returns
 //! [`MetalError::Unavailable`].
@@ -23,7 +25,10 @@
 #[cfg(target_os = "macos")]
 mod device;
 
-use qubivex_compute::{ComputeBackend, ComputeError, WeightView};
+use std::sync::Arc;
+
+use qubivex_compute::host::PageAligned;
+use qubivex_compute::{ComputeBackend, ComputeError, MatMul, WeightView};
 use qubivex_core::{DType, GgmlType};
 use thiserror::Error;
 
@@ -138,11 +143,13 @@ pub struct MetalBackend {
     dev: device::Device,
 }
 
-/// A weight matrix resident in a device buffer.
-#[derive(Debug)]
+/// A weight matrix resident in a device buffer (a copy, or a range of a wrapped host
+/// region). It holds the buffer, and so the host memory, alive.
+#[derive(Clone, Debug)]
 pub struct MetalWeights {
     #[cfg(target_os = "macos")]
     buf: device::Buffer,
+    offset: usize,
     dtype: DType,
     rows: usize,
     cols: usize,
@@ -150,6 +157,12 @@ pub struct MetalWeights {
 }
 
 impl MetalWeights {
+    /// Byte offset of the matrix in its device buffer (0 for an upload).
+    #[must_use]
+    pub const fn offset(&self) -> usize {
+        self.offset
+    }
+
     /// Element type.
     #[must_use]
     pub const fn dtype(&self) -> DType {
@@ -173,6 +186,68 @@ impl MetalWeights {
     pub const fn row_bytes(&self) -> usize {
         self.row_bytes
     }
+}
+
+/// A host region wrapped as one device buffer without a copy (ADR-011 §4).
+#[derive(Debug)]
+pub struct MetalHost {
+    #[cfg(target_os = "macos")]
+    buf: device::Buffer,
+    host: Arc<PageAligned>,
+}
+
+impl MetalHost {
+    /// The bytes wrapped (the region's unpadded length).
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.host.len()
+    }
+
+    /// Whether the region is empty.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.host.is_empty()
+    }
+
+    /// `w` as resident weights, if its bytes lie inside the region; `None` otherwise.
+    ///
+    /// # Errors
+    /// [`ComputeError::Unsupported`] for a dtype without a kernel.
+    pub fn weights(&self, w: &WeightView<'_>) -> Result<Option<MetalWeights>, ComputeError> {
+        check_dtype(w.dtype(), "matmul")?;
+        let Some(offset) = self.host.offset_of(w.bytes()) else {
+            return Ok(None);
+        };
+        #[cfg(target_os = "macos")]
+        {
+            Ok(Some(MetalWeights {
+                buf: self.buf.clone(),
+                offset,
+                dtype: w.dtype(),
+                rows: w.rows(),
+                cols: w.cols(),
+                row_bytes: w.row_bytes(),
+            }))
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            let _ = offset;
+            unreachable!("a MetalHost cannot be created off macOS")
+        }
+    }
+}
+
+/// One matmul of a resident batch (see [`MetalBackend::matmul_many_resident`]).
+#[derive(Debug)]
+pub struct ResidentMatMul<'a> {
+    /// The weights.
+    pub w: &'a MetalWeights,
+    /// `s × cols` activations.
+    pub xs: &'a [f32],
+    /// Activation rows.
+    pub s: usize,
+    /// `s × rows` outputs.
+    pub ys: &'a mut [f32],
 }
 
 impl MetalBackend {
@@ -219,6 +294,7 @@ impl MetalBackend {
         {
             Ok(MetalWeights {
                 buf: self.dev.buffer_from(w.bytes())?,
+                offset: 0,
                 dtype: w.dtype(),
                 rows: w.rows(),
                 cols: w.cols(),
@@ -227,6 +303,26 @@ impl MetalBackend {
         }
         #[cfg(not(target_os = "macos"))]
         {
+            unreachable!("a MetalBackend cannot be created off macOS")
+        }
+    }
+
+    /// Wraps `host` as one device buffer without copying it. The buffer, and every
+    /// [`MetalWeights`] taken from it, hold `host` alive.
+    ///
+    /// # Errors
+    /// [`ComputeError::Device`] if Metal refuses the region.
+    pub fn map_host(&self, host: Arc<PageAligned>) -> Result<MetalHost, ComputeError> {
+        #[cfg(target_os = "macos")]
+        {
+            Ok(MetalHost {
+                buf: self.dev.wrap(Arc::clone(&host))?,
+                host,
+            })
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            let _ = host;
             unreachable!("a MetalBackend cannot be created off macOS")
         }
     }
@@ -244,30 +340,71 @@ impl MetalBackend {
         s: usize,
         ys: &mut [f32],
     ) -> Result<(), ComputeError> {
-        let (n, k) = (w.rows, w.cols);
-        if xs.len() != s * k || ys.len() != s * n {
-            return Err(ComputeError::Shape {
-                op: "matmul",
-                detail: format!(
-                    "{s} x {k} into {s} x {n}, got {} and {}",
-                    xs.len(),
-                    ys.len()
-                ),
-            });
+        self.matmul_many_resident(&mut [ResidentMatMul { w, xs, s, ys }])
+    }
+
+    /// Runs independent resident matmuls in one command buffer and waits for it. Each
+    /// output has the bits [`MetalBackend::matmul_resident`] gives it.
+    ///
+    /// # Errors
+    /// [`ComputeError::Shape`] for mismatched lengths (nothing runs) and
+    /// [`ComputeError::Device`] if the GPU fails.
+    pub fn matmul_many_resident(&self, ops: &mut [ResidentMatMul<'_>]) -> Result<(), ComputeError> {
+        let mut pipelines = Vec::with_capacity(ops.len());
+        for op in ops.iter() {
+            let w = op.w;
+            let (n, k, s) = (w.rows, w.cols, op.s);
+            if op.xs.len() != s * k || op.ys.len() != s * n {
+                return Err(ComputeError::Shape {
+                    op: "matmul",
+                    detail: format!(
+                        "{s} x {k} into {s} x {n}, got {} and {}",
+                        op.xs.len(),
+                        op.ys.len()
+                    ),
+                });
+            }
+            pipelines.push(check_dtype(w.dtype, "matmul")?);
         }
-        if s == 0 || n == 0 {
-            return Ok(());
-        }
-        let p = check_dtype(w.dtype, "matmul")?;
         #[cfg(target_os = "macos")]
         {
-            let params = device::Params::new(n, k, s, w.row_bytes)?;
-            self.dev.matmul(p, &w.buf, xs, ys, params)?;
+            let mut ds = Vec::with_capacity(ops.len());
+            for (op, p) in ops.iter_mut().zip(pipelines) {
+                if op.s == 0 || op.w.rows == 0 {
+                    continue;
+                }
+                let w = op.w;
+                let end = w
+                    .rows
+                    .checked_mul(w.row_bytes)
+                    .and_then(|b| b.checked_add(w.offset));
+                if end.is_none_or(|e| e > w.buf.len()) {
+                    return Err(ComputeError::Shape {
+                        op: "matmul",
+                        detail: format!(
+                            "{} rows of {} bytes at {} exceed a {}-byte buffer",
+                            w.rows,
+                            w.row_bytes,
+                            w.offset,
+                            w.buf.len()
+                        ),
+                    });
+                }
+                ds.push(device::Dispatch {
+                    pipeline: p,
+                    w: &w.buf,
+                    w_offset: w.offset,
+                    xs: op.xs,
+                    params: device::Params::new(w.rows, w.cols, op.s, w.row_bytes)?,
+                    ys: &mut *op.ys,
+                });
+            }
+            self.dev.run(&mut ds)?;
             Ok(())
         }
         #[cfg(not(target_os = "macos"))]
         {
-            let _ = p;
+            let _ = pipelines;
             unreachable!("a MetalBackend cannot be created off macOS")
         }
     }
@@ -296,6 +433,33 @@ impl ComputeBackend for MetalBackend {
         }
         let resident = self.upload(w)?;
         self.matmul_resident(&resident, xs, s, ys)
+    }
+
+    /// Copies each op's weights to the device, then runs them in one command buffer.
+    fn matmul_many(&self, ops: &mut [MatMul<'_>]) -> Result<(), ComputeError> {
+        let mut resident = Vec::with_capacity(ops.len());
+        for op in ops.iter() {
+            check_dtype(op.w.dtype(), "matmul")?;
+            check_shapes(&op.w, op.xs, op.s, op.ys)?;
+            resident.push(if op.s == 0 || op.w.rows() == 0 {
+                None
+            } else {
+                Some(self.upload(&op.w)?)
+            });
+        }
+        let mut batch: Vec<ResidentMatMul<'_>> = ops
+            .iter_mut()
+            .zip(&resident)
+            .filter_map(|(op, w)| {
+                w.as_ref().map(|w| ResidentMatMul {
+                    w,
+                    xs: op.xs,
+                    s: op.s,
+                    ys: &mut *op.ys,
+                })
+            })
+            .collect();
+        self.matmul_many_resident(&mut batch)
     }
 
     /// Dequantisation of one row is a host operation (embedding lookup); it is not

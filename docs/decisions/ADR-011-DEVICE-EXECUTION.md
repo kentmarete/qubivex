@@ -1,6 +1,6 @@
 # ADR-011: Device execution, buffer lifetimes and GPU parity
 
-- Status: Proposed (Phase 8 slice 1, 2026-11-03). Owner review pending.
+- Status: Proposed (Phase 8 slice 1, 2026-11-03; amendment 1, slice 2). Owner review pending.
 - Date: 2026-11-03
 - Related: ADR-007 (backends; amendment 2026-11-03), ADR-010 (lossless by default),
   `docs/engineering/ARCHITECTURE_DECISIONS.md` §2.4–2.5, TENSOR_ARCHITECTURE §6.
@@ -68,3 +68,71 @@ What slice 1 found on the M3 Pro (Apple GPU, 14 cores, unified memory):
 - A Q4_K kernel that dequantises per element reaches only about 21 GiB/s of kernel time on
   expert shapes; a block-reusing kernel (same bits) is the next kernel step, and prefill
   needs a kernel that reuses dequantised weights across activation rows.
+
+## Amendment 1 (2026-11-03): batching, zero-copy weights and placement in the engine, Phase 8 slice 2
+
+### What was built
+- **Batched submission (§2).** `ComputeBackend::matmul_many` takes independent matmuls as
+  one submission (the default loops over `matmul`, so the CPU is unchanged). Metal encodes
+  the whole batch in one command buffer, stages each distinct input once and reuses its
+  staging buffers between submissions. The forward pass submits q, k and v together, and
+  each expert's gate and up together.
+- **Zero-copy weights (§4).** The engine reads every dense tensor into one page-aligned
+  arena (`qubivex_compute::host::PageAligned`: an over-allocated `Vec`, aligned inside,
+  so no unsafe code). `MetalBackend::map_host` wraps it with
+  `newBufferWithBytesNoCopy`. Each placed matrix is an offset into that one buffer, and
+  the buffer holds the arena's `Arc` (§3). The ledger charges the dense tensor bytes once,
+  as before; the arena's alignment slack (under 40 KiB for OLMoE) is not charged.
+- **Placement (§5).** `EngineOptions::{backend, metal_ops}` and the CLI's `--backend
+  cpu|metal` and `--metal-ops attention,router,head`. Placement is fixed at load, by
+  weight: the dense matmuls of the chosen kinds run on Metal, and everything else
+  (embedding lookup, norms, attention, experts) runs on the CPU. `Engine::placement()`
+  reports it, and `qubivex bench` records it as `config.device`.
+- **Token parity.** The fixture invariant `metal_placement_never_changes_bits` checks
+  every placement on all three fixtures. The env-gated `engine_on_metal_gives_the_cpu_tokens`
+  places all 81 dense matmul weights of OLMoE on Metal (q, k, v, o and router for each of 16 layers, plus the head): the 10 × 50304 prompt logits are
+  bit-identical, and so are the 48 generated tokens. Every `qubivex bench` run below
+  matches the Phase 7 reference tokens.
+
+### Measurements (M3 Pro, OLMoE Q4_K_M, all experts resident, 160 tokens, 3 runs)
+Kernel level (Criterion, resident weights):
+
+| | time |
+|---|---|
+| 64 × 64 f32, one submission (pure overhead) | 109 µs (slice 1: 120 µs; staging reuse) |
+| q, k, v (3 × 2048 × 2048 Q4_K) as 3 submissions | 727 µs |
+| the same in one command buffer | 424 µs |
+
+Polling the command buffer's status instead of `waitUntilCompleted` did not lower the
+109 µs (113 µs), so that cost is on the GPU side.
+
+End to end (`qubivex bench`, records `docs/performance/baselines/2026-11-03-m3pro-phase8-*.json`):
+
+| `--backend` / `--metal-ops` | decode tok/s (median step) | median step | prefill tok/s |
+|---|---|---|---|
+| cpu | 25.51 | 39.19 ms | 32.9 |
+| metal / head | 25.07 | 39.90 ms | 32.6 |
+| metal / attention,head | 22.16 | 45.13 ms | 30.1 |
+| metal / attention,router,head | 21.01 | 47.60 ms | 29.6 |
+
+An interleaved A/B of the CPU path against `main` (26.05 and 26.05 tok/s, then 26.05
+and 26.13) shows the dense arena costs nothing.
+
+**Why the head does not win in the engine.** In a tight loop the Q6_K head takes 1.78 ms
+on Metal against 2.77 ms on the CPU. Timed inside decode, the Metal head takes a median
+3.99 ms against the CPU's 3.18 ms. The GPU is idle for about 36 ms between heads, and a
+lone submission after an idle period runs slower than one in a busy stream. Attention
+loses for the reason slice 1 predicted: 5 submissions per layer at about 110 µs each
+cost more than the kernels save.
+
+### Decision
+- **The CPU stays the default backend.** `--backend metal` is a correct, bit-identical
+  opt-in. Its default placement is `head`, the only candidate whose kernel beats the CPU
+  by more than one submission's cost.
+- **A Metal speed-up needs the GPU kept busy, not more placed matmuls.** That means one
+  submission per layer or per token, which needs norms, RoPE, attention and the expert
+  FFN as Metal kernels with the same bit contract. Then the per-submission cost is paid
+  once per token, and the GPU stays clocked up. That work, and the block-reusing Q4_K
+  kernel, is slice 3.
+- The scratch staging buffers (at most a few MiB) are not charged to the ledger yet.
+  They will be once device tiers are charged per ADR-005.

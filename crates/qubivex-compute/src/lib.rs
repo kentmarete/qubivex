@@ -12,6 +12,7 @@
 //! [`TensorDesc`](qubivex_core::TensorDesc); kernels take a [`WeightView`], which a
 //! contiguous rank-2 byte view converts into.
 
+pub mod host;
 pub mod tensor;
 
 use qubivex_core::{CoreError, DType, Shape};
@@ -172,6 +173,20 @@ impl<'a> WeightView<'a> {
     }
 }
 
+/// One matmul of a batch: `ys = W · xs` for `s` activation rows (as
+/// [`ComputeBackend::matmul`]).
+#[derive(Debug)]
+pub struct MatMul<'a> {
+    /// The weights.
+    pub w: WeightView<'a>,
+    /// `s × cols` activations.
+    pub xs: &'a [f32],
+    /// Activation rows.
+    pub s: usize,
+    /// `s × rows` outputs.
+    pub ys: &'a mut [f32],
+}
+
 /// A compute backend.
 pub trait ComputeBackend: Send + Sync {
     /// Short name (`cpu`).
@@ -196,6 +211,19 @@ pub trait ComputeBackend: Send + Sync {
         s: usize,
         ys: &mut [f32],
     ) -> Result<(), ComputeError>;
+
+    /// Independent matmuls (no output feeds another's input), as one submission where
+    /// the backend can batch them (ADR-011: one command buffer on a GPU). Each output
+    /// has the bits [`ComputeBackend::matmul`] gives it.
+    ///
+    /// # Errors
+    /// As [`ComputeBackend::matmul`]; on an error, outputs may be partly written.
+    fn matmul_many(&self, ops: &mut [MatMul<'_>]) -> Result<(), ComputeError> {
+        for op in ops {
+            self.matmul(&op.w, op.xs, op.s, op.ys)?;
+        }
+        Ok(())
+    }
 
     /// Writes the exact f32 values of row `r` (embedding lookup).
     ///

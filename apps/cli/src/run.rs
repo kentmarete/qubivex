@@ -102,6 +102,16 @@ pub(crate) fn run(a: &RunArgs<'_>) -> Result<(), String> {
             st.evictions,
             memory_line(&engine)
         );
+        let place = engine.placement();
+        if let (Some(dev), Some(ops)) = (&place.device, place.ops) {
+            eprintln!(
+                "[backend: {} on {dev} | {}: {} tensors, {}]",
+                place.backend.name(),
+                ops.describe(),
+                place.tensors,
+                Bytes(place.bytes)
+            );
+        }
         if let Some(p) = engine.prefetch_report() {
             let f = p.store;
             eprintln!(

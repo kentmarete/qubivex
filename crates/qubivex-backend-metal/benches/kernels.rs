@@ -6,7 +6,9 @@
 //! - `metal_prefill_s128`: 128 activation rows, resident;
 //! - `metal_copying`: through `ComputeBackend::matmul`, which uploads the weights on
 //!   every call (the slice-1 integration path);
-//! - `metal_dispatch`: a 64 × 64 f32 matmul, which is all per-call overhead.
+//! - `metal_dispatch`: a 64 × 64 f32 matmul, which is all per-call overhead;
+//! - `metal_batch`: the attention projections of one OLMoE layer (q, k, v: three
+//!   2048 × 2048 Q4_K matrices, one shared input) as three submissions and as one.
 //!
 //! Run with `cargo bench -p qubivex-backend-metal --bench kernels`. Skipped without a
 //! Metal device.
@@ -19,7 +21,7 @@
 )]
 
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
-use qubivex_backend_metal::MetalBackend;
+use qubivex_backend_metal::{MetalBackend, ResidentMatMul};
 use qubivex_compute::{ComputeBackend, WeightView};
 use qubivex_core::{DType, GgmlType, Shape};
 
@@ -146,6 +148,45 @@ fn benches(c: &mut Criterion) {
         1,
         true,
     );
+    batch(c, &gpu);
+}
+
+fn batch(c: &mut Criterion, gpu: &MetalBackend) {
+    let mut g = c.benchmark_group("metal_batch");
+    let mut rng = Rng(2);
+    let (n, k) = (2048, 2048);
+    let ws: Vec<_> = (0..3)
+        .map(|_| {
+            let wb = weights(Q4_K, n, k, &mut rng);
+            gpu.upload(&WeightView::new(Q4_K, n, k, &wb).unwrap())
+                .unwrap()
+        })
+        .collect();
+    let xs: Vec<f32> = (0..k).map(|_| rng.f()).collect();
+    let mut ys = vec![vec![0f32; n]; 3];
+    g.bench_function("qkv_2048_q4_k/separate", |b| {
+        b.iter(|| {
+            for (w, y) in ws.iter().zip(ys.iter_mut()) {
+                gpu.matmul_resident(w, &xs, 1, y).unwrap();
+            }
+        });
+    });
+    g.bench_function("qkv_2048_q4_k/one_buffer", |b| {
+        b.iter(|| {
+            let mut ops: Vec<ResidentMatMul<'_>> = ws
+                .iter()
+                .zip(ys.iter_mut())
+                .map(|(w, y)| ResidentMatMul {
+                    w,
+                    xs: &xs,
+                    s: 1,
+                    ys: y,
+                })
+                .collect();
+            gpu.matmul_many_resident(&mut ops).unwrap();
+        });
+    });
+    g.finish();
 }
 
 criterion_group!(kernels, benches);

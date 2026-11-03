@@ -10,8 +10,11 @@
 )]
 
 use qubivex_backend_cpu::CpuBackend;
-use qubivex_backend_metal::MetalBackend;
-use qubivex_compute::{ComputeBackend, ComputeError, WeightView};
+use std::sync::Arc;
+
+use qubivex_backend_metal::{MetalBackend, ResidentMatMul};
+use qubivex_compute::host::PageAligned;
+use qubivex_compute::{ComputeBackend, ComputeError, MatMul, WeightView};
 use qubivex_core::{DType, GgmlType, Shape};
 
 /// xorshift64*.
@@ -295,4 +298,143 @@ fn errors_are_reported_not_panics() {
     let info = gpu.info();
     eprintln!("{info:?}");
     assert!(!info.name.is_empty());
+}
+
+/// Batches in one command buffer, over a wrapped host region at odd offsets, with a
+/// shared input, every dtype and shrinking sizes (staging reuse): the CPU's bits.
+#[test]
+fn batched_and_wrapped_weights_give_the_cpu_bits() {
+    let Some(gpu) = metal() else { return };
+    let cpu = CpuBackend::new();
+    let mut rng = Rng(23);
+    let k = 1024;
+    // Every dtype as one matrix of a single host region, at offsets that are not page
+    // (or even 16-byte) aligned.
+    let mats: Vec<(DType, usize, Vec<u8>)> = DTYPES
+        .iter()
+        .enumerate()
+        .map(|(i, &d)| {
+            let n = 17 + 8 * i;
+            (d, n, weights(d, n, k, Fill::Typical, &mut rng))
+        })
+        .collect();
+    let mut at = Vec::new();
+    let mut len = 0;
+    for (_, _, b) in &mats {
+        len += 4; // misalign the next matrix
+        at.push(len);
+        len += b.len();
+    }
+    let mut region = PageAligned::zeroed(len);
+    for ((_, _, b), &a) in mats.iter().zip(&at) {
+        region.as_mut_slice()[a..a + b.len()].copy_from_slice(b);
+    }
+    let region = Arc::new(region);
+    let host = gpu.map_host(Arc::clone(&region)).unwrap();
+    assert_eq!(host.len(), len);
+    let views: Vec<WeightView<'_>> = mats
+        .iter()
+        .zip(&at)
+        .map(|((d, n, b), &a)| {
+            WeightView::new(*d, *n, k, &region.as_slice()[a..a + b.len()]).unwrap()
+        })
+        .collect();
+    let resident: Vec<_> = views
+        .iter()
+        .map(|w| host.weights(w).unwrap().unwrap())
+        .collect();
+    let outside = weights(DType::F32, 2, k, Fill::Typical, &mut rng);
+    let outside = WeightView::new(DType::F32, 2, k, &outside).unwrap();
+    assert!(host.weights(&outside).unwrap().is_none());
+
+    for s in [8, 3, 1] {
+        let shared = activations(s * k, Fill::Typical, &mut rng);
+        let own = activations(s * k, Fill::Typical, &mut rng);
+        // Even ops read the shared input, odd ones their own.
+        let input = |i: usize| if i % 2 == 0 { &shared } else { &own };
+        let want: Vec<Vec<f32>> = views
+            .iter()
+            .enumerate()
+            .map(|(i, w)| {
+                let mut y = vec![0f32; s * w.rows()];
+                cpu.matmul(w, input(i), s, &mut y).unwrap();
+                y
+            })
+            .collect();
+        let mut got: Vec<Vec<f32>> = views.iter().map(|w| vec![f32::NAN; s * w.rows()]).collect();
+        let mut ops: Vec<ResidentMatMul<'_>> = resident
+            .iter()
+            .zip(got.iter_mut())
+            .enumerate()
+            .map(|(i, (w, y))| ResidentMatMul {
+                w,
+                xs: input(i),
+                s,
+                ys: y,
+            })
+            .collect();
+        gpu.matmul_many_resident(&mut ops).unwrap();
+        for (i, (a, b)) in want.iter().zip(&got).enumerate() {
+            assert_eq!(
+                bits(a),
+                bits(b),
+                "resident op {i} ({}) s={s}",
+                views[i].dtype()
+            );
+        }
+        // The copying batch path, through the trait.
+        let mut got2: Vec<Vec<f32>> = views.iter().map(|w| vec![f32::NAN; s * w.rows()]).collect();
+        let mut ops: Vec<MatMul<'_>> = views
+            .iter()
+            .zip(got2.iter_mut())
+            .enumerate()
+            .map(|(i, (w, y))| MatMul {
+                w: *w,
+                xs: input(i),
+                s,
+                ys: y,
+            })
+            .collect();
+        gpu.matmul_many(&mut ops).unwrap();
+        assert_eq!(
+            want.iter().map(|v| bits(v)).collect::<Vec<_>>(),
+            got2.iter().map(|v| bits(v)).collect::<Vec<_>>()
+        );
+    }
+    // The weights outlive the region's other holders.
+    drop(host);
+    drop(views);
+    let xs = activations(k, Fill::Typical, &mut rng);
+    let mut y = vec![0f32; resident[0].rows()];
+    gpu.matmul_resident(&resident[0], &xs, 1, &mut y).unwrap();
+}
+
+#[test]
+fn batch_shape_errors_run_nothing() {
+    let Some(gpu) = metal() else { return };
+    let wb = vec![0u8; 4 * 64 * 4];
+    let w = WeightView::new(DType::F32, 4, 64, &wb).unwrap();
+    let r = gpu.upload(&w).unwrap();
+    let xs = [1.0f32; 64];
+    let (mut a, mut b) = ([7.0f32; 4], [7.0f32; 3]);
+    let mut ops = [
+        ResidentMatMul {
+            w: &r,
+            xs: &xs,
+            s: 1,
+            ys: &mut a,
+        },
+        ResidentMatMul {
+            w: &r,
+            xs: &xs,
+            s: 1,
+            ys: &mut b,
+        },
+    ];
+    assert!(matches!(
+        gpu.matmul_many_resident(&mut ops),
+        Err(ComputeError::Shape { .. })
+    ));
+    assert_eq!(a, [7.0; 4], "nothing ran");
+    gpu.matmul_many_resident(&mut []).unwrap();
 }

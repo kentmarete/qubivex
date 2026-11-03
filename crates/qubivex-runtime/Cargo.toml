@@ -11,6 +11,7 @@ publish.workspace = true
 [dependencies]
 qubivex-arch = { workspace = true }
 qubivex-backend-cpu = { workspace = true }
+qubivex-backend-metal = { workspace = true }
 qubivex-compute = { workspace = true }
 qubivex-core = { workspace = true }
 qubivex-expert-stream = { workspace = true }
@@ -25,7 +26,6 @@ thiserror = { workspace = true }
 rustix = { workspace = true }
 
 [dev-dependencies]
-qubivex-backend-metal = { workspace = true }
 serde_json = { workspace = true }
 
 [lints]

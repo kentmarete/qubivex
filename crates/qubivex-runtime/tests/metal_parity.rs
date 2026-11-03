@@ -1,5 +1,6 @@
-//! Metal against CPU on every weight matrix of the real model (env-gated): with
-//! activations in the range a forward pass produces, every output is bit-identical.
+//! Metal against CPU on the real model (env-gated): with activations in the range a
+//! forward pass produces, every weight matrix's output is bit-identical; and the engine
+//! with every dense matmul on Metal gives the CPU engine's logits and tokens.
 //!
 //! Set QUBIVEX_OLMOE_GGUF_DIR to the imported model directory. Skipped without it or
 //! without a Metal device.
@@ -96,4 +97,71 @@ fn every_real_weight_matrix_is_bit_identical() {
         bytes as f64 / (1u64 << 30) as f64
     );
     assert!(matrices > 0);
+}
+
+/// End-to-end token parity (Phase 8 slice 2): the engine with attention, routers and
+/// the head on Metal gives the CPU engine's prompt logits bit for bit, and the same
+/// generated tokens.
+#[test]
+fn engine_on_metal_gives_the_cpu_tokens() {
+    use qubivex_runtime::{BackendKind, Engine, EngineOptions, Logits, MetalOps, Sampling};
+    let Ok(dir) = std::env::var("QUBIVEX_OLMOE_GGUF_DIR") else {
+        eprintln!("skipping: QUBIVEX_OLMOE_GGUF_DIR not set");
+        return;
+    };
+    if let Err(e) = MetalBackend::new() {
+        eprintln!("skipping: {e}");
+        return;
+    }
+    let meta =
+        || ModelMetadata::load(Path::new(&dir), &ArchitectureRegistry::with_builtins()).unwrap();
+    let opts = EngineOptions {
+        max_context: Some(512),
+        ..EngineOptions::default()
+    };
+    let cpu = Engine::load(meta(), opts).unwrap();
+    let gpu = Engine::load(
+        meta(),
+        EngineOptions {
+            backend: BackendKind::Metal,
+            metal_ops: MetalOps {
+                attention: true,
+                router: true,
+                head: true,
+            },
+            ..opts
+        },
+    )
+    .unwrap();
+    let p = gpu.placement();
+    eprintln!(
+        "{:?}: {} tensors, {} bytes on the device",
+        p.device, p.tensors, p.bytes
+    );
+    assert_eq!(
+        p.tensors,
+        16 * 5 + 1,
+        "q, k, v, o and router per layer, and the head"
+    );
+    let prompt = cpu
+        .tokenizer()
+        .encode("Write a long story about a lighthouse keeper.", true)
+        .unwrap();
+    let bits = |v: &[f32]| v.iter().map(|x| x.to_bits()).collect::<Vec<_>>();
+    let (mut a, mut b) = (cpu.new_cache(), gpu.new_cache());
+    let la = cpu.forward(&prompt, &mut a, Logits::All, None).unwrap();
+    let lb = gpu.forward(&prompt, &mut b, Logits::All, None).unwrap();
+    assert!(bits(&la) == bits(&lb), "prompt logits differ");
+    let ta = cpu
+        .generate(&prompt, 48, Sampling::default(), |_| true)
+        .unwrap();
+    let tb = gpu
+        .generate(&prompt, 48, Sampling::default(), |_| true)
+        .unwrap();
+    assert_eq!(ta, tb);
+    eprintln!(
+        "{} prompt tokens, {} generated tokens identical",
+        prompt.len(),
+        ta.len()
+    );
 }

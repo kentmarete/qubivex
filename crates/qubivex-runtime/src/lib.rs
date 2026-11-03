@@ -7,12 +7,14 @@
 
 mod engine;
 mod experts;
+mod placement;
 
 pub use engine::{
     DEFAULT_IO_THREADS, Engine, EngineOptions, PredictionStats, PrefetchOptions, PrefetchReport,
     Sampling,
 };
 pub use experts::{ExpertIo, ExpertLayout, IoPath, ModelExpertSource, PartLayout};
+pub use placement::{BackendKind, MetalOps, PlacementReport};
 pub use qubivex_arch::{KvCache, Logits};
 use qubivex_model::manifest::TokenizerSection;
 use qubivex_model::{GgufMetadata, GgufValue, ModelMetadata};

@@ -445,3 +445,78 @@ fn prefetch_never_changes_routing_or_bits() {
         assert!(hidden > 0, "{id}: some prefetched read was used");
     }
 }
+
+/// Phase 8 (ADR-011): the device placement never changes bits. Every Metal placement
+/// gives the CPU's logits for a prompt batch and its generated tokens. Skipped without
+/// a Metal device.
+#[test]
+fn metal_placement_never_changes_bits() {
+    use qubivex_runtime::{BackendKind, MetalOps};
+    if let Err(e) = qubivex_backend_metal::MetalBackend::new() {
+        eprintln!("skipping: {e}");
+        return;
+    }
+    let all = MetalOps {
+        attention: true,
+        router: true,
+        head: true,
+    };
+    let placements = [
+        MetalOps::default(),
+        MetalOps {
+            attention: true,
+            router: false,
+            head: false,
+        },
+        MetalOps {
+            attention: false,
+            router: true,
+            head: false,
+        },
+        all,
+    ];
+    for id in IDS {
+        let meta =
+            || ModelMetadata::load(&dir(id), &ArchitectureRegistry::with_builtins()).unwrap();
+        let opts = EngineOptions {
+            max_context: Some(256),
+            ..EngineOptions::default()
+        };
+        let cpu = Engine::load(meta(), opts).unwrap();
+        assert_eq!(cpu.placement().backend, BackendKind::Cpu);
+        let mut c = cpu.new_cache();
+        let want = bits(&cpu.forward(PROMPT, &mut c, Logits::All, None).unwrap());
+        let want_toks = cpu
+            .generate(PROMPT, 12, Sampling::default(), |_| true)
+            .unwrap();
+        for ops in placements {
+            let e = Engine::load(
+                meta(),
+                EngineOptions {
+                    backend: BackendKind::Metal,
+                    metal_ops: ops,
+                    ..opts
+                },
+            )
+            .unwrap();
+            let p = e.placement();
+            eprintln!(
+                "{id} {}: {} tensors, {} bytes",
+                ops.describe(),
+                p.tensors,
+                p.bytes
+            );
+            assert!(p.device.is_some(), "{id}");
+            let mut c = e.new_cache();
+            let got = bits(&e.forward(PROMPT, &mut c, Logits::All, None).unwrap());
+            assert_eq!(got, want, "{id} {}: prompt logits", ops.describe());
+            let toks = e
+                .generate(PROMPT, 12, Sampling::default(), |_| true)
+                .unwrap();
+            assert_eq!(toks, want_toks, "{id} {}: tokens", ops.describe());
+            if ops == all {
+                assert!(p.tensors > 0, "{id}: something was placed");
+            }
+        }
+    }
+}

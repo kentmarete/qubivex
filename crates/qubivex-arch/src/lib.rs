@@ -16,7 +16,7 @@
 
 pub mod ops;
 
-use qubivex_compute::{ComputeBackend, ComputeError, WeightView};
+use qubivex_compute::{ComputeBackend, ComputeError, MatMul, WeightView};
 use qubivex_core::{ExpertIdx, LayerIdx};
 use qubivex_model::ArchConfig;
 use qubivex_model::arch::{MoeConfig, QkNorm, RouterScoring};
@@ -47,6 +47,18 @@ pub enum ArchError {
     /// Inputs are inconsistent (token id out of range, context full, wrong config).
     #[error("{0}")]
     Input(String),
+}
+
+/// The kinds of dense matmul in the forward pass (see
+/// [`TransformerMoeModel::dense_matmuls`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum DenseMatmul {
+    /// The q, k, v and output projections of attention.
+    Attention,
+    /// The MoE router (and the lookahead router, which uses the next layer's weights).
+    Router,
+    /// The output head (the embedding when tied).
+    Head,
 }
 
 /// The resident weights, by tensor name.
@@ -358,6 +370,28 @@ impl TransformerMoeModel {
         })
     }
 
+    /// Every dense matmul weight of the forward pass, by kind: what an execution plan
+    /// can place on a device (ADR-007, ADR-011 §5). Routed experts are not listed.
+    #[must_use]
+    pub fn dense_matmuls(&self) -> Vec<(DenseMatmul, String)> {
+        let c = &self.cfg;
+        let mut v = Vec::new();
+        for l in 0..c.layers {
+            let n = |p: &str| layer_name(p, l);
+            for p in [&c.names.q, &c.names.k, &c.names.v, &c.names.o] {
+                v.push((DenseMatmul::Attention, n(p)));
+            }
+            v.push((DenseMatmul::Router, n(&c.names.router)));
+        }
+        let head = if c.tie_embeddings {
+            &c.names.embedding
+        } else {
+            &c.names.output
+        };
+        v.push((DenseMatmul::Head, head.clone()));
+        v
+    }
+
     /// The config.
     #[must_use]
     pub const fn config(&self) -> &MoeConfig {
@@ -468,9 +502,27 @@ impl TransformerMoeModel {
             for xt in x.chunks_exact_mut(h) {
                 rms_norm(xt, &norms.attn, c.rms_eps);
             }
-            be.matmul(&dense.view(&n(&c.names.q))?, &x, s, &mut q)?;
-            be.matmul(&dense.view(&n(&c.names.k))?, &x, s, &mut k)?;
-            be.matmul(&dense.view(&n(&c.names.v))?, &x, s, &mut v)?;
+            // One submission: the three projections share their input.
+            be.matmul_many(&mut [
+                MatMul {
+                    w: dense.view(&n(&c.names.q))?,
+                    xs: &x,
+                    s,
+                    ys: &mut q,
+                },
+                MatMul {
+                    w: dense.view(&n(&c.names.k))?,
+                    xs: &x,
+                    s,
+                    ys: &mut k,
+                },
+                MatMul {
+                    w: dense.view(&n(&c.names.v))?,
+                    xs: &x,
+                    s,
+                    ys: &mut v,
+                },
+            ])?;
             if let Some(clip) = c.clip_qkv {
                 #[allow(clippy::cast_possible_truncation)]
                 let clip = clip as f32;
@@ -601,8 +653,20 @@ impl TransformerMoeModel {
                     let ffn = w.gate.rows();
                     let mut g = vec![0f32; n_t * ffn];
                     let mut u = vec![0f32; n_t * ffn];
-                    be.matmul(&w.gate, &xe, n_t, &mut g)?;
-                    be.matmul(&w.up, &xe, n_t, &mut u)?;
+                    be.matmul_many(&mut [
+                        MatMul {
+                            w: w.gate,
+                            xs: &xe,
+                            s: n_t,
+                            ys: &mut g,
+                        },
+                        MatMul {
+                            w: w.up,
+                            xs: &xe,
+                            s: n_t,
+                            ys: &mut u,
+                        },
+                    ])?;
                     swiglu(&mut g, &u);
                     let mut y = vec![0f32; n_t * h];
                     be.matmul(&w.down, &g, n_t, &mut y)?;

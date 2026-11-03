@@ -11,10 +11,10 @@ use qubivex_arch::{
     ArchError, DenseWeights, ExpertProvider, ExpertWeights, KvCache, Logits, Sources, Tracer,
     TransformerMoeModel,
 };
-use qubivex_backend_cpu::CpuBackend;
 use qubivex_compute::WeightView;
-use qubivex_compute::tensor::Tensor;
-use qubivex_core::{Bytes, ExpertIdx, LayerIdx, Shape};
+use qubivex_compute::host::PageAligned;
+use qubivex_compute::tensor::TensorView;
+use qubivex_core::{Bytes, ExpertIdx, LayerIdx, Shape, TensorDesc};
 use qubivex_expert_stream::predict::{Lookahead, LookaheadConfig};
 use qubivex_expert_stream::{
     ExpertKey, ExpertStore, Policy, PoolSpec, PrefetchStats, StoreError, StoreStats,
@@ -27,6 +27,7 @@ use qubivex_memory::{
 use qubivex_model::{ExpertPart, ModelMetadata, TensorRole};
 use qubivex_tokenizer::Tokenizer;
 
+use crate::placement::{BackendKind, MetalOps, Placed, PlacementReport};
 use crate::{ExpertIo, IoPath, ModelExpertSource, RuntimeError, load_tokenizer};
 
 /// How to load a model.
@@ -62,6 +63,10 @@ pub struct EngineOptions {
     pub threads: Option<usize>,
     /// Router-lookahead prefetch during decode (Phase 7). `None`: off.
     pub prefetch: Option<PrefetchOptions>,
+    /// The compute backend (Phase 8). Placement changes speed, never bits.
+    pub backend: BackendKind,
+    /// The dense matmuls placed on Metal with [`BackendKind::Metal`].
+    pub metal_ops: MetalOps,
 }
 
 /// Router-lookahead prefetch settings (Phase 7).
@@ -140,19 +145,25 @@ fn default_threads() -> usize {
         .unwrap_or_else(|| std::thread::available_parallelism().map_or(1, std::num::NonZero::get))
 }
 
-/// The resident tensors: everything except routed experts. Each is stored as read
-/// from the file and described as a matrix (a vector `[n]` is viewed as `[1, n]`).
+/// The resident tensors: everything except routed experts. They are stored as read
+/// from the file, in one page-aligned arena that a unified-memory GPU uses in place
+/// (ADR-011 §4), each described as a matrix (a vector `[n]` is viewed as `[1, n]`).
 struct Dense {
-    tensors: HashMap<String, Tensor<u8>>,
+    arena: Arc<PageAligned>,
+    tensors: HashMap<String, (TensorDesc, std::ops::Range<usize>)>,
 }
+
+/// Tensors start at multiples of this many bytes in the arena.
+const DENSE_ALIGN: usize = 256;
 
 impl DenseWeights for Dense {
     fn view(&self, name: &str) -> Result<WeightView<'_>, ArchError> {
-        let t = self
+        let (desc, range) = self
             .tensors
             .get(name)
             .ok_or_else(|| ArchError::Missing(name.to_owned()))?;
-        Ok(WeightView::try_from(t.view())?)
+        let bytes = &self.arena.as_slice()[range.clone()];
+        Ok(WeightView::try_from(TensorView::new(*desc, bytes)?)?)
     }
 }
 
@@ -413,7 +424,7 @@ pub struct Engine {
     cache_target: AtomicU64,
     model: TransformerMoeModel,
     tokenizer: Tokenizer,
-    backend: CpuBackend,
+    backend: Placed,
     max_context: usize,
     /// The forward pass runs inside this pool, so every matmul starts on a worker that
     /// joins the work instead of a caller blocked on a condition variable.
@@ -431,13 +442,13 @@ impl std::fmt::Debug for Engine {
     }
 }
 
-fn read_tensor(file: &File, offset: u64, len: usize) -> std::io::Result<Vec<u8>> {
-    let mut b = vec![0u8; len];
+fn read_into(file: &File, offset: u64, b: &mut [u8]) -> std::io::Result<()> {
     #[cfg(unix)]
-    std::os::unix::fs::FileExt::read_exact_at(file, &mut b, offset)?;
+    std::os::unix::fs::FileExt::read_exact_at(file, b, offset)?;
     #[cfg(windows)]
     {
         use std::os::windows::fs::FileExt;
+        let len = b.len();
         let mut done = 0;
         while done < len {
             let n = file.seek_read(&mut b[done..], offset + done as u64)?;
@@ -447,7 +458,7 @@ fn read_tensor(file: &File, offset: u64, len: usize) -> std::io::Result<Vec<u8>>
             done += n;
         }
     }
-    Ok(b)
+    Ok(())
 }
 
 impl Engine {
@@ -468,8 +479,9 @@ impl Engine {
                 })
             })
             .collect::<Result<Vec<_>, _>>()?;
-        let mut tensors = HashMap::new();
-        let mut dense_bytes = 0u64;
+        // Layout first, then one arena, then the reads.
+        let mut layout = Vec::new();
+        let mut arena_len = 0usize;
         for (name, role) in &meta.roles {
             if matches!(
                 role,
@@ -497,15 +509,46 @@ impl Engine {
                 }
             }
             let len = usize::try_from(t.tensor.bytes).map_err(|_| bad(&"is too large"))?;
-            let bytes = read_tensor(&files[t.file], t.tensor.offset, len)
-                .map_err(|e| bad(&format!("cannot read: {e}")))?;
-            dense_bytes += bytes.len() as u64;
-            let tensor = Tensor::new(desc, bytes).map_err(|e| bad(&e))?;
-            tensors.insert(name.clone(), tensor);
+            let at = arena_len.div_ceil(DENSE_ALIGN) * DENSE_ALIGN;
+            arena_len = at
+                .checked_add(len)
+                .ok_or_else(|| bad(&"overflows the dense arena"))?;
+            layout.push((name.clone(), desc, at..at + len, t.file, t.tensor.offset));
         }
-        let dense = Dense { tensors };
-        let backend = CpuBackend::new();
-        let model = TransformerMoeModel::new(&meta.config, &dense, &backend)?;
+        let mut arena = PageAligned::zeroed(arena_len);
+        let mut tensors = HashMap::with_capacity(layout.len());
+        // The ledger is charged the tensor bytes, as the plan prices them. The arena's
+        // alignment slack (under 256 bytes per tensor, plus at most two pages) is not.
+        let mut dense_bytes = 0u64;
+        for (name, desc, range, file, offset) in layout {
+            dense_bytes += range.len() as u64;
+            let bad = |e: &dyn std::fmt::Display| RuntimeError::Model(format!("{name:?}: {e}"));
+            read_into(
+                &files[file],
+                offset,
+                &mut arena.as_mut_slice()[range.clone()],
+            )
+            .map_err(|e| bad(&format!("cannot read: {e}")))?;
+            TensorView::new(desc, &arena.as_slice()[range.clone()]).map_err(|e| bad(&e))?;
+            tensors.insert(name, (desc, range));
+        }
+        let dense = Dense {
+            arena: Arc::new(arena),
+            tensors,
+        };
+        let model = TransformerMoeModel::new(&meta.config, &dense, &Placed::cpu())?;
+        let backend = match opts.backend {
+            BackendKind::Cpu => Placed::cpu(),
+            BackendKind::Metal => {
+                let weights = model
+                    .dense_matmuls()
+                    .into_iter()
+                    .map(|(kind, name)| Ok((kind, dense.view(&name)?)))
+                    .collect::<Result<Vec<_>, ArchError>>()?;
+                Placed::metal(&dense.arena, weights, opts.metal_ops)
+                    .map_err(|e| RuntimeError::Model(format!("cannot place on Metal: {e}")))?
+            }
+        };
         let source = Arc::new(ModelExpertSource::with_io(&meta, opts.expert_io)?);
         let footprint = ModelFootprint::from_metadata(&meta)
             .map_err(|e| RuntimeError::Memory(e.to_string()))?;
@@ -600,6 +643,12 @@ impl Engine {
             tokenizer,
             backend,
         })
+    }
+
+    /// What the execution plan placed on a device.
+    #[must_use]
+    pub const fn placement(&self) -> &PlacementReport {
+        self.backend.report()
     }
 
     /// Expert I/O threads in use.

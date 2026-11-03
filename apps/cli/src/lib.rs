@@ -105,6 +105,8 @@ enum Command {
         direct_io: bool,
         #[command(flatten)]
         prefetch: PrefetchArgs,
+        #[command(flatten)]
+        device: DeviceArgs,
         /// Context limit in tokens (default: the model's).
         #[arg(long)]
         context: Option<usize>,
@@ -170,6 +172,8 @@ enum Command {
         direct_io: bool,
         #[command(flatten)]
         prefetch: PrefetchArgs,
+        #[command(flatten)]
+        device: DeviceArgs,
         /// Context limit in tokens (default: the model's).
         #[arg(long)]
         context: Option<usize>,
@@ -295,6 +299,55 @@ pub(crate) struct MemoryOptions {
     io_threads: Option<usize>,
     expert_io: qubivex_runtime::ExpertIo,
     prefetch: Option<qubivex_runtime::PrefetchOptions>,
+    backend: qubivex_runtime::BackendKind,
+    metal_ops: qubivex_runtime::MetalOps,
+}
+
+/// The compute backend and device placement (Phase 8), shared by `run` and `bench`.
+#[derive(clap::Args, Clone, Debug)]
+pub(crate) struct DeviceArgs {
+    /// Compute backend: cpu, or metal (the dense matmuls chosen by --metal-ops on the
+    /// Apple GPU, the rest on the CPU). Output bits are the same on both.
+    #[arg(long, default_value = "cpu")]
+    backend: String,
+    /// With --backend metal: the dense matmuls on the GPU, comma-separated from
+    /// attention, router and head (default: head).
+    #[arg(long)]
+    metal_ops: Option<String>,
+}
+
+impl DeviceArgs {
+    fn options(&self) -> Result<(qubivex_runtime::BackendKind, qubivex_runtime::MetalOps), String> {
+        let backend = match self.backend.as_str() {
+            "cpu" => qubivex_runtime::BackendKind::Cpu,
+            "metal" => qubivex_runtime::BackendKind::Metal,
+            other => return Err(format!("unknown --backend {other:?}; use cpu or metal")),
+        };
+        let Some(list) = &self.metal_ops else {
+            return Ok((backend, qubivex_runtime::MetalOps::default()));
+        };
+        if backend != qubivex_runtime::BackendKind::Metal {
+            return Err("--metal-ops needs --backend metal".to_owned());
+        }
+        let mut ops = qubivex_runtime::MetalOps {
+            attention: false,
+            router: false,
+            head: false,
+        };
+        for item in list.split(',').map(str::trim).filter(|i| !i.is_empty()) {
+            match item {
+                "attention" => ops.attention = true,
+                "router" => ops.router = true,
+                "head" => ops.head = true,
+                other => {
+                    return Err(format!(
+                        "unknown --metal-ops item {other:?}; use attention, router or head"
+                    ));
+                }
+            }
+        }
+        Ok((backend, ops))
+    }
 }
 
 /// Router-lookahead prefetch (Phase 7), shared by `run` and `bench`.
@@ -367,6 +420,16 @@ impl MemoryOptions {
         self
     }
 
+    /// The same options with this backend and placement.
+    const fn with_device(
+        mut self,
+        (backend, ops): (qubivex_runtime::BackendKind, qubivex_runtime::MetalOps),
+    ) -> Self {
+        self.backend = backend;
+        self.metal_ops = ops;
+        self
+    }
+
     /// Prefetch settings (`None`: off).
     pub(crate) const fn prefetch(self) -> Option<qubivex_runtime::PrefetchOptions> {
         self.prefetch
@@ -388,6 +451,8 @@ impl MemoryOptions {
             io_threads: self.io_threads,
             expert_io: self.expert_io,
             prefetch: self.prefetch,
+            backend: self.backend,
+            metal_ops: self.metal_ops,
             ..qubivex_runtime::EngineOptions::default()
         }
     }
@@ -404,6 +469,8 @@ fn memory_options(
 ) -> Result<MemoryOptions, String> {
     Ok(MemoryOptions {
         prefetch: None,
+        backend: qubivex_runtime::BackendKind::Cpu,
+        metal_ops: qubivex_runtime::MetalOps::default(),
         io_threads,
         expert_io: if direct_io {
             qubivex_runtime::ExpertIo::Direct
@@ -505,6 +572,7 @@ fn execute(cmd: &Command) -> Result<(), String> {
             io_threads,
             direct_io,
             prefetch,
+            device,
             context,
             threads,
             quiet,
@@ -528,7 +596,8 @@ fn execute(cmd: &Command) -> Result<(), String> {
                 *io_threads,
                 *direct_io,
             )?
-            .with_prefetch(prefetch.options()?),
+            .with_prefetch(prefetch.options()?)
+            .with_device(device.options()?),
             context: *context,
             threads: *threads,
             quiet: *quiet,
@@ -550,6 +619,7 @@ fn execute(cmd: &Command) -> Result<(), String> {
             io_threads,
             direct_io,
             prefetch,
+            device,
             context,
             label,
             reference,
@@ -574,7 +644,8 @@ fn execute(cmd: &Command) -> Result<(), String> {
                 *io_threads,
                 *direct_io,
             )?
-            .with_prefetch(prefetch.options()?),
+            .with_prefetch(prefetch.options()?)
+            .with_device(device.options()?),
             context: *context,
             label: label.as_deref(),
             reference: reference.as_deref(),
