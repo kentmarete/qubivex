@@ -19,11 +19,14 @@
 //! [`MetalError::Unavailable`].
 
 // FFI into Metal through objc2 (RUST_GUIDELINES §3: GPU backends may opt in). The
-// unsafe code is confined to `device.rs`.
+// unsafe code is confined to `device.rs`; `program.rs` records through its safe API.
 #![allow(unsafe_code)]
 
 #[cfg(target_os = "macos")]
 mod device;
+mod program;
+
+pub use program::{AttentionShape, Batch, DeviceVec, Span};
 
 use std::sync::Arc;
 
@@ -87,7 +90,7 @@ const fn kernel_name(dtype: DType) -> Option<&'static str> {
 }
 
 /// Every dtype with a kernel, in pipeline order.
-const DTYPES: [DType; 6] = [
+pub(crate) const DTYPES: [DType; 6] = [
     DType::F32,
     DType::F16,
     DType::BF16,
@@ -128,7 +131,7 @@ fn check_shapes(w: &WeightView<'_>, xs: &[f32], s: usize, ys: &[f32]) -> Result<
     Ok(())
 }
 
-fn check_dtype(dtype: DType, op: &'static str) -> Result<usize, ComputeError> {
+pub(crate) fn check_dtype(dtype: DType, op: &'static str) -> Result<usize, ComputeError> {
     pipeline_index(dtype).ok_or(ComputeError::Unsupported {
         backend: "metal",
         op,
@@ -259,7 +262,11 @@ impl MetalBackend {
     pub fn new() -> Result<Self, MetalError> {
         #[cfg(target_os = "macos")]
         {
-            let names = DTYPES.map(|d| kernel_name(d).unwrap_or_default());
+            let mut names: Vec<&str> = DTYPES
+                .iter()
+                .map(|d| kernel_name(*d).unwrap_or_default())
+                .collect();
+            names.extend(program::OP_KERNELS);
             Ok(Self {
                 dev: device::Device::new(KERNEL_SOURCE, &names)?,
             })

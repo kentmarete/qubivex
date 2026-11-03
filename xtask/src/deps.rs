@@ -98,8 +98,9 @@ fn is_allowed(from: &str, to: &str, dev: bool, allowed: &[&str]) -> bool {
     if dev && to == "qubivex-test-utils" && from != to {
         return true;
     }
-    // A GPU backend's parity tests use the CPU backend as their reference (ADR-007).
-    if dev && to == "qubivex-backend-cpu" && BACKENDS.contains(&from) {
+    // A GPU backend's parity tests use the CPU backend's kernels and the forward
+    // pass's ops as their reference (ADR-007, ADR-011).
+    if dev && (to == "qubivex-backend-cpu" || to == "qubivex-arch") && BACKENDS.contains(&from) {
         return true;
     }
     allowed.contains(&to)

@@ -809,6 +809,7 @@ dependencies = [
  "objc2",
  "objc2-foundation",
  "objc2-metal",
+ "qubivex-arch",
  "qubivex-backend-cpu",
  "qubivex-compute",
  "qubivex-core",
