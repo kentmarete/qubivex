@@ -56,6 +56,13 @@ Full data and caveats: [`docs/performance/ADR-002-SPIKE.md`](../performance/ADR-
   Colibri's faster quantized paths are lossy by default (integer dot, about 4e-3), like
   Candle's. Colibri is also bitwise deterministic across thread counts.
 
+## Implementation status (2026-11-03)
+Built: own lossless GEMV kernels with fused NEON decode (PR #2).
+**Not yet built:** the persistent spinning pool (the engine uses a dedicated rayon pool),
+and the dequantise + `gemm` prefill (prefill reuses the decode kernel with `s > 1`).
+Both are open items, to be measured with in-workspace benchmarks before they land
+(`docs/engineering/BASELINE_AUDIT.md` §4.2).
+
 ## Decision
 **Option 3 (hybrid) without Candle.** Own kernels on the decode hot path (GEMV and
 attention, on a persistent spinning pool), and own dequantize plus the `gemm` crate for

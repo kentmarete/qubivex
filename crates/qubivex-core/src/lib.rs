@@ -7,6 +7,7 @@
 //! - byte quantities ([`Bytes`]),
 //! - tensor element types and their storage sizes ([`DType`], [`GgmlType`]),
 //! - tensor shapes with overflow-checked arithmetic ([`Shape`]),
+//! - tensor descriptors with byte strides and offsets, and zero-copy views ([`TensorDesc`]),
 //! - the core error type ([`CoreError`]),
 //! - typed configuration ([`config::QubivexConfig`]).
 //!
@@ -19,12 +20,14 @@ mod dtype;
 mod error;
 mod ids;
 mod shape;
+mod tensor_desc;
 
 pub use bytes::Bytes;
 pub use dtype::{DType, GgmlType, StorageLayout};
 pub use error::CoreError;
 pub use ids::{DeviceId, DeviceKind, ExpertId, ExpertIdx, LayerIdx, ModelKey};
 pub use shape::{MAX_RANK, Shape};
+pub use tensor_desc::TensorDesc;
 
 /// The QUBIVEX version string, taken from the workspace package version.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");

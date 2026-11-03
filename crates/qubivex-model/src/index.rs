@@ -5,7 +5,7 @@ use std::fs::File;
 use std::io::BufReader;
 use std::path::{Path, PathBuf};
 
-use qubivex_core::{DType, Shape};
+use qubivex_core::{CoreError, DType, Shape, TensorDesc};
 use serde::Serialize;
 
 use crate::gguf::{self, GgufMetadata};
@@ -24,6 +24,17 @@ pub struct RawTensor {
     pub offset: u64,
     /// Exact byte length, from `dtype` and `shape`.
     pub bytes: u64,
+}
+
+impl RawTensor {
+    /// The contiguous descriptor of this tensor's bytes, relative to its first byte
+    /// (the file offset is [`RawTensor::offset`]).
+    ///
+    /// # Errors
+    /// As [`TensorDesc::contiguous`]; never for a tensor that passed the index's checks.
+    pub fn desc(&self) -> Result<TensorDesc, CoreError> {
+        TensorDesc::contiguous(self.dtype, self.shape)
+    }
 }
 
 /// A weight file's container format.
