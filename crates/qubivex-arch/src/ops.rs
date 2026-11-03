@@ -3,7 +3,7 @@
 //! Every function computes each output from its inputs in one fixed order, so a
 //! token's result does not depend on how many other tokens are processed with it.
 //! Only IEEE-754 basic operations, fused multiply-add and the portable
-//! [`exp`](qubivex_compute::math::exp) are used, so the bits are the same on every
+//! [`exp`] are used, so the bits are the same on every
 //! platform and on a GPU that evaluates them in the same order.
 
 use qubivex_compute::math::exp;
