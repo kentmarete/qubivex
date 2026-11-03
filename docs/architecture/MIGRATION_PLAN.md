@@ -1,6 +1,10 @@
 # QUBIVEX: Migration Plan
 
-Status: **Proposed. Awaiting architectural review before Phase 1.**
+Status: **The single QUBIVEX roadmap.** Phases 1–4 are done. On 2026-11-03 the
+Engineering Improvement Plan (EIP) was folded in here rather than run as a second
+roadmap (`docs/engineering/ARCHITECTURE_DECISIONS.md` §3); the changes are in §3a.
+§2 describes the original Intel machine; development has since moved to an Apple M3 Pro
+(see `IMPLEMENTATION_STATUS.md`, "Environment change").
 
 This plan converts Colibri's *mechanisms* into a Rust runtime. It is a redesign, not a
 line-by-line port. It follows the specification's phase order with two adjustments,
@@ -150,7 +154,9 @@ OLMoE benchmark, with negative results recorded if it does not help. A test prov
 that routing is identical with prediction on and off.
 
 ### Phase 8: GPU acceleration
-CUDA first (`cudarc` and ported kernels): device buffers, ledger accounting, dense
+**Order amended 2026-11-03 (ADR-007): Metal first** (`qubivex-backend-metal`, testable on
+the M3 Pro), then CUDA, then Vulkan. The CUDA work below is unchanged, but comes second.
+CUDA (`cudarc` and ported kernels): device buffers, ledger accounting, dense
 layers on the device, a VRAM expert tier, hybrid split (`hybrid_split.h`), and CPU/GPU
 in-frame combination in rank order. Then Vulkan (`ash` and ported shaders). Parity
 tests against CPU tokens use a documented drift tolerance (as Colibri's
@@ -169,6 +175,30 @@ and a cancellation test passes.
 ### Phases 10–11
 As in the specification: batched expert execution across requests, KV prefix reuse,
 paged KV, NUMA, multi-device; then a CLI UX catalogue and recommendations UI.
+
+### 3a. Folded in from the Engineering Improvement Plan (2026-11-03)
+- **Phase 4.5: tensor descriptors (done, ADR-009).** `TensorDesc` (byte strides, offset,
+  zero-copy views) in `qubivex-core`; typed `TensorView`, `TensorViewMut` and `Tensor<T>`
+  in `qubivex-compute`. The runtime's dense weights use `Tensor<u8>`. Decode output is
+  byte-identical, with no speed regression.
+- **Before more kernel work: in-workspace benchmarks.** Criterion benches for the
+  existing kernels, and a decode/prefill harness that records the EIP §13.3 fields
+  (hardware, flags, threads, warm-up, median and P95, peak memory, error). Every later
+  kernel change is measured before and after against these.
+- **Phase 4 follow-ups, each measured:** AVX2 kernels; the dequantise + `gemm` prefill
+  and the spinning pool that ADR-002 accepted but which are not built yet; a faster
+  lossless Q4_K kernel (the EIP's quantised GEMV target is ≥ 70% of STREAM; Q4_K was
+  about 20%).
+- **KV cache on `Tensor<f32>`** with `narrow` views: the next consumer of ADR-009, with
+  its own benchmark.
+- **Extensibility:** a dense (non-MoE) architecture and a real SafeTensors run, alongside
+  the existing MoE path.
+- **Precision (ADR-010):** lossless by default; lossy behaviour only as named opt-ins,
+  never in a profile.
+- **Graph IR and compiler: deferred** until operator contracts exist and a second
+  architecture family or the first GPU backend shows a need (future ADR-012).
+- The EIP's `qubivex-tensor` and `qubivex-quant` crates are not created. Their content
+  lives in `qubivex-core`, `qubivex-compute` and `backend-cpu::formats`.
 
 ### Milestone summary
 

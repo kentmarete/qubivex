@@ -10,7 +10,8 @@ use qubivex_arch::{
 };
 use qubivex_backend_cpu::CpuBackend;
 use qubivex_compute::WeightView;
-use qubivex_core::{DType, ExpertIdx, LayerIdx};
+use qubivex_compute::tensor::Tensor;
+use qubivex_core::{ExpertIdx, LayerIdx, Shape};
 use qubivex_expert_stream::{ExpertStore, StoreStats};
 use qubivex_model::{ExpertPart, ModelMetadata, TensorRole};
 use qubivex_tokenizer::Tokenizer;
@@ -39,16 +40,10 @@ fn default_threads() -> usize {
         .unwrap_or_else(|| std::thread::available_parallelism().map_or(1, std::num::NonZero::get))
 }
 
-struct Tensor {
-    dtype: DType,
-    rows: usize,
-    cols: usize,
-    bytes: Vec<u8>,
-}
-
-/// The resident tensors: everything except routed experts.
+/// The resident tensors: everything except routed experts. Each is stored as read
+/// from the file and described as a matrix (a vector `[n]` is viewed as `[1, n]`).
 struct Dense {
-    tensors: HashMap<String, Tensor>,
+    tensors: HashMap<String, Tensor<u8>>,
 }
 
 impl DenseWeights for Dense {
@@ -57,7 +52,7 @@ impl DenseWeights for Dense {
             .tensors
             .get(name)
             .ok_or_else(|| ArchError::Missing(name.to_owned()))?;
-        Ok(WeightView::new(t.dtype, t.rows, t.cols, &t.bytes)?)
+        Ok(WeightView::try_from(t.view())?)
     }
 }
 
@@ -207,30 +202,26 @@ impl Engine {
                 .tensors
                 .get(name)
                 .ok_or_else(|| RuntimeError::Model(format!("tensor {name:?} not indexed")))?;
-            let (rows, cols) = match t.tensor.shape.dims() {
-                [n] => (1, *n),
-                [r, c] => (*r, *c),
-                d => {
-                    return Err(RuntimeError::Model(format!(
-                        "tensor {name:?} has shape {d:?}"
+            let bad = |e: &dyn std::fmt::Display| RuntimeError::Model(format!("{name:?}: {e}"));
+            let mut desc = t.tensor.desc().map_err(|e| bad(&e))?;
+            match *desc.dims() {
+                [n] => {
+                    desc = desc
+                        .reshape(&Shape::new(&[1, n]).map_err(|e| bad(&e))?)
+                        .map_err(|e| bad(&e))?
+                }
+                [_, _] => {}
+                ref d => {
+                    return Err(bad(&format!(
+                        "has shape {d:?}, expected a matrix or vector"
                     )));
                 }
-            };
-            let us = |v: u64| {
-                usize::try_from(v)
-                    .map_err(|_| RuntimeError::Model(format!("{name:?} is too large")))
-            };
-            let bytes = read_tensor(&files[t.file], t.tensor.offset, us(t.tensor.bytes)?)
-                .map_err(|e| RuntimeError::Model(format!("reading {name:?}: {e}")))?;
-            tensors.insert(
-                name.clone(),
-                Tensor {
-                    dtype: t.tensor.dtype,
-                    rows: us(rows)?,
-                    cols: us(cols)?,
-                    bytes,
-                },
-            );
+            }
+            let len = usize::try_from(t.tensor.bytes).map_err(|_| bad(&"is too large"))?;
+            let bytes = read_tensor(&files[t.file], t.tensor.offset, len)
+                .map_err(|e| bad(&format!("cannot read: {e}")))?;
+            let tensor = Tensor::new(desc, bytes).map_err(|e| bad(&e))?;
+            tensors.insert(name.clone(), tensor);
         }
         let dense = Dense { tensors };
         let backend = CpuBackend::new();

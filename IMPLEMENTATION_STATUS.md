@@ -3,6 +3,14 @@
 Last updated: 2026-11-03
 
 ## Current phase
+**Engineering Improvement Plan: Phase 0 audit and the tensor-descriptor step (Phase 4.5), done (2026-11-03).**
+- Audit: `docs/engineering/BASELINE_AUDIT.md`. Reconciliation: `docs/engineering/ARCHITECTURE_DECISIONS.md`. The EIP is folded into `MIGRATION_PLAN.md` §3a.
+- Owner decisions: one roadmap (MIGRATION_PLAN); lossless by default with named lossy opt-ins only (ADR-010); Metal first (ADR-007 amendment); tensor scope = descriptors, views and migration (ADR-009).
+- Code: `TensorDesc` in `qubivex-core`; `TensorView`, `TensorViewMut` and `Tensor<T>` in `qubivex-compute`; `RawTensor::desc()`; the runtime's dense weights on `Tensor<u8>`; `WeightView: TryFrom<TensorView<u8>>`. Kernel signatures are unchanged.
+- Tests: 145 pass (123 before), plus the env-gated real-model generation and expert tests.
+- Decode, OLMoE Q4_K_M, 160 tokens, 3 runs: 19.98 / 20.03 / 20.81 tok/s before and 21.33 / 21.24 / 21.06 after. The output is byte-identical (sha1 `dc51dd49`).
+- **Next:** in-workspace benchmarks (Criterion and a decode/prefill harness), then Phase 5 (memory planner), with measured kernel follow-ups (MIGRATION_PLAN §3a).
+
 **Phase 4: CPU inference prototype, done.** `qubivex run` generates correct text on CPU from the real OLMoE GGUF, and every numerical test passes:
 - against `transformers` the worst relative error is ≤ 7.2e-7, with identical experts and greedy tokens;
 - against an independent f64 reference it is ≤ 3.3e-7;
@@ -258,7 +266,7 @@ Development moved to an **Apple M3 Pro (arm64, 18 GB RAM, macOS)** with about 37
 - ~~**B3** Git repository~~: resolved (`origin` = `github.com/kentmarete/qubivex`).
 
 ## Test results (2026-11-02, M3 Pro, Rust 1.99.1 and 1.85)
-- `cargo test --workspace`: 123 passed, 0 failed on Rust 1.99.1 and 1.85 (2026-11-03, Phase 4 done). After step 4: 120; step 3: 110. Loom: 2 model checks. Env-gated real-model tests: tokenizer (3), expert extents (1) and generation with cache invariance (1), all passing. After step 2: 103; step 1: 98; Phase 3: 92. Loom: 2 model checks (`RUSTFLAGS="--cfg loom"`). Earlier: 91 passed on Rust 1.99.1 and 1.85. Breakdown: core 22 (including a proptest over untrusted dims); hardware 24 (including live smoke and storage tests); model 23 (including proptests over corrupted containers and the committed fixtures); CLI 14; xtask 9. The env-gated `real_files` tests are skipped without `QUBIVEX_REAL_MODEL_*`.
+- `cargo test --workspace`: **145 passed**, 0 failed on Rust 1.99.1 and 1.85 (2026-11-03, after the tensor-descriptor step: core 35, compute 9 + 1 compile-fail doctest). Clippy `-D warnings` is clean natively and for `x86_64-unknown-linux-gnu`. Before that: `cargo test --workspace`: 123 passed, 0 failed on Rust 1.99.1 and 1.85 (2026-11-03, Phase 4 done). After step 4: 120; step 3: 110. Loom: 2 model checks. Env-gated real-model tests: tokenizer (3), expert extents (1) and generation with cache invariance (1), all passing. After step 2: 103; step 1: 98; Phase 3: 92. Loom: 2 model checks (`RUSTFLAGS="--cfg loom"`). Earlier: 91 passed on Rust 1.99.1 and 1.85. Breakdown: core 22 (including a proptest over untrusted dims); hardware 24 (including live smoke and storage tests); model 23 (including proptests over corrupted containers and the committed fixtures); CLI 14; xtask 9. The env-gated `real_files` tests are skipped without `QUBIVEX_REAL_MODEL_*`.
 - Cross-checks: `cargo clippy -D warnings` and `cargo +1.85 check` for `x86_64-unknown-linux-gnu` and `x86_64-apple-darwin`.
 - `cargo clippy --workspace --all-targets -- -D warnings`: clean.
 - `cargo fmt --check`, `cargo doc` (`-D warnings`), `cargo deny check` and `cargo xtask check`: clean.
@@ -268,4 +276,7 @@ Development moved to an **Apple M3 Pro (arm64, 18 GB RAM, macOS)** with about 37
 ADR-002 spike, M3 Pro: [`docs/performance/ADR-002-SPIKE.md`](docs/performance/ADR-002-SPIKE.md).
 
 ## Architectural decisions
-ADR-001 … ADR-008, all Proposed. ADR-001 is implemented as written. ADR-002 has spike data and a preliminary choice (hybrid without Candle), pending the Colibri baseline.
+Register and proposed status changes: `docs/engineering/ARCHITECTURE_DECISIONS.md` §1.
+- Accepted: ADR-002 (hybrid, no Candle; the spinning pool and `gemm` prefill are not built yet), ADR-009 (tensor descriptors), ADR-010 (numerical precision).
+- Amended: ADR-007 (Metal first; device assignment fixed per execution plan).
+- Proposed: ADR-001, 003, 004 and 006 are implemented and proposed for Accepted, awaiting owner review. ADR-005 and ADR-008 are not built yet.

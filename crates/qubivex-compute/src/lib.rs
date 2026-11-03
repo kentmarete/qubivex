@@ -7,6 +7,12 @@
 //!
 //! Phase 4 defines the host-memory form used by the CPU backend. Device buffers,
 //! uploads and events join the trait with the first GPU backend (Phase 8).
+//!
+//! [`tensor`] holds host tensors and views described by a
+//! [`TensorDesc`](qubivex_core::TensorDesc); kernels take a [`WeightView`], which a
+//! contiguous rank-2 byte view converts into.
+
+pub mod tensor;
 
 use qubivex_core::{CoreError, DType, Shape};
 use thiserror::Error;
@@ -36,6 +42,17 @@ pub enum ComputeError {
     /// A size computation failed.
     #[error(transparent)]
     Core(#[from] CoreError),
+    /// The storage element type cannot hold or address this dtype.
+    #[error("{element} storage cannot hold or address {dtype} elements")]
+    ElementType {
+        /// The dtype.
+        dtype: DType,
+        /// The storage element type.
+        element: &'static str,
+    },
+    /// Mutation needs unique storage, but another tensor shares it.
+    #[error("tensor storage is shared; mutation needs a unique owner")]
+    Shared,
 }
 
 /// A row-major `rows × cols` weight matrix in its stored dtype.

@@ -209,6 +209,22 @@ impl DType {
         }
     }
 
+    /// Whether the innermost dimension is packed (blocked or row-scaled): it has no
+    /// per-element byte stride and must stay whole and innermost.
+    #[must_use]
+    pub const fn is_packed(self) -> bool {
+        !matches!(self.layout(), StorageLayout::Elementwise { .. })
+    }
+
+    /// Bytes per element for elementwise dtypes; `None` for packed ones.
+    #[must_use]
+    pub const fn elem_bytes(self) -> Option<u64> {
+        match self.layout() {
+            StorageLayout::Elementwise { bytes_per_elem } => Some(bytes_per_elem),
+            _ => None,
+        }
+    }
+
     /// The exact number of bytes a tensor of this dtype and shape occupies on disk
     /// and in memory.
     ///
