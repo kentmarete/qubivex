@@ -536,9 +536,10 @@ fn metal_placement_never_changes_bits() {
     }
 }
 
-/// Phase 8 slice 3: the whole-layer Metal pass gives the CPU's bits when experts run in
-/// waves (a pool of one slot per layer, so a prompt batch needs many waves), when the
-/// device KV cache grows past a chunk, and when decode steps follow a prompt.
+/// Phase 8 slices 3–4: the whole-layer Metal pass gives the CPU's bits when experts run
+/// in waves (memory pressure shrinks the pools after load, below a prompt's routed set),
+/// when the device KV cache grows past a chunk, and when decode steps follow a prompt.
+/// A plan whose pools are smaller than top-k from the start runs the CPU pass instead.
 #[test]
 fn metal_layers_match_the_cpu_in_waves_and_across_kv_growth() {
     use qubivex_runtime::{BackendKind, MetalOps};
@@ -553,32 +554,53 @@ fn metal_layers_match_the_cpu_in_waves_and_across_kv_growth() {
     for id in IDS {
         let meta =
             || ModelMetadata::load(&dir(id), &ArchitectureRegistry::with_builtins()).unwrap();
-        // The smallest cache that still holds one expert per layer.
+        let metal = |opts: EngineOptions| {
+            Engine::load(
+                meta(),
+                EngineOptions {
+                    backend: BackendKind::Metal,
+                    metal_ops: MetalOps::default(),
+                    ..opts
+                },
+            )
+            .unwrap()
+        };
+        // Pools of one slot from the start: the plan keeps the CPU pass.
         let one_slot = Engine::load(meta(), EngineOptions::default())
             .unwrap()
             .expert_pools()
             .iter()
             .map(|p| p.slot_bytes)
             .sum::<u64>();
+        let small = metal(EngineOptions {
+            expert_cache_bytes: Some(one_slot),
+            ..EngineOptions::default()
+        });
+        let p = small.placement();
+        assert!(p.fallback.is_some() && p.tensors == 0, "{id}: {p:?}");
+
+        // Planned, so pressure can shrink the cache after load.
         let opts = EngineOptions {
             max_context: Some(600),
-            expert_cache_bytes: Some(one_slot),
+            pressure_interval_ms: Some(0),
             ..EngineOptions::default()
         };
         let cpu = Engine::load(meta(), opts).unwrap();
-        let gpu = Engine::load(
-            meta(),
-            EngineOptions {
-                backend: BackendKind::Metal,
-                metal_ops: MetalOps::default(),
-                ..opts
-            },
-        )
-        .unwrap();
-        assert!(gpu.expert_pools().iter().all(|p| p.slots == 1), "{id}");
+        let gpu = metal(opts);
+        assert!(gpu.placement().fallback.is_none(), "{id}");
+        assert!(gpu.placement().tensors > 0, "{id}");
+        let before: Vec<u32> = gpu.expert_pools().iter().map(|p| p.slots).collect();
+        // Critical pressure: the cache drops to its floor at the next forward pass.
+        gpu.observe_pressure(qubivex_core::Bytes(1 << 20));
         let (mut cc, mut gc) = (cpu.new_cache(), gpu.new_cache());
         let want = bits(&cpu.forward(PROMPT, &mut cc, Logits::All, None).unwrap());
         let got = bits(&gpu.forward(PROMPT, &mut gc, Logits::All, None).unwrap());
+        let after: Vec<u32> = gpu.expert_pools().iter().map(|p| p.slots).collect();
+        eprintln!("{id}: slots {before:?} -> {after:?}");
+        assert!(
+            after.iter().zip(&before).all(|(a, b)| a < b),
+            "{id}: the pools shrank"
+        );
         assert_eq!(got, want, "{id}: prompt logits in waves");
         // Greedy decode across the 256-position chunk boundary, step by step.
         let mut next = PROMPT[PROMPT.len() - 1];

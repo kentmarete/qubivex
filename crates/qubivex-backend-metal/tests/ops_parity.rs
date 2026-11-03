@@ -352,3 +352,57 @@ fn gather_and_scatter_rows() {
             .is_err()
     );
 }
+
+/// Asynchronous submissions run in commit order, host reads wait for them, and a
+/// wrapped host region stays alive until the GPU is done even when the caller drops
+/// every handle to it first.
+#[test]
+fn async_submissions_are_ordered_and_keep_host_memory_alive() {
+    use qubivex_compute::WeightView;
+    use qubivex_compute::host::PageAligned;
+    use qubivex_core::DType;
+    use std::sync::Arc;
+    let Some(be) = backend() else { return };
+    let mut rng = Rng(31);
+    let n = 50_000;
+    let (a, b) = (rng.vec(n, 1.0), rng.vec(n, 1.0));
+    let (da, db) = (be.vec_from(&a).unwrap(), be.vec_from(&b).unwrap());
+    let p1 = be
+        .submit_async(|bt| bt.add(&da.all(), &db.all(), n))
+        .unwrap();
+    let p2 = be
+        .submit_async(|bt| bt.add(&da.all(), &db.all(), n))
+        .unwrap();
+    // The read drains both before copying.
+    let mut got = vec![0f32; n];
+    be.read(&da.all(), &mut got).unwrap();
+    let want: Vec<f32> = a.iter().zip(&b).map(|(x, y)| (x + y) + y).collect();
+    same_bits("two ordered adds", &got, &want);
+    assert!(p1.is_complete() && p2.is_complete());
+
+    // A matmul over a wrapped region whose every handle is dropped before waiting.
+    let (rows, cols) = (512, 1024);
+    let w: Vec<f32> = rng.vec(rows * cols, 0.05);
+    let x = rng.vec(cols, 1.0);
+    let mut region = PageAligned::zeroed(rows * cols * 4);
+    for (dst, v) in region.as_mut_slice().chunks_exact_mut(4).zip(&w) {
+        dst.copy_from_slice(&v.to_le_bytes());
+    }
+    let region = Arc::new(region);
+    let host = be.map_host(Arc::clone(&region)).unwrap();
+    let view = WeightView::new(DType::F32, rows, cols, region.as_slice()).unwrap();
+    let mw = host.weights(&view).unwrap().unwrap();
+    let (dx, dy) = (be.vec_from(&x).unwrap(), be.vec(rows).unwrap());
+    let mut p = be
+        .submit_async(|bt| bt.matmul(&mw, &dx.all(), 1, &dy.all()))
+        .unwrap();
+    drop((mw, host, region));
+    p.wait().unwrap();
+    let mut y = vec![0f32; rows];
+    be.read(&dy.all(), &mut y).unwrap();
+    let want: Vec<f32> = w
+        .chunks_exact(cols)
+        .map(|r| qubivex_compute::reduce::dot(r, &x))
+        .collect();
+    same_bits("matmul over a released region", &y, &want);
+}

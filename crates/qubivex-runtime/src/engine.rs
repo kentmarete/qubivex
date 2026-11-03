@@ -593,7 +593,26 @@ impl Engine {
                 (Some(plan), capacity, ctx)
             }
         };
+        // Whole layers beat the CPU only when each layer's pool holds a token's routed
+        // experts: with fewer slots, experts stream through the pool and every layer's
+        // GPU round trip costs more than the GPU saves (ADR-011 amendment 3). The plan
+        // then runs the CPU pass.
+        let top_k = model.config().top_k as usize;
+        let short = pools_for(&footprint.layers, capacity)
+            .into_iter()
+            .find(|p| (p.slots as usize) < top_k);
         let (backend, gpu) = match layers_on {
+            Some((be, _)) if short.is_some() => {
+                let p = short.map_or(0, |p| p.slots);
+                let reason = format!(
+                    "the expert cache holds {p} experts in some layer, fewer than the {top_k} \
+                     routed per token; the CPU pass is faster then"
+                );
+                (
+                    Placed::fallback(be.info().name, opts.metal_ops, reason),
+                    None,
+                )
+            }
             Some((be, host)) => {
                 let g = MetalForward::new(be, host, model.config(), &dense, max_context)
                     .map_err(|e| metal_err(&e))?;

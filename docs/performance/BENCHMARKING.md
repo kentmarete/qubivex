@@ -132,8 +132,9 @@ tokens must match. Kernel-level numbers come from the Criterion groups of
 `cargo bench -p qubivex-backend-metal --bench kernels`: `metal_batch` (batching) and
 `metal_stream` (kernel throughput over 96 distinct expert matrices in one submission,
 with no per-call overhead). Measure Metal both with every expert resident and under a
-small `--ram-budget`: the two regimes rank the backends differently. Results: ADR-011
-amendments 1 and 2.
+small `--ram-budget`: the two regimes rank the backends differently. When the plan's
+pools are smaller than top-k, `--backend metal` runs the CPU pass, and the record's
+`config.device.fallback` says so. Results: ADR-011 amendments 1–3.
 
 ### How to read the numbers
 
