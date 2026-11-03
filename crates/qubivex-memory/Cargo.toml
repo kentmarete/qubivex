@@ -1,0 +1,23 @@
+[package]
+name = "qubivex-memory"
+description = "QUBIVEX memory planner: RAM and VRAM budgets, KV and expert-cache room sharing, the memory ledger"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+qubivex-core = { workspace = true }
+qubivex-hardware = { workspace = true }
+qubivex-model = { workspace = true }
+serde = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+proptest = { workspace = true }
+serde_json = { workspace = true }
+
+[lints]
+workspace = true

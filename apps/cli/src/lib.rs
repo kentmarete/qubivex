@@ -1,12 +1,13 @@
 //! The `qubivex` command-line interface.
 //!
 //! Subcommands arrive with the phases that implement them (MIGRATION_PLAN §3):
-//! `system` and `doctor` (Phase 2), `models` (Phase 3), `run` and `bench` (Phase 4);
-//! `plan` and `serve` later.
+//! `system` and `doctor` (Phase 2), `models` (Phase 3), `run` and `bench` (Phase 4),
+//! `plan` (Phase 5); `serve` later.
 
 mod bench;
 mod doctor;
 mod models;
+mod plan;
 mod run;
 mod system;
 
@@ -134,6 +135,32 @@ enum Command {
         #[arg(long)]
         out: Option<PathBuf>,
         /// Print the JSON record instead of text.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Explain how a model would be placed in memory on this machine.
+    Plan {
+        /// A model id, or a model directory.
+        model: String,
+        /// A model directory to search for the id (repeatable).
+        #[arg(long = "dir")]
+        dirs: Vec<PathBuf>,
+        /// performance (0.88 of available RAM), balanced (0.75) or saver (0.50).
+        #[arg(long, default_value = "performance")]
+        profile: String,
+        /// A custom fraction of available RAM, in (0, 1] (the custom profile).
+        #[arg(long)]
+        ram_fraction: Option<f64>,
+        /// An explicit RAM budget, for example 8GiB; replaces the profile's.
+        #[arg(long)]
+        ram_budget: Option<String>,
+        /// Context per sequence in tokens (default: the model's, shortened to fit).
+        #[arg(long = "ctx")]
+        context: Option<u64>,
+        /// Sequences whose KV must fit at once.
+        #[arg(long, default_value_t = 1)]
+        sequences: u32,
+        /// Print JSON instead of text.
         #[arg(long)]
         json: bool,
     },
@@ -330,6 +357,25 @@ fn execute(cmd: &Command) -> Result<(), String> {
             label: label.as_deref(),
             reference: reference.as_deref(),
             out: out.as_deref(),
+            json: *json,
+        })?),
+        Command::Plan {
+            model,
+            dirs,
+            profile,
+            ram_fraction,
+            ram_budget,
+            context,
+            sequences,
+            json,
+        } => emit(&plan::run(&plan::PlanArgs {
+            model,
+            dirs,
+            profile,
+            ram_fraction: *ram_fraction,
+            ram_budget: ram_budget.as_deref(),
+            context: *context,
+            sequences: *sequences,
             json: *json,
         })?),
         Command::Models { command } => emit(&match command {
