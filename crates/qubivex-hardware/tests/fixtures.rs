@@ -82,13 +82,17 @@ fn hybrid_intel_in_a_cgroup2_container() {
         p.memory.effective_total(),
         Probed::Known(Bytes(129_601_297_408))
     );
-    let s = SystemProbe::new(h).snapshot().unwrap();
+    let s = SystemProbe::new(h.clone()).snapshot().unwrap();
     // room = limit − (current − inactive_file − active_file) = 120.7 GiB − 4 GiB
     assert_eq!(
         s.ram_available,
         Probed::Known(Bytes(129_601_297_408 - 4 * GIB))
     );
     assert_eq!(s.process_rss, Probed::Known(Bytes(524_288 * 1024)));
+    assert_eq!(
+        qubivex_hardware::process_peak_rss(&h),
+        Probed::Known(Bytes(550_000 * 1024))
+    );
 
     let st = storage(&p);
     assert_eq!(st.len(), 3, "{st:?}"); // /etc/hosts bind mount, /proc, /dev, cgroup and shm skipped

@@ -1,3 +1,4 @@
 Name:	qubivex
 VmPeak:	  600000 kB
+VmHWM:	  550000 kB
 VmRSS:	  524288 kB

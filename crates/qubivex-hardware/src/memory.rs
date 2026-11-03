@@ -99,6 +99,22 @@ pub(crate) fn process_rss(host: &Host) -> Probed<Bytes> {
     }
 }
 
+/// Peak resident set size of this process (the kernel's high-water mark).
+///
+/// Linux reports it as `VmHWM` in `/proc/self/status`. macOS keeps it only in
+/// `getrusage`, which needs FFI this crate does not use, so it is unknown there:
+/// callers sample [`process_rss`] instead and say so.
+pub(crate) fn process_peak_rss(host: &Host) -> Probed<Bytes> {
+    match host.os() {
+        OsFamily::Linux => host
+            .read("/proc/self/status")
+            .and_then(|s| kib_field("/proc/self/status", &s, "VmHWM"))
+            .into(),
+        OsFamily::MacOs => Probed::unknown("macOS reports peak RSS only through getrusage"),
+        OsFamily::Other => Probed::unknown("not probed on this OS"),
+    }
+}
+
 fn kib(what: &str, k: u64) -> Result<Bytes, HardwareError> {
     k.checked_mul(1024)
         .map(Bytes)

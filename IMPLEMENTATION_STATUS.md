@@ -9,7 +9,8 @@ Last updated: 2026-11-03
 - Code: `TensorDesc` in `qubivex-core`; `TensorView`, `TensorViewMut` and `Tensor<T>` in `qubivex-compute`; `RawTensor::desc()`; the runtime's dense weights on `Tensor<u8>`; `WeightView: TryFrom<TensorView<u8>>`. Kernel signatures are unchanged.
 - Tests: 145 pass (123 before), plus the env-gated real-model generation and expert tests.
 - Decode, OLMoE Q4_K_M, 160 tokens, 3 runs: 19.98 / 20.03 / 20.81 tok/s before and 21.33 / 21.24 / 21.06 after. The output is byte-identical (sha1 `dc51dd49`).
-- **Next:** in-workspace benchmarks (Criterion and a decode/prefill harness), then Phase 5 (memory planner), with measured kernel follow-ups (MIGRATION_PLAN §3a).
+- **In-workspace benchmarks, done (2026-11-03).** Criterion kernel benches (`cargo bench -p qubivex-backend-cpu --bench kernels`) and `qubivex bench` (prefill and decode with build, hardware, median/P95, peak RSS and a token check, as a JSON record). Baseline on the M3 Pro, warm, 5 threads: decode 25.8 tok/s at the median step (P95 step 51.6 ms vs median 38.8 ms); prefill 44 tok/s at 128 tokens. Q4_K decode is limited by compute (17 GiB/s whether the matrix is in cache or in DRAM, against 80 GiB/s for bf16). Protocol and tables: `docs/performance/BENCHMARKING.md`; records: `docs/performance/baselines/`.
+- **Next:** Phase 5 (memory planner), with measured kernel follow-ups (MIGRATION_PLAN §3a).
 
 **Phase 4: CPU inference prototype, done.** `qubivex run` generates correct text on CPU from the real OLMoE GGUF, and every numerical test passes:
 - against `transformers` the worst relative error is ≤ 7.2e-7, with identical experts and greedy tokens;

@@ -1,9 +1,10 @@
 //! The `qubivex` command-line interface.
 //!
 //! Subcommands arrive with the phases that implement them (MIGRATION_PLAN §3):
-//! `system` and `doctor` (Phase 2), `models` (Phase 3), `run` (Phase 4); `plan` and
-//! `serve` later.
+//! `system` and `doctor` (Phase 2), `models` (Phase 3), `run` and `bench` (Phase 4);
+//! `plan` and `serve` later.
 
+mod bench;
 mod doctor;
 mod models;
 mod run;
@@ -88,6 +89,53 @@ enum Command {
         /// Do not print timing and cache statistics.
         #[arg(long)]
         quiet: bool,
+    },
+    /// Time prefill and decode, and record them with hardware, build flags, peak
+    /// memory and a token check (docs/performance/BENCHMARKING.md).
+    Bench {
+        /// A model id, or a model directory.
+        #[arg(long)]
+        model: String,
+        /// A model directory to search for the id (repeatable).
+        #[arg(long = "dir")]
+        dirs: Vec<PathBuf>,
+        /// The prompt (encoded as `run` encodes it, without a chat template).
+        #[arg(long, default_value = bench::DEFAULT_PROMPT)]
+        prompt: String,
+        /// Prompt length in tokens: the encoded prompt repeated or cut to this length.
+        /// Default: the encoded prompt as is.
+        #[arg(long)]
+        prompt_tokens: Option<usize>,
+        /// Tokens generated per run (the first comes from prefill).
+        #[arg(long, default_value_t = 128)]
+        decode_tokens: usize,
+        /// Unmeasured runs first (they also fill the expert cache).
+        #[arg(long, default_value_t = 1)]
+        warmup: usize,
+        /// Measured runs.
+        #[arg(long, default_value_t = 5)]
+        runs: usize,
+        /// Compute threads (default: the CPU's performance cores).
+        #[arg(long)]
+        threads: Option<usize>,
+        /// Expert cache size in MiB (default: every expert resident).
+        #[arg(long)]
+        expert_cache_mb: Option<u64>,
+        /// Context limit in tokens (default: the model's).
+        #[arg(long)]
+        context: Option<usize>,
+        /// A label stored in the record, for example `before` or `after`.
+        #[arg(long)]
+        label: Option<String>,
+        /// A previous record (or a JSON array of token ids) whose tokens must match.
+        #[arg(long)]
+        reference: Option<PathBuf>,
+        /// Also write the JSON record to this file.
+        #[arg(long)]
+        out: Option<PathBuf>,
+        /// Print the JSON record instead of text.
+        #[arg(long)]
+        json: bool,
     },
     /// List, inspect and import models.
     Models {
@@ -253,6 +301,37 @@ fn execute(cmd: &Command) -> Result<(), String> {
             threads: *threads,
             quiet: *quiet,
         }),
+        Command::Bench {
+            model,
+            dirs,
+            prompt,
+            prompt_tokens,
+            decode_tokens,
+            warmup,
+            runs,
+            threads,
+            expert_cache_mb,
+            context,
+            label,
+            reference,
+            out,
+            json,
+        } => emit(&bench::bench(&bench::BenchArgs {
+            model,
+            dirs,
+            prompt,
+            prompt_tokens: *prompt_tokens,
+            decode_tokens: *decode_tokens,
+            warmup: *warmup,
+            runs: *runs,
+            threads: *threads,
+            expert_cache_mb: *expert_cache_mb,
+            context: *context,
+            label: label.as_deref(),
+            reference: reference.as_deref(),
+            out: out.as_deref(),
+            json: *json,
+        })?),
         Command::Models { command } => emit(&match command {
             ModelsCommand::List { dirs, json } => models::list(dirs, *json)?,
             ModelsCommand::Inspect {
