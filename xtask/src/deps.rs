@@ -98,6 +98,10 @@ fn is_allowed(from: &str, to: &str, dev: bool, allowed: &[&str]) -> bool {
     if dev && to == "qubivex-test-utils" && from != to {
         return true;
     }
+    // A GPU backend's parity tests use the CPU backend as their reference (ADR-007).
+    if dev && to == "qubivex-backend-cpu" && BACKENDS.contains(&from) {
+        return true;
+    }
     allowed.contains(&to)
 }
 
@@ -224,6 +228,19 @@ mod tests {
         let v = with_all(&[("qubivex-arch", &[("qubivex-test-utils", None)])]);
         assert_eq!(v.len(), 1);
         assert!(v[0].contains("normal dependency"));
+    }
+
+    #[test]
+    fn gpu_backends_use_the_cpu_backend_only_in_tests() {
+        let v = with_all(&[(
+            "qubivex-backend-metal",
+            &[("qubivex-backend-cpu", Some("dev"))],
+        )]);
+        assert!(v.is_empty(), "{v:?}");
+        let v = with_all(&[("qubivex-backend-metal", &[("qubivex-backend-cpu", None)])]);
+        assert_eq!(v.len(), 1);
+        let v = with_all(&[("qubivex-arch", &[("qubivex-backend-cpu", Some("dev"))])]);
+        assert_eq!(v.len(), 1, "only backends get the exception");
     }
 
     #[test]

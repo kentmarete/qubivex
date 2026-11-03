@@ -25,6 +25,7 @@ thiserror = { workspace = true }
 rustix = { workspace = true }
 
 [dev-dependencies]
+qubivex-backend-metal = { workspace = true }
 serde_json = { workspace = true }
 
 [lints]

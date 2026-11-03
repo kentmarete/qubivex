@@ -53,6 +53,14 @@ pub enum ComputeError {
     /// Mutation needs unique storage, but another tensor shares it.
     #[error("tensor storage is shared; mutation needs a unique owner")]
     Shared,
+    /// A device backend failed (driver, allocation or execution).
+    #[error("{backend} device error: {detail}")]
+    Device {
+        /// Backend name.
+        backend: &'static str,
+        /// What failed.
+        detail: String,
+    },
 }
 
 /// A row-major `rows × cols` weight matrix in its stored dtype.
