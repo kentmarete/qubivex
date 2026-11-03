@@ -141,10 +141,7 @@ fn engine_on_metal_gives_the_cpu_tokens() {
         head: true,
         layers: false,
     };
-    let layers = MetalOps {
-        layers: true,
-        ..MetalOps::default()
-    };
+    let layers = MetalOps::default();
     for ops in [matmuls, layers] {
         let gpu = Engine::load(
             meta(),

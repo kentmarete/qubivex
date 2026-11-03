@@ -466,12 +466,15 @@ fn metal_placement_never_changes_bits() {
         head: true,
         layers: false,
     };
-    let layers = MetalOps {
-        layers: true,
-        ..MetalOps::default()
-    };
+    let layers = MetalOps::default();
+    assert!(layers.layers, "whole layers are the default placement");
     let placements = [
-        MetalOps::default(),
+        MetalOps {
+            attention: false,
+            router: false,
+            head: true,
+            layers: false,
+        },
         MetalOps {
             attention: true,
             router: false,
@@ -567,10 +570,7 @@ fn metal_layers_match_the_cpu_in_waves_and_across_kv_growth() {
             meta(),
             EngineOptions {
                 backend: BackendKind::Metal,
-                metal_ops: MetalOps {
-                    layers: true,
-                    ..MetalOps::default()
-                },
+                metal_ops: MetalOps::default(),
                 ..opts
             },
         )

@@ -36,12 +36,14 @@ impl BackendKind {
     }
 }
 
-/// Which dense matmuls run on Metal with [`BackendKind::Metal`].
+/// What runs on Metal with [`BackendKind::Metal`].
 ///
-/// The default is the output head only: a Metal submission costs about 110 µs on the
-/// M3 Pro, and the head is the only decode matmul whose kernel alone beats the CPU by
-/// more than that. In the engine even the head only breaks even, because the GPU idles
-/// between tokens (ADR-011 amendment 1), which is why the CPU stays the default backend.
+/// The default is whole layers ([`MetalOps::layers`]): one submission per layer, with
+/// the norms, attention and the routed experts on the GPU (ADR-011 amendment 2). That
+/// is the only placement that beats the CPU: a submission costs about 110 µs on the M3
+/// Pro, so placing single dense matmuls (attention, router, head) only adds
+/// submissions while the GPU idles in between (amendment 1). Those placements remain
+/// for comparison.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct MetalOps {
     /// The q, k, v and output projections.
@@ -60,8 +62,8 @@ impl Default for MetalOps {
         Self {
             attention: false,
             router: false,
-            head: true,
-            layers: false,
+            head: false,
+            layers: true,
         }
     }
 }

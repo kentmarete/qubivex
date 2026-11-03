@@ -306,13 +306,13 @@ pub(crate) struct MemoryOptions {
 /// The compute backend and device placement (Phase 8), shared by `run` and `bench`.
 #[derive(clap::Args, Clone, Debug)]
 pub(crate) struct DeviceArgs {
-    /// Compute backend: cpu, or metal (the dense matmuls chosen by --metal-ops on the
-    /// Apple GPU, the rest on the CPU). Output bits are the same on both.
+    /// Compute backend: cpu, or metal (the Apple GPU runs what --metal-ops chooses, the
+    /// CPU the rest). Output bits are the same on both.
     #[arg(long, default_value = "cpu")]
     backend: String,
-    /// With --backend metal: what runs on the GPU, comma-separated from attention,
-    /// router and head (those dense matmuls; default: head), or layers (whole layers,
-    /// experts included, one submission per layer).
+    /// With --backend metal: what runs on the GPU. layers (the default): whole layers,
+    /// experts included, one submission per layer. Or a comma-separated list of single
+    /// dense matmuls from attention, router and head (slower; kept for comparison).
     #[arg(long)]
     metal_ops: Option<String>,
 }

@@ -1,6 +1,6 @@
 # ADR-011: Device execution, buffer lifetimes and GPU parity
 
-- Status: Proposed (Phase 8 slice 1, 2026-11-03; amendment 1, slice 2). Owner review pending.
+- Status: Proposed (Phase 8 slice 1, 2026-11-03; amendment 1, slice 2; amendment 2, slice 3). Owner review pending.
 - Date: 2026-11-03
 - Related: ADR-007 (backends; amendment 2026-11-03), ADR-010 (lossless by default),
   `docs/engineering/ARCHITECTURE_DECISIONS.md` §2.4–2.5, TENSOR_ARCHITECTURE §6.
@@ -136,3 +136,101 @@ cost more than the kernels save.
   kernel, is slice 3.
 - The scratch staging buffers (at most a few MiB) are not charged to the ledger yet.
   They will be once device tiers are charged per ADR-005.
+
+## Amendment 2 (2026-11-03): whole layers on the GPU, Phase 8 slice 3
+
+### Portable numerics (a change to the CPU's bits)
+Three CPU operations could not be reproduced on Metal: `rms_norm` summed squares in f64
+(Metal has no f64), and softmax, SwiGLU and RoPE used the platform's `expf`, `sinf` and
+`cosf`, which also differ between macOS and Linux. The owner chose to make the CPU
+portable rather than emulate f64 and libm on the GPU, or accept a tolerance:
+- `qubivex_compute::math::exp`: Cody–Waite reduction and the Cephes polynomial, built
+  from IEEE basic operations and fused multiply-add only, within 2 ulp; results that
+  would be subnormal are `+0`, so flush-to-zero cannot make them differ.
+- `rms_norm` sums squares with the shared 64-lane reduction (moved to
+  `qubivex_compute::reduce`), then `1 / sqrt(ss / n + eps)` in f32.
+- RoPE takes a per-position cos/sin table, evaluated in f64 and rounded once (the
+  correctly rounded value except in rare near-ties), built on the host and uploaded.
+
+The CPU's output bits changed once. On real OLMoE Q4_K_M the 128 bench tokens equal the
+previous reference and Colibri's 12 reference tokens still match. On the tiny fixtures
+the worst error against transformers went from 7.2e-7 to 6.5e-7, and against the f64
+reference from 3.3e-7 to 2.8e-7. A side effect: the bits no longer depend on the
+platform's libm.
+
+### What was built
+- **Forward-pass kernels** (`kernels.metal`, `program.rs`): `rms_norm`, `rope`, clamp,
+  add, copy, `swiglu`, `exp`, `kv_store`, attention (scores, softmax, values), the MoE
+  combine, and row gather/scatter. Each mirrors `qubivex-arch`'s ops operation for
+  operation. **Every division and square root is `precise::`**: with plain `/` and
+  `sqrt`, the compiler turned `1 / sqrt(x)` into a reciprocal square root that is not
+  correctly rounded (1 ulp off). `tests/ops_parity.rs` checks every op bit for bit.
+- **Recorded submissions (§2).** `MetalBackend::submit` records any number of
+  operations over device vectors (`DeviceVec`, `Span`, `Batch`) into one command buffer.
+  Each operation checks its bounds before it is recorded.
+- **Block-wise K-quant kernels.** Per 64-element chunk, the scales are computed once
+  and each quant byte is loaded once for both of a thread's lanes; two rows per SIMD
+  group share activation loads; Q4_K reads each block's 16-byte header as one `uint4`
+  (so Q4_K weights must be 16-byte aligned, and a misaligned matrix is not placed).
+  Lanes and order are unchanged, so the bits are unchanged (all 130 OLMoE tensors).
+  Throughput, 96 distinct expert matrices in one submission: Q4_K 23 → 38 GiB/s (48 in
+  a single dispatch), Q6_K 38 → 64 GiB/s (90); the CPU does about 17 GiB/s.
+- **Whole layers (`--metal-ops layers`, now the default placement of `--backend
+  metal`).** `qubivex-runtime`'s `MetalForward` makes each layer one submission: the
+  previous layer's routed experts (gather, gate, up, SwiGLU, down, scatter), the
+  combine and residual, then this layer's attention block, MoE norm and router. Only the
+  router logits return to the host, where routing runs with the CPU pass's own
+  `ops::route` and the store leases the chosen experts. The last submission adds the
+  final norm and the head. The embedding lookup stays on the host.
+- **Expert slabs in place (§4).** Expert slabs are now page-aligned (`Slab`: an
+  `Arc<PageAligned>` and an attachment slot). The first GPU use of a loaded expert wraps
+  its slab with `newBufferWithBytesNoCopy` and keeps the handle in the attachment; the
+  store drops the attachment before it reuses the slab, so a handle never outlives its
+  expert. When a layer is routed to more experts than its pool holds, they run in waves
+  of at most the pool's slots (the store hands out more leases only as earlier ones are
+  released).
+- **Device KV.** Keys and values are position-major (`[pos][kv_head][d]`) device
+  buffers in the `KvCache`'s device slot. They grow by the host cache's 256-position
+  chunks (a prefix copy), and their bytes are charged to the ledger's KV owner.
+- GPU tests now skip only when no Metal device exists; a shader that fails to compile
+  fails them (it used to skip silently).
+
+### Parity
+The fixture invariant `metal_placement_never_changes_bits` covers the layers placement.
+`metal_layers_match_the_cpu_in_waves_and_across_kv_growth` runs every fixture with
+one-slot pools (a prompt needs many waves) through 300 decode steps past the 256-position
+chunk: every step's logits are bit-identical. On real OLMoE (env-gated), the 10 × 50304
+prompt logits are bit-identical and so are the 48 generated tokens.
+
+### Measurements (M3 Pro, OLMoE Q4_K_M, 10 prompt + 128 generated tokens, 5 runs)
+Records: `docs/performance/baselines/2026-11-03-m3pro-phase8s3-*.json`. Every run's
+tokens match the CPU reference.
+
+| | decode tok/s (median step) | median step | P95 step | prefill (10 tokens) |
+|---|---|---|---|---|
+| cpu, all experts resident | 26.41 | 37.86 ms | 47.80 ms | 300 ms (33 tok/s) |
+| metal layers, all resident | **44.47** | 22.49 ms | 23.36 ms | 131 ms (77 tok/s) |
+| cpu, `--ram-budget 1GiB` | 20.31 | 49.24 ms | 59.13 ms | 317 ms |
+| metal layers, `--ram-budget 1GiB` | 14.66 | 68.22 ms | 70.36 ms | 364 ms |
+
+With every expert resident, whole layers are 1.68× faster at decode and 2.3× at
+prefill, and the P95 step is within 4% of the median. Under a 1 GiB budget the pools
+hold 2–3 experts per layer, fewer than the 8 routed per token, so each layer runs about
+three waves. Each wave waits for all of its loads and pays a submission, while the CPU
+pass computes each expert the moment its load lands. Blocked time per token is 29 ms
+against 7.5 ms.
+
+### Decision
+- **`--backend metal` defaults to whole layers.** Single dense matmuls on the GPU
+  (amendment 1) never beat the CPU, and they stay available for comparison.
+- **The CPU stays the default backend** until the owner reviews this amendment. The
+  measured case for Metal is the resident one, which is what the planner chooses
+  whenever RAM allows.
+- Not yet done, for the next slice:
+  - asynchronous submission (commit without waiting, with events per §2), so expert
+    loads overlap GPU work when the pools are smaller than top-k;
+  - a concurrent encoder for independent matmuls (serial dispatch costs about 25% of
+    kernel time on the expert batch);
+  - routing on the GPU, for one submission per token.
+- Device scratch (activations and scores; a few MiB at decode) is not charged to the
+  ledger yet; the device KV is.
