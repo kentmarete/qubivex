@@ -483,6 +483,7 @@ impl TransformerMoeModel {
         let mut o = vec![0f32; s * h];
         let mut router = vec![0f32; s * ne];
         let mut scores = Vec::new();
+        let mut rope_cs = vec![0f32; 2 * self.rope.half()];
         // The lookahead router runs during decode only: a prompt batch routes to most
         // experts of every layer, so there is nothing to predict.
         let lookahead = s == 1 && experts.wants_lookahead();
@@ -552,13 +553,13 @@ impl TransformerMoeModel {
                 }
             }
             for t in 0..s {
-                let pos = p0 + t;
+                self.rope.table(p0 + t, &mut rope_cs);
                 q[t * q_out..(t + 1) * q_out]
                     .chunks_exact_mut(d)
-                    .for_each(|hd| self.rope.apply(hd, pos));
+                    .for_each(|hd| Rope::rotate(hd, &rope_cs));
                 k[t * kv_out..(t + 1) * kv_out]
                     .chunks_exact_mut(d)
-                    .for_each(|hd| self.rope.apply(hd, pos));
+                    .for_each(|hd| Rope::rotate(hd, &rope_cs));
                 for g in 0..kvh {
                     let src = t * kv_out + g * d;
                     cache.k[l][g].extend_from_slice(&k[src..src + d]);
