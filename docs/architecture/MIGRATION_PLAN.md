@@ -150,6 +150,12 @@ mirrors, and metrics.
 **Exit:** OLMoE runs correctly with an expert budget well below its expert size (for
 example 1 GB of 6.4 GB). Duplicate-request and cancellation stress tests pass. The
 benchmark records the hit rate, bytes read per token and tok/s.
+**Progress (2026-11-03):** slice 1 is done: per-layer pools with slab reuse and LFRU
+(the default) in the store, the engine sizing pools with the plan's `distribute`,
+`qubivex bench --routing-trace` and the trace-replay example, and the hit rate, bytes
+per token and slab allocations in the bench record (ADR-008 amendment 1). At a 1 GiB
+budget the hit rate goes from 0% to 10.9% and decode from 12.0 to 14.9 tok/s. Next:
+the I/O queue, worker pool and `acquire_many`.
 
 ### Phase 7: Predictive loading
 Router-lookahead predictor (next layer's norm and router on the current hidden state,
