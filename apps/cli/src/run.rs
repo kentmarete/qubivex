@@ -113,8 +113,11 @@ pub(crate) fn memory_line(engine: &Engine) -> String {
         || "fixed cache".to_owned(),
         |p| format!("{} budget {}", p.profile.name(), p.ram.budget.bytes),
     );
+    let pressure = engine.pressure().map_or_else(String::new, |d| {
+        format!("; pressure {:?}", d.level).to_lowercase()
+    });
     format!(
-        "memory: {plan}; ledger {} (dense {}, experts {}, KV {})",
+        "memory: {plan}; ledger {} (dense {}, experts {}, KV {}){pressure}",
         l.total(),
         l.dense,
         l.expert_cache,

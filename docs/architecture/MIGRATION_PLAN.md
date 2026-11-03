@@ -138,7 +138,8 @@ profiles, the shared KV/expert room with admission, per-layer slots, `MemoryLedg
 `qubivex plan`, and property tests (ADR-005 amendment 1). Slice 2 is done: the engine
 plans at load, the KV takes room back from the expert store as it grows, the ledger
 is charged, and the ledger-against-RSS test passes on the real model (amendment 2).
-Next: the pressure monitor (slice 3).
+Slice 3 is done: the pressure monitor, with an opt-in external RAM-hog test on the
+real model (amendment 3). **Phase 5 is complete;** every exit check passes.
 
 ### Phase 6: Expert streaming (full)
 Bounded priority I/O queue, a pool of I/O workers, `acquire_many` that issues all of

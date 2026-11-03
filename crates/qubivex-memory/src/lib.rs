@@ -9,6 +9,9 @@
 //!   is refused).
 //! - [`MemoryLedger`]: bytes actually allocated, per tier and owner. Plans are
 //!   targets; the ledger is what happened.
+//! - [`PressureMonitor`]: what to do when RAM runs short, in a fixed order: stop
+//!   prefetch, shrink the expert cache, refuse new requests. It never kills an active
+//!   request.
 //!
 //! RAM and VRAM budgets are separate and never summed. There is no VRAM budget until
 //! a GPU backend exists (Phase 8).
@@ -16,6 +19,7 @@
 mod footprint;
 mod ledger;
 mod plan;
+mod pressure;
 
 pub use footprint::{DenseGroup, KV_ELEMENT_BYTES, LayerExperts, ModelFootprint, RoleGroup};
 pub use ledger::{Charge, LedgerSnapshot, MemoryLedger, Owner, Tier};
@@ -23,6 +27,7 @@ pub use plan::{
     ACTIVATION_RESERVE, CacheBudget, DEFAULT_CONTEXT, HostMemory, LayerSlots, Location, MemoryPlan,
     Placement, PlanRequest, Profile, Quantity, RamBudget, Refusal, Source, VramBudget, plan,
 };
+pub use pressure::{PressureConfig, PressureDecision, PressureLevel, PressureMonitor};
 use qubivex_core::Bytes;
 use thiserror::Error;
 

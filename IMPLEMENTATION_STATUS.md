@@ -29,7 +29,24 @@ Last updated: 2026-11-03
   - the ledger-against-RSS test on the real model: the ledger is 3.90 GiB against 3.75 GiB of RSS growth, and 510 MiB against 441 MiB under a 1 GiB budget.
 - Real model: output is byte-identical (sha1 `dc51dd49`) both all-resident and under `--ram-budget 1GiB`. Decode is unchanged (median step 38.63 ms against the 38.82 ms baseline, and the tokens match the baseline record).
 - Known limit, for Phase 6: under a 1 GiB budget the global LRU gets 0 hits (12.0 tok/s). Per-layer pools and LFRU (ADR-008) fix this.
-- **Next:** slice 3, the pressure monitor (stop prefetch, then shrink the cache, then refuse admission; never kill a request) and the RAM-hog test.
+
+**Phase 5 slice 3 done (2026-11-03): the pressure monitor. Phase 5 is complete.**
+- `PressureMonitor` levels, each adding to the one before:
+  - Normal;
+  - Elevated (below 1 GiB available): stop prefetch;
+  - High (below 512 MiB): shrink the cache by the shortfall;
+  - Critical (below 256 MiB): cache at the floor, refuse new requests.
+
+  It escalates at once and recovers only past a 256 MiB hysteresis margin. It never kills an active request.
+- Runtime: a sampling thread (500 ms, stopped on drop). The cap applies between tokens, and `generate` checks `Engine::admit`. The pressure level is in `run`'s stats line.
+- Tests (all pass):
+  - unit tests for order, hysteresis and the floor;
+  - a property test (2,000 random sequences);
+  - a fixture test: critical pressure drops the cache to the floor with bit-identical logits, refuses a new request, and recovers;
+  - the sampling thread stops with the engine;
+  - the opt-in RAM-hog test on the real model (`QUBIVEX_PRESSURE_TEST=1`), which passed 3 of 3 runs.
+- Finding: macOS compresses memory, so available RAM falls by only 50–65% of an incompressible allocation, and by far less for uniform bytes. See ADR-005 amendment 3.
+- **Next:** Phase 6 (full expert streaming). The first target is the per-layer slab pools and LFRU of ADR-008: under a 1 GiB budget the global LRU gets 0 hits. Measured kernel follow-ups remain in MIGRATION_PLAN §3a.
 
 **Phase 4: CPU inference prototype, done.** `qubivex run` generates correct text on CPU from the real OLMoE GGUF, and every numerical test passes:
 - against `transformers` the worst relative error is ≤ 7.2e-7, with identical experts and greedy tokens;
