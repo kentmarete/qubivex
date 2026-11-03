@@ -20,6 +20,7 @@ objc2-metal = { version = "0.3", default-features = false, features = ["std", "M
 
 [dev-dependencies]
 criterion = { workspace = true }
+qubivex-arch = { workspace = true }
 qubivex-backend-cpu = { workspace = true }
 
 [lints]

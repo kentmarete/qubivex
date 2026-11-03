@@ -3,7 +3,20 @@
 Last updated: 2026-11-03
 
 ## Current phase
-**Phase 8 (GPU acceleration, Metal first): slices 1 and 2 done (2026-11-03).** Phase 7 slice 1 is done and its exit criterion is met; its remaining items (a disk-saturation throttle, deeper lookahead) are parked.
+**Phase 8 (GPU acceleration, Metal first): slices 1–3 done (2026-11-03).** Phase 7 slice 1 is done and its exit criterion is met; its remaining items (a disk-saturation throttle, deeper lookahead) are parked.
+
+**Phase 8 slice 3 done (2026-11-03): whole layers on Metal, bit-identical, 1.68× decode with experts resident.**
+- Portable numerics (owner's choice; the CPU's bits changed once): `qubivex_compute::math::exp` (IEEE basic ops and fma, ≤ 2 ulp, subnormal results are 0), `rms_norm` on the shared 64-lane reduction (`qubivex_compute::reduce`, moved from backend-cpu), and RoPE from a host cos/sin table evaluated in f64. Real OLMoE: the 128 bench tokens match the previous reference and Colibri's 12 tokens still match. Fixtures: transformers error 7.2e-7 → 6.5e-7, f64 reference 3.3e-7 → 2.8e-7.
+- Code:
+  - `qubivex-backend-metal`: forward-pass kernels (norm, RoPE, clamp, add, copy, SwiGLU, exp, KV store, attention, MoE combine, row gather/scatter), all with `precise::` division and sqrt; `MetalBackend::submit` records many ops over `DeviceVec`s into one command buffer (`program.rs`); block-wise Q4_K/Q6_K kernels (Q4_K needs 16-byte alignment).
+  - `qubivex-expert-stream`: page-aligned slabs (`Slab`, with an attachment slot dropped before reuse); `qubivex-compute`: `PageAligned::resized`.
+  - `qubivex-arch`: `KvCache` device slot (`device_mut`, `advance`, `set_device_bytes`), `ops::route` shared by both passes, `layer_name` public.
+  - `qubivex-runtime`: `MetalForward` (one submission per layer; routing on the host; experts wrapped in place once per load; waves when a pool is smaller than the routed set; device KV in 256-position chunks, charged). `MetalOps::layers`, now the default of `--backend metal`.
+  - CLI: `--metal-ops layers`.
+- Tests: 240 pass (Rust 1.99.1; 1.85 checks). New: `ops_parity.rs` (every op bit-identical, including exp over −110..110), gather/scatter, misaligned Q4_K is declined, `metal_layers_match_the_cpu_in_waves_and_across_kv_growth` (one-slot pools, 300 decode steps past 256 positions, three fixtures). Env-gated: whole layers on real OLMoE give bit-identical prompt logits and 48 identical tokens; all 130 tensors stay bit-identical with the new kernels. GPU tests now fail (not skip) on a shader compile error.
+- Measured (M3 Pro, OLMoE Q4_K_M, ADR-011 amendment 2; records `2026-11-03-m3pro-phase8s3-*.json`): all resident, decode 26.41 → 44.47 tok/s (median step 37.86 → 22.49 ms, P95 47.80 → 23.36 ms), prefill 33 → 77 tok/s. At `--ram-budget 1GiB`, Metal is slower (14.66 vs 20.31 tok/s): the pools hold 2–3 experts, so each layer runs about three waves that each wait for all their loads. Kernel throughput (`metal_stream`): Q4_K 23 → 38 GiB/s, Q6_K 38 → 64 GiB/s.
+- Decision (pending owner review): the CPU stays the default backend; `--backend metal` means whole layers.
+- **Next (slice 4):** asynchronous submission so loads overlap GPU work under small budgets, a concurrent encoder (serial dispatch costs about 25% of expert kernel time), routing on the GPU (one submission per token). Then CUDA.
 
 **Phase 8 slice 2 done (2026-11-03): Metal in the engine (batching, zero-copy weights, placement, token parity).**
 - Code:
@@ -15,7 +28,7 @@ Last updated: 2026-11-03
 - Tests: 229 pass on Rust 1.99.1 and 1.85. New: batched and wrapped parity (every dtype, unaligned offsets, a shared input, shrinking batches), batch shape errors, the page-aligned region, and the fixture invariant `metal_placement_never_changes_bits` (every placement, three fixtures, prompt logits and 12 tokens). Env-gated: `engine_on_metal_gives_the_cpu_tokens` places all 81 dense matmul weights of OLMoE on Metal, and the prompt logits are bit-identical and the 48 generated tokens identical. The slice-1 per-tensor parity, `ledger_rss`, `real_model` and `reference` still pass.
 - Measured (M3 Pro, all resident, 160 tokens; ADR-011 amendment 1): one submission costs 109 µs (120 before staging reuse); q, k and v in one command buffer take 424 µs against 727 µs as three. End to end, decode is cpu 25.51, metal head 25.07, attention + head 22.16, all dense 21.01 tok/s, with every run's tokens matching the Phase 7 reference. The head's kernel wins in a loop (1.78 vs 2.77 ms), but in decode it takes 3.99 ms against 3.18 ms, because the GPU idles between tokens. An A/B against `main` shows the dense arena costs nothing on the CPU (26.05 vs 26.05/26.13 tok/s).
 - Decision: the CPU stays the default; `--backend metal` is a bit-identical opt-in.
-- **Next (slice 3):** keep the GPU busy. That needs one submission per layer or per token, which needs norms, RoPE, attention and the expert FFN as bit-identical Metal kernels; then the block-reusing Q4_K kernel and the Metal exit benchmark.
+- Slice 3 (above) kept the GPU busy with whole layers.
 
 **Phase 8 slice 1 done (2026-11-03): the Metal kernels and their parity.**
 - Code:

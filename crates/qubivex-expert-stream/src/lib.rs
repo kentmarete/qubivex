@@ -40,10 +40,14 @@
 pub mod policy;
 pub mod predict;
 pub mod replay;
+mod slab;
+
+pub use slab::{Attachment, Slab};
 
 use std::collections::{BinaryHeap, HashMap, VecDeque};
 use std::fmt;
 
+use qubivex_compute::host::PageAligned;
 use qubivex_core::{ExpertIdx, LayerIdx};
 use thiserror::Error;
 
@@ -183,7 +187,7 @@ enum Entry {
         spec: Option<Instant>,
     },
     Ready {
-        data: Arc<Vec<u8>>,
+        data: Arc<Slab>,
         leases: u32,
         last_use: u64,
         spec: Option<Instant>,
@@ -251,7 +255,7 @@ impl Pool {
 
     /// Removes an expert, counting a prefetch that was never used as wasted. Returns
     /// its buffer if it was ready.
-    fn evict(&mut self, e: u32, pf: &mut PrefetchStats) -> Option<Arc<Vec<u8>>> {
+    fn evict(&mut self, e: u32, pf: &mut PrefetchStats) -> Option<Arc<Slab>> {
         match self.entries.remove(&e) {
             Some(Entry::Ready { data, spec, .. }) => {
                 if spec.is_some() {
@@ -280,7 +284,7 @@ struct Request {
     key: ExpertKey,
     size: u64,
     /// An evicted expert's buffer to read into, if the miss evicted one.
-    slab: Option<Vec<u8>>,
+    slab: Option<PageAligned>,
     priority: Priority,
     seq: u64,
 }
@@ -452,7 +456,7 @@ impl fmt::Debug for ExpertStore {
 pub struct Lease<'a> {
     store: &'a ExpertStore,
     key: ExpertKey,
-    data: Arc<Vec<u8>>,
+    data: Arc<Slab>,
 }
 
 impl fmt::Debug for Lease<'_> {
@@ -468,6 +472,12 @@ impl Lease<'_> {
     /// The expert's bytes.
     #[must_use]
     pub fn bytes(&self) -> &[u8] {
+        self.data.bytes()
+    }
+
+    /// The slab holding the bytes (page-aligned, with a device attachment slot).
+    #[must_use]
+    pub fn slab(&self) -> &Slab {
         &self.data
     }
 
@@ -500,7 +510,7 @@ impl Drop for Lease<'_> {
 
 /// What claiming one expert of a batch gave.
 enum Claim {
-    Leased(Arc<Vec<u8>>),
+    Leased(Arc<Slab>),
     /// A load is queued or in flight and this caller is one of its waiters.
     Pending,
     /// No slot of the layer is free now.
@@ -904,7 +914,7 @@ impl ExpertStore {
         self.shared.inner.lock().map_err(|_| StoreError::Poisoned)
     }
 
-    const fn lease(&self, key: ExpertKey, data: Arc<Vec<u8>>) -> Lease<'_> {
+    const fn lease(&self, key: ExpertKey, data: Arc<Slab>) -> Lease<'_> {
         Lease {
             store: self,
             key,
@@ -1052,7 +1062,10 @@ impl ExpertStore {
             if let Some(data) = pool.evict(v, &mut g.prefetch) {
                 freed += data.len() as u64;
                 // Keep one buffer to read into; the others are freed.
-                slab = Arc::try_unwrap(data).ok().or(slab);
+                slab = Arc::try_unwrap(data)
+                    .ok()
+                    .and_then(Slab::into_region)
+                    .or(slab);
             }
             evicted += 1;
         }
@@ -1158,7 +1171,7 @@ impl ExpertStore {
                 }
                 if let Some(data) = pool.evict(v, &mut g.prefetch) {
                     g.used -= data.len() as u64;
-                    slab = Arc::try_unwrap(data).ok();
+                    slab = Arc::try_unwrap(data).ok().and_then(Slab::into_region);
                 }
                 evicted += 1;
             }
@@ -1232,14 +1245,13 @@ fn execute(s: &Shared, req: Request) {
             capacity: size,
         })
         .and_then(|len| {
-            let mut buf = if let Some(mut b) = slab {
-                b.resize(len, 0);
-                b
+            let mut buf = if let Some(b) = slab {
+                b.resized(len)
             } else {
                 s.slab_allocs.fetch_add(1, Ordering::Relaxed);
-                vec![0u8; len]
+                PageAligned::zeroed(len)
             };
-            s.source.read_expert(key, &mut buf).map(|()| buf)
+            s.source.read_expert(key, buf.as_mut_slice()).map(|()| buf)
         });
     let Ok(mut g) = s.inner.lock() else {
         return;
@@ -1258,7 +1270,7 @@ fn execute(s: &Shared, req: Request) {
                     pool.entries.insert(
                         key.1.0,
                         Entry::Ready {
-                            data: Arc::new(buf),
+                            data: Arc::new(Slab::new(buf)),
                             leases: waiters,
                             last_use,
                             spec,

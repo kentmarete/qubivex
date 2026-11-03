@@ -19,11 +19,14 @@
 //! [`MetalError::Unavailable`].
 
 // FFI into Metal through objc2 (RUST_GUIDELINES §3: GPU backends may opt in). The
-// unsafe code is confined to `device.rs`.
+// unsafe code is confined to `device.rs`; `program.rs` records through its safe API.
 #![allow(unsafe_code)]
 
 #[cfg(target_os = "macos")]
 mod device;
+mod program;
+
+pub use program::{AttentionShape, Batch, DeviceVec, Span};
 
 use std::sync::Arc;
 
@@ -87,7 +90,7 @@ const fn kernel_name(dtype: DType) -> Option<&'static str> {
 }
 
 /// Every dtype with a kernel, in pipeline order.
-const DTYPES: [DType; 6] = [
+pub(crate) const DTYPES: [DType; 6] = [
     DType::F32,
     DType::F16,
     DType::BF16,
@@ -128,7 +131,16 @@ fn check_shapes(w: &WeightView<'_>, xs: &[f32], s: usize, ys: &[f32]) -> Result<
     Ok(())
 }
 
-fn check_dtype(dtype: DType, op: &'static str) -> Result<usize, ComputeError> {
+/// The Q4_K kernel loads each block's 16-byte header as one `uint4`, so its weights must
+/// start 16-byte aligned (every Q4_K row is 144 · n bytes, so rows stay aligned).
+pub(crate) const Q4_K_ALIGN: usize = 16;
+
+/// Whether weights of `dtype` may start at byte `offset` of a device buffer.
+pub(crate) const fn offset_ok(dtype: DType, offset: usize) -> bool {
+    !matches!(dtype, DType::Ggml(GgmlType::Q4_K)) || offset % Q4_K_ALIGN == 0
+}
+
+pub(crate) fn check_dtype(dtype: DType, op: &'static str) -> Result<usize, ComputeError> {
     pipeline_index(dtype).ok_or(ComputeError::Unsupported {
         backend: "metal",
         op,
@@ -218,6 +230,9 @@ impl MetalHost {
         let Some(offset) = self.host.offset_of(w.bytes()) else {
             return Ok(None);
         };
+        if !offset_ok(w.dtype(), offset) {
+            return Ok(None);
+        }
         #[cfg(target_os = "macos")]
         {
             Ok(Some(MetalWeights {
@@ -259,7 +274,11 @@ impl MetalBackend {
     pub fn new() -> Result<Self, MetalError> {
         #[cfg(target_os = "macos")]
         {
-            let names = DTYPES.map(|d| kernel_name(d).unwrap_or_default());
+            let mut names: Vec<&str> = DTYPES
+                .iter()
+                .map(|d| kernel_name(*d).unwrap_or_default())
+                .collect();
+            names.extend(program::OP_KERNELS);
             Ok(Self {
                 dev: device::Device::new(KERNEL_SOURCE, &names)?,
             })
@@ -378,11 +397,11 @@ impl MetalBackend {
                     .rows
                     .checked_mul(w.row_bytes)
                     .and_then(|b| b.checked_add(w.offset));
-                if end.is_none_or(|e| e > w.buf.len()) {
+                if end.is_none_or(|e| e > w.buf.len()) || !offset_ok(w.dtype, w.offset) {
                     return Err(ComputeError::Shape {
                         op: "matmul",
                         detail: format!(
-                            "{} rows of {} bytes at {} exceed a {}-byte buffer",
+                            "{} rows of {} bytes at {} exceed a {}-byte buffer or are misaligned",
                             w.rows,
                             w.row_bytes,
                             w.offset,

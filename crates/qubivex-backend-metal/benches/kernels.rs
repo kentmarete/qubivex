@@ -8,7 +8,10 @@
 //!   every call (the slice-1 integration path);
 //! - `metal_dispatch`: a 64 × 64 f32 matmul, which is all per-call overhead;
 //! - `metal_batch`: the attention projections of one OLMoE layer (q, k, v: three
-//!   2048 × 2048 Q4_K matrices, one shared input) as three submissions and as one.
+//!   2048 × 2048 Q4_K matrices, one shared input) as three submissions and as one;
+//! - `metal_stream`: kernel throughput without submission cost: 96 distinct expert
+//!   matrices (more than the system cache holds) recorded into one submission, as a
+//!   token's routed experts would be.
 //!
 //! Run with `cargo bench -p qubivex-backend-metal --bench kernels`. Skipped without a
 //! Metal device.
@@ -149,6 +152,55 @@ fn benches(c: &mut Criterion) {
         true,
     );
     batch(c, &gpu);
+    stream(c, &gpu);
+}
+
+fn stream(c: &mut Criterion, gpu: &MetalBackend) {
+    let mut g = c.benchmark_group("metal_stream");
+    let mut rng = Rng(3);
+    let count = 96;
+    for (dtype, (name, n, k)) in [(Q4_K, EXPERT[0]), (Q4_K, EXPERT[1]), (Q6_K, EXPERT[0])] {
+        let ws: Vec<_> = (0..count)
+            .map(|_| {
+                let wb = weights(dtype, n, k, &mut rng);
+                gpu.upload(&WeightView::new(dtype, n, k, &wb).unwrap())
+                    .unwrap()
+            })
+            .collect();
+        let bytes: usize = ws.iter().map(|w| w.rows() * w.row_bytes()).sum();
+        let x = gpu
+            .vec_from(&(0..k).map(|_| rng.f()).collect::<Vec<_>>())
+            .unwrap();
+        let y = gpu.vec(n).unwrap();
+        g.throughput(Throughput::Bytes(bytes as u64));
+        g.bench_function(BenchmarkId::new(format!("{dtype}"), name), |b| {
+            b.iter(|| {
+                gpu.submit(|bt| {
+                    for w in &ws {
+                        bt.matmul(w, &x.all(), 1, &y.all())?;
+                    }
+                    Ok(())
+                })
+                .unwrap();
+            });
+        });
+        // The same bytes as one dispatch: what the serial dispatches cost.
+        let wb = weights(dtype, n * count, k, &mut rng);
+        let big = gpu
+            .upload(&WeightView::new(dtype, n * count, k, &wb).unwrap())
+            .unwrap();
+        let ybig = gpu.vec(n * count).unwrap();
+        g.bench_function(
+            BenchmarkId::new(format!("{dtype}/one_dispatch"), name),
+            |b| {
+                b.iter(|| {
+                    gpu.submit(|bt| bt.matmul(&big, &x.all(), 1, &ybig.all()))
+                        .unwrap();
+                });
+            },
+        );
+    }
+    g.finish();
 }
 
 fn batch(c: &mut Criterion, gpu: &MetalBackend) {

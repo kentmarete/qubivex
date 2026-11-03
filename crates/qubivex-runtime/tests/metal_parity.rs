@@ -44,10 +44,11 @@ fn every_real_weight_matrix_is_bit_identical() {
     };
     let gpu = match MetalBackend::new() {
         Ok(g) => g,
-        Err(e) => {
+        Err(qubivex_backend_metal::MetalError::Unavailable(e)) => {
             eprintln!("skipping: {e}");
             return;
         }
+        Err(e) => panic!("{e}"),
     };
     let cpu = CpuBackend::new();
     let meta =
@@ -99,9 +100,9 @@ fn every_real_weight_matrix_is_bit_identical() {
     assert!(matrices > 0);
 }
 
-/// End-to-end token parity (Phase 8 slice 2): the engine with attention, routers and
-/// the head on Metal gives the CPU engine's prompt logits bit for bit, and the same
-/// generated tokens.
+/// End-to-end token parity (Phase 8 slices 2 and 3): the engine with attention, routers
+/// and the head on Metal, and with whole layers on Metal (experts included), gives the
+/// CPU engine's prompt logits bit for bit, and the same generated tokens.
 #[test]
 fn engine_on_metal_gives_the_cpu_tokens() {
     use qubivex_runtime::{BackendKind, Engine, EngineOptions, Logits, MetalOps, Sampling};
@@ -109,9 +110,13 @@ fn engine_on_metal_gives_the_cpu_tokens() {
         eprintln!("skipping: QUBIVEX_OLMOE_GGUF_DIR not set");
         return;
     };
-    if let Err(e) = MetalBackend::new() {
-        eprintln!("skipping: {e}");
-        return;
+    match MetalBackend::new() {
+        Err(qubivex_backend_metal::MetalError::Unavailable(e)) => {
+            eprintln!("skipping: {e}");
+            return;
+        }
+        Err(e) => panic!("{e}"),
+        Ok(_) => {}
     }
     let meta =
         || ModelMetadata::load(Path::new(&dir), &ArchitectureRegistry::with_builtins()).unwrap();
@@ -120,48 +125,62 @@ fn engine_on_metal_gives_the_cpu_tokens() {
         ..EngineOptions::default()
     };
     let cpu = Engine::load(meta(), opts).unwrap();
-    let gpu = Engine::load(
-        meta(),
-        EngineOptions {
-            backend: BackendKind::Metal,
-            metal_ops: MetalOps {
-                attention: true,
-                router: true,
-                head: true,
-            },
-            ..opts
-        },
-    )
-    .unwrap();
-    let p = gpu.placement();
-    eprintln!(
-        "{:?}: {} tensors, {} bytes on the device",
-        p.device, p.tensors, p.bytes
-    );
-    assert_eq!(
-        p.tensors,
-        16 * 5 + 1,
-        "q, k, v, o and router per layer, and the head"
-    );
     let prompt = cpu
         .tokenizer()
         .encode("Write a long story about a lighthouse keeper.", true)
         .unwrap();
     let bits = |v: &[f32]| v.iter().map(|x| x.to_bits()).collect::<Vec<_>>();
-    let (mut a, mut b) = (cpu.new_cache(), gpu.new_cache());
+    let mut a = cpu.new_cache();
     let la = cpu.forward(&prompt, &mut a, Logits::All, None).unwrap();
-    let lb = gpu.forward(&prompt, &mut b, Logits::All, None).unwrap();
-    assert!(bits(&la) == bits(&lb), "prompt logits differ");
     let ta = cpu
         .generate(&prompt, 48, Sampling::default(), |_| true)
         .unwrap();
-    let tb = gpu
-        .generate(&prompt, 48, Sampling::default(), |_| true)
+    let matmuls = MetalOps {
+        attention: true,
+        router: true,
+        head: true,
+        layers: false,
+    };
+    let layers = MetalOps::default();
+    for ops in [matmuls, layers] {
+        let gpu = Engine::load(
+            meta(),
+            EngineOptions {
+                backend: BackendKind::Metal,
+                metal_ops: ops,
+                ..opts
+            },
+        )
         .unwrap();
-    assert_eq!(ta, tb);
-    eprintln!(
-        "{} prompt tokens, {} generated tokens identical",
-        prompt.len(),
-        ta.len()
-    );
+        let p = gpu.placement();
+        eprintln!(
+            "{} {:?}: {} tensors, {} bytes on the device",
+            ops.describe(),
+            p.device,
+            p.tensors,
+            p.bytes
+        );
+        assert_eq!(
+            p.tensors,
+            16 * 5 + 1,
+            "q, k, v, o and router per layer, and the head"
+        );
+        let mut b = gpu.new_cache();
+        let lb = gpu.forward(&prompt, &mut b, Logits::All, None).unwrap();
+        assert!(
+            bits(&la) == bits(&lb),
+            "{}: prompt logits differ",
+            ops.describe()
+        );
+        let tb = gpu
+            .generate(&prompt, 48, Sampling::default(), |_| true)
+            .unwrap();
+        assert_eq!(ta, tb, "{}", ops.describe());
+        eprintln!(
+            "{}: {} prompt tokens, {} generated tokens identical",
+            ops.describe(),
+            prompt.len(),
+            ta.len()
+        );
+    }
 }

@@ -23,9 +23,22 @@ use qubivex_compute::host::PageAligned;
 use crate::{DeviceInfo, MetalError};
 
 /// Rows per threadgroup; must equal `ROWS` in `kernels.metal`.
-const ROWS: usize = 8;
+pub(crate) const ROWS: usize = 8;
+/// Rows per SIMD group of the K-quant matmul kernels; must equal `NR` in
+/// `kernels.metal`.
+pub(crate) const KQ_ROWS: usize = 2;
+
+/// Output rows one threadgroup of matmul `pipeline` (a `DTYPES` index) covers.
+pub(crate) fn rows_per_group(pipeline: usize) -> usize {
+    use qubivex_core::{DType, GgmlType};
+    match crate::DTYPES.get(pipeline) {
+        Some(DType::Ggml(GgmlType::Q4_K | GgmlType::Q6_K)) => ROWS * KQ_ROWS,
+        _ => ROWS,
+    }
+}
+
 /// Threads per SIMD group on Apple GPUs; the kernels' reduction assumes it.
-const SIMD_WIDTH: usize = 32;
+pub(crate) const SIMD_WIDTH: usize = 32;
 
 fn ns_error(e: &NSError) -> String {
     e.localizedDescription().to_string()
@@ -114,6 +127,9 @@ pub(crate) struct Device {
     pipelines: Vec<Retained<ProtocolObject<dyn MTLComputePipelineState>>>,
     /// Submissions are serialised: one batch owns the staging buffers at a time.
     scratch: Mutex<Scratch>,
+    /// Held while a recorded submission is in flight and while the host reads or writes
+    /// a device vector, so the host never touches memory the GPU is using.
+    gpu: Mutex<()>,
 }
 
 impl Device {
@@ -161,6 +177,7 @@ impl Device {
             queue,
             pipelines,
             scratch: Mutex::new(Scratch::default()),
+            gpu: Mutex::new(()),
         })
     }
 
@@ -239,7 +256,7 @@ impl Device {
         })
     }
 
-    fn buffer_zeroed(&self, len: usize) -> Result<Buffer, MetalError> {
+    pub(crate) fn buffer_zeroed(&self, len: usize) -> Result<Buffer, MetalError> {
         let raw = self
             .device
             .newBufferWithLength_options(len, MTLResourceOptions::StorageModeShared)
@@ -331,7 +348,7 @@ impl Device {
                 enc.setBytes_length_atIndex(params, core::mem::size_of::<Params>(), 3);
             }
             let groups = MTLSize {
-                width: (op.params.n as usize).div_ceil(ROWS),
+                width: (op.params.n as usize).div_ceil(rows_per_group(op.pipeline)),
                 height: op.params.s as usize,
                 depth: 1,
             };
@@ -366,5 +383,145 @@ impl Device {
         }
         drop(scratch);
         Ok(())
+    }
+}
+
+/// The bytes of a kernel parameter block.
+///
+/// `T` must be a `#[repr(C)]` struct of 4-byte fields (u32 or f32) with no padding, as
+/// every parameter block of this crate is.
+pub(crate) fn bytes_of<T: Copy>(v: &T) -> Vec<u8> {
+    let n = core::mem::size_of::<T>();
+    debug_assert_eq!(n % 4, 0);
+    let mut out = vec![0u8; n];
+    // SAFETY: `v` is valid for `n` bytes, and with no padding every byte is initialised.
+    unsafe {
+        core::ptr::copy_nonoverlapping(core::ptr::from_ref(v).cast::<u8>(), out.as_mut_ptr(), n);
+    }
+    out
+}
+
+/// One argument of a recorded dispatch.
+pub(crate) enum Arg<'a> {
+    /// A buffer bound from a byte offset.
+    Buf(&'a Buffer, usize),
+    /// Small constant data, copied when recorded.
+    Bytes(&'a [u8]),
+}
+
+/// Records dispatches into one command buffer (see [`Device::submit`]).
+pub(crate) struct Recorder<'a> {
+    enc: &'a ProtocolObject<dyn MTLComputeCommandEncoder>,
+    pipelines: &'a [Retained<ProtocolObject<dyn MTLComputePipelineState>>],
+}
+
+impl Recorder<'_> {
+    /// Records `pipeline` over `groups` threadgroups of `threads` threads, with `args`
+    /// bound at indices `0..args.len()`.
+    ///
+    /// The caller (this crate's typed operations) has checked that every element the
+    /// kernel reads or writes for these sizes lies inside its buffer, from its offset,
+    /// and that the arguments match the kernel's bindings. Dispatches run in recorded
+    /// order, each after the previous one has finished (a serial encoder).
+    pub(crate) fn dispatch(
+        &mut self,
+        pipeline: usize,
+        args: &[Arg<'_>],
+        groups: [usize; 3],
+        threads: [usize; 3],
+    ) {
+        self.enc.setComputePipelineState(&self.pipelines[pipeline]);
+        for (i, a) in args.iter().enumerate() {
+            match a {
+                // SAFETY: the buffer lives until the submission completes (it is
+                // borrowed for the whole `Device::submit` call), and the caller has
+                // checked the kernel's accesses against its length.
+                Arg::Buf(b, off) => unsafe {
+                    self.enc.setBuffer_offset_atIndex(Some(&b.raw), *off, i);
+                },
+                Arg::Bytes(d) => {
+                    if let Some(ptr) = NonNull::new(d.as_ptr().cast_mut().cast::<c_void>()) {
+                        // SAFETY: `d` is valid for `d.len()` bytes; setBytes copies them.
+                        unsafe { self.enc.setBytes_length_atIndex(ptr, d.len(), i) };
+                    }
+                }
+            }
+        }
+        let size = |v: [usize; 3]| MTLSize {
+            width: v[0],
+            height: v[1],
+            depth: v[2],
+        };
+        self.enc
+            .dispatchThreadgroups_threadsPerThreadgroup(size(groups), size(threads));
+    }
+}
+
+impl Device {
+    /// Runs the dispatches `record` records in one command buffer and waits for it.
+    /// Nothing is committed if `record` fails.
+    pub(crate) fn submit<E: From<MetalError>>(
+        &self,
+        record: impl FnOnce(&mut Recorder<'_>) -> Result<(), E>,
+    ) -> Result<(), E> {
+        let _gpu = self
+            .gpu
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let cmd = self.queue.commandBuffer().ok_or(MetalError::Create {
+            what: "command buffer",
+            detail: None,
+        })?;
+        let enc = cmd.computeCommandEncoder().ok_or(MetalError::Create {
+            what: "compute encoder",
+            detail: None,
+        })?;
+        let mut rec = Recorder {
+            enc: &enc,
+            pipelines: &self.pipelines,
+        };
+        let recorded = record(&mut rec);
+        enc.endEncoding();
+        recorded?;
+        cmd.commit();
+        cmd.waitUntilCompleted();
+        if cmd.status() != MTLCommandBufferStatus::Completed {
+            return Err(MetalError::Execution(
+                cmd.error()
+                    .map_or_else(|| format!("status {:?}", cmd.status()), |e| ns_error(&e)),
+            )
+            .into());
+        }
+        Ok(())
+    }
+
+    /// Copies `data` into `buf` from f32 index `at`. The caller has checked the range.
+    pub(crate) fn write_f32(&self, buf: &Buffer, at: usize, data: &[f32]) {
+        let _gpu = self
+            .gpu
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert!(
+            buf._host.is_none() && (at + data.len()) * 4 <= buf.len,
+            "write out of range"
+        );
+        let base = buf.raw.contents().as_ptr().cast::<f32>();
+        // SAFETY: the range is inside the buffer (checked above); no submission is in
+        // flight (the gpu lock is held, and submissions wait for completion); the
+        // buffer is device-allocated, not wrapped host memory, so nothing else aliases
+        // it on the host.
+        unsafe { core::ptr::copy_nonoverlapping(data.as_ptr(), base.add(at), data.len()) };
+    }
+
+    /// Copies `out.len()` f32 from `buf` at index `at`. The caller has checked the range.
+    pub(crate) fn read_f32(&self, buf: &Buffer, at: usize, out: &mut [f32]) {
+        let _gpu = self
+            .gpu
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert!((at + out.len()) * 4 <= buf.len, "read out of range");
+        let base = buf.raw.contents().as_ptr().cast::<f32>();
+        // SAFETY: as for `write_f32`; `out` is a distinct host allocation.
+        unsafe { core::ptr::copy_nonoverlapping(base.add(at), out.as_mut_ptr(), out.len()) };
     }
 }

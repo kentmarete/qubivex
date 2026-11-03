@@ -42,6 +42,19 @@ impl PageAligned {
         }
     }
 
+    /// The region holding `len` bytes, reusing this allocation when its padded length
+    /// is large enough (the address stays the same) and allocating a zeroed one
+    /// otherwise. Reused bytes keep their old contents; callers overwrite them.
+    #[must_use]
+    pub fn resized(mut self, len: usize) -> Self {
+        if len <= self.padded {
+            self.len = len;
+            self
+        } else {
+            Self::zeroed(len)
+        }
+    }
+
     /// The `len` bytes asked for.
     #[must_use]
     pub fn as_slice(&self) -> &[u8] {
@@ -105,6 +118,19 @@ mod tests {
             r.as_mut_slice().fill(7);
             assert!(r.padded()[len..].iter().all(|&b| b == 0));
         }
+    }
+
+    #[test]
+    fn resized_reuses_when_it_fits() {
+        let r = PageAligned::zeroed(3 * DEVICE_PAGE);
+        let p = r.as_slice().as_ptr();
+        let r = r.resized(DEVICE_PAGE + 5);
+        assert_eq!((r.as_slice().as_ptr(), r.len()), (p, DEVICE_PAGE + 5));
+        let r = r.resized(3 * DEVICE_PAGE);
+        assert_eq!(r.as_slice().as_ptr(), p);
+        let r = r.resized(3 * DEVICE_PAGE + 1);
+        assert_eq!(r.len(), 3 * DEVICE_PAGE + 1);
+        assert_eq!(r.as_slice().as_ptr() as usize % DEVICE_PAGE, 0);
     }
 
     #[test]

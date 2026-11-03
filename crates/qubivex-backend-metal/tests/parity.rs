@@ -161,10 +161,12 @@ fn shapes(d: DType) -> &'static [(usize, usize)] {
 fn metal() -> Option<MetalBackend> {
     match MetalBackend::new() {
         Ok(m) => Some(m),
-        Err(e) => {
+        // Only a missing device skips; a shader that fails to compile is a failure.
+        Err(qubivex_backend_metal::MetalError::Unavailable(e)) => {
             eprintln!("skipping: {e}");
             None
         }
+        Err(e) => panic!("{e}"),
     }
 }
 
@@ -309,7 +311,7 @@ fn batched_and_wrapped_weights_give_the_cpu_bits() {
     let mut rng = Rng(23);
     let k = 1024;
     // Every dtype as one matrix of a single host region, at offsets that are not page
-    // (or even 16-byte) aligned.
+    // (or even 16-byte) aligned, except Q4_K, whose kernel needs 16-byte alignment.
     let mats: Vec<(DType, usize, Vec<u8>)> = DTYPES
         .iter()
         .enumerate()
@@ -319,9 +321,12 @@ fn batched_and_wrapped_weights_give_the_cpu_bits() {
         })
         .collect();
     let mut at = Vec::new();
-    let mut len = 0;
-    for (_, _, b) in &mats {
+    let mut len = 0usize;
+    for (d, _, b) in &mats {
         len += 4; // misalign the next matrix
+        if *d == DType::Ggml(GgmlType::Q4_K) {
+            len = len.next_multiple_of(16);
+        }
         at.push(len);
         len += b.len();
     }
@@ -346,6 +351,20 @@ fn batched_and_wrapped_weights_give_the_cpu_bits() {
     let outside = weights(DType::F32, 2, k, Fill::Typical, &mut rng);
     let outside = WeightView::new(DType::F32, 2, k, &outside).unwrap();
     assert!(host.weights(&outside).unwrap().is_none());
+    // A misaligned Q4_K matrix is not placed (the caller keeps it on the CPU).
+    let q4 = DTYPES
+        .iter()
+        .position(|d| *d == DType::Ggml(GgmlType::Q4_K))
+        .unwrap();
+    let (d, n, b) = &mats[q4];
+    let a = at[q4];
+    let shifted = WeightView::new(
+        *d,
+        *n - 1,
+        k,
+        &region.as_slice()[a + 4..a + 4 + b.len() / n * (n - 1)],
+    );
+    assert!(host.weights(&shifted.unwrap()).unwrap().is_none());
 
     for s in [8, 3, 1] {
         let shared = activations(s * k, Fill::Typical, &mut rng);

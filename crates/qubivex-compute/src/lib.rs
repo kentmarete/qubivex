@@ -13,6 +13,8 @@
 //! contiguous rank-2 byte view converts into.
 
 pub mod host;
+pub mod math;
+pub mod reduce;
 pub mod tensor;
 
 use qubivex_core::{CoreError, DType, Shape};

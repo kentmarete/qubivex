@@ -124,12 +124,16 @@ decode rate says whether that mattered. Results: ADR-008 amendment 2.
 
 ### Device placement (Phase 8)
 
-`--backend metal` (with `--metal-ops attention,router,head`; default `head`) runs the
-chosen dense matmuls on the Apple GPU and adds `config.device` to the record: backend,
-device, placed kinds, tensor count and bytes. Placement never changes bits, so always
-pass `--reference` with a CPU record: the tokens must match. Kernel-level batching is
-measured by the Criterion group `metal_batch` (`cargo bench -p qubivex-backend-metal
---bench kernels`). Results: ADR-011 amendment 1.
+`--backend metal` runs whole layers on the Apple GPU (`--metal-ops layers`, the
+default), or with `--metal-ops attention,router,head` only those dense matmuls, and adds
+`config.device` to the record: backend, device, placed kinds, tensor count and bytes.
+Placement never changes bits, so always pass `--reference` with a CPU record: the
+tokens must match. Kernel-level numbers come from the Criterion groups of
+`cargo bench -p qubivex-backend-metal --bench kernels`: `metal_batch` (batching) and
+`metal_stream` (kernel throughput over 96 distinct expert matrices in one submission,
+with no per-call overhead). Measure Metal both with every expert resident and under a
+small `--ram-budget`: the two regimes rank the backends differently. Results: ADR-011
+amendments 1 and 2.
 
 ### How to read the numbers
 

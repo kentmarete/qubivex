@@ -195,7 +195,11 @@ parity in the engine (**done 2026-11-03**, ADR-011 amendment 1: bit-identical to
 no decode gain, because a lone submission costs about 110 µs and the GPU idles between
 tokens; the CPU stays the default); (3) keeping the GPU busy (one submission per layer or
 token, with norms, RoPE, attention and the expert FFN as bit-exact Metal kernels), faster
-bit-exact kernels and the Metal exit benchmark.
+bit-exact kernels and the Metal exit benchmark (**done 2026-11-03**, ADR-011 amendment 2:
+portable CPU numerics, whole layers on Metal with experts wrapped in place; decode
+26.4 → 44.5 tok/s and prefill 33 → 77 tok/s with experts resident, bit-identical; slower
+than the CPU when the pools hold fewer experts than top-k); (4) asynchronous submission
+so expert loads overlap GPU work, a concurrent encoder, and routing on the GPU.
 CUDA (`cudarc` and ported kernels): device buffers, ledger accounting, dense
 layers on the device, a VRAM expert tier, hybrid split (`hybrid_split.h`), and CPU/GPU
 in-frame combination in rank order. Then Vulkan (`ash` and ported shaders). Parity
