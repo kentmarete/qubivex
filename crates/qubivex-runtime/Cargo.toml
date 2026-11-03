@@ -21,6 +21,9 @@ qubivex-tokenizer = { workspace = true }
 rayon = { workspace = true }
 thiserror = { workspace = true }
 
+[target.'cfg(unix)'.dependencies]
+rustix = { workspace = true }
+
 [dev-dependencies]
 serde_json = { workspace = true }
 

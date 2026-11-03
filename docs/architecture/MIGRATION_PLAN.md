@@ -159,8 +159,13 @@ the I/O queue, worker pool and `acquire_many`.
 Slice 2 is done: `acquire_many` and the `Batch` iterator; the MoE layer requests a
 whole layer through `with_experts`; a priority queue with 4 I/O threads by default;
 cancellation and error delivery; and within-expert coalescing (ADR-006 amendment 1).
-At 1 GiB, decode goes from 14.9 to 20.2 tok/s with identical tokens. Next: direct I/O,
-io_uring, the I/O matrix and the exit check.
+At 1 GiB, decode goes from 14.9 to 20.2 tok/s with identical tokens.
+Slice 3 is done: direct I/O (`--direct-io`: `F_NOCACHE` on macOS, aligned `O_DIRECT` on
+Linux), off by default; the warm I/O matrix (buffered against direct at 0–8 I/O threads);
+and the exit check: at a 1 GiB budget (149 MiB of slots for 3.63 GiB of experts), 160
+tokens match the all-resident run at 19.9 tok/s, with a 10.4% hit rate and 427 MiB read
+per token (ADR-006 amendment 2). **Phase 6 is complete.** Moved out: io_uring and the
+cold `O_DIRECT` rows (they need a Linux host), multi-drive mirrors and per-device queues.
 
 ### Phase 7: Predictive loading
 Router-lookahead predictor (next layer's norm and router on the current hidden state,

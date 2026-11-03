@@ -1,7 +1,8 @@
 # ADR-006: Synchronous lease-based expert store with dedicated I/O threads
 
 - Status: Proposed (Phase 0). **This deviates from the specification's async trait.**
-  The queue, I/O threads and `acquire_many` were built in Phase 6 (amendment 1); awaiting acceptance.
+  The queue, I/O threads and `acquire_many` were built in Phase 6 (amendment 1), and
+  direct I/O in slice 3 (amendment 2); io_uring is deferred. Awaiting acceptance.
 - Date: 2026-11-01
 
 ## Context
@@ -100,3 +101,62 @@ condvar, plus a loader pool, with no async runtime.
   per-device queues, the I/O strategy matrix, and the exit check at a 1 GB expert
   budget. Prefetch at `Priority::Prefetch` arrives in Phase 7.
 
+
+## Amendment 2 (2026-11-03): direct I/O, the I/O matrix and the exit check, Phase 6 slice 3
+
+- **Direct I/O, off by default** (`--direct-io`, `EngineOptions::expert_io`,
+  `ExpertIo::Direct`). The model source opens the weight files so reads bypass the page
+  cache:
+  - macOS: `F_NOCACHE`, which takes any offset and length, so reads go straight into the
+    expert's slab;
+  - Linux: `O_DIRECT`, which needs 4 KiB-aligned offsets, lengths and buffers. GGUF
+    extents are not aligned that far, so each extent is read as the aligned window around
+    it into a per-thread bounce buffer (safe code: an over-allocated vector) and copied
+    out. A window may run past the end of the file; a read that ends off a block
+    boundary is taken as the end of the file;
+  - other systems, and filesystems without `O_DIRECT` (`EINVAL`), refuse it with an
+    error instead of silently reading buffered.
+
+  The bench record holds `config.expert_io` (`buffered`, `f_nocache` or `o_direct`).
+- **Tests.** A strict reader that fails on any misaligned offset, length or buffer, and
+  returns short reads, checks the window logic on every platform: extents at unaligned
+  offsets, extents ending at an unaligned end of file, and a read past the end (an
+  error, not zeros). Direct reads of every fixture expert equal the buffered bytes, and
+  so do sampled experts of the real model (env-gated). The engine's I/O-thread test has
+  direct rows with bit-identical logits.
+- **The I/O matrix, warm** (M3 Pro, OLMoE Q4_K_M, `--ram-budget 1GiB`, 149 MiB of slots,
+  LFRU, 128 tokens, 1 warm-up + 3 runs). Tokens are identical to the slice-2 record in
+  every row. Records: `docs/performance/baselines/2026-11-03-m3pro-1gib-lfru-io4.json`
+  (buffered, slice 2) and `2026-11-03-m3pro-1gib-direct-io4.json`.
+
+  | I/O threads | Buffered tok/s | `F_NOCACHE` tok/s | Blocked per token (buffered / direct) |
+  |---|---|---|---|
+  | 0 | 15.5 | 15.4 | 27.4 / 27.7 ms |
+  | 1 | 18.1 | 17.8 | 13.4 / 14.3 ms |
+  | 2 | 20.5 | 20.3 | 7.4 / 7.6 ms |
+  | **4 (default)** | **20.5** | 20.2 | 7.7 / 9.0 ms |
+  | 8 | 20.5 | 19.3 | 7.7 / 11.5 ms |
+
+  Prefill at 128 tokens: 47.8 tok/s buffered and 48.1 tok/s direct. The hit rate (about
+  10.6%) and the bytes read per token (about 449 MB) are the same in both modes.
+- **These are warm numbers only.** The whole model was in the page cache from the first
+  run on (`vm_stat` file-backed pages stopped growing), and macOS serves an `F_NOCACHE`
+  read from pages already cached. The table therefore says that direct I/O costs nothing
+  at 2–4 threads and a little at 8. It does not show what direct I/O is for: reading
+  without filling the page cache, and cold-disk rates. Cold rows need the page cache
+  emptied before each run (`sudo purge` on macOS, `drop_caches` on Linux) and are left
+  for later. **The default stays buffered.**
+- **Exit check (Phase 6): passed.** OLMoE at `--ram-budget 1GiB` (149 MiB of expert
+  slots against 3.63 GiB of experts, about 4%), 10 prompt + 160 generated tokens:
+  tokens identical to the all-resident record (`2026-11-03-m3pro-decode.json`), 19.9
+  tok/s at the median step, 10.4% hit rate, 427 MiB read and 7.9 ms blocked per token,
+  0 slab allocations. Record: `2026-11-03-m3pro-phase6-exit-1gib.json`. The duplicate-
+  request and cancellation stress tests are those of amendment 1.
+- **Not built, moved out of Phase 6:**
+  - io_uring. It needs a new dependency with `unsafe` submission, cannot be built or
+    measured on the development Mac, and the plan keeps it off until measured. It
+    returns with a Linux measurement host, together with `O_DIRECT` cold rows;
+  - multi-drive mirrors and per-device queues (no second drive yet);
+  - cross-expert coalescing: in GGUF, an expert's parts are spread over three stacked
+    tensors, so neighbouring experts are adjacent only within a part. A layer's misses
+    are rarely neighbours (10.6% hits, top-8 of 64).

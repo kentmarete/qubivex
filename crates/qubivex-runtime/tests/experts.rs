@@ -9,7 +9,7 @@ use std::sync::Arc;
 use qubivex_core::{ExpertIdx, LayerIdx};
 use qubivex_expert_stream::{ExpertStore, Policy, PoolSpec};
 use qubivex_model::{ArchitectureRegistry, ExpertPart, ModelMetadata, TensorRole};
-use qubivex_runtime::ModelExpertSource;
+use qubivex_runtime::{ExpertIo, IoPath, ModelExpertSource};
 
 fn load(dir: &Path) -> ModelMetadata {
     ModelMetadata::load(dir, &ArchitectureRegistry::with_builtins()).unwrap()
@@ -33,8 +33,18 @@ fn pools(meta: &ModelMetadata, slots: u32, bytes: u64) -> Vec<PoolSpec> {
         .collect()
 }
 
-fn check_model(meta: &ModelMetadata) {
-    let src = Arc::new(ModelExpertSource::new(meta).unwrap());
+/// The read modes this system supports.
+fn io_modes() -> Vec<ExpertIo> {
+    if cfg!(any(target_os = "linux", target_os = "macos")) {
+        vec![ExpertIo::Buffered, ExpertIo::Direct]
+    } else {
+        vec![ExpertIo::Buffered]
+    }
+}
+
+fn check_model(meta: &ModelMetadata, io: ExpertIo) {
+    let src = Arc::new(ModelExpertSource::with_io(meta, io).unwrap());
+    assert_eq!(src.io_path() == IoPath::Buffered, io == ExpertIo::Buffered);
     let d = meta.config.dims;
     assert_eq!(src.len(), d.layers as usize * d.experts as usize);
     assert_eq!(src.total_bytes(), meta.bytes().routed_experts);
@@ -75,7 +85,11 @@ fn check_model(meta: &ModelMetadata) {
             parts.sort_by_key(|p| p.0);
             let expect: Vec<u8> = parts.iter().flat_map(|p| p.1.clone()).collect();
             let lease = store.acquire(*k).unwrap();
-            assert_eq!(lease.bytes(), expect.as_slice(), "{k:?} slots {slots}");
+            assert_eq!(
+                lease.bytes(),
+                expect.as_slice(),
+                "{k:?} slots {slots} {io:?}"
+            );
             let layout = src.layout(k.0, k.1).unwrap();
             assert_eq!(layout.size, expect.len());
             assert!(layout.part(ExpertPart::Down).is_some());
@@ -87,7 +101,9 @@ fn check_model(meta: &ModelMetadata) {
 fn fixture_experts_read_back_exactly() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/models");
     for id in ["olmoe-tiny", "qwen3-moe-tiny", "olmoe-tiny-gguf"] {
-        check_model(&load(&root.join(id)));
+        for io in io_modes() {
+            check_model(&load(&root.join(id)), io);
+        }
     }
     // The stacked layout's parts: gate-up then down.
     let meta = load(&root.join("qwen3-moe-tiny"));
@@ -123,4 +139,30 @@ fn real_gguf_expert_extents() {
         }
     }
     assert!(store.stats().evictions > 0);
+}
+
+/// Set QUBIVEX_OLMOE_GGUF_DIR: direct reads of the real model give the buffered bytes.
+#[test]
+fn real_gguf_direct_reads_match_buffered() {
+    let Ok(dir) = std::env::var("QUBIVEX_OLMOE_GGUF_DIR") else {
+        return;
+    };
+    if io_modes().len() < 2 {
+        return;
+    }
+    let meta = load(Path::new(&dir));
+    let buffered = ModelExpertSource::new(&meta).unwrap();
+    let direct = ModelExpertSource::with_io(&meta, ExpertIo::Direct).unwrap();
+    assert_ne!(direct.io_path(), IoPath::Buffered);
+    use qubivex_expert_stream::ExpertSource;
+    for l in [0u32, 5, 15] {
+        for e in [0u32, 1, 33, 63] {
+            let k = (LayerIdx(l), ExpertIdx(e));
+            let n = buffered.expert_size(k).unwrap() as usize;
+            let (mut a, mut b) = (vec![0u8; n], vec![1u8; n]);
+            buffered.read_expert(k, &mut a).unwrap();
+            direct.read_expert(k, &mut b).unwrap();
+            assert!(a == b, "{k:?}");
+        }
+    }
 }

@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 
 use qubivex_arch::Logits;
 use qubivex_model::{ArchitectureRegistry, ModelMetadata};
-use qubivex_runtime::{Engine, EngineOptions, Sampling};
+use qubivex_runtime::{Engine, EngineOptions, ExpertIo, IoPath, Sampling};
 
 fn dir(id: &str) -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -92,19 +92,23 @@ fn expert_cache_capacity_never_changes_bits() {
 }
 
 /// The I/O thread count changes only when experts arrive, never the bits: the MoE
-/// layer may compute experts in any order (ADR-006 `acquire_many`).
+/// layer may compute experts in any order (ADR-006 `acquire_many`). Direct I/O
+/// changes only how bytes are read (amendment 2).
 #[test]
 fn io_threads_never_change_bits() {
+    let direct = cfg!(any(target_os = "linux", target_os = "macos"));
     for id in IDS {
         let largest = engine(id, None).metadata().bytes().largest_expert;
         let mut want = None;
-        for (io, cap) in [
-            (0, None),
-            (0, Some(2)),
-            (1, Some(2)),
-            (4, Some(2)),
-            (4, Some(3)),
-            (8, Some(1)),
+        for (io, cap, d) in [
+            (0, None, false),
+            (0, Some(2), false),
+            (1, Some(2), false),
+            (4, Some(2), false),
+            (4, Some(3), false),
+            (8, Some(1), false),
+            (0, Some(2), direct),
+            (4, Some(1), direct),
         ] {
             let meta =
                 ModelMetadata::load(&dir(id), &ArchitectureRegistry::with_builtins()).unwrap();
@@ -114,11 +118,17 @@ fn io_threads_never_change_bits() {
                     expert_cache_bytes: cap.map(|n: u64| n * largest),
                     max_context: Some(256),
                     io_threads: Some(io),
+                    expert_io: if d {
+                        ExpertIo::Direct
+                    } else {
+                        ExpertIo::Buffered
+                    },
                     ..EngineOptions::default()
                 },
             )
             .unwrap();
             assert_eq!(e.io_threads(), io);
+            assert_eq!(e.expert_io() != IoPath::Buffered, d);
             let mut c = e.new_cache();
             let mut logits = bits(&e.forward(PROMPT, &mut c, Logits::All, None).unwrap());
             for &t in &PROMPT[..6] {
@@ -126,7 +136,7 @@ fn io_threads_never_change_bits() {
             }
             match &want {
                 None => want = Some(logits),
-                Some(w) => assert_eq!(&logits, w, "{id} io {io} slots {cap:?}"),
+                Some(w) => assert_eq!(&logits, w, "{id} io {io} slots {cap:?} direct {d}"),
             }
         }
     }
