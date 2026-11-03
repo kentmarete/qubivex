@@ -135,8 +135,10 @@ reasons. Property tests cover plans that never exceed budget for random hardware
 models. A ledger-against-RSS test runs on real OLMoE.
 **Progress (2026-11-03):** slice 1 is done: `qubivex-memory` (footprint from roles,
 profiles, the shared KV/expert room with admission, per-layer slots, `MemoryLedger`),
-`qubivex plan`, and property tests (ADR-005 amendment 1). Next: load-time planning and
-ledger charges in the engine, then the pressure monitor.
+`qubivex plan`, and property tests (ADR-005 amendment 1). Slice 2 is done: the engine
+plans at load, the KV takes room back from the expert store as it grows, the ledger
+is charged, and the ledger-against-RSS test passes on the real model (amendment 2).
+Next: the pressure monitor (slice 3).
 
 ### Phase 6: Expert streaming (full)
 Bounded priority I/O queue, a pool of I/O workers, `acquire_many` that issues all of

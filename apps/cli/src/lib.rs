@@ -78,9 +78,19 @@ enum Command {
         /// Random seed for sampling.
         #[arg(long, default_value_t = 0)]
         seed: u64,
-        /// Expert cache size in MiB (default: every expert resident).
+        /// A fixed expert cache in MiB, bypassing the memory planner (default: planned
+        /// from available RAM, shrinking as the KV grows).
         #[arg(long)]
         expert_cache_mb: Option<u64>,
+        /// Memory profile: performance (0.88 of available RAM), balanced (0.75) or saver (0.50).
+        #[arg(long, default_value = "performance")]
+        profile: String,
+        /// A custom fraction of available RAM, in (0, 1].
+        #[arg(long)]
+        ram_fraction: Option<f64>,
+        /// An explicit RAM budget, for example 8GiB; replaces the profile's.
+        #[arg(long)]
+        ram_budget: Option<String>,
         /// Context limit in tokens (default: the model's).
         #[arg(long)]
         context: Option<usize>,
@@ -119,9 +129,19 @@ enum Command {
         /// Compute threads (default: the CPU's performance cores).
         #[arg(long)]
         threads: Option<usize>,
-        /// Expert cache size in MiB (default: every expert resident).
+        /// A fixed expert cache in MiB, bypassing the memory planner (default: planned
+        /// from available RAM, shrinking as the KV grows).
         #[arg(long)]
         expert_cache_mb: Option<u64>,
+        /// Memory profile: performance (0.88 of available RAM), balanced (0.75) or saver (0.50).
+        #[arg(long, default_value = "performance")]
+        profile: String,
+        /// A custom fraction of available RAM, in (0, 1].
+        #[arg(long)]
+        ram_fraction: Option<f64>,
+        /// An explicit RAM budget, for example 8GiB; replaces the profile's.
+        #[arg(long)]
+        ram_budget: Option<String>,
         /// Context limit in tokens (default: the model's).
         #[arg(long)]
         context: Option<usize>,
@@ -232,6 +252,44 @@ fn chain(e: &dyn std::error::Error) -> String {
     s
 }
 
+/// How `run` and `bench` size memory.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct MemoryOptions {
+    expert_cache_bytes: Option<u64>,
+    profile: qubivex_memory::Profile,
+    ram_budget: Option<u64>,
+}
+
+impl MemoryOptions {
+    /// Engine options with these memory settings.
+    pub(crate) fn engine(
+        self,
+        context: Option<usize>,
+        threads: Option<usize>,
+    ) -> qubivex_runtime::EngineOptions {
+        qubivex_runtime::EngineOptions {
+            expert_cache_bytes: self.expert_cache_bytes,
+            max_context: context,
+            threads,
+            profile: self.profile,
+            ram_budget: self.ram_budget,
+        }
+    }
+}
+
+fn memory_options(
+    expert_cache_mb: Option<u64>,
+    profile: &str,
+    ram_fraction: Option<f64>,
+    ram_budget: Option<&str>,
+) -> Result<MemoryOptions, String> {
+    Ok(MemoryOptions {
+        expert_cache_bytes: expert_cache_mb.map(|mb| mb.saturating_mul(1 << 20)),
+        profile: plan::profile(profile, ram_fraction)?,
+        ram_budget: ram_budget.map(plan::parse_bytes).transpose()?.map(|b| b.0),
+    })
+}
+
 fn emit(text: &str) -> Result<(), String> {
     std::io::stdout()
         .lock()
@@ -309,6 +367,9 @@ fn execute(cmd: &Command) -> Result<(), String> {
             top_p,
             seed,
             expert_cache_mb,
+            profile,
+            ram_fraction,
+            ram_budget,
             context,
             threads,
             quiet,
@@ -323,7 +384,12 @@ fn execute(cmd: &Command) -> Result<(), String> {
                 top_p: *top_p,
                 seed: *seed,
             },
-            expert_cache_mb: *expert_cache_mb,
+            memory: memory_options(
+                *expert_cache_mb,
+                profile,
+                *ram_fraction,
+                ram_budget.as_deref(),
+            )?,
             context: *context,
             threads: *threads,
             quiet: *quiet,
@@ -338,6 +404,9 @@ fn execute(cmd: &Command) -> Result<(), String> {
             runs,
             threads,
             expert_cache_mb,
+            profile,
+            ram_fraction,
+            ram_budget,
             context,
             label,
             reference,
@@ -352,7 +421,12 @@ fn execute(cmd: &Command) -> Result<(), String> {
             warmup: *warmup,
             runs: *runs,
             threads: *threads,
-            expert_cache_mb: *expert_cache_mb,
+            memory: memory_options(
+                *expert_cache_mb,
+                profile,
+                *ram_fraction,
+                ram_budget.as_deref(),
+            )?,
             context: *context,
             label: label.as_deref(),
             reference: reference.as_deref(),

@@ -114,6 +114,8 @@ struct Inner {
     used: u64,
     /// Monotonic use counter for LRU order.
     tick: u64,
+    /// The byte capacity. The memory planner lowers it as the KV cache grows.
+    capacity: u64,
 }
 
 /// Counters, for diagnostics and the capacity-sweep tests.
@@ -134,7 +136,6 @@ pub struct StoreStats {
 /// The expert store. Share it by reference (it is `Sync`); leases borrow it.
 pub struct ExpertStore {
     source: Arc<dyn ExpertSource>,
-    capacity: u64,
     inner: Mutex<Inner>,
     /// Signalled when a load finishes (successfully or not).
     loaded: Condvar,
@@ -148,7 +149,7 @@ pub struct ExpertStore {
 impl fmt::Debug for ExpertStore {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("ExpertStore")
-            .field("capacity", &self.capacity)
+            .field("capacity", &self.capacity())
             .field("stats", &self.stats())
             .finish_non_exhaustive()
     }
@@ -208,11 +209,11 @@ impl ExpertStore {
     pub fn new(source: Arc<dyn ExpertSource>, capacity: u64) -> Self {
         Self {
             source,
-            capacity,
             inner: Mutex::new(Inner {
                 slots: HashMap::new(),
                 used: 0,
                 tick: 0,
+                capacity,
             }),
             loaded: Condvar::new(),
             hits: AtomicU64::new(0),
@@ -223,10 +224,30 @@ impl ExpertStore {
         }
     }
 
-    /// The byte capacity.
+    /// The byte capacity (0 if the lock is poisoned).
     #[must_use]
-    pub const fn capacity(&self) -> u64 {
-        self.capacity
+    pub fn capacity(&self) -> u64 {
+        self.lock().map_or(0, |g| g.capacity)
+    }
+
+    /// Changes the byte capacity, evicting least-recently-used unleased experts until
+    /// the resident bytes fit. Leased experts stay until released; the next miss
+    /// evicts them. Returns the bytes resident afterwards.
+    ///
+    /// The memory planner calls this as the KV cache grows (Colibri's `kv_room_fit`):
+    /// the two share one room.
+    ///
+    /// # Errors
+    /// [`StoreError::Poisoned`].
+    pub fn set_capacity(&self, capacity: u64) -> Result<u64, StoreError> {
+        let mut g = self.lock()?;
+        g.capacity = capacity;
+        while g.used > capacity {
+            if !self.evict_one(&mut g) {
+                break;
+            }
+        }
+        Ok(g.used)
     }
 
     /// Counters so far.
@@ -295,11 +316,12 @@ impl ExpertStore {
         }
         // A miss: reserve room, mark it loading, and read outside the lock.
         let size = self.source.expert_size(key)?;
-        if size > self.capacity {
+        let capacity = g.capacity;
+        if size > capacity {
             return Err(StoreError::TooLarge {
                 key,
                 size,
-                capacity: self.capacity,
+                capacity,
             });
         }
         self.make_room(&mut g, size)?;
@@ -312,7 +334,7 @@ impl ExpertStore {
             usize::try_from(size).map_err(|_| StoreError::TooLarge {
                 key,
                 size,
-                capacity: self.capacity,
+                capacity,
             })?
         ];
         let read = self.source.read_expert(key, &mut buf);
@@ -355,31 +377,39 @@ impl ExpertStore {
 
     /// Evicts least-recently-used unleased experts until `size` more bytes fit.
     fn make_room(&self, g: &mut Inner, size: u64) -> Result<(), StoreError> {
-        while g.used + size > self.capacity {
-            let victim = g
-                .slots
-                .iter()
-                .filter_map(|(k, s)| match s {
-                    Slot::Ready {
-                        leases: 0,
-                        last_use,
-                        data,
-                    } => Some((*last_use, *k, data.len() as u64)),
-                    _ => None,
-                })
-                .min();
-            let Some((_, k, bytes)) = victim else {
+        while g.used + size > g.capacity {
+            if !self.evict_one(g) {
                 return Err(StoreError::Full {
                     leased: g.used,
-                    capacity: self.capacity,
+                    capacity: g.capacity,
                     needed: size,
                 });
-            };
-            g.slots.remove(&k);
-            g.used -= bytes;
-            self.evictions.fetch_add(1, Ordering::Relaxed);
+            }
         }
         Ok(())
+    }
+
+    /// Evicts the least-recently-used unleased expert; `false` if there is none.
+    fn evict_one(&self, g: &mut Inner) -> bool {
+        let victim = g
+            .slots
+            .iter()
+            .filter_map(|(k, s)| match s {
+                Slot::Ready {
+                    leases: 0,
+                    last_use,
+                    data,
+                } => Some((*last_use, *k, data.len() as u64)),
+                _ => None,
+            })
+            .min();
+        let Some((_, k, bytes)) = victim else {
+            return false;
+        };
+        g.slots.remove(&k);
+        g.used -= bytes;
+        self.evictions.fetch_add(1, Ordering::Relaxed);
+        true
     }
 
     /// Experts currently resident (ready), in no particular order. Diagnostics only.

@@ -6,11 +6,11 @@ use std::time::Instant;
 
 use qubivex_core::Bytes;
 use qubivex_model::{ArchitectureRegistry, find};
-use qubivex_runtime::{Engine, EngineOptions, Sampling};
+use qubivex_runtime::{Engine, Sampling};
 use qubivex_tokenizer::ChatMessage;
 
-use crate::chain;
 use crate::models::roots;
+use crate::{MemoryOptions, chain};
 
 pub(crate) struct RunArgs<'a> {
     pub(crate) model: &'a str,
@@ -19,7 +19,7 @@ pub(crate) struct RunArgs<'a> {
     pub(crate) chat: bool,
     pub(crate) max_tokens: usize,
     pub(crate) sampling: Sampling,
-    pub(crate) expert_cache_mb: Option<u64>,
+    pub(crate) memory: MemoryOptions,
     pub(crate) context: Option<usize>,
     pub(crate) threads: Option<usize>,
     pub(crate) quiet: bool,
@@ -33,12 +33,8 @@ pub(crate) fn run(a: &RunArgs<'_>) -> Result<(), String> {
         &ArchitectureRegistry::with_builtins(),
     )
     .map_err(|e| chain(&e))?;
-    let opts = EngineOptions {
-        expert_cache_bytes: a.expert_cache_mb.map(|mb| mb.saturating_mul(1 << 20)),
-        max_context: a.context,
-        threads: a.threads,
-    };
-    let engine = Engine::load(meta, opts).map_err(|e| chain(&e))?;
+    let engine =
+        Engine::load(meta, a.memory.engine(a.context, a.threads)).map_err(|e| chain(&e))?;
     let load = t0.elapsed();
     let tok = engine.tokenizer();
     let text = if a.chat {
@@ -92,7 +88,7 @@ pub(crate) fn run(a: &RunArgs<'_>) -> Result<(), String> {
         #[allow(clippy::cast_precision_loss)]
         let prefill = prompt.len() as f64 / ttft.max(1e-9);
         eprintln!(
-            "\n[{} prompt tokens, {} generated | {} threads | load {:.2}s | prefill {:.1} tok/s | decode {:.2} tok/s | experts: cache {}, {} hits, {} loads ({}), {} evictions]",
+            "\n[{} prompt tokens, {} generated | {} threads | load {:.2}s | prefill {:.1} tok/s | decode {:.2} tok/s | experts: cache {}, {} hits, {} loads ({}), {} evictions | {}]",
             prompt.len(),
             generated.len(),
             engine.threads(),
@@ -103,8 +99,25 @@ pub(crate) fn run(a: &RunArgs<'_>) -> Result<(), String> {
             st.hits,
             st.loads,
             Bytes(st.bytes_read),
-            st.evictions
+            st.evictions,
+            memory_line(&engine)
         );
     }
     Ok(())
+}
+
+/// The plan's budget and the ledger's totals, for the stats line.
+pub(crate) fn memory_line(engine: &Engine) -> String {
+    let l = engine.ledger().snapshot(qubivex_memory::Tier::Ram);
+    let plan = engine.memory_plan().map_or_else(
+        || "fixed cache".to_owned(),
+        |p| format!("{} budget {}", p.profile.name(), p.ram.budget.bytes),
+    );
+    format!(
+        "memory: {plan}; ledger {} (dense {}, experts {}, KV {})",
+        l.total(),
+        l.dense,
+        l.expert_cache,
+        l.kv
+    )
 }

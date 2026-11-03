@@ -63,7 +63,7 @@ pub(crate) fn parse_bytes(s: &str) -> Result<Bytes, String> {
     Ok(Bytes(b))
 }
 
-fn profile(name: &str, fraction: Option<f64>) -> Result<Profile, String> {
+pub(crate) fn profile(name: &str, fraction: Option<f64>) -> Result<Profile, String> {
     if let Some(f) = fraction {
         return Ok(Profile::Custom(f));
     }

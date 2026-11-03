@@ -17,11 +17,11 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use qubivex_core::Bytes;
 use qubivex_hardware::{CpuInfo, Host, MemoryInfo, OperatingSystem, Probed};
 use qubivex_model::{ArchitectureRegistry, find};
-use qubivex_runtime::{Engine, EngineOptions, Logits};
+use qubivex_runtime::{Engine, Logits};
 use serde::{Deserialize, Serialize};
 
-use crate::chain;
 use crate::models::roots;
+use crate::{MemoryOptions, chain};
 
 /// The record format version; bump it when a field changes meaning.
 const SCHEMA: u32 = 1;
@@ -38,7 +38,7 @@ pub(crate) struct BenchArgs<'a> {
     pub(crate) warmup: usize,
     pub(crate) runs: usize,
     pub(crate) threads: Option<usize>,
-    pub(crate) expert_cache_mb: Option<u64>,
+    pub(crate) memory: MemoryOptions,
     pub(crate) context: Option<usize>,
     pub(crate) label: Option<&'a str>,
     pub(crate) reference: Option<&'a Path>,
@@ -195,6 +195,19 @@ struct Memory {
     /// after load and after each prefill and run (macOS, where the kernel's peak needs
     /// `getrusage`); a sampled peak misses transient scratch inside a forward pass.
     peak_source: String,
+    /// The memory plan's RAM budget (`None`: a fixed expert cache was requested).
+    plan_budget: Option<Bytes>,
+    /// The ledger after the last measured run: bytes the engine allocated.
+    ledger: Ledger,
+}
+
+/// The engine's RAM ledger.
+#[derive(Debug, Serialize, Deserialize)]
+struct Ledger {
+    dense: Bytes,
+    expert_cache: Bytes,
+    kv: Bytes,
+    total: Bytes,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -411,15 +424,8 @@ pub(crate) fn bench(a: &BenchArgs<'_>) -> Result<String, String> {
         architecture: meta.manifest.architecture.id.clone(),
         dir: home_relative(&meta.dir),
     };
-    let engine = Engine::load(
-        meta,
-        EngineOptions {
-            expert_cache_bytes: a.expert_cache_mb.map(|mb| mb.saturating_mul(1 << 20)),
-            max_context: a.context,
-            threads: a.threads,
-        },
-    )
-    .map_err(|e| chain(&e))?;
+    let engine =
+        Engine::load(meta, a.memory.engine(a.context, a.threads)).map_err(|e| chain(&e))?;
     let mut peak = PeakRss::new(host);
     let rss_after_load = peak.sample();
 
@@ -535,6 +541,16 @@ pub(crate) fn bench(a: &BenchArgs<'_>) -> Result<String, String> {
             rss_after_load,
             peak_rss,
             peak_source,
+            plan_budget: engine.memory_plan().map(|p| p.ram.budget.bytes),
+            ledger: {
+                let l = engine.ledger().snapshot(qubivex_memory::Tier::Ram);
+                Ledger {
+                    dense: l.dense,
+                    expert_cache: l.expert_cache,
+                    kv: l.kv,
+                    total: l.total(),
+                }
+            },
         },
         experts: Experts {
             hits: after.hits - before.hits,
@@ -647,6 +663,18 @@ fn render(r: &Record) -> String {
         known(&r.memory.rss_after_load),
         known(&r.memory.peak_rss),
         r.memory.peak_source
+    );
+    let l = &r.memory.ledger;
+    let _ = writeln!(
+        s,
+        "            ledger {} (dense {}, experts {}, KV {}), plan budget {}",
+        l.total,
+        l.dense,
+        l.expert_cache,
+        l.kv,
+        r.memory
+            .plan_budget
+            .map_or_else(|| "none (fixed cache)".to_owned(), |b| b.to_string())
     );
     let e = &r.experts;
     let _ = writeln!(

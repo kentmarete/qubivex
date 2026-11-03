@@ -170,3 +170,36 @@ fn threads_share_loads_and_respect_capacity() {
     assert_eq!(st.loads, src.reads.load(Ordering::Relaxed));
     assert!(st.hits > 0);
 }
+
+/// The planner lowers the capacity as the KV grows: unleased experts go first, in LRU
+/// order; leased ones stay until released; bytes seen are unchanged.
+#[test]
+fn shrinking_evicts_lru_and_keeps_leases() {
+    let s = ExpertStore::new(source(), 1000);
+    for e in 0..5 {
+        drop(s.acquire(key(0, e)).unwrap()); // 5 × 100 bytes, LRU order 0..5
+    }
+    let held = s.acquire(key(0, 0)).unwrap(); // now most recent, and leased
+    assert_eq!(s.set_capacity(300).unwrap(), 300);
+    let mut r = s.resident().unwrap();
+    r.sort();
+    assert_eq!(
+        r,
+        [key(0, 0), key(0, 3), key(0, 4)],
+        "1 and 2 were least recent"
+    );
+    // Below the leased bytes: everything unleased goes, the lease stays.
+    assert_eq!(s.set_capacity(50).unwrap(), 100);
+    assert_eq!(s.resident().unwrap(), [key(0, 0)]);
+    check(held.bytes(), key(0, 0));
+    assert!(matches!(
+        s.acquire(key(0, 1)),
+        Err(StoreError::TooLarge { .. })
+    ));
+    drop(held);
+    // Growing again: misses load normally.
+    assert_eq!(s.set_capacity(1000).unwrap(), 100);
+    check(s.acquire(key(0, 1)).unwrap().bytes(), key(0, 1));
+    assert_eq!(s.capacity(), 1000);
+    assert_eq!(s.stats().evictions, 4);
+}
