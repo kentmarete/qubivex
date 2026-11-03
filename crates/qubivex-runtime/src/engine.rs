@@ -24,7 +24,7 @@ use qubivex_memory::{
 use qubivex_model::{ExpertPart, ModelMetadata, TensorRole};
 use qubivex_tokenizer::Tokenizer;
 
-use crate::{ModelExpertSource, RuntimeError, load_tokenizer};
+use crate::{ExpertIo, IoPath, ModelExpertSource, RuntimeError, load_tokenizer};
 
 /// How to load a model.
 #[derive(Clone, Copy, Debug, Default)]
@@ -51,6 +51,9 @@ pub struct EngineOptions {
     /// Dedicated threads reading experts (ADR-006). `None`: the default (see
     /// [`DEFAULT_IO_THREADS`]); `Some(0)`: the compute thread reads its own misses.
     pub io_threads: Option<usize>,
+    /// How experts are read: buffered (default) or bypassing the page cache
+    /// (ADR-006 amendment 2).
+    pub expert_io: ExpertIo,
     /// Compute threads. `None`: the CPU's compute team (its fastest cores: efficiency
     /// cores slow a team that meets at every matmul), else every logical CPU.
     pub threads: Option<usize>,
@@ -393,7 +396,7 @@ impl Engine {
         let dense = Dense { tensors };
         let backend = CpuBackend::new();
         let model = TransformerMoeModel::new(&meta.config, &dense, &backend)?;
-        let source = Arc::new(ModelExpertSource::new(&meta)?);
+        let source = Arc::new(ModelExpertSource::with_io(&meta, opts.expert_io)?);
         let footprint = ModelFootprint::from_metadata(&meta)
             .map_err(|e| RuntimeError::Memory(e.to_string()))?;
         let model_ctx = meta
@@ -482,6 +485,12 @@ impl Engine {
     #[must_use]
     pub fn io_threads(&self) -> usize {
         self.store.io_threads()
+    }
+
+    /// How experts are read from the weight files.
+    #[must_use]
+    pub fn expert_io(&self) -> IoPath {
+        self.source.io_path()
     }
 
     /// Compute threads in use.

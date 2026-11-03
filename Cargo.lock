@@ -847,6 +847,7 @@ dependencies = [
  "qubivex-model",
  "qubivex-tokenizer",
  "rayon",
+ "rustix",
  "serde_json",
  "thiserror",
 ]

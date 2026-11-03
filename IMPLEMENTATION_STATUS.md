@@ -3,7 +3,7 @@
 Last updated: 2026-11-03
 
 ## Current phase
-**Phase 6 (full expert streaming) in progress: slices 1 and 2 of 3 done.** See below.
+**Phase 6 (full expert streaming) is complete: slices 1–3 done.** See below. Next: Phase 7 (predictive loading).
 
 **Engineering Improvement Plan: Phase 0 audit and the tensor-descriptor step (Phase 4.5), done (2026-11-03).**
 - Audit: `docs/engineering/BASELINE_AUDIT.md`. Reconciliation: `docs/engineering/ARCHITECTURE_DECISIONS.md`. The EIP is folded into `MIGRATION_PLAN.md` §3a.
@@ -49,6 +49,13 @@ Last updated: 2026-11-03
   - the opt-in RAM-hog test on the real model (`QUBIVEX_PRESSURE_TEST=1`), which passed 3 of 3 runs.
 - Finding: macOS compresses memory, so available RAM falls by only 50–65% of an incompressible allocation, and by far less for uniform bytes. See ADR-005 amendment 3.
 - **Next:** Phase 6 (full expert streaming). The first target is the per-layer slab pools and LFRU of ADR-008: under a 1 GiB budget the global LRU gets 0 hits. Measured kernel follow-ups remain in MIGRATION_PLAN §3a.
+
+**Phase 6 slice 3 done (2026-11-03): direct I/O, the I/O matrix and the exit check. Phase 6 is complete.**
+- Code (`qubivex-runtime`, ADR-006 amendment 2): `ExpertIo::{Buffered, Direct}` and `IoPath`. Direct I/O uses `F_NOCACHE` on macOS (straight into the slab) and `O_DIRECT` on Linux (the aligned window around each extent goes into a per-thread bounce buffer, then is copied out). It is refused, with an error, where unsupported. `--direct-io` on `run` and `bench`; `config.expert_io` in the bench record.
+- Tests: the window reader under a strict aligned reader that also returns short reads (unaligned extents, an unaligned end of file, a read past the end); direct bytes equal buffered bytes on every fixture expert and on the real model (env-gated); direct rows in the engine's bit-identity test.
+- Warm I/O matrix at `--ram-budget 1GiB` (identical tokens in every row): buffered 15.5 / 18.1 / 20.5 / 20.5 / 20.5 tok/s at 0 / 1 / 2 / 4 / 8 I/O threads; `F_NOCACHE` 15.4 / 17.8 / 20.3 / 20.2 / 19.3. The model stayed in the page cache, so this is no cold measurement; the default stays buffered.
+- Exit check: 160 tokens at 1 GiB match the all-resident record; 19.9 tok/s, 10.4% hits, 427 MiB read per token, 0 slab allocations (`docs/performance/baselines/2026-11-03-m3pro-phase6-exit-1gib.json`).
+- Deferred: io_uring and cold `O_DIRECT` rows (a Linux host), multi-drive mirrors, per-device queues.
 
 **Phase 6 slice 2 done (2026-11-03): the I/O queue, I/O threads and `acquire_many`.**
 - Code (`qubivex-expert-stream`, ADR-006 amendment 1):

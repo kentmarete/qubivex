@@ -22,7 +22,7 @@ recorded in the ADR it affects, or in a new ADR numbered from 009.
 | 003 | Architecture registry by manifest id | Proposed | Implemented; OLMoE and a Qwen3-MoE fixture load through one factory | **Accepted** |
 | 004 | Versioned manifest, cross-validated | Proposed | Implemented (schema v1, import, cross-checks) | **Accepted** |
 | 005 | One measured, role-driven memory planner | Proposed | Not built (Phase 5) | Proposed; extended by §2.3 |
-| 006 | Synchronous lease-based expert store | Proposed | Leases, dedup, the priority I/O queue, I/O threads and `acquire_many` built (Phase 6 slice 2, amendment 1); direct I/O and io_uring not built | **Accepted** for the lease and sync model; direct I/O and io_uring stay Phase 6 |
+| 006 | Synchronous lease-based expert store | Proposed | Leases, dedup, the priority I/O queue, I/O threads and `acquire_many` built (Phase 6 slice 2, amendment 1); direct I/O built, off by default (slice 3, amendment 2); io_uring deferred to a Linux host | **Accepted** for the lease and sync model; io_uring waits for a Linux measurement |
 | 007 | Backends behind one trait | Proposed | Trait exists in host-only form | Proposed; amended by §2.4 and §2.6 (backend order) |
 | 008 | Expert cache: slabs, LFRU, hysteresis | Proposed | Per-layer pools, slab reuse and LFRU built (Phase 6 slice 1, amendment 1); pins and the persisted hot set not built | Proposed |
 

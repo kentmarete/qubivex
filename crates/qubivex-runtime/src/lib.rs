@@ -9,7 +9,7 @@ mod engine;
 mod experts;
 
 pub use engine::{DEFAULT_IO_THREADS, Engine, EngineOptions, Sampling};
-pub use experts::{ExpertLayout, ModelExpertSource, PartLayout};
+pub use experts::{ExpertIo, ExpertLayout, IoPath, ModelExpertSource, PartLayout};
 pub use qubivex_arch::{KvCache, Logits};
 use qubivex_model::manifest::TokenizerSection;
 use qubivex_model::{GgufMetadata, GgufValue, ModelMetadata};

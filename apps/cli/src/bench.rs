@@ -128,6 +128,10 @@ struct Config {
     /// Expert I/O threads (absent before Phase 6 slice 2).
     #[serde(default)]
     io_threads: Option<usize>,
+    /// How experts were read: `buffered`, `f_nocache` or `o_direct` (absent before
+    /// Phase 6 slice 3).
+    #[serde(default)]
+    expert_io: Option<String>,
     context: usize,
     prompt: String,
     prompt_tokens: usize,
@@ -558,6 +562,7 @@ pub(crate) fn bench(a: &BenchArgs<'_>) -> Result<String, String> {
             expert_slots: engine.expert_pools().iter().map(|p| p.slots).collect(),
             cache_policy: Some(format!("{:?}", a.memory.cache_policy())),
             io_threads: Some(engine.io_threads()),
+            expert_io: Some(engine.expert_io().name().to_owned()),
             context,
             prompt: a.prompt.to_owned(),
             prompt_tokens: prompt.len(),
@@ -732,7 +737,7 @@ fn render(r: &Record) -> String {
     );
     let _ = writeln!(
         s,
-        "            hit rate {:.1}%, {} read and {:.2} ms blocked per token, {} slab allocations; {} pools of {}, {} I/O threads",
+        "            hit rate {:.1}%, {} read and {:.2} ms blocked per token, {} slab allocations; {} pools of {}, {} I/O threads, {} reads",
         e.hit_rate * 100.0,
         e.bytes_per_token,
         e.wait_ms_per_token,
@@ -741,7 +746,8 @@ fn render(r: &Record) -> String {
         slot_runs(&r.config.expert_slots),
         r.config
             .io_threads
-            .map_or_else(|| "?".to_owned(), |n| n.to_string())
+            .map_or_else(|| "?".to_owned(), |n| n.to_string()),
+        r.config.expert_io.as_deref().unwrap_or("buffered")
     );
     let k = &r.check;
     let reference = match (k.reference_match, k.reference_divergence) {

@@ -99,6 +99,10 @@ enum Command {
         /// misses). Default: 4.
         #[arg(long)]
         io_threads: Option<usize>,
+        /// Read experts bypassing the OS page cache (F_NOCACHE on macOS, O_DIRECT on
+        /// Linux), so streaming does not fill the file cache.
+        #[arg(long)]
+        direct_io: bool,
         /// Context limit in tokens (default: the model's).
         #[arg(long)]
         context: Option<usize>,
@@ -158,6 +162,10 @@ enum Command {
         /// misses). Default: 4.
         #[arg(long)]
         io_threads: Option<usize>,
+        /// Read experts bypassing the OS page cache (F_NOCACHE on macOS, O_DIRECT on
+        /// Linux), so streaming does not fill the file cache.
+        #[arg(long)]
+        direct_io: bool,
         /// Context limit in tokens (default: the model's).
         #[arg(long)]
         context: Option<usize>,
@@ -281,6 +289,7 @@ pub(crate) struct MemoryOptions {
     ram_budget: Option<u64>,
     cache_policy: qubivex_expert_stream::Policy,
     io_threads: Option<usize>,
+    expert_io: qubivex_runtime::ExpertIo,
 }
 
 impl MemoryOptions {
@@ -303,6 +312,7 @@ impl MemoryOptions {
             ram_budget: self.ram_budget,
             cache_policy: self.cache_policy,
             io_threads: self.io_threads,
+            expert_io: self.expert_io,
             ..qubivex_runtime::EngineOptions::default()
         }
     }
@@ -315,9 +325,15 @@ fn memory_options(
     ram_budget: Option<&str>,
     cache_policy: &str,
     io_threads: Option<usize>,
+    direct_io: bool,
 ) -> Result<MemoryOptions, String> {
     Ok(MemoryOptions {
         io_threads,
+        expert_io: if direct_io {
+            qubivex_runtime::ExpertIo::Direct
+        } else {
+            qubivex_runtime::ExpertIo::Buffered
+        },
         cache_policy: match cache_policy {
             "lfru" => qubivex_expert_stream::Policy::LFRU,
             "lru" => qubivex_expert_stream::Policy::Lru,
@@ -411,6 +427,7 @@ fn execute(cmd: &Command) -> Result<(), String> {
             ram_budget,
             cache_policy,
             io_threads,
+            direct_io,
             context,
             threads,
             quiet,
@@ -432,6 +449,7 @@ fn execute(cmd: &Command) -> Result<(), String> {
                 ram_budget.as_deref(),
                 cache_policy,
                 *io_threads,
+                *direct_io,
             )?,
             context: *context,
             threads: *threads,
@@ -452,6 +470,7 @@ fn execute(cmd: &Command) -> Result<(), String> {
             ram_budget,
             cache_policy,
             io_threads,
+            direct_io,
             context,
             label,
             reference,
@@ -474,6 +493,7 @@ fn execute(cmd: &Command) -> Result<(), String> {
                 ram_budget.as_deref(),
                 cache_policy,
                 *io_threads,
+                *direct_io,
             )?,
             context: *context,
             label: label.as_deref(),

@@ -68,6 +68,7 @@ measured runs see no expert loads at the default all-resident capacity. Pass
 | `--out FILE`, `--json`, `--label` | | |
 | `--cache-policy` | `lfru` | the expert pools' replacement policy, `lfru` or `lru` (ADR-008) |
 | `--io-threads N` | 4 | expert I/O threads; 0 makes the compute thread read its own misses (ADR-006) |
+| `--direct-io` | off | read experts bypassing the page cache (`F_NOCACHE` on macOS, `O_DIRECT` on Linux); recorded as `config.expert_io` (ADR-006 amendment 2) |
 | `--routing-trace FILE` | | writes every expert acquire of the measured runs, for trace replay (below) |
 
 The JSON record (schema 1) holds:
