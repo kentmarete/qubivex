@@ -91,6 +91,10 @@ enum Command {
         /// An explicit RAM budget, for example 8GiB; replaces the profile's.
         #[arg(long)]
         ram_budget: Option<String>,
+        /// How a full per-layer expert pool picks its victim: lfru (the coldest, by
+        /// decaying heat) or lru.
+        #[arg(long, default_value = "lfru")]
+        cache_policy: String,
         /// Context limit in tokens (default: the model's).
         #[arg(long)]
         context: Option<usize>,
@@ -142,6 +146,10 @@ enum Command {
         /// An explicit RAM budget, for example 8GiB; replaces the profile's.
         #[arg(long)]
         ram_budget: Option<String>,
+        /// How a full per-layer expert pool picks its victim: lfru (the coldest, by
+        /// decaying heat) or lru.
+        #[arg(long, default_value = "lfru")]
+        cache_policy: String,
         /// Context limit in tokens (default: the model's).
         #[arg(long)]
         context: Option<usize>,
@@ -154,6 +162,11 @@ enum Command {
         /// Also write the JSON record to this file.
         #[arg(long)]
         out: Option<PathBuf>,
+        /// Write every expert acquire of the measured runs to this file, one
+        /// `layer expert` pair per line, for trace replay
+        /// (`cargo run -p qubivex-expert-stream --example replay`).
+        #[arg(long)]
+        routing_trace: Option<PathBuf>,
         /// Print the JSON record instead of text.
         #[arg(long)]
         json: bool,
@@ -258,9 +271,15 @@ pub(crate) struct MemoryOptions {
     expert_cache_bytes: Option<u64>,
     profile: qubivex_memory::Profile,
     ram_budget: Option<u64>,
+    cache_policy: qubivex_expert_stream::Policy,
 }
 
 impl MemoryOptions {
+    /// The expert pools' replacement policy.
+    pub(crate) const fn cache_policy(self) -> qubivex_expert_stream::Policy {
+        self.cache_policy
+    }
+
     /// Engine options with these memory settings.
     pub(crate) fn engine(
         self,
@@ -273,6 +292,7 @@ impl MemoryOptions {
             threads,
             profile: self.profile,
             ram_budget: self.ram_budget,
+            cache_policy: self.cache_policy,
             ..qubivex_runtime::EngineOptions::default()
         }
     }
@@ -283,8 +303,14 @@ fn memory_options(
     profile: &str,
     ram_fraction: Option<f64>,
     ram_budget: Option<&str>,
+    cache_policy: &str,
 ) -> Result<MemoryOptions, String> {
     Ok(MemoryOptions {
+        cache_policy: match cache_policy {
+            "lfru" => qubivex_expert_stream::Policy::LFRU,
+            "lru" => qubivex_expert_stream::Policy::Lru,
+            other => return Err(format!("unknown cache policy {other:?}; use lfru or lru")),
+        },
         expert_cache_bytes: expert_cache_mb.map(|mb| mb.saturating_mul(1 << 20)),
         profile: plan::profile(profile, ram_fraction)?,
         ram_budget: ram_budget.map(plan::parse_bytes).transpose()?.map(|b| b.0),
@@ -371,6 +397,7 @@ fn execute(cmd: &Command) -> Result<(), String> {
             profile,
             ram_fraction,
             ram_budget,
+            cache_policy,
             context,
             threads,
             quiet,
@@ -390,6 +417,7 @@ fn execute(cmd: &Command) -> Result<(), String> {
                 profile,
                 *ram_fraction,
                 ram_budget.as_deref(),
+                cache_policy,
             )?,
             context: *context,
             threads: *threads,
@@ -408,10 +436,12 @@ fn execute(cmd: &Command) -> Result<(), String> {
             profile,
             ram_fraction,
             ram_budget,
+            cache_policy,
             context,
             label,
             reference,
             out,
+            routing_trace,
             json,
         } => emit(&bench::bench(&bench::BenchArgs {
             model,
@@ -427,11 +457,13 @@ fn execute(cmd: &Command) -> Result<(), String> {
                 profile,
                 *ram_fraction,
                 ram_budget.as_deref(),
+                cache_policy,
             )?,
             context: *context,
             label: label.as_deref(),
             reference: reference.as_deref(),
             out: out.as_deref(),
+            routing_trace: routing_trace.as_deref(),
             json: *json,
         })?),
         Command::Plan {

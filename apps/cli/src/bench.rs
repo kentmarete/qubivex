@@ -43,6 +43,7 @@ pub(crate) struct BenchArgs<'a> {
     pub(crate) label: Option<&'a str>,
     pub(crate) reference: Option<&'a Path>,
     pub(crate) out: Option<&'a Path>,
+    pub(crate) routing_trace: Option<&'a Path>,
     pub(crate) json: bool,
 }
 
@@ -118,6 +119,12 @@ struct ModelInfo {
 struct Config {
     threads: usize,
     expert_cache: Bytes,
+    /// Experts each layer's pool may hold, layer by layer (absent before Phase 6).
+    #[serde(default)]
+    expert_slots: Vec<u32>,
+    /// The expert pools' replacement policy (absent before Phase 6).
+    #[serde(default)]
+    cache_policy: Option<String>,
     context: usize,
     prompt: String,
     prompt_tokens: usize,
@@ -217,6 +224,15 @@ struct Experts {
     loads: u64,
     bytes_read: Bytes,
     evictions: u64,
+    /// `hits / (hits + loads)` (absent before Phase 6).
+    #[serde(default)]
+    hit_rate: f64,
+    /// Bytes read per generated token (absent before Phase 6).
+    #[serde(default)]
+    bytes_per_token: Bytes,
+    /// Slab buffers allocated during the measured runs (absent before Phase 6).
+    #[serde(default)]
+    slab_allocs: u64,
 }
 
 /// The correctness part of the record.
@@ -473,6 +489,9 @@ pub(crate) fn bench(a: &BenchArgs<'_>) -> Result<String, String> {
         peak.sample();
     }
     let before = engine.store_stats();
+    if a.routing_trace.is_some() {
+        engine.record_routing(true);
+    }
     let mut samples = Vec::with_capacity(a.runs);
     for i in 0..a.runs {
         progress(&format!("run {}/{}", i + 1, a.runs));
@@ -482,6 +501,14 @@ pub(crate) fn bench(a: &BenchArgs<'_>) -> Result<String, String> {
         samples.push(s);
     }
     let after = engine.store_stats();
+    if let Some(path) = a.routing_trace {
+        let trace = engine.take_routing();
+        engine.record_routing(false);
+        let f = std::fs::File::create(path)
+            .map_err(|e| format!("cannot create {}: {e}", path.display()))?;
+        qubivex_expert_stream::replay::write_trace(&trace, std::io::BufWriter::new(f))
+            .map_err(|e| format!("cannot write {}: {e}", path.display()))?;
+    }
     let (peak_rss, peak_source) = peak.finish();
 
     let prefill_ms: Vec<f64> = samples.iter().map(|s| ms(s.prefill)).collect();
@@ -521,6 +548,8 @@ pub(crate) fn bench(a: &BenchArgs<'_>) -> Result<String, String> {
         config: Config {
             threads: engine.threads(),
             expert_cache: Bytes(engine.expert_cache_bytes()),
+            expert_slots: engine.expert_pools().iter().map(|p| p.slots).collect(),
+            cache_policy: Some(format!("{:?}", a.memory.cache_policy())),
             context,
             prompt: a.prompt.to_owned(),
             prompt_tokens: prompt.len(),
@@ -557,6 +586,14 @@ pub(crate) fn bench(a: &BenchArgs<'_>) -> Result<String, String> {
             loads: after.loads - before.loads,
             bytes_read: Bytes(after.bytes_read - before.bytes_read),
             evictions: after.evictions - before.evictions,
+            hit_rate: {
+                let (h, l) = (after.hits - before.hits, after.loads - before.loads);
+                h as f64 / ((h + l) as f64).max(1.0)
+            },
+            bytes_per_token: Bytes(
+                (after.bytes_read - before.bytes_read) / (a.runs * a.decode_tokens).max(1) as u64,
+            ),
+            slab_allocs: after.slab_allocs - before.slab_allocs,
         },
         check: Check {
             deterministic: first_divergence.is_none(),
@@ -682,6 +719,15 @@ fn render(r: &Record) -> String {
         "  experts   {} hits, {} loads ({}), {} evictions during measured runs",
         e.hits, e.loads, e.bytes_read, e.evictions
     );
+    let _ = writeln!(
+        s,
+        "            hit rate {:.1}%, {} read per token, {} slab allocations; {} pools of {}",
+        e.hit_rate * 100.0,
+        e.bytes_per_token,
+        e.slab_allocs,
+        r.config.cache_policy.as_deref().unwrap_or("?"),
+        slot_runs(&r.config.expert_slots)
+    );
     let k = &r.check;
     let reference = match (k.reference_match, k.reference_divergence) {
         (None, _) => String::new(),
@@ -701,6 +747,21 @@ fn render(r: &Record) -> String {
         }
     );
     s
+}
+
+/// Slot counts as runs of layers, for example `5 layers × 3, 11 layers × 2`.
+fn slot_runs(slots: &[u32]) -> String {
+    let mut runs: Vec<(usize, u32)> = Vec::new();
+    for &v in slots {
+        match runs.last_mut() {
+            Some((n, x)) if *x == v => *n += 1,
+            _ => runs.push((1, v)),
+        }
+    }
+    runs.iter()
+        .map(|(n, v)| format!("{n} layer{} × {v}", if *n == 1 { "" } else { "s" }))
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 #[cfg(test)]

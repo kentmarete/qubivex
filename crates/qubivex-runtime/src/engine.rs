@@ -2,7 +2,7 @@
 
 use std::collections::HashMap;
 use std::fs::File;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::Duration;
@@ -15,10 +15,10 @@ use qubivex_backend_cpu::CpuBackend;
 use qubivex_compute::WeightView;
 use qubivex_compute::tensor::Tensor;
 use qubivex_core::{Bytes, ExpertIdx, LayerIdx, Shape};
-use qubivex_expert_stream::{ExpertStore, StoreStats};
+use qubivex_expert_stream::{ExpertKey, ExpertStore, Policy, PoolSpec, StoreStats};
 use qubivex_hardware::{Host, Probed, ResourceProbe, SystemProbe};
 use qubivex_memory::{
-    Charge, HostMemory, MemoryLedger, MemoryPlan, ModelFootprint, Owner, PlanRequest,
+    Charge, HostMemory, LayerExperts, MemoryLedger, MemoryPlan, ModelFootprint, Owner, PlanRequest,
     PressureConfig, PressureDecision, PressureMonitor, Profile, Tier,
 };
 use qubivex_model::{ExpertPart, ModelMetadata, TensorRole};
@@ -46,6 +46,8 @@ pub struct EngineOptions {
     pub pressure_interval_ms: Option<u64>,
     /// The pressure monitor's thresholds.
     pub pressure: PressureConfig,
+    /// How a full expert pool picks its victim (ADR-008).
+    pub cache_policy: Policy,
     /// Compute threads. `None`: the CPU's compute team (its fastest cores: efficiency
     /// cores slow a team that meets at every matmul), else every logical CPU.
     pub threads: Option<usize>,
@@ -240,6 +242,10 @@ pub struct Engine {
     dense: Dense,
     source: Arc<ModelExpertSource>,
     store: ExpertStore,
+    /// Expert layers, for turning a byte budget into per-layer slots.
+    layers: Vec<LayerExperts>,
+    /// The byte budget the pools were last sized for.
+    cache_target: AtomicU64,
     model: TransformerMoeModel,
     tokenizer: Tokenizer,
     backend: CpuBackend,
@@ -334,6 +340,8 @@ impl Engine {
         let backend = CpuBackend::new();
         let model = TransformerMoeModel::new(&meta.config, &dense, &backend)?;
         let source = Arc::new(ModelExpertSource::new(&meta)?);
+        let footprint = ModelFootprint::from_metadata(&meta)
+            .map_err(|e| RuntimeError::Memory(e.to_string()))?;
         let model_ctx = meta
             .manifest
             .context_length
@@ -344,7 +352,7 @@ impl Engine {
         let (plan, capacity, max_context) = match opts.expert_cache_bytes {
             Some(c) => (None, c, wanted_ctx.unwrap_or(model_ctx)),
             None => {
-                let plan = plan_at_load(&meta, &opts, wanted_ctx)?;
+                let plan = plan_at_load(&footprint, &opts, wanted_ctx)?;
                 let capacity = plan
                     .expert_cache_for(0)
                     .map_err(|r| RuntimeError::Memory(r.to_string()))?
@@ -353,7 +361,12 @@ impl Engine {
                 (Some(plan), capacity, ctx)
             }
         };
-        let store = ExpertStore::new(source.clone(), capacity);
+        let layers = footprint.layers;
+        let store = ExpertStore::new(
+            source.clone(),
+            &pools_for(&layers, capacity),
+            opts.cache_policy,
+        );
         let ledger = MemoryLedger::new(0);
         let charges = Charges {
             _dense: ledger.charge(Tier::Ram, Owner::Dense, Bytes(dense_bytes)),
@@ -400,6 +413,8 @@ impl Engine {
             dense,
             source,
             store,
+            layers,
+            cache_target: AtomicU64::new(capacity),
             model,
             tokenizer,
             backend,
@@ -430,10 +445,30 @@ impl Engine {
         self.store.stats()
     }
 
-    /// The expert cache capacity in bytes now (the planner lowers it as the KV grows).
+    /// The expert cache capacity in bytes now: the slots of every layer's pool (the
+    /// planner lowers it as the KV grows).
     #[must_use]
     pub fn expert_cache_bytes(&self) -> u64 {
         self.store.capacity()
+    }
+
+    /// The per-layer expert pools now.
+    #[must_use]
+    pub fn expert_pools(&self) -> Vec<PoolSpec> {
+        self.store.pools().unwrap_or_default()
+    }
+
+    /// Starts (or stops) recording every expert acquire, for trace replay.
+    pub fn record_routing(&self, on: bool) {
+        // A poisoned store fails the next forward pass anyway.
+        let _ = self.store.record(on);
+    }
+
+    /// The expert acquires recorded since the last call (see
+    /// [`Engine::record_routing`]).
+    #[must_use]
+    pub fn take_routing(&self) -> Vec<ExpertKey> {
+        self.store.take_trace().unwrap_or_default()
     }
 
     /// The memory plan made at load, unless a fixed cache size was requested.
@@ -495,9 +530,9 @@ impl Engine {
         if let Some(limit) = self.pressure().and_then(|d| d.cache_cap) {
             cap = cap.min(limit);
         }
-        if cap.0 != self.store.capacity() {
+        if self.cache_target.swap(cap.0, Ordering::Relaxed) != cap.0 {
             self.store
-                .set_capacity(cap.0)
+                .set_pools(&pools_for(&self.layers, cap.0))
                 .map_err(|e| RuntimeError::Memory(e.to_string()))?;
         }
         Ok(())
@@ -585,13 +620,26 @@ impl Engine {
 
 /// Plans memory with the dense weights resident: available RAM is measured now
 /// (Colibri's after-load measurement).
+/// Per-layer pools for an expert cache of `bytes`, spread as the plan spreads them
+/// (at least one slot per layer).
+fn pools_for(layers: &[LayerExperts], bytes: u64) -> Vec<PoolSpec> {
+    let slots = qubivex_memory::distribute(layers, Bytes(bytes), None);
+    layers
+        .iter()
+        .zip(slots)
+        .map(|(l, slots)| PoolSpec {
+            layer: l.layer,
+            slots,
+            slot_bytes: l.expert_bytes.0,
+        })
+        .collect()
+}
+
 fn plan_at_load(
-    meta: &ModelMetadata,
+    fp: &ModelFootprint,
     opts: &EngineOptions,
     context: Option<usize>,
 ) -> Result<MemoryPlan, RuntimeError> {
-    let fp =
-        ModelFootprint::from_metadata(meta).map_err(|e| RuntimeError::Memory(e.to_string()))?;
     let host = Host::live();
     let memory = qubivex_hardware::probe_memory(&host);
     let now = SystemProbe::new(host)
@@ -609,7 +657,7 @@ fn plan_at_load(
         sequences: 1,
         layer_weights: None,
     };
-    qubivex_memory::plan(&fp, &hm, &req).map_err(|e| RuntimeError::Memory(e.to_string()))
+    qubivex_memory::plan(fp, &hm, &req).map_err(|e| RuntimeError::Memory(e.to_string()))
 }
 
 /// xorshift64*.

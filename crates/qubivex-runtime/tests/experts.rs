@@ -7,7 +7,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 use qubivex_core::{ExpertIdx, LayerIdx};
-use qubivex_expert_stream::ExpertStore;
+use qubivex_expert_stream::{ExpertStore, Policy, PoolSpec};
 use qubivex_model::{ArchitectureRegistry, ExpertPart, ModelMetadata, TensorRole};
 use qubivex_runtime::ModelExpertSource;
 
@@ -20,6 +20,17 @@ fn tensor_bytes(meta: &ModelMetadata, name: &str) -> Vec<u8> {
     let t = meta.tensors.get(name).unwrap();
     let f = std::fs::read(&meta.tensors.files()[t.file].path).unwrap();
     f[t.tensor.offset as usize..(t.tensor.offset + t.tensor.bytes) as usize].to_vec()
+}
+
+/// `slots` slots of `bytes` for each of the model's layers.
+fn pools(meta: &ModelMetadata, slots: u32, bytes: u64) -> Vec<PoolSpec> {
+    (0..meta.config.dims.layers)
+        .map(|l| PoolSpec {
+            layer: LayerIdx(l),
+            slots,
+            slot_bytes: bytes,
+        })
+        .collect()
 }
 
 fn check_model(meta: &ModelMetadata) {
@@ -58,17 +69,13 @@ fn check_model(meta: &ModelMetadata) {
             _ => {}
         }
     }
-    for capacity in [largest, largest * 3, src.total_bytes()] {
-        let store = ExpertStore::new(src.clone(), capacity);
+    for slots in [1, 3, meta.config.dims.experts] {
+        let store = ExpertStore::new(src.clone(), &pools(meta, slots, largest), Policy::LFRU);
         for (k, parts) in &mut want {
             parts.sort_by_key(|p| p.0);
             let expect: Vec<u8> = parts.iter().flat_map(|p| p.1.clone()).collect();
             let lease = store.acquire(*k).unwrap();
-            assert_eq!(
-                lease.bytes(),
-                expect.as_slice(),
-                "{k:?} capacity {capacity}"
-            );
+            assert_eq!(lease.bytes(), expect.as_slice(), "{k:?} slots {slots}");
             let layout = src.layout(k.0, k.1).unwrap();
             assert_eq!(layout.size, expect.len());
             assert!(layout.part(ExpertPart::Down).is_some());
@@ -101,7 +108,11 @@ fn real_gguf_expert_extents() {
     let src = Arc::new(ModelExpertSource::new(&meta).unwrap());
     assert_eq!(src.len(), 16 * 64);
     assert_eq!(src.total_bytes(), meta.bytes().routed_experts);
-    let store = ExpertStore::new(src.clone(), meta.bytes().largest_expert * 4);
+    let store = ExpertStore::new(
+        src.clone(),
+        &pools(&meta, 2, meta.bytes().largest_expert),
+        Policy::LFRU,
+    );
     for l in [0u32, 7, 15] {
         for e in [0u32, 31, 63] {
             let lease = store.acquire((LayerIdx(l), ExpertIdx(e))).unwrap();

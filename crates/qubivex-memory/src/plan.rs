@@ -503,7 +503,7 @@ pub fn plan(
     } else {
         let min_slots = |s: &[LayerSlots]| s.iter().map(|l| l.slots).min().unwrap_or(0);
         reasons.push(format!(
-            "Expert cache {cache_start} with an empty KV, shrinking to {cache_full} at full context (at least {} of {} experts per layer); the rest stream from disk. Per-layer slots are enforced from Phase 6; until then the store keeps one LRU of this many bytes.",
+            "Expert cache {cache_start} with an empty KV, shrinking to {cache_full} at full context (at least {} of {} experts per layer); the rest stream from disk. Each layer's pool holds its slots and evicts only its own experts.",
             min_slots(&at_full),
             model.layers.iter().map(|l| l.experts).max().unwrap_or(0)
         ));

@@ -24,7 +24,7 @@ recorded in the ADR it affects, or in a new ADR numbered from 009.
 | 005 | One measured, role-driven memory planner | Proposed | Not built (Phase 5) | Proposed; extended by §2.3 |
 | 006 | Synchronous lease-based expert store | Proposed | Leases and dedup built; I/O queue and I/O threads not built | **Accepted** for the lease and sync model; the I/O queue stays Phase 6 |
 | 007 | Backends behind one trait | Proposed | Trait exists in host-only form | Proposed; amended by §2.4 and §2.6 (backend order) |
-| 008 | Expert cache: slabs, LFRU, hysteresis | Proposed | Not built (minimal LRU today) | Proposed |
+| 008 | Expert cache: slabs, LFRU, hysteresis | Proposed | Per-layer pools, slab reuse and LFRU built (Phase 6 slice 1, amendment 1); pins and the persisted hot set not built | Proposed |
 
 The EIP proposes `docs/adr/ADR-003-TENSOR-STORAGE.md` through `ADR-008-ASYNC-EXECUTION.md`.
 Those numbers are taken. **Proposal:** keep `docs/decisions/`, and map the EIP's ADRs as

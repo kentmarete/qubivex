@@ -66,6 +66,8 @@ measured runs see no expert loads at the default all-resident capacity. Pass
 | `--threads`, `--expert-cache-mb`, `--context` | as `qubivex run` | |
 | `--reference FILE` | | a previous record, or a JSON array of ids, whose tokens must match |
 | `--out FILE`, `--json`, `--label` | | |
+| `--cache-policy` | `lfru` | the expert pools' replacement policy, `lfru` or `lru` (ADR-008) |
+| `--routing-trace FILE` | | writes every expert acquire of the measured runs, for trace replay (below) |
 
 The JSON record (schema 1) holds:
 
@@ -85,11 +87,28 @@ The JSON record (schema 1) holds:
   `sampled`: the largest RSS seen after load and after each run, outside timed regions.
   A sampled peak can miss transient scratch inside a forward pass;
 - **experts:** expert-store hits, loads, bytes read and evictions during measured runs;
+  the hit rate, bytes read per generated token and slab allocations (Phase 6). The
+  config holds the policy and the slots of each layer's pool. Records from before
+  Phase 6 lack these fields and still load;
 - **check (the error field):** whether every run produced the same tokens (invariant
   1), and whether they match `--reference`. Lossless kernel changes must keep the tokens
   identical. The command fails if runs disagree with each other.
 
 The text summary prints the same fields on one screen.
+
+### Trace replay (cache policies)
+
+A routing trace replays through the real expert store over a source that reads
+nothing, so policies and slot counts are compared in seconds, without the model:
+
+```sh
+./target/release/qubivex bench --model <id> --ram-budget 1GiB --routing-trace trace.txt
+cargo run --release -p qubivex-expert-stream --example replay -- trace.txt [slots...]
+```
+
+It prints the hit rate per slots-per-layer for a global LRU of the same size, pool LRU
+and pool LFRU at several decay windows. A new policy must beat the default here before
+it ships (ADR-008). Results: ADR-008 amendment 1.
 
 ### How to read the numbers
 

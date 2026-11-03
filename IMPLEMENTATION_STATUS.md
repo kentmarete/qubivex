@@ -3,6 +3,8 @@
 Last updated: 2026-11-03
 
 ## Current phase
+**Phase 6 (full expert streaming) in progress: slice 1 of 3 done.** See below.
+
 **Engineering Improvement Plan: Phase 0 audit and the tensor-descriptor step (Phase 4.5), done (2026-11-03).**
 - Audit: `docs/engineering/BASELINE_AUDIT.md`. Reconciliation: `docs/engineering/ARCHITECTURE_DECISIONS.md`. The EIP is folded into `MIGRATION_PLAN.md` §3a.
 - Owner decisions: one roadmap (MIGRATION_PLAN); lossless by default with named lossy opt-ins only (ADR-010); Metal first (ADR-007 amendment); tensor scope = descriptors, views and migration (ADR-009).
@@ -47,6 +49,17 @@ Last updated: 2026-11-03
   - the opt-in RAM-hog test on the real model (`QUBIVEX_PRESSURE_TEST=1`), which passed 3 of 3 runs.
 - Finding: macOS compresses memory, so available RAM falls by only 50–65% of an incompressible allocation, and by far less for uniform bytes. See ADR-005 amendment 3.
 - **Next:** Phase 6 (full expert streaming). The first target is the per-layer slab pools and LFRU of ADR-008: under a 1 GiB budget the global LRU gets 0 hits. Measured kernel follow-ups remain in MIGRATION_PLAN §3a.
+
+**Phase 6: full expert streaming, slice 1 done (2026-11-03): per-layer pools and LFRU.**
+- Code (`qubivex-expert-stream`, ADR-008 amendment 1):
+  - one pool per expert layer (`PoolSpec`: slots and slot size); a miss evicts only within its layer;
+  - slab reuse: a miss reads into the evicted expert's buffer, so a streaming decode allocates no expert memory once the pools fill;
+  - `Policy::LFRU` (default; heat per layer, halved every 256 accesses) or `Policy::Lru`; `policy::lfru_score` and the 25% + 4 hysteresis `policy::beats` are pure and unit-tested;
+  - trace recording (`ExpertStore::record`) and `replay`, which runs a trace through the real store over a null source.
+- Runtime and CLI: the engine sizes the pools with the plan's `distribute` and resizes them as the KV grows (`set_pools`). `run` and `bench` gain `--cache-policy`; `bench` gains `--routing-trace` and records the hit rate, bytes per token, slab allocations and per-layer slots. Replay: `cargo run --release -p qubivex-expert-stream --example replay -- trace.txt`.
+- Tests: 186 pass, plus 18 real-model runtime tests. New: per-layer isolation, LFRU scan resistance, slab reuse at every slot count and policy, recording, replay against a global LRU, and per-layer pools in the engine's room-sharing test. The loom checks pass.
+- Real model, M3 Pro, `--ram-budget 1GiB` (149 MiB of slots: 9 layers × 3, 7 × 2): the hit rate goes from 0% to 10.9%, reads per token from 479 to 427 MiB, decode from 12.1 to 14.9 tok/s. Tokens are identical. Pool LRU alone stays at 0% (experts are visited in ascending index order). All resident: no change (38.04 ms median step against 38.82 ms).
+- **Next:** slice 2, the I/O queue (Demand > Prefetch > Warm), the worker pool and `acquire_many` (issue a layer's misses before waiting), then direct I/O, io_uring and the I/O strategy matrix.
 
 **Phase 4: CPU inference prototype, done.** `qubivex run` generates correct text on CPU from the real OLMoE GGUF, and every numerical test passes:
 - against `transformers` the worst relative error is ≤ 7.2e-7, with identical experts and greedy tokens;

@@ -761,6 +761,7 @@ version = "0.1.0"
 dependencies = [
  "clap",
  "qubivex-core",
+ "qubivex-expert-stream",
  "qubivex-hardware",
  "qubivex-memory",
  "qubivex-model",

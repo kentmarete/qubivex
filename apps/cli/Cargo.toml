@@ -15,6 +15,7 @@ path = "src/main.rs"
 [dependencies]
 clap = { workspace = true }
 qubivex-core = { workspace = true }
+qubivex-expert-stream = { workspace = true }
 qubivex-hardware = { workspace = true }
 qubivex-memory = { workspace = true }
 qubivex-model = { workspace = true }

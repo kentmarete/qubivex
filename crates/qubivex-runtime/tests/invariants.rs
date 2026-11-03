@@ -191,6 +191,17 @@ fn room_sharing_never_changes_bits() {
             "{id}: monotonic while the KV grows"
         );
         assert!(end >= fp.cache_floor().0, "{id}: never below the floor");
+        // One pool per expert layer, each keeping at least one slot of its layer's size.
+        let pools = planned.expert_pools();
+        assert_eq!(pools.len(), fp.layers.len(), "{id}");
+        for (p, l) in pools.iter().zip(&fp.layers) {
+            assert_eq!((p.layer, p.slot_bytes), (l.layer, l.expert_bytes.0), "{id}");
+            assert!(p.slots >= 1 && p.slots <= l.experts, "{id}: {p:?}");
+        }
+        assert!(
+            pools.iter().any(|p| p.slots < fp.layers[0].experts),
+            "{id}: streaming"
+        );
         // The KV grows in whole chunks: 300 positions reserve 512, as the plan prices.
         let reserved = qubivex_runtime::KvCache::reserved_for(300, cache.capacity()) as u64;
         assert_eq!(reserved, 512);
