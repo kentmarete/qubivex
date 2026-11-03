@@ -325,6 +325,81 @@ impl MetalBackend {
     }
 }
 
+/// A submission committed by [`MetalBackend::submit_async`] that may still be running.
+///
+/// It keeps every wrapped host region its operations touch alive until the GPU is done,
+/// and dropping it waits for the GPU, so nothing it reads is released early. Host reads
+/// and writes of device vectors ([`MetalBackend::read`], [`MetalBackend::write`]) wait
+/// for every outstanding submission first.
+pub struct Pending<'a> {
+    #[cfg(target_os = "macos")]
+    inner: crate::device::Pending<'a>,
+    #[cfg(not(target_os = "macos"))]
+    _never: core::marker::PhantomData<&'a ()>,
+}
+
+impl std::fmt::Debug for Pending<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Pending")
+            .field("complete", &self.is_complete())
+            .finish()
+    }
+}
+
+impl Pending<'_> {
+    /// Whether the GPU has finished it.
+    #[must_use]
+    pub fn is_complete(&self) -> bool {
+        #[cfg(target_os = "macos")]
+        {
+            self.inner.is_complete()
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            unreachable!("a MetalBackend cannot be created off macOS")
+        }
+    }
+
+    /// Waits for the GPU.
+    ///
+    /// # Errors
+    /// [`ComputeError::Device`] if the submission failed.
+    pub fn wait(&mut self) -> Result<(), ComputeError> {
+        #[cfg(target_os = "macos")]
+        {
+            Ok(self.inner.wait()?)
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            unreachable!("a MetalBackend cannot be created off macOS")
+        }
+    }
+}
+
+impl MetalBackend {
+    /// As [`MetalBackend::submit`], but returns once the work is committed. Submissions
+    /// run in commit order, so a later one sees this one's results.
+    ///
+    /// # Errors
+    /// `f`'s error (nothing is committed), or [`ComputeError::Device`].
+    pub fn submit_async(
+        &self,
+        f: impl FnOnce(&mut Batch<'_, '_>) -> Result<(), ComputeError>,
+    ) -> Result<Pending<'_>, ComputeError> {
+        #[cfg(target_os = "macos")]
+        {
+            Ok(Pending {
+                inner: self.dev.submit_async(|rec| f(&mut Batch { rec }))?,
+            })
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            let _ = f;
+            unreachable!("a MetalBackend cannot be created off macOS")
+        }
+    }
+}
+
 #[cfg(target_os = "macos")]
 fn groups(n: usize) -> [usize; 3] {
     [n.div_ceil(TG).max(1), 1, 1]

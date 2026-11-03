@@ -7,6 +7,7 @@
 
 use core::ffi::c_void;
 use core::ptr::NonNull;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use objc2::rc::Retained;
@@ -130,6 +131,8 @@ pub(crate) struct Device {
     /// Held while a recorded submission is in flight and while the host reads or writes
     /// a device vector, so the host never touches memory the GPU is using.
     gpu: Mutex<()>,
+    /// Asynchronous submissions not yet waited for (see [`Device::submit_async`]).
+    outstanding: AtomicUsize,
 }
 
 impl Device {
@@ -178,6 +181,7 @@ impl Device {
             pipelines,
             scratch: Mutex::new(Scratch::default()),
             gpu: Mutex::new(()),
+            outstanding: AtomicUsize::new(0),
         })
     }
 
@@ -413,6 +417,10 @@ pub(crate) enum Arg<'a> {
 pub(crate) struct Recorder<'a> {
     enc: &'a ProtocolObject<dyn MTLComputeCommandEncoder>,
     pipelines: &'a [Retained<ProtocolObject<dyn MTLComputePipelineState>>],
+    /// Every wrapped host buffer bound, so an asynchronous submission keeps the host
+    /// memory alive until the GPU is done with it (the command buffer retains the
+    /// Metal objects, but not the Rust allocation they wrap).
+    keep: Vec<Buffer>,
 }
 
 impl Recorder<'_> {
@@ -433,12 +441,21 @@ impl Recorder<'_> {
         self.enc.setComputePipelineState(&self.pipelines[pipeline]);
         for (i, a) in args.iter().enumerate() {
             match a {
-                // SAFETY: the buffer lives until the submission completes (it is
-                // borrowed for the whole `Device::submit` call), and the caller has
-                // checked the kernel's accesses against its length.
-                Arg::Buf(b, off) => unsafe {
-                    self.enc.setBuffer_offset_atIndex(Some(&b.raw), *off, i);
-                },
+                Arg::Buf(b, off) => {
+                    if b._host.is_some()
+                        && !self
+                            .keep
+                            .iter()
+                            .any(|k| Retained::as_ptr(&k.raw) == Retained::as_ptr(&b.raw))
+                    {
+                        self.keep.push((*b).clone());
+                    }
+                    // SAFETY: the Metal buffer is retained by the command buffer until it
+                    // completes, and wrapped host memory by `keep` (held by the
+                    // submission until it completes); the caller has checked the
+                    // kernel's accesses against the buffer's length.
+                    unsafe { self.enc.setBuffer_offset_atIndex(Some(&b.raw), *off, i) };
+                }
                 Arg::Bytes(d) => {
                     if let Some(ptr) = NonNull::new(d.as_ptr().cast_mut().cast::<c_void>()) {
                         // SAFETY: `d` is valid for `d.len()` bytes; setBytes copies them.
@@ -457,17 +474,62 @@ impl Recorder<'_> {
     }
 }
 
+type CommandBuffer = Retained<ProtocolObject<dyn MTLCommandBuffer>>;
+
+/// An asynchronous submission (see [`Device::submit_async`]). Dropping it waits for the
+/// GPU, so the host memory it keeps is never released while the GPU may read it.
+pub(crate) struct Pending<'d> {
+    dev: &'d Device,
+    cmd: CommandBuffer,
+    _keep: Vec<Buffer>,
+    done: bool,
+}
+
+impl Pending<'_> {
+    /// Whether the GPU has finished (successfully or not).
+    pub(crate) fn is_complete(&self) -> bool {
+        self.done
+            || matches!(
+                self.cmd.status(),
+                MTLCommandBufferStatus::Completed | MTLCommandBufferStatus::Error
+            )
+    }
+
+    /// Waits for the GPU and reports whether the submission succeeded.
+    pub(crate) fn wait(&mut self) -> Result<(), MetalError> {
+        if !self.done {
+            self.cmd.waitUntilCompleted();
+            self.done = true;
+            self.dev.outstanding.fetch_sub(1, Ordering::AcqRel);
+        }
+        status(&self.cmd)
+    }
+}
+
+impl Drop for Pending<'_> {
+    fn drop(&mut self) {
+        // The status was the caller's to check; Drop only must not release early.
+        let _ = self.wait();
+    }
+}
+
+fn status(cmd: &ProtocolObject<dyn MTLCommandBuffer>) -> Result<(), MetalError> {
+    if cmd.status() == MTLCommandBufferStatus::Completed {
+        Ok(())
+    } else {
+        Err(MetalError::Execution(cmd.error().map_or_else(
+            || format!("status {:?}", cmd.status()),
+            |e| ns_error(&e),
+        )))
+    }
+}
+
 impl Device {
-    /// Runs the dispatches `record` records in one command buffer and waits for it.
-    /// Nothing is committed if `record` fails.
-    pub(crate) fn submit<E: From<MetalError>>(
+    /// Encodes what `record` records into a new command buffer (not committed).
+    fn encode<E: From<MetalError>>(
         &self,
         record: impl FnOnce(&mut Recorder<'_>) -> Result<(), E>,
-    ) -> Result<(), E> {
-        let _gpu = self
-            .gpu
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+    ) -> Result<(CommandBuffer, Vec<Buffer>), E> {
         let cmd = self.queue.commandBuffer().ok_or(MetalError::Create {
             what: "command buffer",
             detail: None,
@@ -479,20 +541,64 @@ impl Device {
         let mut rec = Recorder {
             enc: &enc,
             pipelines: &self.pipelines,
+            keep: Vec::new(),
         };
         let recorded = record(&mut rec);
+        let keep = rec.keep;
         enc.endEncoding();
         recorded?;
+        Ok((cmd, keep))
+    }
+
+    /// Runs the dispatches `record` records in one command buffer and waits for it.
+    /// Nothing is committed if `record` fails.
+    pub(crate) fn submit<E: From<MetalError>>(
+        &self,
+        record: impl FnOnce(&mut Recorder<'_>) -> Result<(), E>,
+    ) -> Result<(), E> {
+        let _gpu = self
+            .gpu
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let (cmd, keep) = self.encode(record)?;
         cmd.commit();
         cmd.waitUntilCompleted();
-        if cmd.status() != MTLCommandBufferStatus::Completed {
-            return Err(MetalError::Execution(
-                cmd.error()
-                    .map_or_else(|| format!("status {:?}", cmd.status()), |e| ns_error(&e)),
-            )
-            .into());
-        }
+        drop(keep);
+        status(&cmd)?;
         Ok(())
+    }
+
+    /// Commits what `record` records without waiting. Submissions run in commit order
+    /// (one queue), so later ones see this one's writes.
+    pub(crate) fn submit_async<E: From<MetalError>>(
+        &self,
+        record: impl FnOnce(&mut Recorder<'_>) -> Result<(), E>,
+    ) -> Result<Pending<'_>, E> {
+        let _gpu = self
+            .gpu
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let (cmd, keep) = self.encode(record)?;
+        cmd.commit();
+        self.outstanding.fetch_add(1, Ordering::AcqRel);
+        Ok(Pending {
+            dev: self,
+            cmd,
+            _keep: keep,
+            done: false,
+        })
+    }
+
+    /// Waits until no asynchronous submission is running: an empty command buffer
+    /// completes only after every one committed before it. The gpu lock is held.
+    fn drain(&self) {
+        if self.outstanding.load(Ordering::Acquire) == 0 {
+            return;
+        }
+        if let Some(cmd) = self.queue.commandBuffer() {
+            cmd.commit();
+            cmd.waitUntilCompleted();
+        }
     }
 
     /// Copies `data` into `buf` from f32 index `at`. The caller has checked the range.
@@ -505,9 +611,11 @@ impl Device {
             buf._host.is_none() && (at + data.len()) * 4 <= buf.len,
             "write out of range"
         );
+        self.drain();
         let base = buf.raw.contents().as_ptr().cast::<f32>();
         // SAFETY: the range is inside the buffer (checked above); no submission is in
-        // flight (the gpu lock is held, and submissions wait for completion); the
+        // flight (the gpu lock is held, synchronous submissions wait for completion
+        // and `drain` waited for asynchronous ones); the
         // buffer is device-allocated, not wrapped host memory, so nothing else aliases
         // it on the host.
         unsafe { core::ptr::copy_nonoverlapping(data.as_ptr(), base.add(at), data.len()) };
@@ -520,6 +628,7 @@ impl Device {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         assert!((at + out.len()) * 4 <= buf.len, "read out of range");
+        self.drain();
         let base = buf.raw.contents().as_ptr().cast::<f32>();
         // SAFETY: as for `write_f32`; `out` is a distinct host allocation.
         unsafe { core::ptr::copy_nonoverlapping(base.add(at), out.as_mut_ptr(), out.len()) };

@@ -103,7 +103,9 @@ pub(crate) fn run(a: &RunArgs<'_>) -> Result<(), String> {
             memory_line(&engine)
         );
         let place = engine.placement();
-        if let (Some(dev), Some(ops)) = (&place.device, place.ops) {
+        if let Some(why) = &place.fallback {
+            eprintln!("[backend: cpu, not {}: {why}]", place.backend.name());
+        } else if let (Some(dev), Some(ops)) = (&place.device, place.ops) {
             eprintln!(
                 "[backend: {} on {dev} | {}: {} tensors, {}]",
                 place.backend.name(),

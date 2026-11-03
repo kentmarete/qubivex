@@ -198,8 +198,11 @@ token, with norms, RoPE, attention and the expert FFN as bit-exact Metal kernels
 bit-exact kernels and the Metal exit benchmark (**done 2026-11-03**, ADR-011 amendment 2:
 portable CPU numerics, whole layers on Metal with experts wrapped in place; decode
 26.4 → 44.5 tok/s and prefill 33 → 77 tok/s with experts resident, bit-identical; slower
-than the CPU when the pools hold fewer experts than top-k); (4) asynchronous submission
-so expert loads overlap GPU work, a concurrent encoder, and routing on the GPU.
+than the CPU when the pools hold fewer experts than top-k); (4) small expert caches
+(**done 2026-11-03**, ADR-011 amendment 3: asynchronous submission built; overlapping
+streamed experts with GPU work measured slower than the CPU pass, so the plan runs the
+CPU pass when a pool is smaller than top-k); (5) routing on the GPU (one submission per
+token) and a concurrent encoder.
 CUDA (`cudarc` and ported kernels): device buffers, ledger accounting, dense
 layers on the device, a VRAM expert tier, hybrid split (`hybrid_split.h`), and CPU/GPU
 in-frame combination in rank order. Then Vulkan (`ash` and ported shaders). Parity

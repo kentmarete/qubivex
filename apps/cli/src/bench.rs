@@ -265,6 +265,9 @@ struct DeviceConfig {
     ops: Option<String>,
     tensors: usize,
     bytes: Bytes,
+    /// Why the plan ran the CPU pass instead, if it did.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    fallback: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -671,6 +674,7 @@ pub(crate) fn bench(a: &BenchArgs<'_>) -> Result<String, String> {
                     ops: p.ops.map(qubivex_runtime::MetalOps::describe),
                     tensors: p.tensors,
                     bytes: Bytes(p.bytes),
+                    fallback: p.fallback.clone(),
                 })
             },
             context,

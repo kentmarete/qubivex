@@ -117,6 +117,8 @@ pub struct PlacementReport {
     pub tensors: usize,
     /// Their bytes (host bytes used in place: no copy and no extra ledger charge).
     pub bytes: u64,
+    /// Why the plan ran the CPU pass although a device was asked for, if it did.
+    pub fallback: Option<String>,
 }
 
 struct OnMetal {
@@ -152,12 +154,26 @@ impl Placed {
                 ops: None,
                 tensors: 0,
                 bytes: 0,
+                fallback: None,
             },
         }
     }
 
-    /// The `weights` (views into `arena`) of the selected kinds on Metal, the arena
-    /// wrapped in place. Weights whose dtype has no Metal kernel stay on the CPU.
+    /// Every operation on the CPU although Metal was asked for, because the plan found
+    /// the CPU faster; `reason` says why.
+    pub(crate) fn fallback(device: String, ops: MetalOps, reason: String) -> Self {
+        let mut p = Self::cpu();
+        p.report = PlacementReport {
+            backend: BackendKind::Metal,
+            device: Some(device),
+            ops: Some(ops),
+            tensors: 0,
+            bytes: 0,
+            fallback: Some(reason),
+        };
+        p
+    }
+
     /// A Metal report for the whole-layer pass, which places its own weights; every
     /// matmul this backend is asked for (the embedding lookup) stays on the CPU.
     pub(crate) fn layers(device: String, tensors: usize, bytes: u64, ops: MetalOps) -> Self {
@@ -170,10 +186,13 @@ impl Placed {
                 ops: Some(ops),
                 tensors,
                 bytes,
+                fallback: None,
             },
         }
     }
 
+    /// The `weights` (views into `arena`) of the selected kinds on Metal, the arena
+    /// wrapped in place. Weights whose dtype has no Metal kernel stay on the CPU.
     pub(crate) fn metal<'a>(
         arena: &Arc<PageAligned>,
         weights: impl IntoIterator<Item = (DenseMatmul, WeightView<'a>)>,
@@ -204,6 +223,7 @@ impl Placed {
             ops: Some(ops),
             tensors: on.len(),
             bytes,
+            fallback: None,
         };
         Ok(Self {
             cpu: CpuBackend::new(),

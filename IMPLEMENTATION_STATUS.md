@@ -3,7 +3,13 @@
 Last updated: 2026-11-03
 
 ## Current phase
-**Phase 8 (GPU acceleration, Metal first): slices 1–3 done (2026-11-03).** Phase 7 slice 1 is done and its exit criterion is met; its remaining items (a disk-saturation throttle, deeper lookahead) are parked.
+**Phase 8 (GPU acceleration, Metal first): slices 1–4 done (2026-11-03).**
+
+**Phase 8 slice 4 done (2026-11-03): small expert caches.**
+- Code: `MetalBackend::submit_async` and `Pending` (keeps wrapped host memory alive until the GPU is done; dropping waits; host reads and writes drain outstanding work). `PlacementReport::fallback`: with `--backend metal`, a plan whose pools are smaller than top-k runs the CPU pass and says why (`run` prints it; `bench` records it).
+- Measured at `--ram-budget 1GiB` (ADR-011 amendment 3): every way of overlapping streamed experts with GPU work was slower than the CPU pass (async per expert 8.3–9.0 tok/s, hits on GPU and misses on CPU 14.7, waves 14.7, CPU 20.3), because each lone GPU submission costs about 0.5 ms and every layer needs a host round trip for routing. `--backend metal` at 1 GiB now gives 19.96 tok/s (the CPU pass) instead of 14.66.
+- Tests: 241 pass. New: async ordering and keep-alive; the wave test now shrinks pools from 8 slots to 1 under critical pressure after load (the plan keeps whole layers, the waves run, and the bits match through 300 decode steps), and checks that a plan with one-slot pools falls back.
+- **Next (slice 5):** routing on the GPU, so a token is one submission, and a concurrent encoder. Then CUDA. Phase 7 slice 1 is done and its exit criterion is met; its remaining items (a disk-saturation throttle, deeper lookahead) are parked.
 
 **Phase 8 slice 3 done (2026-11-03): whole layers on Metal, bit-identical, 1.68× decode with experts resident.**
 - Portable numerics (owner's choice; the CPU's bits changed once): `qubivex_compute::math::exp` (IEEE basic ops and fma, ≤ 2 ulp, subnormal results are 0), `rms_norm` on the shared 64-lane reduction (`qubivex_compute::reduce`, moved from backend-cpu), and RoPE from a host cos/sin table evaluated in f64. Real OLMoE: the 128 bench tokens match the previous reference and Colibri's 12 tokens still match. Fixtures: transformers error 7.2e-7 → 6.5e-7, f64 reference 3.3e-7 → 2.8e-7.
@@ -16,7 +22,7 @@ Last updated: 2026-11-03
 - Tests: 240 pass (Rust 1.99.1; 1.85 checks). New: `ops_parity.rs` (every op bit-identical, including exp over −110..110), gather/scatter, misaligned Q4_K is declined, `metal_layers_match_the_cpu_in_waves_and_across_kv_growth` (one-slot pools, 300 decode steps past 256 positions, three fixtures). Env-gated: whole layers on real OLMoE give bit-identical prompt logits and 48 identical tokens; all 130 tensors stay bit-identical with the new kernels. GPU tests now fail (not skip) on a shader compile error.
 - Measured (M3 Pro, OLMoE Q4_K_M, ADR-011 amendment 2; records `2026-11-03-m3pro-phase8s3-*.json`): all resident, decode 26.41 → 44.47 tok/s (median step 37.86 → 22.49 ms, P95 47.80 → 23.36 ms), prefill 33 → 77 tok/s. At `--ram-budget 1GiB`, Metal is slower (14.66 vs 20.31 tok/s): the pools hold 2–3 experts, so each layer runs about three waves that each wait for all their loads. Kernel throughput (`metal_stream`): Q4_K 23 → 38 GiB/s, Q6_K 38 → 64 GiB/s.
 - Decision (pending owner review): the CPU stays the default backend; `--backend metal` means whole layers.
-- **Next (slice 4):** asynchronous submission so loads overlap GPU work under small budgets, a concurrent encoder (serial dispatch costs about 25% of expert kernel time), routing on the GPU (one submission per token). Then CUDA.
+- Slice 4 (above) handled small expert caches.
 
 **Phase 8 slice 2 done (2026-11-03): Metal in the engine (batching, zero-copy weights, placement, token parity).**
 - Code:

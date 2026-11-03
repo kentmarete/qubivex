@@ -1,6 +1,6 @@
 # ADR-011: Device execution, buffer lifetimes and GPU parity
 
-- Status: Proposed (Phase 8 slice 1, 2026-11-03; amendment 1, slice 2; amendment 2, slice 3). Owner review pending.
+- Status: Proposed (Phase 8 slice 1, 2026-11-03; amendments 1–3, slices 2–4). Owner review pending.
 - Date: 2026-11-03
 - Related: ADR-007 (backends; amendment 2026-11-03), ADR-010 (lossless by default),
   `docs/engineering/ARCHITECTURE_DECISIONS.md` §2.4–2.5, TENSOR_ARCHITECTURE §6.
@@ -234,3 +234,59 @@ against 7.5 ms.
   - routing on the GPU, for one submission per token.
 - Device scratch (activations and scores; a few MiB at decode) is not charged to the
   ledger yet; the device KV is.
+
+## Amendment 3 (2026-11-03): small expert caches, Phase 8 slice 4
+
+### The question
+Amendment 2 left one regime where whole layers lose: an expert cache whose per-layer
+pools hold fewer experts than a token routes (2–3 slots against top-k 8 at
+`--ram-budget 1GiB`), where decode fell from 20.3 tok/s (CPU) to 14.7 (Metal). Slice 4
+tried to make the GPU pass overlap expert loads.
+
+### What was built
+- **Asynchronous submission (§2).** `MetalBackend::submit_async` commits a recorded
+  batch without waiting and returns a `Pending`. The `Pending` holds every wrapped host
+  region its operations bind (the command buffer retains the Metal objects, but not the
+  Rust allocations they wrap), and dropping it waits for the GPU, so host memory the GPU
+  may read is never released early (§3). Host reads and writes of device vectors first
+  drain outstanding submissions (an empty command buffer completes only after every
+  earlier one). Tests: two asynchronous submissions run in commit order, and a matmul
+  over a wrapped region gives the CPU's bits after the caller drops every handle to the
+  region before waiting.
+
+### What was measured, and not kept (M3 Pro, OLMoE Q4_K_M, `--ram-budget 1GiB`)
+Every variant gave the reference tokens.
+
+| expert scheme in the whole-layer pass | decode tok/s | blocked per token |
+|---|---|---|
+| waves of at most `slots` experts (amendment 2) | 14.66 | 29.1 ms |
+| one async submission per arriving expert, released when the GPU is done | 9.02 | 62.8 ms |
+| the same, releasing GPU groups before waiting on the store | 8.29 | 20.8 ms |
+| hits on the GPU, misses on the CPU as they land | 14.66 | 26.6 ms |
+| **the CPU pass** | **20.31** | 7.5 ms |
+
+A lone submission after the GPU idles costs about 0.5 ms end to end. With about 117
+misses per token, submitting experts as they stream in costs more than the GPU saves.
+Holding leases until the GPU finishes also pins pool slots the store needs for its next
+reads. Running the misses on the CPU recovers the blocking, but the per-layer GPU round
+trips (one per layer, waiting for the router logits) remain. In this regime the CPU
+pass, which overlaps each expert's compute with the next loads and has no round trips,
+is fastest.
+
+### Decision
+- **The plan chooses the CPU pass when pools are smaller than top-k.** If `--backend
+  metal` (whole layers) is asked for and the plan gives any layer fewer slots than the
+  routed experts per token, the engine runs the CPU pass. `PlacementReport::fallback`
+  says why; `qubivex run` prints it, and `qubivex bench` records it in `config.device`.
+  At 1 GiB this gives 19.96 tok/s (record
+  `2026-11-03-m3pro-phase8s4-metal-1gib-fallback.json`) instead of 14.66. The choice is
+  made at load from the plan, as §5 requires; it does not follow live load.
+- When memory pressure shrinks the pools after load, the whole-layer pass keeps running
+  in waves, with the same bits (`metal_layers_match_the_cpu_in_waves_and_across_kv_growth`
+  now shrinks the pools from 8 slots to 1 under critical pressure and checks the prompt
+  and 300 decode steps). It is slower than the CPU pass there, but the placement is
+  never moved mid-run.
+- `submit_async` stays: it is the event mechanism §2 calls for. Overlapping loads with
+  GPU work needs routing on the GPU first (no host round trip per layer). With that, a
+  token could be one submission that waits on expert availability, which is the next
+  step for this regime.
