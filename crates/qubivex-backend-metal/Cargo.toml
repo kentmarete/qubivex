@@ -1,0 +1,30 @@
+[package]
+name = "qubivex-backend-metal"
+description = "Metal compute backend for QUBIVEX: deterministic lossless kernels on Apple GPUs"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+qubivex-compute = { workspace = true }
+qubivex-core = { workspace = true }
+thiserror = { workspace = true }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.6"
+objc2-foundation = { version = "0.3", default-features = false, features = ["std", "NSString", "NSError"] }
+objc2-metal = { version = "0.3", default-features = false, features = ["std", "MTLDevice", "MTLLibrary", "MTLBuffer", "MTLResource", "MTLCommandQueue", "MTLCommandBuffer", "MTLComputeCommandEncoder", "MTLCommandEncoder", "MTLComputePipeline", "MTLTypes", "MTLAllocation"] }
+
+[dev-dependencies]
+criterion = { workspace = true }
+qubivex-backend-cpu = { workspace = true }
+
+[lints]
+workspace = true
+
+[[bench]]
+name = "kernels"
+harness = false

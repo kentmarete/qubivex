@@ -3,7 +3,18 @@
 Last updated: 2026-11-03
 
 ## Current phase
-**Phase 7 (predictive loading): slice 1 done; the exit criterion is met.** See below. Next: decide whether Phase 7 continues (a disk-saturation throttle, deeper lookahead) or Phase 8 (Metal) starts.
+**Phase 8 (GPU acceleration, Metal first): slice 1 done (2026-11-03).** Phase 7 slice 1 is done and its exit criterion is met; its remaining items (a disk-saturation throttle, deeper lookahead) are parked.
+
+**Phase 8 slice 1 done (2026-11-03): the Metal kernels and their parity.**
+- Code:
+  - New crate `qubivex-backend-metal` (objc2-metal; macOS only, an empty stub elsewhere). Kernels in `src/kernels.metal`, compiled from source at start-up with `MTLMathModeSafe` and contraction off; no offline Metal toolchain needed.
+  - matmul for f32, f16, bf16, Q8_0, Q4_K and Q6_K: one 32-thread SIMD group per output, reproducing the CPU's dequantised values and 64-lane reduction shape.
+  - `MetalBackend` implements `ComputeBackend` (it copies weights per call: a correctness path); `MetalBackend::upload` and `matmul_resident` keep weights on the device. `dequant_row` stays on the CPU.
+  - `ComputeError::Device`. Dependency rule: a GPU backend may dev-depend on `qubivex-backend-cpu` as its parity reference (`xtask` test added).
+- Tests: synthetic parity (all six dtypes, tails of 32–37 lanes, s = 1, 3, 8, typical and wide-range values) is bit-identical; resident and copying paths agree; errors are reported. The env-gated `qubivex-runtime/tests/metal_parity.rs` is bit-identical on all 130 real OLMoE tensors (3.92 GiB, about 11M outputs).
+- Finding: Apple GPUs flush f32 subnormals to zero (safe mode too). That is the only divergence; `subnormals_are_the_only_divergence` documents it. Parity contract: ADR-011 (Proposed).
+- Kernel benches (`cargo bench -p qubivex-backend-metal --bench kernels`), resident weights, against the CPU baseline at 5 threads: expert Q4_K 1024 × 2048 decode 176 µs vs 63 µs; Q6_K head 1.78 ms vs 2.77 ms; Q4_K prefill s = 128 4.84 ms vs 3.44 ms; a 64 × 64 matmul costs 120 µs, which is per-call synchronisation.
+- **Next (slice 2):** command-buffer batching (a layer or a token per submission, with events), zero-copy weights over the mapping, the head and dense layers on Metal by plan, `--backend`, and end-to-end token parity. Then faster bit-exact kernels (block-reusing Q4_K, prefill reuse across rows).
 
 **Phase 7 slice 1 done (2026-11-03): router-lookahead prefetch.**
 - Code:

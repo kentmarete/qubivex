@@ -189,6 +189,9 @@ throttle, lookahead beyond one layer, and next-token layer-0 prediction.
 ### Phase 8: GPU acceleration
 **Order amended 2026-11-03 (ADR-007): Metal first** (`qubivex-backend-metal`, testable on
 the M3 Pro), then CUDA, then Vulkan. The CUDA work below is unchanged, but comes second.
+Metal slices: (1) kernels with bit-identical CPU parity and benches (**done 2026-11-03**,
+ADR-011); (2) command-buffer batching, zero-copy weights, plan-time placement and token
+parity in the engine; (3) faster bit-exact kernels and the Metal exit benchmark.
 CUDA (`cudarc` and ported kernels): device buffers, ledger accounting, dense
 layers on the device, a VRAM expert tier, hybrid split (`hybrid_split.h`), and CPU/GPU
 in-frame combination in rank order. Then Vulkan (`ash` and ported shaders). Parity

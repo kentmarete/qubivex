@@ -1,7 +1,7 @@
 [workspace]
 resolver = "3"
-members = ["crates/qubivex-core", "crates/qubivex-hardware", "crates/qubivex-model", "crates/qubivex-compute", "crates/qubivex-backend-cpu", "crates/qubivex-tokenizer", "crates/qubivex-runtime", "crates/qubivex-expert-stream", "crates/qubivex-arch", "crates/qubivex-memory", "apps/cli", "xtask"]
-default-members = ["crates/qubivex-core", "crates/qubivex-hardware", "crates/qubivex-model", "crates/qubivex-compute", "crates/qubivex-backend-cpu", "crates/qubivex-tokenizer", "crates/qubivex-runtime", "crates/qubivex-expert-stream", "crates/qubivex-arch", "crates/qubivex-memory", "apps/cli", "xtask"]
+members = ["crates/qubivex-core", "crates/qubivex-hardware", "crates/qubivex-model", "crates/qubivex-compute", "crates/qubivex-backend-cpu", "crates/qubivex-tokenizer", "crates/qubivex-runtime", "crates/qubivex-expert-stream", "crates/qubivex-arch", "crates/qubivex-memory", "crates/qubivex-backend-metal", "apps/cli", "xtask"]
+default-members = ["crates/qubivex-core", "crates/qubivex-hardware", "crates/qubivex-model", "crates/qubivex-compute", "crates/qubivex-backend-cpu", "crates/qubivex-tokenizer", "crates/qubivex-runtime", "crates/qubivex-expert-stream", "crates/qubivex-arch", "crates/qubivex-memory", "crates/qubivex-backend-metal", "apps/cli", "xtask"]
 # Spikes are standalone packages with their own lock files (their dependencies are not
 # product dependencies until an ADR accepts them).
 exclude = ["spikes"]
@@ -26,6 +26,7 @@ qubivex-runtime = { path = "crates/qubivex-runtime", version = "0.1.0" }
 qubivex-expert-stream = { path = "crates/qubivex-expert-stream", version = "0.1.0" }
 qubivex-arch = { path = "crates/qubivex-arch", version = "0.1.0" }
 qubivex-memory = { path = "crates/qubivex-memory", version = "0.1.0" }
+qubivex-backend-metal = { path = "crates/qubivex-backend-metal", version = "0.1.0" }
 
 # Third-party versions are declared here once (ADR-001); members use `{ workspace = true }`.
 # Requirements stay at the oldest version we need. Exact versions live in Cargo.lock,
