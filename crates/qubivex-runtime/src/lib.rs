@@ -8,7 +8,10 @@
 mod engine;
 mod experts;
 
-pub use engine::{DEFAULT_IO_THREADS, Engine, EngineOptions, Sampling};
+pub use engine::{
+    DEFAULT_IO_THREADS, Engine, EngineOptions, PredictionStats, PrefetchOptions, PrefetchReport,
+    Sampling,
+};
 pub use experts::{ExpertIo, ExpertLayout, IoPath, ModelExpertSource, PartLayout};
 pub use qubivex_arch::{KvCache, Logits};
 use qubivex_model::manifest::TokenizerSection;

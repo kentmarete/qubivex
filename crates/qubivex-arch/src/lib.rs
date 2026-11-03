@@ -99,6 +99,21 @@ pub trait ExpertProvider: Sync {
         }
         Ok(())
     }
+
+    /// Whether the provider wants [`ExpertProvider::lookahead`] calls. When `false`
+    /// (the default) the forward pass skips the lookahead router entirely.
+    fn wants_lookahead(&self) -> bool {
+        false
+    }
+
+    /// Advisory, during decode: `layer`'s router logits computed early, from the
+    /// hidden state just after the previous layer's attention, normalized with
+    /// `layer`'s MoE norm (Colibri's PILOT lookahead). The provider may read predicted
+    /// experts ahead. Routing never uses these logits, so nothing a provider does with
+    /// them changes the output.
+    fn lookahead(&self, layer: LayerIdx, router_logits: &[f32]) {
+        let _ = (layer, router_logits);
+    }
 }
 
 /// Points of the forward pass that can be observed (numerical tests).
@@ -434,6 +449,15 @@ impl TransformerMoeModel {
         let mut o = vec![0f32; s * h];
         let mut router = vec![0f32; s * ne];
         let mut scores = Vec::new();
+        // The lookahead router runs during decode only: a prompt batch routes to most
+        // experts of every layer, so there is nothing to predict.
+        let lookahead = s == 1 && experts.wants_lookahead();
+        let mut ahead = if lookahead {
+            vec![0f32; ne]
+        } else {
+            Vec::new()
+        };
+        let mut ahead_x = if lookahead { vec![0f32; h] } else { Vec::new() };
 
         for (l, norms) in self.norms.iter().enumerate() {
             let li = u32::try_from(l).map_err(|_| ArchError::Input("too many layers".into()))?;
@@ -510,6 +534,16 @@ impl TransformerMoeModel {
             }
             for (a, b) in hs.iter_mut().zip(&o) {
                 *a += b;
+            }
+
+            // Lookahead: the next layer's MoE norm and router on this state. Its logits
+            // only go to the provider as a hint; routing below uses this layer's own.
+            if let Some(next) = self.norms.get(l + 1).filter(|_| lookahead) {
+                ahead_x.copy_from_slice(&hs);
+                rms_norm(&mut ahead_x, &next.ffn, c.rms_eps);
+                let ln = layer_name(&c.names.router, li + 1);
+                be.matmul(&dense.view(&ln)?, &ahead_x, 1, &mut ahead)?;
+                experts.lookahead(LayerIdx(li + 1), &ahead);
             }
 
             // MoE.

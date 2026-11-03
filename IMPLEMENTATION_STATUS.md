@@ -3,7 +3,18 @@
 Last updated: 2026-11-03
 
 ## Current phase
-**Phase 6 (full expert streaming) is complete: slices 1–3 done.** See below. Next: Phase 7 (predictive loading).
+**Phase 7 (predictive loading): slice 1 done; the exit criterion is met.** See below. Next: decide whether Phase 7 continues (a disk-saturation throttle, deeper lookahead) or Phase 8 (Metal) starts.
+
+**Phase 7 slice 1 done (2026-11-03): router-lookahead prefetch.**
+- Code:
+  - `qubivex-expert-stream`: `predict::Lookahead` (EMA 0.3, confidence 0.92, width 1; pure, unit-tested); `ExpertStore::prefetch(keys, guard)` at `Priority::Prefetch`; `cancel_prefetch`; `policy::speculation_beats` (Colibri's guard); `StoreStats::prefetch`.
+  - Store rules: a prediction never evicts its own experts; demand promotes its queued prefetches and drops the stale ones of the layer; a demand waits for in-flight prefetches instead of failing `Full`.
+  - `qubivex-arch`: `ExpertProvider::{wants_lookahead, lookahead}`. During decode, the next layer's norm and router run on the post-attention state; routing never reads the result.
+  - `qubivex-runtime`: `EngineOptions::prefetch`, the predictor state in the engine, issue after the layer's demand, recall and precision (`Engine::prefetch_report`), `Engine::end_turn`, and a stop under memory pressure.
+  - CLI: `run` and `bench` gain `--prefetch`, `--prefetch-guard on|off`, `--prefetch-width`, `--prefetch-confidence` and `--prefetch-smooth`; `bench` records `config.prefetch` and `experts.prefetch`.
+- Tests: 217 pass, plus 3 loom models. New: 11 store prefetch tests (50 repeated runs, no failure), the predictor unit tests, and the Phase 7 exit test `prefetch_never_changes_routing_or_bits` (router logits, experts, weights and logits bit-identical on the three fixtures across every prefetch setting).
+- Real model, M3 Pro, 160 tokens, tokens identical to the Phase 6 exit record. Recall is 79.7%. At 1 GiB, decode goes 19.87 → 20.32 tok/s (guard on) or 20.50 (guard off), and blocked time per token goes 8.29 → 4.87 or 3.95 ms. At 2–3 GiB and all resident there is no gain. Decode at 1 GiB is limited by read throughput, so hiding latency gains little. Prefetch stays opt-in; the guard is on by default. Tables: ADR-008 amendment 2.
+- Not built: a disk-saturation throttle, lookahead beyond one layer, and layer-0 prediction for the next token.
 
 **Engineering Improvement Plan: Phase 0 audit and the tensor-descriptor step (Phase 4.5), done (2026-11-03).**
 - Audit: `docs/engineering/BASELINE_AUDIT.md`. Reconciliation: `docs/engineering/ARCHITECTURE_DECISIONS.md`. The EIP is folded into `MIGRATION_PLAN.md` §3a.

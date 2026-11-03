@@ -113,6 +113,15 @@ It prints the hit rate per slots-per-layer for a global LRU of the same size, po
 and pool LFRU at several decay windows. A new policy must beat the default here before
 it ships (ADR-008). Results: ADR-008 amendment 1.
 
+### Prefetch (Phase 7)
+
+`--prefetch` (with `--prefetch-guard on|off` and the predictor's settings) adds an
+`experts.prefetch` section to the record: recall and precision of the prediction,
+issued, present and refused predictions, ready and late uses, wasted reads, cancelled
+prefetches and the mean lead time. Compare it against a run without `--prefetch` at the
+same budget, interleaved. Blocked time per token is the latency prefetch hides, and the
+decode rate says whether that mattered. Results: ADR-008 amendment 2.
+
 ### How to read the numbers
 
 - **Report the median, and the P95 next to it.** A P95 far above the median means jitter

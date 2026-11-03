@@ -99,7 +99,8 @@ condvar, plus a loader pool, with no async runtime.
   A third loom model covers a batch racing an acquire and being dropped mid-way.
 - **Not built yet (slice 3):** `O_DIRECT`/`F_NOCACHE`, io_uring, multi-drive mirrors,
   per-device queues, the I/O strategy matrix, and the exit check at a 1 GB expert
-  budget. Prefetch at `Priority::Prefetch` arrives in Phase 7.
+  budget. Prefetch at `Priority::Prefetch` arrives in Phase 7 (built: ADR-008
+  amendment 2, which also covers promotion and cancellation of queued prefetches).
 
 
 ## Amendment 2 (2026-11-03): direct I/O, the I/O matrix and the exit check, Phase 6 slice 3

@@ -38,6 +38,7 @@
 //! `loom` (`RUSTFLAGS="--cfg loom"`), without I/O threads.
 
 pub mod policy;
+pub mod predict;
 pub mod replay;
 
 use std::collections::{BinaryHeap, HashMap, VecDeque};
@@ -61,6 +62,7 @@ mod sync {
 }
 
 use std::sync::Arc;
+use std::time::Instant;
 
 use sync::{AtomicU64, Condvar, Mutex, MutexGuard, Ordering};
 
@@ -173,12 +175,18 @@ pub struct PoolSpec {
 
 enum Entry {
     /// A load is queued or in flight; its bytes are already counted. `waiters` are the
-    /// acquirers that will each take one lease when it is ready.
-    Loading { bytes: u64, waiters: u32 },
+    /// acquirers that will each take one lease when it is ready. `spec`: issued by
+    /// [`ExpertStore::prefetch`] and not demanded yet (when it was issued).
+    Loading {
+        bytes: u64,
+        waiters: u32,
+        spec: Option<Instant>,
+    },
     Ready {
         data: Arc<Vec<u8>>,
         leases: u32,
         last_use: u64,
+        spec: Option<Instant>,
     },
     /// The read failed; each waiter takes the error, and the last removes the entry.
     Failed { detail: String, waiters: u32 },
@@ -206,12 +214,17 @@ impl Pool {
 
     /// The unleased ready expert to evict next, if any.
     fn victim(&self, policy: Policy) -> Option<u32> {
+        self.victim_except(policy, &[])
+    }
+
+    /// As [`Pool::victim`], never choosing an expert of `keep`.
+    fn victim_except(&self, policy: Policy, keep: &[ExpertKey]) -> Option<u32> {
         let ready = self.entries.iter().filter_map(|(&e, s)| match s {
             Entry::Ready {
                 leases: 0,
                 last_use,
                 ..
-            } => Some((e, *last_use)),
+            } if !keep.iter().any(|k| k.1.0 == e) => Some((e, *last_use)),
             _ => None,
         });
         match policy {
@@ -219,6 +232,35 @@ impl Pool {
             Policy::Lfru { .. } => ready
                 .min_by_key(|&(e, t)| (policy::lfru_score(self.heat.get(e), self.tick - t), t, e))
                 .map(|(e, _)| e),
+        }
+    }
+
+    /// Whether a prefetch nobody waits for is loading: its slot frees up when it lands.
+    fn speculating(&self) -> bool {
+        self.entries.values().any(|s| {
+            matches!(
+                s,
+                Entry::Loading {
+                    waiters: 0,
+                    spec: Some(_),
+                    ..
+                }
+            )
+        })
+    }
+
+    /// Removes an expert, counting a prefetch that was never used as wasted. Returns
+    /// its buffer if it was ready.
+    fn evict(&mut self, e: u32, pf: &mut PrefetchStats) -> Option<Arc<Vec<u8>>> {
+        match self.entries.remove(&e) {
+            Some(Entry::Ready { data, spec, .. }) => {
+                if spec.is_some() {
+                    pf.wasted += 1;
+                    pf.wasted_bytes += data.len() as u64;
+                }
+                Some(data)
+            }
+            _ => None,
         }
     }
 
@@ -273,6 +315,79 @@ struct Inner {
     queue: BinaryHeap<Request>,
     seq: u64,
     shutdown: bool,
+    prefetch: PrefetchStats,
+}
+
+impl Inner {
+    /// Drops queued prefetches of `layer` that nobody waits for and that `keep` does
+    /// not name; promotes those it names to [`Priority::Demand`]. Returns how many
+    /// were dropped. A read already started is left to finish.
+    fn settle_prefetches(&mut self, layer: LayerIdx, keep: &[ExpertKey]) -> u64 {
+        let mut dropped = 0;
+        let mut q = std::mem::take(&mut self.queue).into_vec();
+        q.retain_mut(|r| {
+            if r.key.0 != layer || r.priority != Priority::Prefetch {
+                return true;
+            }
+            if keep.contains(&r.key) {
+                r.priority = Priority::Demand;
+                return true;
+            }
+            let Some(pool) = self.pools.get_mut(&layer) else {
+                return true;
+            };
+            match pool.entries.get(&r.key.1.0) {
+                Some(&Entry::Loading {
+                    bytes, waiters: 0, ..
+                }) => {
+                    pool.entries.remove(&r.key.1.0);
+                    self.used -= bytes;
+                    dropped += 1;
+                    false
+                }
+                _ => true,
+            }
+        });
+        self.queue = q.into();
+        self.prefetch.cancelled += dropped;
+        dropped
+    }
+}
+
+/// What prefetching did, for the Phase 7 metrics.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct PrefetchStats {
+    /// Predicted experts queued for reading.
+    pub issued: u64,
+    /// Predicted experts already resident or loading.
+    pub present: u64,
+    /// Predicted experts not read: no free slot, the eviction guard kept the resident
+    /// expert, or no I/O threads.
+    pub refused: u64,
+    /// Prefetched experts demanded after their read finished: the whole read was
+    /// hidden.
+    pub ready: u64,
+    /// Prefetched experts demanded while still loading: part of the read was hidden.
+    pub late: u64,
+    /// Prefetched experts evicted without being demanded.
+    pub wasted: u64,
+    /// Bytes of those.
+    pub wasted_bytes: u64,
+    /// Queued prefetches dropped before any read started.
+    pub cancelled: u64,
+    /// Nanoseconds from issue to demand, summed over `ready` and `late`.
+    pub lead_ns: u64,
+}
+
+/// What one [`ExpertStore::prefetch`] call did with each key.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct PrefetchReceipt {
+    /// Queued for reading.
+    pub issued: u32,
+    /// Already resident or loading.
+    pub present: u32,
+    /// Not read (no free slot, the guard, no I/O threads, or an unknown expert).
+    pub refused: u32,
 }
 
 /// Counters, for diagnostics and the capacity-sweep tests.
@@ -294,6 +409,8 @@ pub struct StoreStats {
     pub cancelled: u64,
     /// Nanoseconds callers spent blocked waiting for loads.
     pub wait_ns: u64,
+    /// Prefetch counters.
+    pub prefetch: PrefetchStats,
 }
 
 struct Shared {
@@ -471,7 +588,13 @@ impl<'a> Iterator for Batch<'a> {
             if let Some(r) = self.take_finished(&mut g) {
                 break Some(r);
             }
-            if self.pending.is_empty() {
+            // A deferred expert whose layer is full of prefetches still loading gets a
+            // slot when they land: wait for them instead of failing.
+            let speculating = self
+                .deferred
+                .iter()
+                .any(|k| g.pools.get(&k.0).is_some_and(Pool::speculating));
+            if self.pending.is_empty() && !speculating {
                 break self.deferred.first().map(|&key| {
                     let (leased, slots) =
                         g.pools.get(&key.0).map_or((0, 0), |p| (p.busy(), p.slots));
@@ -559,7 +682,7 @@ impl Drop for Batch<'_> {
                 continue;
             };
             match pool.entries.get_mut(&e) {
-                Some(Entry::Loading { bytes, waiters }) => {
+                Some(Entry::Loading { bytes, waiters, .. }) => {
                     *waiters -= 1;
                     let bytes = *bytes;
                     let queued = inner.queue.iter().any(|r| r.key == (layer, ExpertIdx(e)));
@@ -636,6 +759,7 @@ impl ExpertStore {
                     queue: BinaryHeap::new(),
                     seq: 0,
                     shutdown: false,
+                    prefetch: PrefetchStats::default(),
                 }),
                 loaded: Condvar::new(),
                 work: Condvar::new(),
@@ -703,7 +827,8 @@ impl ExpertStore {
     /// # Errors
     /// [`StoreError::Poisoned`].
     pub fn set_pools(&self, pools: &[PoolSpec]) -> Result<u64, StoreError> {
-        let mut g = self.lock()?;
+        let mut guard = self.lock()?;
+        let g = &mut *guard;
         let policy = g.policy;
         let mut freed = 0u64;
         let mut evicted = 0u64;
@@ -716,7 +841,7 @@ impl ExpertStore {
             pool.slot_bytes = spec.slot_bytes;
             while pool.entries.len() > pool.slots as usize {
                 let Some(e) = pool.victim(policy) else { break };
-                if let Some(Entry::Ready { data, .. }) = pool.entries.remove(&e) {
+                if let Some(data) = pool.evict(e, &mut g.prefetch) {
                     freed += data.len() as u64;
                 }
                 evicted += 1;
@@ -741,6 +866,7 @@ impl ExpertStore {
             slab_allocs: s.slab_allocs.load(Ordering::Relaxed),
             cancelled: s.cancelled.load(Ordering::Relaxed),
             wait_ns: s.wait_ns.load(Ordering::Relaxed),
+            prefetch: self.lock().map(|g| g.prefetch).unwrap_or_default(),
         }
     }
 
@@ -806,6 +932,14 @@ impl ExpertStore {
     pub fn acquire_many(&self, keys: &[ExpertKey]) -> Result<Batch<'_>, StoreError> {
         let mut g = self.lock()?;
         let policy = g.policy;
+        // Queued prefetches of these layers: the demanded ones become demand reads,
+        // the others are stale and give their slots back.
+        let mut layers: Vec<LayerIdx> = keys.iter().map(|k| k.0).collect();
+        layers.sort_unstable();
+        layers.dedup();
+        for layer in layers {
+            g.settle_prefetches(layer, keys);
+        }
         for &key in keys {
             let pool = g.pools.get_mut(&key.0).ok_or(StoreError::NoPool(key.0))?;
             pool.tick += 1;
@@ -874,14 +1008,23 @@ impl ExpertStore {
                 data,
                 leases,
                 last_use,
+                spec,
             }) => {
                 *leases += 1;
                 *last_use = now;
+                if let Some(t) = spec.take() {
+                    g.prefetch.ready += 1;
+                    g.prefetch.lead_ns += elapsed_ns(t);
+                }
                 s.hits.fetch_add(1, Ordering::Relaxed);
                 return Ok(Claim::Leased(Arc::clone(data)));
             }
-            Some(Entry::Loading { waiters, .. }) => {
+            Some(Entry::Loading { waiters, spec, .. }) => {
                 *waiters += 1;
+                if let Some(t) = spec.take() {
+                    g.prefetch.late += 1;
+                    g.prefetch.lead_ns += elapsed_ns(t);
+                }
                 s.dedup_waits.fetch_add(1, Ordering::Relaxed);
                 return Ok(Claim::Pending);
             }
@@ -906,7 +1049,7 @@ impl ExpertStore {
         let mut freed = 0u64;
         while pool.entries.len() >= pool.slots as usize {
             let Some(v) = pool.victim(policy) else { break };
-            if let Some(Entry::Ready { data, .. }) = pool.entries.remove(&v) {
+            if let Some(data) = pool.evict(v, &mut g.prefetch) {
                 freed += data.len() as u64;
                 // Keep one buffer to read into; the others are freed.
                 slab = Arc::try_unwrap(data).ok().or(slab);
@@ -924,6 +1067,7 @@ impl ExpertStore {
             Entry::Loading {
                 bytes: size,
                 waiters: 1,
+                spec: None,
             },
         );
         g.used += size;
@@ -944,6 +1088,136 @@ impl ExpertStore {
     fn execute(&self, req: Request) {
         execute(&self.shared, req);
     }
+
+    /// Advisory: queues reads of experts predicted to be needed soon, at
+    /// [`Priority::Prefetch`], in the order given (best first: a full layer stops
+    /// accepting). Never waits, never takes a leased or loading slot, never fails a
+    /// later demand: [`ExpertStore::acquire_many`] promotes a queued prefetch it
+    /// demands and drops those of the same layer it does not.
+    ///
+    /// When the layer's pool is full, the prefetch evicts the policy's victim among the
+    /// experts `keys` does not name (a prediction never evicts itself). With
+    /// `guard` under [`Policy::Lfru`], only if the prediction's heat beats the victim's
+    /// LFRU score by the hysteresis ([`policy::speculation_beats`]; ADR-008): a
+    /// speculation must not displace an expert the layer keeps using.
+    ///
+    /// Without I/O threads every key is refused: nobody would read ahead.
+    ///
+    /// # Errors
+    /// [`StoreError::Poisoned`].
+    pub fn prefetch(&self, keys: &[ExpertKey], guard: bool) -> Result<PrefetchReceipt, StoreError> {
+        let mut r = PrefetchReceipt::default();
+        let mut guard_lock = self.lock()?;
+        let g = &mut *guard_lock;
+        let s = &self.shared;
+        if s.io_threads == 0 {
+            r.refused = u32::try_from(keys.len()).unwrap_or(u32::MAX);
+            g.prefetch.refused += u64::from(r.refused);
+            return Ok(r);
+        }
+        let policy = g.policy;
+        let mut queued = false;
+        let mut evicted = 0u64;
+        for &key in keys {
+            let (layer, ExpertIdx(e)) = key;
+            let Some(pool) = g.pools.get_mut(&layer) else {
+                r.refused += 1;
+                continue;
+            };
+            if pool.entries.contains_key(&e) {
+                r.present += 1;
+                continue;
+            }
+            let size = match s.source.expert_size(key) {
+                Ok(size) if size <= pool.slot_bytes => size,
+                _ => {
+                    r.refused += 1;
+                    continue;
+                }
+            };
+            let mut slab = None;
+            if pool.entries.len() >= pool.slots as usize {
+                // Never evict another expert of the same prediction.
+                let same: Vec<ExpertKey> = keys.iter().filter(|k| k.0 == layer).copied().collect();
+                let Some(v) = pool.victim_except(policy, &same) else {
+                    r.refused += 1;
+                    continue;
+                };
+                if guard {
+                    if let Policy::Lfru { .. } = policy {
+                        let age = match pool.entries.get(&v) {
+                            Some(Entry::Ready { last_use, .. }) => pool.tick - last_use,
+                            _ => 0,
+                        };
+                        let victim = policy::lfru_score(pool.heat.get(v), age);
+                        if !policy::speculation_beats(pool.heat.get(e), victim) {
+                            r.refused += 1;
+                            continue;
+                        }
+                    }
+                }
+                if let Some(data) = pool.evict(v, &mut g.prefetch) {
+                    g.used -= data.len() as u64;
+                    slab = Arc::try_unwrap(data).ok();
+                }
+                evicted += 1;
+            }
+            let Some(pool) = g.pools.get_mut(&layer) else {
+                continue;
+            };
+            pool.entries.insert(
+                e,
+                Entry::Loading {
+                    bytes: size,
+                    waiters: 0,
+                    spec: Some(Instant::now()),
+                },
+            );
+            g.used += size;
+            g.seq += 1;
+            g.queue.push(Request {
+                key,
+                size,
+                slab,
+                priority: Priority::Prefetch,
+                seq: g.seq,
+            });
+            r.issued += 1;
+            queued = true;
+        }
+        g.prefetch.issued += u64::from(r.issued);
+        g.prefetch.present += u64::from(r.present);
+        g.prefetch.refused += u64::from(r.refused);
+        s.evictions.fetch_add(evicted, Ordering::Relaxed);
+        drop(guard_lock);
+        if queued {
+            s.work.notify_all();
+        }
+        Ok(r)
+    }
+
+    /// Drops queued prefetches nobody waits for, of `layer` or of every layer (a turn
+    /// ends, or memory pressure stops prefetch). Reads already started finish.
+    /// Returns how many were dropped.
+    ///
+    /// # Errors
+    /// [`StoreError::Poisoned`].
+    pub fn cancel_prefetch(&self, layer: Option<LayerIdx>) -> Result<u64, StoreError> {
+        let mut g = self.lock()?;
+        let layers: Vec<LayerIdx> = match layer {
+            Some(l) => vec![l],
+            None => g.pools.keys().copied().collect(),
+        };
+        Ok(layers
+            .into_iter()
+            .map(|l| g.settle_prefetches(l, &[]))
+            .sum())
+    }
+}
+
+/// Nanoseconds since `t`, saturating.
+fn elapsed_ns(t: Instant) -> u64 {
+    u64::try_from(t.elapsed().as_nanos()).unwrap_or(u64::MAX)
 }
 
 /// Reads a request outside the lock and publishes the result to its waiters.
@@ -973,8 +1247,12 @@ fn execute(s: &Shared, req: Request) {
     let inner = &mut *g;
     if let Some(pool) = inner.pools.get_mut(&key.0) {
         let last_use = pool.tick;
-        if let Some(Entry::Loading { bytes, waiters }) = pool.entries.get(&key.1.0) {
-            let (bytes, waiters) = (*bytes, *waiters);
+        if let Some(&Entry::Loading {
+            bytes,
+            waiters,
+            spec,
+        }) = pool.entries.get(&key.1.0)
+        {
             match read {
                 Ok(buf) => {
                     pool.entries.insert(
@@ -983,6 +1261,7 @@ fn execute(s: &Shared, req: Request) {
                             data: Arc::new(buf),
                             leases: waiters,
                             last_use,
+                            spec,
                         },
                     );
                     s.loads.fetch_add(1, Ordering::Relaxed);

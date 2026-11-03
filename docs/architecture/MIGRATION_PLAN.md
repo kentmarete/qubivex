@@ -175,6 +175,16 @@ prefetch rate, wasted bytes, lead time, blocking time saved).
 **Exit:** a measured reduction in blocking expert-load time on a cache-constrained
 OLMoE benchmark, with negative results recorded if it does not help. A test proves
 that routing is identical with prediction on and off.
+Slice 1 is done (ADR-008 amendment 2): the lookahead predictor (EMA, confidence
+cutoff, width cap), `ExpertStore::prefetch` at `Prefetch` priority with the LFRU guard,
+a prediction that never evicts its own experts, promotion and cancellation of queued
+prefetches at layer and turn boundaries, a pressure stop, and the metrics (recall,
+precision, ready/late, wasted bytes, lead time, blocked time). **Exit met:** at 1 GiB,
+blocked time falls from 8.29 to 4.87 ms per token (guard on) or 3.95 ms (guard off),
+and decode goes from 19.87 to 20.3–20.5 tok/s. At 2–3 GiB and all resident there is no
+gain (guard on) or a 1–2% loss (guard off), so prefetch stays opt-in (`--prefetch`).
+The routing-identity test passes on every fixture. Not built: a disk-saturation
+throttle, lookahead beyond one layer, and next-token layer-0 prediction.
 
 ### Phase 8: GPU acceleration
 **Order amended 2026-11-03 (ADR-007): Metal first** (`qubivex-backend-metal`, testable on
