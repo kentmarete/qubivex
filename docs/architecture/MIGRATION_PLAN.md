@@ -181,14 +181,17 @@ paged KV, NUMA, multi-device; then a CLI UX catalogue and recommendations UI.
   zero-copy views) in `qubivex-core`; typed `TensorView`, `TensorViewMut` and `Tensor<T>`
   in `qubivex-compute`. The runtime's dense weights use `Tensor<u8>`. Decode output is
   byte-identical, with no speed regression.
-- **Before more kernel work: in-workspace benchmarks.** Criterion benches for the
-  existing kernels, and a decode/prefill harness that records the EIP §13.3 fields
-  (hardware, flags, threads, warm-up, median and P95, peak memory, error). Every later
-  kernel change is measured before and after against these.
+- **In-workspace benchmarks (done).** Criterion benches for the existing kernels
+  (`qubivex-backend-cpu/benches/kernels.rs`, including a DRAM-bound decode group) and
+  `qubivex bench`, a decode/prefill harness that records the EIP §13.3 fields (hardware,
+  flags, threads, warm-up, median and P95, peak memory, and a token check as the error
+  field). Protocol and the 2026-11-03 baseline: `docs/performance/BENCHMARKING.md`.
+  Every later kernel change is measured before and after against these.
 - **Phase 4 follow-ups, each measured:** AVX2 kernels; the dequantise + `gemm` prefill
   and the spinning pool that ADR-002 accepted but which are not built yet; a faster
-  lossless Q4_K kernel (the EIP's quantised GEMV target is ≥ 70% of STREAM; Q4_K was
-  about 20%).
+  lossless Q4_K kernel (the EIP's quantised GEMV target is ≥ 70% of STREAM; the
+  baseline measures Q4_K at 17 GiB/s, about 22% of the 80 GiB/s bf16 streams from DRAM
+  on the M3 Pro, and the kernel is limited by compute, not memory).
 - **KV cache on `Tensor<f32>`** with `narrow` views: the next consumer of ADR-009, with
   its own benchmark.
 - **Extensibility:** a dense (non-MoE) architecture and a real SafeTensors run, alongside

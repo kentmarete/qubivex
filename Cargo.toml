@@ -30,6 +30,8 @@ qubivex-arch = { path = "crates/qubivex-arch", version = "0.1.0" }
 # Requirements stay at the oldest version we need. Exact versions live in Cargo.lock,
 # which resolver 3 fills with the newest releases compatible with `rust-version`.
 clap = { version = "4.5", features = ["derive"] }
+# Kernel benchmarks only (dev-dependency); no plotters, no HTML reports.
+criterion = { version = "0.7", default-features = false, features = ["cargo_bench_support"] }
 loom = "0.7.2"
 minijinja = { version = "3.0", default-features = false, features = ["builtins", "fuel", "serde"] }
 minijinja-contrib = { version = "3.0", features = ["pycompat"] }

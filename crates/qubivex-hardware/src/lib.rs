@@ -65,6 +65,31 @@ pub fn probe_cpu(host: &Host) -> CpuInfo {
     cpu::probe(host)
 }
 
+/// Probes only RAM.
+#[must_use]
+pub fn probe_memory(host: &Host) -> MemoryInfo {
+    memory::probe(host)
+}
+
+/// Probes only the operating system.
+#[must_use]
+pub fn probe_os(host: &Host) -> OperatingSystem {
+    os::probe(host)
+}
+
+/// This process's resident set size now.
+#[must_use]
+pub fn process_rss(host: &Host) -> Probed<qubivex_core::Bytes> {
+    memory::process_rss(host)
+}
+
+/// This process's peak resident set size so far, where the OS reports one without
+/// FFI (Linux `VmHWM`); unknown on macOS.
+#[must_use]
+pub fn process_peak_rss(host: &Host) -> Probed<qubivex_core::Bytes> {
+    memory::process_peak_rss(host)
+}
+
 /// Probes `host`. Never fails: whatever cannot be determined is [`Probed::Unknown`].
 #[must_use]
 pub fn probe(host: &Host) -> HardwareProfile {

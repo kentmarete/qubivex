@@ -10,6 +10,7 @@ mod experts;
 
 pub use engine::{Engine, EngineOptions, Sampling};
 pub use experts::{ExpertLayout, ModelExpertSource, PartLayout};
+pub use qubivex_arch::{KvCache, Logits};
 use qubivex_model::manifest::TokenizerSection;
 use qubivex_model::{GgufMetadata, GgufValue, ModelMetadata};
 use qubivex_tokenizer::{GgufVocab, Tokenizer, TokenizerError};
