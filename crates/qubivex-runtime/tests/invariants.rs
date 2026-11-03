@@ -91,6 +91,47 @@ fn expert_cache_capacity_never_changes_bits() {
     }
 }
 
+/// The I/O thread count changes only when experts arrive, never the bits: the MoE
+/// layer may compute experts in any order (ADR-006 `acquire_many`).
+#[test]
+fn io_threads_never_change_bits() {
+    for id in IDS {
+        let largest = engine(id, None).metadata().bytes().largest_expert;
+        let mut want = None;
+        for (io, cap) in [
+            (0, None),
+            (0, Some(2)),
+            (1, Some(2)),
+            (4, Some(2)),
+            (4, Some(3)),
+            (8, Some(1)),
+        ] {
+            let meta =
+                ModelMetadata::load(&dir(id), &ArchitectureRegistry::with_builtins()).unwrap();
+            let e = Engine::load(
+                meta,
+                EngineOptions {
+                    expert_cache_bytes: cap.map(|n: u64| n * largest),
+                    max_context: Some(256),
+                    io_threads: Some(io),
+                    ..EngineOptions::default()
+                },
+            )
+            .unwrap();
+            assert_eq!(e.io_threads(), io);
+            let mut c = e.new_cache();
+            let mut logits = bits(&e.forward(PROMPT, &mut c, Logits::All, None).unwrap());
+            for &t in &PROMPT[..6] {
+                logits.extend(bits(&e.forward(&[t], &mut c, Logits::Last, None).unwrap()));
+            }
+            match &want {
+                None => want = Some(logits),
+                Some(w) => assert_eq!(&logits, w, "{id} io {io} slots {cap:?}"),
+            }
+        }
+    }
+}
+
 #[test]
 fn sampling_is_reproducible() {
     let e = engine("qwen3-moe-tiny", None);

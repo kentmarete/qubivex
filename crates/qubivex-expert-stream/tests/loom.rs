@@ -76,3 +76,31 @@ fn eviction_never_takes_a_leased_expert() {
         assert!(store.used().unwrap() <= 4);
     });
 }
+
+#[test]
+fn a_batch_and_an_acquire_share_loads_and_cancel_cleanly() {
+    loom::model(|| {
+        let src = SrcArc::new(Counting(AtomicUsize::new(0)));
+        let store = Arc::new(ExpertStore::new(src.clone(), &pool(2), Policy::LFRU));
+        let s2 = store.clone();
+        let t = loom::thread::spawn(move || {
+            let l = s2.acquire(key(1)).unwrap();
+            assert_eq!(l.bytes(), &[1, 1, 1, 1]);
+        });
+        // Take one lease of the batch, then drop it with the other possibly unread.
+        let mut b = store.acquire_many(&[key(1), key(2)]).unwrap();
+        let l = b.next().unwrap().unwrap();
+        assert_eq!(l.bytes(), &[l.key().1.0 as u8; 4]);
+        drop(l);
+        drop(b);
+        t.join().unwrap();
+        // Expert 1 was read once however the threads interleaved.
+        assert!(src.0.load(Ordering::Relaxed) <= 2);
+        let used = store.used().unwrap();
+        assert_eq!(
+            used,
+            4 * store.resident().unwrap().len() as u64,
+            "no leaked bytes"
+        );
+    });
+}

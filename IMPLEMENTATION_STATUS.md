@@ -3,7 +3,7 @@
 Last updated: 2026-11-03
 
 ## Current phase
-**Phase 6 (full expert streaming) in progress: slice 1 of 3 done.** See below.
+**Phase 6 (full expert streaming) in progress: slices 1 and 2 of 3 done.** See below.
 
 **Engineering Improvement Plan: Phase 0 audit and the tensor-descriptor step (Phase 4.5), done (2026-11-03).**
 - Audit: `docs/engineering/BASELINE_AUDIT.md`. Reconciliation: `docs/engineering/ARCHITECTURE_DECISIONS.md`. The EIP is folded into `MIGRATION_PLAN.md` §3a.
@@ -49,6 +49,17 @@ Last updated: 2026-11-03
   - the opt-in RAM-hog test on the real model (`QUBIVEX_PRESSURE_TEST=1`), which passed 3 of 3 runs.
 - Finding: macOS compresses memory, so available RAM falls by only 50–65% of an incompressible allocation, and by far less for uniform bytes. See ADR-005 amendment 3.
 - **Next:** Phase 6 (full expert streaming). The first target is the per-layer slab pools and LFRU of ADR-008: under a 1 GiB budget the global LRU gets 0 hits. Measured kernel follow-ups remain in MIGRATION_PLAN §3a.
+
+**Phase 6 slice 2 done (2026-11-03): the I/O queue, I/O threads and `acquire_many`.**
+- Code (`qubivex-expert-stream`, ADR-006 amendment 1):
+  - `acquire_many` returns a `Batch` that leases hits, queues every miss with a free slot before waiting, and yields leases as loads finish;
+  - a priority queue (Demand > Prefetch > Warm) with `with_io_threads(n)`;
+  - read errors reach every waiter, and dropping a batch cancels its unstarted loads;
+  - without I/O threads, the caller reads on demand.
+- Arch and runtime: `ExpertProvider::with_experts` (order-free; the MoE layer requests a whole layer); the provider pipelines through `acquire_many`; within-expert extent coalescing in `ModelExpertSource`; `--io-threads` (default 4). The bench records the blocked time per token and the I/O threads.
+- Tests: 197 pass, plus 20 real-model runtime tests and 3 loom models. New: the I/O stress suite (exactly-once batches, duplicate requests, contention, cancellation, error delivery, parallel reads, shutdown; 50 repeated runs, no failure), I/O-thread bit-identity on the fixtures, and coalescing.
+- Real model, M3 Pro, `--ram-budget 1GiB`: decode goes from 14.9 to 20.2 tok/s (blocked time 7.6 ms per token), and prefill at 128 tokens from 42.7 to 49.5 tok/s, with identical tokens. All resident: unchanged (38.06 ms step).
+- **Next:** slice 3: direct I/O (`F_NOCACHE`/`O_DIRECT`) and io_uring behind options, the I/O strategy matrix, and the exit check (OLMoE correct and benchmarked well below its expert size).
 
 **Phase 6: full expert streaming, slice 1 done (2026-11-03): per-layer pools and LFRU.**
 - Code (`qubivex-expert-stream`, ADR-008 amendment 1):

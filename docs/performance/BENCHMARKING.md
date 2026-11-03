@@ -67,6 +67,7 @@ measured runs see no expert loads at the default all-resident capacity. Pass
 | `--reference FILE` | | a previous record, or a JSON array of ids, whose tokens must match |
 | `--out FILE`, `--json`, `--label` | | |
 | `--cache-policy` | `lfru` | the expert pools' replacement policy, `lfru` or `lru` (ADR-008) |
+| `--io-threads N` | 4 | expert I/O threads; 0 makes the compute thread read its own misses (ADR-006) |
 | `--routing-trace FILE` | | writes every expert acquire of the measured runs, for trace replay (below) |
 
 The JSON record (schema 1) holds:
@@ -87,8 +88,9 @@ The JSON record (schema 1) holds:
   `sampled`: the largest RSS seen after load and after each run, outside timed regions.
   A sampled peak can miss transient scratch inside a forward pass;
 - **experts:** expert-store hits, loads, bytes read and evictions during measured runs;
-  the hit rate, bytes read per generated token and slab allocations (Phase 6). The
-  config holds the policy and the slots of each layer's pool. Records from before
+  the hit rate, bytes read per generated token, slab allocations and the time the
+  forward pass was blocked on loads per token (Phase 6). The config holds the policy,
+  the I/O threads and the slots of each layer's pool. Records from before
   Phase 6 lack these fields and still load;
 - **check (the error field):** whether every run produced the same tokens (invariant
   1), and whether they match `--reference`. Lossless kernel changes must keep the tokens
