@@ -200,3 +200,91 @@ fn room_sharing_never_changes_bits() {
         assert_eq!(l.dense, fp.dense_bytes(), "{id}: the ledger's dense charge");
     }
 }
+
+/// Under pressure (ADR-005): the cache drops to the floor between tokens, an active
+/// request runs to the end with the same bits, new requests are refused, and
+/// everything recovers when RAM comes back.
+#[test]
+fn pressure_shrinks_refuses_and_recovers() {
+    use qubivex_core::Bytes;
+    use qubivex_memory::{ModelFootprint, PressureLevel};
+    for id in IDS {
+        let meta = ModelMetadata::load(&dir(id), &ArchitectureRegistry::with_builtins()).unwrap();
+        let fp = ModelFootprint::from_metadata(&meta).unwrap();
+        let e = Engine::load(
+            meta,
+            EngineOptions {
+                ram_budget: Some(fp.dense_bytes().0 + (1 << 30)),
+                max_context: Some(256),
+                pressure_interval_ms: Some(0), // driven by hand below
+                ..EngineOptions::default()
+            },
+        )
+        .unwrap();
+        let reference = engine(id, Some(fp.expert_bytes().0));
+        let planned_cap = e.expert_cache_bytes();
+        let (mut c, mut rc) = (e.new_cache(), reference.new_cache());
+        for (i, &t) in PROMPT.iter().cycle().take(40).enumerate() {
+            if i == 10 {
+                let d = e.observe_pressure(Bytes(1 << 20)).unwrap();
+                assert_eq!(
+                    (d.level, d.admit, d.prefetch),
+                    (PressureLevel::Critical, false, false)
+                );
+                // A new request is refused; this one continues.
+                assert!(
+                    e.generate(PROMPT, 1, Sampling::default(), |_| true)
+                        .is_err()
+                );
+            }
+            let a = e.forward(&[t], &mut c, Logits::Last, None).unwrap();
+            let b = reference
+                .forward(&[t], &mut rc, Logits::Last, None)
+                .unwrap();
+            assert_eq!(bits(&a), bits(&b), "{id} position {i}");
+            if i >= 10 {
+                assert_eq!(
+                    e.expert_cache_bytes(),
+                    fp.cache_floor().0,
+                    "{id}: at the floor"
+                );
+            }
+        }
+        // RAM comes back: admitted again, and the cap lifts.
+        let d = e.observe_pressure(Bytes(8 << 30)).unwrap();
+        assert_eq!(
+            (d.level, d.admit, d.cache_cap),
+            (PressureLevel::Normal, true, None)
+        );
+        e.forward(&[PROMPT[0]], &mut c, Logits::Last, None).unwrap();
+        assert_eq!(
+            e.expert_cache_bytes(),
+            planned_cap,
+            "{id}: back to the plan's cache"
+        );
+        assert!(e.generate(PROMPT, 1, Sampling::default(), |_| true).is_ok());
+    }
+}
+
+/// The sampling thread starts with the engine and stops when it is dropped.
+#[test]
+fn pressure_thread_stops_with_the_engine() {
+    let meta =
+        ModelMetadata::load(&dir("olmoe-tiny"), &ArchitectureRegistry::with_builtins()).unwrap();
+    let e = Engine::load(
+        meta,
+        EngineOptions {
+            pressure_interval_ms: Some(5),
+            ..EngineOptions::default()
+        },
+    )
+    .unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(50));
+    assert!(e.pressure().is_some());
+    let t = std::time::Instant::now();
+    drop(e);
+    assert!(
+        t.elapsed() < std::time::Duration::from_secs(2),
+        "joined promptly"
+    );
+}

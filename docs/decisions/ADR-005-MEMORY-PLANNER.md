@@ -1,6 +1,6 @@
 # ADR-005: One measured, role-driven memory planner
 
-- Status: Proposed (Phase 0)
+- Status: Proposed (Phase 0); built in Phase 5 (amendments 1–3), awaiting acceptance
 - Date: 2026-11-01
 
 ## Context
@@ -95,4 +95,43 @@ settled while building it, and the ARCHITECTURE_DECISIONS §2.3 resolution is fo
   page cache. Per-layer slot pools and LFRU (ADR-008) are the fix. The output is still
   byte-identical.
 
-Still to build in Phase 5: the pressure monitor with its RAM-hog test (slice 3).
+## Amendment 3 (2026-11-03): the pressure monitor, Phase 5 slice 3
+
+- **`PressureMonitor`** (`qubivex-memory`) is pure logic. It maps available RAM to
+  four levels, each adding to the response before it:
+  - `Normal`;
+  - `Elevated` (below 1 GiB): stop prefetch;
+  - `High` (below 512 MiB): shrink the expert cache by the shortfall below the
+    recovery point;
+  - `Critical` (below 256 MiB): cache at the one-slot-per-layer floor, refuse new
+    requests.
+
+  It escalates at once and steps down only 256 MiB above a threshold (hysteresis).
+  While pressure lasts the cap never grows, and it never goes below the floor, so an
+  active request always finishes. The thresholds are policy values; revisit them with
+  recorded runs.
+- **Runtime.** A `qubivex-pressure` thread samples available RAM every 500 ms
+  (`EngineOptions::pressure_interval_ms`; `Some(0)` turns it off, leaving
+  `Engine::observe_pressure` for callers and tests) and stops when the engine drops.
+  The cache cap applies at the next forward pass, between tokens. `generate` (the
+  request boundary) calls `Engine::admit`, which refuses under `Critical`. Prefetch
+  does not exist until Phase 7, so `prefetch: false` is recorded but has no effect
+  yet. Fixed-cache engines (`--expert-cache-mb`) have no monitor.
+- **Measured with an external RAM hog** (opt-in test `pressure_hog`, real model, M3
+  Pro, three passes):
+  - The monitor reached `Critical`, a new request was refused, and the active request
+    finished with identical tokens with its cache at the floor.
+  - After the hog exited, pressure returned to `Normal`, the plan's cache came back,
+    and the tokens matched again.
+- **What the hog test showed about macOS.** The OS answers a new allocation partly by
+  compressing other memory, so available RAM falls by less than the allocation: 1.1–1.6
+  GiB for a 2.1–2.4 GiB hog of incompressible data. A hog of uniform bytes lowered it by
+  only 0.4 GiB, because the compressor squeezes such pages to almost nothing. Thresholds
+  and tests must allow for this.
+- **Feedback.** Dropping the cache to the floor frees more RAM (about 3.4 GiB here)
+  than a moderate hog takes, so the monitor relieves its own trigger and the cache
+  regrows after the hysteresis margin. That is the intended behaviour. A cache that
+  oscillates under sustained pressure would need a longer hold, and the monitor
+  records enough to add one later.
+
+Phase 5 is complete.

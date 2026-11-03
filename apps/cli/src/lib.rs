@@ -273,6 +273,7 @@ impl MemoryOptions {
             threads,
             profile: self.profile,
             ram_budget: self.ram_budget,
+            ..qubivex_runtime::EngineOptions::default()
         }
     }
 }

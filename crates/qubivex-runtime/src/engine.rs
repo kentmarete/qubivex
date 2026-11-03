@@ -2,7 +2,10 @@
 
 use std::collections::HashMap;
 use std::fs::File;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
+use std::thread::JoinHandle;
+use std::time::Duration;
 
 use qubivex_arch::{
     ArchError, DenseWeights, ExpertProvider, ExpertWeights, KvCache, Logits, Sources, Tracer,
@@ -13,9 +16,10 @@ use qubivex_compute::WeightView;
 use qubivex_compute::tensor::Tensor;
 use qubivex_core::{Bytes, ExpertIdx, LayerIdx, Shape};
 use qubivex_expert_stream::{ExpertStore, StoreStats};
-use qubivex_hardware::{Host, ResourceProbe, SystemProbe};
+use qubivex_hardware::{Host, Probed, ResourceProbe, SystemProbe};
 use qubivex_memory::{
-    Charge, HostMemory, MemoryLedger, MemoryPlan, ModelFootprint, Owner, PlanRequest, Profile, Tier,
+    Charge, HostMemory, MemoryLedger, MemoryPlan, ModelFootprint, Owner, PlanRequest,
+    PressureConfig, PressureDecision, PressureMonitor, Profile, Tier,
 };
 use qubivex_model::{ExpertPart, ModelMetadata, TensorRole};
 use qubivex_tokenizer::Tokenizer;
@@ -36,6 +40,12 @@ pub struct EngineOptions {
     /// An explicit RAM budget in bytes, replacing the profile's (ignored with
     /// `expert_cache_bytes`).
     pub ram_budget: Option<u64>,
+    /// How often the pressure monitor samples available RAM, in milliseconds.
+    /// `None`: every 500 ms; `Some(0)`: no monitor thread
+    /// ([`Engine::observe_pressure`] still works). Planned engines only.
+    pub pressure_interval_ms: Option<u64>,
+    /// The pressure monitor's thresholds.
+    pub pressure: PressureConfig,
     /// Compute threads. `None`: the CPU's compute team (its fastest cores: efficiency
     /// cores slow a team that meets at every matmul), else every logical CPU.
     pub threads: Option<usize>,
@@ -157,9 +167,75 @@ struct Charges {
     kv: Charge,
 }
 
+/// The pressure monitor's state, shared with its sampling thread.
+struct Pressure {
+    monitor: Mutex<PressureMonitor>,
+    ledger: Arc<MemoryLedger>,
+}
+
+impl Pressure {
+    fn lock(&self) -> std::sync::MutexGuard<'_, PressureMonitor> {
+        // A poisoned lock means the sampling thread panicked mid-update; the monitor's
+        // state is plain data, so keep using it.
+        self.monitor
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    fn observe(&self, available: Bytes) -> PressureDecision {
+        let used = self.ledger.snapshot(Tier::Ram).expert_cache;
+        self.lock().observe(available, used)
+    }
+}
+
+/// The sampling thread; stopped and joined on drop.
+struct Watcher {
+    stop: Arc<AtomicBool>,
+    thread: Option<JoinHandle<()>>,
+}
+
+impl Watcher {
+    fn start(pressure: Arc<Pressure>, interval: Duration) -> Result<Self, RuntimeError> {
+        let stop = Arc::new(AtomicBool::new(false));
+        let flag = Arc::clone(&stop);
+        let thread = std::thread::Builder::new()
+            .name("qubivex-pressure".into())
+            .spawn(move || {
+                let probe = SystemProbe::new(Host::live());
+                while !flag.load(Ordering::Acquire) {
+                    if let Ok(s) = probe.snapshot() {
+                        if let Probed::Known(a) = s.ram_available {
+                            pressure.observe(a);
+                        }
+                    }
+                    std::thread::park_timeout(interval);
+                }
+            })
+            .map_err(|e| RuntimeError::Memory(format!("cannot start the pressure monitor: {e}")))?;
+        Ok(Self {
+            stop,
+            thread: Some(thread),
+        })
+    }
+}
+
+impl Drop for Watcher {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Release);
+        if let Some(t) = self.thread.take() {
+            t.thread().unpark();
+            // A panicked monitor thread has nothing left to clean up.
+            let _ = t.join();
+        }
+    }
+}
+
 /// A model ready to generate.
 pub struct Engine {
     memory: Memory,
+    /// `None` without a plan (a fixed cache was requested).
+    pressure: Option<Arc<Pressure>>,
+    _watcher: Option<Watcher>,
     meta: ModelMetadata,
     dense: Dense,
     source: Arc<ModelExpertSource>,
@@ -284,6 +360,20 @@ impl Engine {
             experts: ledger.charge(Tier::Ram, Owner::ExpertCache, Bytes(0)),
             kv: ledger.charge(Tier::Ram, Owner::Kv, Bytes(0)),
         };
+        let pressure = plan.as_ref().map(|p| {
+            Arc::new(Pressure {
+                monitor: Mutex::new(PressureMonitor::new(opts.pressure, p.ram.cache_floor.bytes)),
+                ledger: Arc::clone(&ledger),
+            })
+        });
+        let interval = opts.pressure_interval_ms.unwrap_or(500);
+        let watcher = match &pressure {
+            Some(p) if interval > 0 => Some(Watcher::start(
+                Arc::clone(p),
+                Duration::from_millis(interval),
+            )?),
+            _ => None,
+        };
         let tokenizer = load_tokenizer(&meta)?;
         let threads = opts
             .threads
@@ -297,6 +387,8 @@ impl Engine {
                 RuntimeError::Model(format!("cannot start {threads} compute threads: {e}"))
             })?;
         Ok(Self {
+            pressure,
+            _watcher: watcher,
             memory: Memory {
                 plan,
                 ledger,
@@ -356,6 +448,40 @@ impl Engine {
         &self.memory.ledger
     }
 
+    /// The pressure monitor's latest decision (`None` without a plan).
+    #[must_use]
+    pub fn pressure(&self) -> Option<PressureDecision> {
+        self.pressure.as_ref().map(|p| p.lock().decision())
+    }
+
+    /// Feeds the pressure monitor one observation of available RAM, as its thread
+    /// does, and returns the decision. A cache cap applies from the next forward pass.
+    pub fn observe_pressure(&self, available: Bytes) -> Option<PressureDecision> {
+        self.pressure.as_ref().map(|p| p.observe(available))
+    }
+
+    /// Replaces the pressure thresholds.
+    pub fn set_pressure_config(&self, config: PressureConfig) {
+        if let Some(p) = &self.pressure {
+            p.lock().set_config(config);
+        }
+    }
+
+    /// Refuses a new request under critical memory pressure (ADR-005). Active
+    /// requests are never stopped.
+    ///
+    /// # Errors
+    /// [`RuntimeError::Memory`] when the pressure monitor refuses admission.
+    pub fn admit(&self) -> Result<(), RuntimeError> {
+        match self.pressure() {
+            Some(d) if !d.admit => Err(RuntimeError::Memory(format!(
+                "new request refused: memory pressure is {:?}; the expert cache is at its floor",
+                d.level
+            ))),
+            _ => Ok(()),
+        }
+    }
+
     /// Shrinks the expert cache to leave room for `cache` growing by `tokens`
     /// (Colibri's `kv_room_fit`), or refuses if that would cross the floor.
     fn fit_room(&self, cache: &KvCache, tokens: usize) -> Result<(), RuntimeError> {
@@ -363,9 +489,12 @@ impl Engine {
             return Ok(());
         };
         let projected = KvCache::reserved_for(cache.len() + tokens, cache.capacity());
-        let cap = plan
+        let mut cap = plan
             .expert_cache_for(projected as u64)
             .map_err(|r| RuntimeError::Memory(r.to_string()))?;
+        if let Some(limit) = self.pressure().and_then(|d| d.cache_cap) {
+            cap = cap.min(limit);
+        }
         if cap.0 != self.store.capacity() {
             self.store
                 .set_capacity(cap.0)
@@ -434,6 +563,7 @@ impl Engine {
         if prompt.is_empty() {
             return Err(RuntimeError::Model("the prompt is empty".into()));
         }
+        self.admit()?;
         let mut cache = self.new_cache();
         let mut rng = Rng(sampling.seed ^ 0x9e37_79b9_7f4a_7c15);
         let mut logits = self.forward(prompt, &mut cache, Logits::Last, None)?;
