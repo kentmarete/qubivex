@@ -95,6 +95,10 @@ enum Command {
         /// decaying heat) or lru.
         #[arg(long, default_value = "lfru")]
         cache_policy: String,
+        /// Threads reading experts from disk (0: the compute thread reads its own
+        /// misses). Default: 4.
+        #[arg(long)]
+        io_threads: Option<usize>,
         /// Context limit in tokens (default: the model's).
         #[arg(long)]
         context: Option<usize>,
@@ -150,6 +154,10 @@ enum Command {
         /// decaying heat) or lru.
         #[arg(long, default_value = "lfru")]
         cache_policy: String,
+        /// Threads reading experts from disk (0: the compute thread reads its own
+        /// misses). Default: 4.
+        #[arg(long)]
+        io_threads: Option<usize>,
         /// Context limit in tokens (default: the model's).
         #[arg(long)]
         context: Option<usize>,
@@ -272,6 +280,7 @@ pub(crate) struct MemoryOptions {
     profile: qubivex_memory::Profile,
     ram_budget: Option<u64>,
     cache_policy: qubivex_expert_stream::Policy,
+    io_threads: Option<usize>,
 }
 
 impl MemoryOptions {
@@ -293,6 +302,7 @@ impl MemoryOptions {
             profile: self.profile,
             ram_budget: self.ram_budget,
             cache_policy: self.cache_policy,
+            io_threads: self.io_threads,
             ..qubivex_runtime::EngineOptions::default()
         }
     }
@@ -304,8 +314,10 @@ fn memory_options(
     ram_fraction: Option<f64>,
     ram_budget: Option<&str>,
     cache_policy: &str,
+    io_threads: Option<usize>,
 ) -> Result<MemoryOptions, String> {
     Ok(MemoryOptions {
+        io_threads,
         cache_policy: match cache_policy {
             "lfru" => qubivex_expert_stream::Policy::LFRU,
             "lru" => qubivex_expert_stream::Policy::Lru,
@@ -398,6 +410,7 @@ fn execute(cmd: &Command) -> Result<(), String> {
             ram_fraction,
             ram_budget,
             cache_policy,
+            io_threads,
             context,
             threads,
             quiet,
@@ -418,6 +431,7 @@ fn execute(cmd: &Command) -> Result<(), String> {
                 *ram_fraction,
                 ram_budget.as_deref(),
                 cache_policy,
+                *io_threads,
             )?,
             context: *context,
             threads: *threads,
@@ -437,6 +451,7 @@ fn execute(cmd: &Command) -> Result<(), String> {
             ram_fraction,
             ram_budget,
             cache_policy,
+            io_threads,
             context,
             label,
             reference,
@@ -458,6 +473,7 @@ fn execute(cmd: &Command) -> Result<(), String> {
                 *ram_fraction,
                 ram_budget.as_deref(),
                 cache_policy,
+                *io_threads,
             )?,
             context: *context,
             label: label.as_deref(),

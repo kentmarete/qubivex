@@ -81,6 +81,24 @@ pub trait ExpertProvider: Sync {
         expert: ExpertIdx,
         f: &mut dyn FnMut(&ExpertWeights<'_>) -> Result<(), ArchError>,
     ) -> Result<(), ArchError>;
+
+    /// Calls `f` once for each of `experts` (distinct) of one layer, in any order. A
+    /// provider that can read several experts at once overrides this to start every
+    /// load before handing out the first; callers must not depend on the order.
+    ///
+    /// # Errors
+    /// As [`ExpertProvider::with_expert`].
+    fn with_experts(
+        &self,
+        layer: LayerIdx,
+        experts: &[ExpertIdx],
+        f: &mut dyn FnMut(ExpertIdx, &ExpertWeights<'_>) -> Result<(), ArchError>,
+    ) -> Result<(), ArchError> {
+        for &e in experts {
+            self.with_expert(layer, e, &mut |w| f(e, w))?;
+        }
+        Ok(())
+    }
 }
 
 /// Points of the forward pass that can be observed (numerical tests).
@@ -527,17 +545,25 @@ impl TransformerMoeModel {
                     by_expert[e as usize].push((t, r));
                 }
             }
-            for (e, users) in by_expert.iter().enumerate() {
-                if users.is_empty() {
-                    continue;
-                }
-                let n_t = users.len();
-                let mut xe = vec![0f32; n_t * h];
-                for (j, &(t, _)) in users.iter().enumerate() {
-                    xe[j * h..(j + 1) * h].copy_from_slice(&x[t * h..(t + 1) * h]);
-                }
-                let ei = ExpertIdx(u32::try_from(e).unwrap_or(u32::MAX));
-                experts.with_expert(LayerIdx(li), ei, &mut |w: &ExpertWeights<'_>| {
+            // Every routed expert of the layer is requested at once, so the provider can
+            // start all its loads first. Each writes its own rank slots of `contrib`, so
+            // the order they come back in cannot change the result.
+            let used: Vec<ExpertIdx> = by_expert
+                .iter()
+                .enumerate()
+                .filter(|(_, u)| !u.is_empty())
+                .map(|(e, _)| ExpertIdx(u32::try_from(e).unwrap_or(u32::MAX)))
+                .collect();
+            experts.with_experts(
+                LayerIdx(li),
+                &used,
+                &mut |ei: ExpertIdx, w: &ExpertWeights<'_>| {
+                    let users = &by_expert[ei.0 as usize];
+                    let n_t = users.len();
+                    let mut xe = vec![0f32; n_t * h];
+                    for (j, &(t, _)) in users.iter().enumerate() {
+                        xe[j * h..(j + 1) * h].copy_from_slice(&x[t * h..(t + 1) * h]);
+                    }
                     let ffn = w.gate.rows();
                     let mut g = vec![0f32; n_t * ffn];
                     let mut u = vec![0f32; n_t * ffn];
@@ -551,8 +577,8 @@ impl TransformerMoeModel {
                         contrib[dst..dst + h].copy_from_slice(&y[j * h..(j + 1) * h]);
                     }
                     Ok(())
-                })?;
-            }
+                },
+            )?;
             for (t, (_, w)) in picks.iter().enumerate() {
                 let out = &mut o[t * h..(t + 1) * h];
                 out.fill(0.0);

@@ -156,6 +156,11 @@ benchmark records the hit rate, bytes read per token and tok/s.
 per token and slab allocations in the bench record (ADR-008 amendment 1). At a 1 GiB
 budget the hit rate goes from 0% to 10.9% and decode from 12.0 to 14.9 tok/s. Next:
 the I/O queue, worker pool and `acquire_many`.
+Slice 2 is done: `acquire_many` and the `Batch` iterator; the MoE layer requests a
+whole layer through `with_experts`; a priority queue with 4 I/O threads by default;
+cancellation and error delivery; and within-expert coalescing (ADR-006 amendment 1).
+At 1 GiB, decode goes from 14.9 to 20.2 tok/s with identical tokens. Next: direct I/O,
+io_uring, the I/O matrix and the exit check.
 
 ### Phase 7: Predictive loading
 Router-lookahead predictor (next layer's norm and router on the current hidden state,

@@ -38,6 +38,42 @@ pub struct ExpertLayout {
     pub parts: Vec<PartLayout>,
     /// Total bytes.
     pub size: usize,
+    /// The reads that fill the expert: parts adjacent both in the file and in the
+    /// expert's bytes are coalesced into one.
+    extents: Vec<Extent>,
+}
+
+/// One read: `len` bytes at `file_offset` of `file` into `offset` of the expert.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Extent {
+    file: usize,
+    file_offset: u64,
+    offset: usize,
+    len: usize,
+}
+
+/// The parts' reads, merging each part into the previous read when it continues it
+/// in both the file and the expert's bytes.
+fn coalesce(parts: &[PartLayout]) -> Vec<Extent> {
+    let mut out: Vec<Extent> = Vec::new();
+    for p in parts {
+        if let Some(last) = out.last_mut() {
+            if last.file == p.file
+                && last.file_offset + last.len as u64 == p.file_offset
+                && last.offset + last.len == p.offset
+            {
+                last.len += p.len;
+                continue;
+            }
+        }
+        out.push(Extent {
+            file: p.file,
+            file_offset: p.file_offset,
+            offset: p.offset,
+            len: p.len,
+        });
+    }
+    out
 }
 
 impl ExpertLayout {
@@ -45,6 +81,12 @@ impl ExpertLayout {
     #[must_use]
     pub fn part(&self, p: ExpertPart) -> Option<&PartLayout> {
         self.parts.iter().find(|x| x.part == p)
+    }
+
+    /// Reads needed to fill the expert, after coalescing.
+    #[must_use]
+    pub fn reads(&self) -> usize {
+        self.extents.len()
     }
 }
 
@@ -148,11 +190,13 @@ impl ModelExpertSource {
                     p.offset = off;
                     off += p.len;
                 }
+                let extents = coalesce(&ps);
                 (
                     k,
                     ExpertLayout {
                         parts: ps,
                         size: off,
+                        extents,
                     },
                 )
             })
@@ -231,17 +275,68 @@ impl ExpertSource for ModelExpertSource {
                 detail: format!("buffer of {} bytes for a {}-byte expert", dst.len(), e.size),
             });
         }
-        for p in &e.parts {
+        for x in &e.extents {
             read_at(
-                &self.files[p.file],
-                &mut dst[p.offset..p.offset + p.len],
-                p.file_offset,
+                &self.files[x.file],
+                &mut dst[x.offset..x.offset + x.len],
+                x.file_offset,
             )
             .map_err(|err| StoreError::Load {
                 key,
-                detail: format!("{:?}: {err}", p.part),
+                detail: format!("{} bytes at {}: {err}", x.len, x.file_offset),
             })?;
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn part(
+        part: ExpertPart,
+        file: usize,
+        file_offset: u64,
+        offset: usize,
+        len: usize,
+    ) -> PartLayout {
+        PartLayout {
+            part,
+            dtype: DType::F32,
+            rows: 1,
+            cols: len / 4,
+            offset,
+            len,
+            file,
+            file_offset,
+        }
+    }
+
+    #[test]
+    fn contiguous_parts_become_one_read() {
+        use ExpertPart::{Down, Gate, Up};
+        // gate, up, down back to back in one file: one read.
+        let ps = [
+            part(Gate, 0, 100, 0, 8),
+            part(Up, 0, 108, 8, 8),
+            part(Down, 0, 116, 16, 8),
+        ];
+        assert_eq!(
+            coalesce(&ps),
+            [Extent {
+                file: 0,
+                file_offset: 100,
+                offset: 0,
+                len: 24
+            }]
+        );
+        // A gap, a different file, or a file order unlike the byte order: separate reads.
+        let gap = [part(Gate, 0, 100, 0, 8), part(Up, 0, 112, 8, 8)];
+        assert_eq!(coalesce(&gap).len(), 2);
+        let files = [part(Gate, 0, 100, 0, 8), part(Up, 1, 108, 8, 8)];
+        assert_eq!(coalesce(&files).len(), 2);
+        let swapped = [part(Gate, 0, 108, 0, 8), part(Up, 0, 100, 8, 8)];
+        assert_eq!(coalesce(&swapped).len(), 2);
     }
 }

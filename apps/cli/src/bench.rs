@@ -125,6 +125,9 @@ struct Config {
     /// The expert pools' replacement policy (absent before Phase 6).
     #[serde(default)]
     cache_policy: Option<String>,
+    /// Expert I/O threads (absent before Phase 6 slice 2).
+    #[serde(default)]
+    io_threads: Option<usize>,
     context: usize,
     prompt: String,
     prompt_tokens: usize,
@@ -233,6 +236,10 @@ struct Experts {
     /// Slab buffers allocated during the measured runs (absent before Phase 6).
     #[serde(default)]
     slab_allocs: u64,
+    /// Time the forward pass spent blocked on expert loads, per generated token
+    /// (absent before Phase 6 slice 2).
+    #[serde(default)]
+    wait_ms_per_token: f64,
 }
 
 /// The correctness part of the record.
@@ -550,6 +557,7 @@ pub(crate) fn bench(a: &BenchArgs<'_>) -> Result<String, String> {
             expert_cache: Bytes(engine.expert_cache_bytes()),
             expert_slots: engine.expert_pools().iter().map(|p| p.slots).collect(),
             cache_policy: Some(format!("{:?}", a.memory.cache_policy())),
+            io_threads: Some(engine.io_threads()),
             context,
             prompt: a.prompt.to_owned(),
             prompt_tokens: prompt.len(),
@@ -594,6 +602,9 @@ pub(crate) fn bench(a: &BenchArgs<'_>) -> Result<String, String> {
                 (after.bytes_read - before.bytes_read) / (a.runs * a.decode_tokens).max(1) as u64,
             ),
             slab_allocs: after.slab_allocs - before.slab_allocs,
+            wait_ms_per_token: (after.wait_ns - before.wait_ns) as f64
+                / 1e6
+                / (a.runs * a.decode_tokens).max(1) as f64,
         },
         check: Check {
             deterministic: first_divergence.is_none(),
@@ -721,12 +732,16 @@ fn render(r: &Record) -> String {
     );
     let _ = writeln!(
         s,
-        "            hit rate {:.1}%, {} read per token, {} slab allocations; {} pools of {}",
+        "            hit rate {:.1}%, {} read and {:.2} ms blocked per token, {} slab allocations; {} pools of {}, {} I/O threads",
         e.hit_rate * 100.0,
         e.bytes_per_token,
+        e.wait_ms_per_token,
         e.slab_allocs,
         r.config.cache_policy.as_deref().unwrap_or("?"),
-        slot_runs(&r.config.expert_slots)
+        slot_runs(&r.config.expert_slots),
+        r.config
+            .io_threads
+            .map_or_else(|| "?".to_owned(), |n| n.to_string())
     );
     let k = &r.check;
     let reference = match (k.reference_match, k.reference_divergence) {

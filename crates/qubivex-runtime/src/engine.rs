@@ -15,7 +15,7 @@ use qubivex_backend_cpu::CpuBackend;
 use qubivex_compute::WeightView;
 use qubivex_compute::tensor::Tensor;
 use qubivex_core::{Bytes, ExpertIdx, LayerIdx, Shape};
-use qubivex_expert_stream::{ExpertKey, ExpertStore, Policy, PoolSpec, StoreStats};
+use qubivex_expert_stream::{ExpertKey, ExpertStore, Policy, PoolSpec, StoreError, StoreStats};
 use qubivex_hardware::{Host, Probed, ResourceProbe, SystemProbe};
 use qubivex_memory::{
     Charge, HostMemory, LayerExperts, MemoryLedger, MemoryPlan, ModelFootprint, Owner, PlanRequest,
@@ -48,10 +48,16 @@ pub struct EngineOptions {
     pub pressure: PressureConfig,
     /// How a full expert pool picks its victim (ADR-008).
     pub cache_policy: Policy,
+    /// Dedicated threads reading experts (ADR-006). `None`: the default (see
+    /// [`DEFAULT_IO_THREADS`]); `Some(0)`: the compute thread reads its own misses.
+    pub io_threads: Option<usize>,
     /// Compute threads. `None`: the CPU's compute team (its fastest cores: efficiency
     /// cores slow a team that meets at every matmul), else every logical CPU.
     pub threads: Option<usize>,
 }
+
+/// I/O threads when none are requested.
+pub const DEFAULT_IO_THREADS: usize = 4;
 
 /// The default thread count: the compute team, else every logical CPU.
 fn default_threads() -> usize {
@@ -85,13 +91,14 @@ struct StoreProvider<'a> {
     source: &'a ModelExpertSource,
 }
 
-impl ExpertProvider for StoreProvider<'_> {
-    fn with_expert(
+impl StoreProvider<'_> {
+    /// An expert's matrices inside its leased bytes.
+    fn weights<'b>(
         &self,
         layer: LayerIdx,
         expert: ExpertIdx,
-        f: &mut dyn FnMut(&ExpertWeights<'_>) -> Result<(), ArchError>,
-    ) -> Result<(), ArchError> {
+        bytes: &'b [u8],
+    ) -> Result<ExpertWeights<'b>, ArchError> {
         let err = |detail: String| ArchError::Expert {
             layer: layer.0,
             expert: expert.0,
@@ -101,12 +108,7 @@ impl ExpertProvider for StoreProvider<'_> {
             .source
             .layout(layer, expert)
             .ok_or_else(|| err("no such expert".into()))?;
-        let lease = self
-            .store
-            .acquire((layer, expert))
-            .map_err(|e| err(e.to_string()))?;
-        let bytes = lease.bytes();
-        let view = |p: ExpertPart| -> Result<Option<WeightView<'_>>, ArchError> {
+        let view = |p: ExpertPart| -> Result<Option<WeightView<'b>>, ArchError> {
             layout
                 .part(p)
                 .map(|l| {
@@ -128,7 +130,59 @@ impl ExpertProvider for StoreProvider<'_> {
             }
             _ => return Err(err("expected gate and up, or a stacked gate-up".into())),
         };
-        f(&ExpertWeights { gate, up, down })
+        Ok(ExpertWeights { gate, up, down })
+    }
+}
+
+fn store_err(layer: LayerIdx, expert: ExpertIdx, e: &StoreError) -> ArchError {
+    ArchError::Expert {
+        layer: layer.0,
+        expert: expert.0,
+        detail: e.to_string(),
+    }
+}
+
+impl ExpertProvider for StoreProvider<'_> {
+    fn with_expert(
+        &self,
+        layer: LayerIdx,
+        expert: ExpertIdx,
+        f: &mut dyn FnMut(&ExpertWeights<'_>) -> Result<(), ArchError>,
+    ) -> Result<(), ArchError> {
+        let lease = self
+            .store
+            .acquire((layer, expert))
+            .map_err(|e| store_err(layer, expert, &e))?;
+        f(&self.weights(layer, expert, lease.bytes())?)
+    }
+
+    /// Starts every miss of the layer before waiting on any, and computes each expert
+    /// as soon as it is ready (hits first). Each lease is released before the next is
+    /// taken, so a layer with fewer slots than routed experts pipelines through them.
+    fn with_experts(
+        &self,
+        layer: LayerIdx,
+        experts: &[ExpertIdx],
+        f: &mut dyn FnMut(ExpertIdx, &ExpertWeights<'_>) -> Result<(), ArchError>,
+    ) -> Result<(), ArchError> {
+        let keys: Vec<_> = experts.iter().map(|&e| (layer, e)).collect();
+        let first = experts.first().copied().unwrap_or(ExpertIdx(0));
+        let batch = self
+            .store
+            .acquire_many(&keys)
+            .map_err(|e| store_err(layer, first, &e))?;
+        for lease in batch {
+            let lease = lease.map_err(|e| {
+                let at = match &e {
+                    StoreError::Load { key, .. } | StoreError::Full { key, .. } => key.1,
+                    _ => first,
+                };
+                store_err(layer, at, &e)
+            })?;
+            let expert = lease.key().1;
+            f(expert, &self.weights(layer, expert, lease.bytes())?)?;
+        }
+        Ok(())
     }
 }
 
@@ -362,11 +416,14 @@ impl Engine {
             }
         };
         let layers = footprint.layers;
-        let store = ExpertStore::new(
+        let io_threads = opts.io_threads.unwrap_or(DEFAULT_IO_THREADS);
+        let store = ExpertStore::with_io_threads(
             source.clone(),
             &pools_for(&layers, capacity),
             opts.cache_policy,
-        );
+            io_threads,
+        )
+        .map_err(|e| RuntimeError::Model(format!("cannot start {io_threads} I/O threads: {e}")))?;
         let ledger = MemoryLedger::new(0);
         let charges = Charges {
             _dense: ledger.charge(Tier::Ram, Owner::Dense, Bytes(dense_bytes)),
@@ -419,6 +476,12 @@ impl Engine {
             tokenizer,
             backend,
         })
+    }
+
+    /// Expert I/O threads in use.
+    #[must_use]
+    pub fn io_threads(&self) -> usize {
+        self.store.io_threads()
     }
 
     /// Compute threads in use.
