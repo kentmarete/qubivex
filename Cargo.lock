@@ -762,6 +762,7 @@ dependencies = [
  "clap",
  "qubivex-core",
  "qubivex-hardware",
+ "qubivex-memory",
  "qubivex-model",
  "qubivex-runtime",
  "qubivex-tokenizer",
@@ -802,6 +803,19 @@ version = "0.1.0"
 dependencies = [
  "qubivex-core",
  "rustix",
+ "serde",
+ "serde_json",
+ "thiserror",
+]
+
+[[package]]
+name = "qubivex-memory"
+version = "0.1.0"
+dependencies = [
+ "proptest",
+ "qubivex-core",
+ "qubivex-hardware",
+ "qubivex-model",
  "serde",
  "serde_json",
  "thiserror",

@@ -12,6 +12,15 @@ Last updated: 2026-11-03
 - **In-workspace benchmarks, done (2026-11-03).** Criterion kernel benches (`cargo bench -p qubivex-backend-cpu --bench kernels`) and `qubivex bench` (prefill and decode with build, hardware, median/P95, peak RSS and a token check, as a JSON record). Baseline on the M3 Pro, warm, 5 threads: decode 25.8 tok/s at the median step (P95 step 51.6 ms vs median 38.8 ms); prefill 44 tok/s at 128 tokens. Q4_K decode is limited by compute (17 GiB/s whether the matrix is in cache or in DRAM, against 80 GiB/s for bf16). Protocol and tables: `docs/performance/BENCHMARKING.md`; records: `docs/performance/baselines/`.
 - **Next:** Phase 5 (memory planner), with measured kernel follow-ups (MIGRATION_PLAN §3a).
 
+**Phase 5: memory planner, slice 1 of 3 done (2026-11-03).**
+- Code: the `qubivex-memory` crate.
+  - `ModelFootprint` is derived from tensor roles only. The KV cost per token is the K/V projection width × 4 bytes.
+  - `plan()` gives one RAM budget per profile (performance 0.88, balanced 0.75, saver 0.50, custom), with the room the KV and expert caches share and admission that keeps one expert slot per layer.
+  - Non-uniform per-layer slots; `MemoryLedger` with RAII charges; `qubivex plan <model> [--ram-budget] [--ctx] [--profile] [--sequences] [--json]`.
+- Tests: the fixture footprints agree with the model's byte summary and the architecture's head counts. The admission test keeps the floor. Property tests (2,000 cases each) show plans never exceed their budget at any KV length, refusals are real, and the slot distribution is tight.
+- Real model, M3 Pro: every expert (3.63 GiB) fits beside a 1 GiB full-context KV in a 5.53 GiB budget. At `--ram-budget 2GiB` the cache shrinks from 1.21 GiB to 215 MiB at full context; at 1 GiB the context is shortened to 629 tokens.
+- **Next:** slice 2 adds load-time planning in the engine (measured after the dense load), ledger charges, KV growth shrinking the store, and the ledger-against-RSS test. Slice 3 adds the pressure monitor and the RAM-hog test.
+
 **Phase 4: CPU inference prototype, done.** `qubivex run` generates correct text on CPU from the real OLMoE GGUF, and every numerical test passes:
 - against `transformers` the worst relative error is ≤ 7.2e-7, with identical experts and greedy tokens;
 - against an independent f64 reference it is ≤ 3.3e-7;

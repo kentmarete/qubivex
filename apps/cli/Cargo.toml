@@ -16,6 +16,7 @@ path = "src/main.rs"
 clap = { workspace = true }
 qubivex-core = { workspace = true }
 qubivex-hardware = { workspace = true }
+qubivex-memory = { workspace = true }
 qubivex-model = { workspace = true }
 qubivex-runtime = { workspace = true }
 qubivex-tokenizer = { workspace = true }
