@@ -7,6 +7,7 @@
 
 use core::ffi::c_void;
 use core::ptr::NonNull;
+use std::sync::{Arc, Mutex};
 
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
@@ -16,6 +17,8 @@ use objc2_metal::{
     MTLCompileOptions, MTLComputeCommandEncoder, MTLComputePipelineState,
     MTLCreateSystemDefaultDevice, MTLDevice, MTLLibrary, MTLMathMode, MTLResourceOptions, MTLSize,
 };
+
+use qubivex_compute::host::PageAligned;
 
 use crate::{DeviceInfo, MetalError};
 
@@ -56,12 +59,52 @@ impl Params {
     }
 }
 
-/// A shared-storage device buffer.
-#[derive(Debug)]
+/// A shared-storage device buffer. A buffer that wraps host memory in place holds that
+/// memory (`_host`) for as long as the buffer, or any clone of it, lives (ADR-011 §3).
+#[derive(Clone, Debug)]
 pub(crate) struct Buffer {
     raw: Retained<ProtocolObject<dyn MTLBuffer>>,
     len: usize,
+    _host: Option<Arc<PageAligned>>,
 }
+
+// SAFETY: an MTLBuffer object may be retained, released and bound from any thread
+// (Metal resources are thread-safe objects; objc2-metal only leaves the protocol
+// unmarked). Its contents are touched by the CPU only in `Device::run` under the
+// scratch lock, after the GPU's last use has completed, and wrapped host memory
+// (`_host`) is never written through a buffer.
+unsafe impl Send for Buffer {}
+// SAFETY: as for `Send`; `&Buffer` only allows binding and reading the length.
+unsafe impl Sync for Buffer {}
+
+impl Buffer {
+    pub(crate) const fn len(&self) -> usize {
+        self.len
+    }
+}
+
+/// One kernel dispatch of a batch: weights `w` from byte `w_offset`, activations `xs`
+/// (`s × k`) and outputs `ys` (`s × n`). The caller has checked the shapes and that
+/// `w` holds `n × row_bytes` bytes from `w_offset`.
+pub(crate) struct Dispatch<'a> {
+    pub(crate) pipeline: usize,
+    pub(crate) w: &'a Buffer,
+    pub(crate) w_offset: usize,
+    pub(crate) xs: &'a [f32],
+    pub(crate) ys: &'a mut [f32],
+    pub(crate) params: Params,
+}
+
+/// Activation and output staging buffers, kept between submissions so a dispatch does
+/// not allocate. Each holds the largest size asked for so far.
+#[derive(Debug, Default)]
+struct Scratch {
+    inputs: Option<Buffer>,
+    outputs: Option<Buffer>,
+}
+
+/// Offsets inside staging buffers are rounded to this many bytes.
+const STAGE_ALIGN: usize = 256;
 
 /// The device, its queue and one pipeline per kernel.
 #[derive(Debug)]
@@ -69,6 +112,8 @@ pub(crate) struct Device {
     device: Retained<ProtocolObject<dyn MTLDevice>>,
     queue: Retained<ProtocolObject<dyn MTLCommandQueue>>,
     pipelines: Vec<Retained<ProtocolObject<dyn MTLComputePipelineState>>>,
+    /// Submissions are serialised: one batch owns the staging buffers at a time.
+    scratch: Mutex<Scratch>,
 }
 
 impl Device {
@@ -115,6 +160,7 @@ impl Device {
             device,
             queue,
             pipelines,
+            scratch: Mutex::new(Scratch::default()),
         })
     }
 
@@ -155,6 +201,41 @@ impl Device {
         Ok(Buffer {
             raw,
             len: bytes.len(),
+            _host: None,
+        })
+    }
+
+    /// A buffer over `host`'s padded region, without a copy. The buffer holds `host`.
+    pub(crate) fn wrap(&self, host: Arc<PageAligned>) -> Result<Buffer, MetalError> {
+        let region = host.padded();
+        let ptr = NonNull::new(region.as_ptr().cast_mut().cast::<c_void>()).ok_or(
+            MetalError::Create {
+                what: "buffer",
+                detail: Some("null region".into()),
+            },
+        )?;
+        // SAFETY: `region` is page-aligned and a whole number of pages (PageAligned's
+        // invariant), as newBufferWithBytesNoCopy requires. The memory stays allocated
+        // and unchanged while the buffer exists: the returned Buffer (and every clone)
+        // holds the Arc, PageAligned never reallocates, and no `&mut` can be taken
+        // through a shared Arc. With no deallocator, Metal never frees it.
+        let raw = unsafe {
+            self.device
+                .newBufferWithBytesNoCopy_length_options_deallocator(
+                    ptr,
+                    region.len(),
+                    MTLResourceOptions::StorageModeShared,
+                    None,
+                )
+        }
+        .ok_or(MetalError::Create {
+            what: "no-copy buffer",
+            detail: Some(format!("{} bytes", region.len())),
+        })?;
+        Ok(Buffer {
+            len: region.len(),
+            raw,
+            _host: Some(host),
         })
     }
 
@@ -166,24 +247,66 @@ impl Device {
                 what: "buffer",
                 detail: Some(format!("{len} bytes")),
             })?;
-        Ok(Buffer { raw, len })
+        Ok(Buffer {
+            raw,
+            len,
+            _host: None,
+        })
     }
 
-    /// Runs kernel `pipeline` on resident weights `w`, synchronously. The caller has
-    /// checked the shapes (`xs` is `s × k`, `ys` is `s × n`, both non-empty) and that
-    /// `w` holds `n × row_bytes` bytes.
-    pub(crate) fn matmul(
-        &self,
-        pipeline: usize,
-        w: &Buffer,
-        xs: &[f32],
-        ys: &mut [f32],
-        p: Params,
-    ) -> Result<(), MetalError> {
-        let x_bytes = f32_bytes(xs);
-        let xbuf = self.buffer_from(x_bytes)?;
-        let ylen = core::mem::size_of_val(ys);
-        let ybuf = self.buffer_zeroed(ylen)?;
+    /// A staging buffer of at least `need` bytes, reusing `slot`'s if it is large enough.
+    fn stage(&self, slot: &mut Option<Buffer>, need: usize) -> Result<Buffer, MetalError> {
+        if let Some(b) = slot.as_ref().filter(|b| b.len >= need) {
+            return Ok(b.clone());
+        }
+        let b = self.buffer_zeroed(need.max(64 * 1024).next_power_of_two())?;
+        *slot = Some(b.clone());
+        Ok(b)
+    }
+
+    /// Runs `ops` in one command buffer and waits for it (ADR-011 §2). Activations that
+    /// are the same slice (for example the shared input of the q, k and v projections)
+    /// are staged once.
+    pub(crate) fn run(&self, ops: &mut [Dispatch<'_>]) -> Result<(), MetalError> {
+        if ops.is_empty() {
+            return Ok(());
+        }
+        let round = |b: usize| b.div_ceil(STAGE_ALIGN) * STAGE_ALIGN;
+        // Staging layout: each distinct input once, each output in order.
+        let mut x_at: Vec<usize> = Vec::with_capacity(ops.len());
+        let mut x_seen: Vec<(*const f32, usize, usize)> = Vec::new();
+        let mut x_len = 0;
+        let mut y_at: Vec<usize> = Vec::with_capacity(ops.len());
+        let mut y_len = 0;
+        for op in ops.iter() {
+            let key = (op.xs.as_ptr(), op.xs.len());
+            let at = if let Some(&(_, _, at)) = x_seen.iter().find(|(p, l, _)| (*p, *l) == key) {
+                at
+            } else {
+                let at = x_len;
+                x_seen.push((key.0, key.1, at));
+                x_len += round(core::mem::size_of_val(op.xs));
+                at
+            };
+            x_at.push(at);
+            y_at.push(y_len);
+            y_len += round(core::mem::size_of_val(op.ys));
+        }
+        let mut scratch = self
+            .scratch
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let xbuf = self.stage(&mut scratch.inputs, x_len)?;
+        let ybuf = self.stage(&mut scratch.outputs, y_len)?;
+        let xbase = xbuf.raw.contents().as_ptr().cast::<u8>();
+        for &(p, l, at) in &x_seen {
+            // SAFETY: no command buffer uses the staging buffers (the scratch lock is
+            // held and every earlier submission was waited for). `at + 4l <= x_len <=
+            // xbuf.len`, and `p` points to `l` f32 of a distinct host allocation.
+            unsafe {
+                core::ptr::copy_nonoverlapping(p.cast::<u8>(), xbase.add(at), 4 * l);
+            }
+        }
         let cmd = self.queue.commandBuffer().ok_or(MetalError::Create {
             what: "command buffer",
             detail: None,
@@ -192,30 +315,33 @@ impl Device {
             what: "compute encoder",
             detail: None,
         })?;
-        enc.setComputePipelineState(&self.pipelines[pipeline]);
-        let params = NonNull::from(&p).cast::<c_void>();
-        // SAFETY: indices 0..=3 match the kernel's [[buffer(n)]] bindings and types
-        // (bytes, f32, f32, Params). The buffers live until `waitUntilCompleted`
-        // returns below; `params` is copied by setBytes. The kernel reads at most
-        // `n × row_bytes` weight bytes, `s × k` activations and writes `s × n`
-        // outputs, which are the buffers' sizes.
-        unsafe {
-            enc.setBuffer_offset_atIndex(Some(&w.raw), 0, 0);
-            enc.setBuffer_offset_atIndex(Some(&xbuf.raw), 0, 1);
-            enc.setBuffer_offset_atIndex(Some(&ybuf.raw), 0, 2);
-            enc.setBytes_length_atIndex(params, core::mem::size_of::<Params>(), 3);
+        for (i, op) in ops.iter().enumerate() {
+            enc.setComputePipelineState(&self.pipelines[op.pipeline]);
+            let params = NonNull::from(&op.params).cast::<c_void>();
+            // SAFETY: indices 0..=3 match the kernel's [[buffer(n)]] bindings and types
+            // (bytes, f32, f32, Params). All three buffers live until
+            // `waitUntilCompleted` returns below; `params` is copied by setBytes. The
+            // kernel reads `n × row_bytes` weight bytes from `w_offset` (checked by the
+            // caller to be inside `w`), `s × k` f32 from `x_at[i]` and writes `s × n`
+            // f32 from `y_at[i]`, both inside the staging buffers by construction.
+            unsafe {
+                enc.setBuffer_offset_atIndex(Some(&op.w.raw), op.w_offset, 0);
+                enc.setBuffer_offset_atIndex(Some(&xbuf.raw), x_at[i], 1);
+                enc.setBuffer_offset_atIndex(Some(&ybuf.raw), y_at[i], 2);
+                enc.setBytes_length_atIndex(params, core::mem::size_of::<Params>(), 3);
+            }
+            let groups = MTLSize {
+                width: (op.params.n as usize).div_ceil(ROWS),
+                height: op.params.s as usize,
+                depth: 1,
+            };
+            let threads = MTLSize {
+                width: ROWS * SIMD_WIDTH,
+                height: 1,
+                depth: 1,
+            };
+            enc.dispatchThreadgroups_threadsPerThreadgroup(groups, threads);
         }
-        let groups = MTLSize {
-            width: (p.n as usize).div_ceil(ROWS),
-            height: p.s as usize,
-            depth: 1,
-        };
-        let threads = MTLSize {
-            width: ROWS * SIMD_WIDTH,
-            height: 1,
-            depth: 1,
-        };
-        enc.dispatchThreadgroups_threadsPerThreadgroup(groups, threads);
         enc.endEncoding();
         cmd.commit();
         cmd.waitUntilCompleted();
@@ -225,23 +351,20 @@ impl Device {
                 |e| ns_error(&e),
             )));
         }
-        debug_assert_eq!(ybuf.len, ylen);
-        // SAFETY: the command buffer has completed, so the GPU no longer writes the
-        // shared buffer; `contents` points to `ylen` bytes of f32 written by the kernel
-        // (or zero), and `ys` is a distinct host allocation of the same length.
-        unsafe {
-            core::ptr::copy_nonoverlapping(
-                ybuf.raw.contents().as_ptr().cast::<f32>(),
-                ys.as_mut_ptr(),
-                ys.len(),
-            );
+        let ybase = ybuf.raw.contents().as_ptr().cast::<u8>();
+        for (op, &at) in ops.iter_mut().zip(&y_at) {
+            // SAFETY: the command buffer has completed, so the GPU no longer writes the
+            // staging buffer; `at + size_of_val(ys) <= y_len <= ybuf.len`, written by the
+            // kernel, and `ys` is a distinct host allocation.
+            unsafe {
+                core::ptr::copy_nonoverlapping(
+                    ybase.add(at).cast::<f32>(),
+                    op.ys.as_mut_ptr(),
+                    op.ys.len(),
+                );
+            }
         }
+        drop(scratch);
         Ok(())
     }
-}
-
-fn f32_bytes(v: &[f32]) -> &[u8] {
-    // SAFETY: f32 has no padding or invalid bit patterns as bytes, u8 has alignment 1,
-    // and the length covers exactly the same memory.
-    unsafe { core::slice::from_raw_parts(v.as_ptr().cast::<u8>(), core::mem::size_of_val(v)) }
 }

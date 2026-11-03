@@ -122,6 +122,15 @@ prefetches and the mean lead time. Compare it against a run without `--prefetch`
 same budget, interleaved. Blocked time per token is the latency prefetch hides, and the
 decode rate says whether that mattered. Results: ADR-008 amendment 2.
 
+### Device placement (Phase 8)
+
+`--backend metal` (with `--metal-ops attention,router,head`; default `head`) runs the
+chosen dense matmuls on the Apple GPU and adds `config.device` to the record: backend,
+device, placed kinds, tensor count and bytes. Placement never changes bits, so always
+pass `--reference` with a CPU record: the tokens must match. Kernel-level batching is
+measured by the Criterion group `metal_batch` (`cargo bench -p qubivex-backend-metal
+--bench kernels`). Results: ADR-011 amendment 1.
+
 ### How to read the numbers
 
 - **Report the median, and the P95 next to it.** A P95 far above the median means jitter

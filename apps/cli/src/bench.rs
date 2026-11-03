@@ -136,6 +136,10 @@ struct Config {
     /// Phase 7).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     prefetch: Option<PrefetchConfig>,
+    /// The compute backend and device placement; absent on the CPU (and before
+    /// Phase 8 slice 2).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    device: Option<DeviceConfig>,
     context: usize,
     prompt: String,
     prompt_tokens: usize,
@@ -254,6 +258,16 @@ struct Experts {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
+struct DeviceConfig {
+    backend: String,
+    device: Option<String>,
+    /// The dense matmul kinds on the device (`head`, `attention,router,head`, ...).
+    ops: Option<String>,
+    tensors: usize,
+    bytes: Bytes,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
 struct PrefetchConfig {
     guard: bool,
     smooth: f32,
@@ -649,6 +663,16 @@ pub(crate) fn bench(a: &BenchArgs<'_>) -> Result<String, String> {
                 confidence: p.lookahead.confidence,
                 width: p.lookahead.width,
             }),
+            device: {
+                let p = engine.placement();
+                (p.backend != qubivex_runtime::BackendKind::Cpu).then(|| DeviceConfig {
+                    backend: p.backend.name().to_owned(),
+                    device: p.device.clone(),
+                    ops: p.ops.map(qubivex_runtime::MetalOps::describe),
+                    tensors: p.tensors,
+                    bytes: Bytes(p.bytes),
+                })
+            },
             context,
             prompt: a.prompt.to_owned(),
             prompt_tokens: prompt.len(),

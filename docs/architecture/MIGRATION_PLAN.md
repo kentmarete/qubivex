@@ -191,7 +191,11 @@ throttle, lookahead beyond one layer, and next-token layer-0 prediction.
 the M3 Pro), then CUDA, then Vulkan. The CUDA work below is unchanged, but comes second.
 Metal slices: (1) kernels with bit-identical CPU parity and benches (**done 2026-11-03**,
 ADR-011); (2) command-buffer batching, zero-copy weights, plan-time placement and token
-parity in the engine; (3) faster bit-exact kernels and the Metal exit benchmark.
+parity in the engine (**done 2026-11-03**, ADR-011 amendment 1: bit-identical tokens, but
+no decode gain, because a lone submission costs about 110 µs and the GPU idles between
+tokens; the CPU stays the default); (3) keeping the GPU busy (one submission per layer or
+token, with norms, RoPE, attention and the expert FFN as bit-exact Metal kernels), faster
+bit-exact kernels and the Metal exit benchmark.
 CUDA (`cudarc` and ported kernels): device buffers, ledger accounting, dense
 layers on the device, a VRAM expert tier, hybrid split (`hybrid_split.h`), and CPU/GPU
 in-frame combination in rank order. Then Vulkan (`ash` and ported shaders). Parity
