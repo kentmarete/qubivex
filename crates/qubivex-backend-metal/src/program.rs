@@ -17,7 +17,7 @@ use crate::device::{Arg, Buffer, Recorder, bytes_of};
 
 /// The forward-pass kernels, after the six matmul kernels in the pipeline list.
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
-pub(crate) const OP_KERNELS: [&str; 14] = [
+pub(crate) const OP_KERNELS: [&str; 21] = [
     "gather_rows",
     "scatter_rows",
     "exp_in_place",
@@ -32,6 +32,13 @@ pub(crate) const OP_KERNELS: [&str; 14] = [
     "attn_softmax",
     "attn_values",
     "moe_combine",
+    "moe_route",
+    "routed_f32",
+    "routed_f16",
+    "routed_bf16",
+    "routed_q8_0",
+    "routed_q4_k",
+    "routed_q6_k",
 ];
 
 #[cfg(target_os = "macos")]
@@ -190,6 +197,39 @@ struct RowsParams {
     h: u32,
     n: u32,
 }
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct RouteParams {
+    s: u32,
+    ne: u32,
+    k: u32,
+    norm: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct RoutedParams {
+    n: u32,
+    k: u32,
+    row_bytes: u32,
+    top_k: u32,
+    ne: u32,
+    per_entry: u32,
+}
+
+/// Which input row a routed entry reads (see [`Batch::routed_matmul`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RoutedInput {
+    /// Entry `j` reads its token's row `j / top_k` (the experts' gate and up).
+    Token,
+    /// Entry `j` reads row `j` (the experts' down, after SwiGLU).
+    Entry,
+}
+
+/// Experts one routed table may hold: the address table is passed inline (`setBytes`
+/// takes at most 4 KiB), and `moe_route` keeps a 256-bit mask.
+pub const MAX_ROUTED_EXPERTS: usize = 256;
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -406,6 +446,27 @@ fn groups(n: usize) -> [usize; 3] {
 }
 
 impl Batch<'_, '_> {
+    /// Records what `f` records so that the GPU may run its operations at once (ADR-011
+    /// amendment 4). They must be independent: none reads what another writes, and no
+    /// two write the same elements. Other operations are ordered as always: each runs
+    /// after everything recorded before it.
+    ///
+    /// # Errors
+    /// `f`'s error.
+    pub fn concurrent(
+        &mut self,
+        f: impl FnOnce(&mut Batch<'_, '_>) -> Result<(), ComputeError>,
+    ) -> Result<(), ComputeError> {
+        #[cfg(target_os = "macos")]
+        {
+            self.rec.group(|rec| f(&mut Batch { rec }))
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            f(self)
+        }
+    }
+
     /// `ys[t] = W · xs[t]` for `s` rows (the bits of [`MetalBackend::matmul_resident`]).
     ///
     /// # Errors
@@ -862,6 +923,171 @@ impl Batch<'_, '_> {
         }
         #[cfg(not(target_os = "macos"))]
         let _ = p;
+        Ok(())
+    }
+
+    /// `ops::route` for each of `s` tokens, on the GPU: the softmax of the token's `ne`
+    /// router logits (in place: `logits` is left holding the probabilities), the top `k`
+    /// experts by probability (ties: the lower id) in rank order, and their
+    /// probabilities, renormalised to sum to 1 when `norm`. Writes `k` expert ids per
+    /// token into `idx` (as u32 bits: read them back with `f32::to_bits`) and their
+    /// weights into `weights`, with the CPU's bits.
+    ///
+    /// # Errors
+    /// [`ComputeError::Shape`] if a span is too short, `k > ne`, or `ne` exceeds
+    /// [`MAX_ROUTED_EXPERTS`].
+    #[allow(clippy::too_many_arguments)]
+    pub fn moe_route(
+        &mut self,
+        logits: &Span<'_>,
+        s: usize,
+        ne: usize,
+        k: usize,
+        norm: bool,
+        idx: &Span<'_>,
+        weights: &Span<'_>,
+    ) -> Result<(), ComputeError> {
+        if ne > MAX_ROUTED_EXPERTS || k > ne {
+            return Err(shape(
+                "moe_route",
+                format!("top {k} of {ne} experts (at most {MAX_ROUTED_EXPERTS})"),
+            ));
+        }
+        need("moe_route", "logits", logits, s * ne)?;
+        need("moe_route", "ids", idx, s * k)?;
+        need("moe_route", "weights", weights, s * k)?;
+        if s == 0 || k == 0 {
+            return Ok(());
+        }
+        let p = RouteParams {
+            s: u32_of(s, "moe_route")?,
+            ne: u32_of(ne, "moe_route")?,
+            k: u32_of(k, "moe_route")?,
+            norm: u32::from(norm),
+        };
+        u32_of(s * ne, "moe_route")?;
+        #[cfg(target_os = "macos")]
+        {
+            let pb = bytes_of(&p);
+            self.rec.dispatch(
+                op("moe_route"),
+                &[logits.arg(), idx.arg(), weights.arg(), Arg::Bytes(&pb)],
+                [s.div_ceil(64), 1, 1],
+                [64, 1, 1],
+            );
+        }
+        #[cfg(not(target_os = "macos"))]
+        let _ = p;
+        Ok(())
+    }
+
+    /// Routed matmuls: for each entry `j` of `tokens × top_k`, `ys[j] = W_e · x` with
+    /// `e = idx[j]` (u32 bits, as [`Batch::moe_route`] writes them) and `x` the row
+    /// `input` names. `experts[e]` is expert `e`'s matrix; all must share a dtype and
+    /// shape. Every output has the bits of [`Batch::matmul`] on the same row, so one
+    /// dispatch replaces a gather, a matmul and a scatter per expert.
+    ///
+    /// An id outside the table reads the last expert (the kernel clamps it), so a bad
+    /// id gives wrong numbers, never an out-of-bounds read.
+    ///
+    /// # Errors
+    /// [`ComputeError::Shape`] if a span is too short, the table is empty, larger than
+    /// [`MAX_ROUTED_EXPERTS`] or mixes shapes, or a matrix overruns its buffer or is
+    /// misaligned; [`ComputeError::Unsupported`] for a dtype without a kernel.
+    #[allow(clippy::too_many_arguments)]
+    pub fn routed_matmul(
+        &mut self,
+        experts: &[&MetalWeights],
+        idx: &Span<'_>,
+        xs: &Span<'_>,
+        input: RoutedInput,
+        tokens: usize,
+        top_k: usize,
+        ys: &Span<'_>,
+    ) -> Result<(), ComputeError> {
+        const OP: &str = "routed_matmul";
+        let Some(first) = experts.first() else {
+            return Err(shape(OP, "no experts".into()));
+        };
+        if experts.len() > MAX_ROUTED_EXPERTS {
+            return Err(shape(
+                OP,
+                format!("{} experts exceed {MAX_ROUTED_EXPERTS}", experts.len()),
+            ));
+        }
+        let pipeline = check_dtype(first.dtype, OP)?;
+        for w in experts {
+            if (w.dtype, w.rows, w.cols, w.row_bytes)
+                != (first.dtype, first.rows, first.cols, first.row_bytes)
+            {
+                return Err(shape(
+                    OP,
+                    "the experts' matrices differ in dtype or shape".into(),
+                ));
+            }
+        }
+        let entries = tokens * top_k;
+        let rows_in = match input {
+            RoutedInput::Token => tokens,
+            RoutedInput::Entry => entries,
+        };
+        need(OP, "ids", idx, entries)?;
+        need(OP, "input", xs, rows_in * first.cols)?;
+        need(OP, "output", ys, entries * first.rows)?;
+        if entries == 0 || first.rows == 0 {
+            return Ok(());
+        }
+        let p = RoutedParams {
+            n: u32_of(first.rows, OP)?,
+            k: u32_of(first.cols, OP)?,
+            row_bytes: u32_of(first.row_bytes, OP)?,
+            top_k: u32_of(top_k, OP)?,
+            ne: u32_of(experts.len(), OP)?,
+            per_entry: u32::from(input == RoutedInput::Entry),
+        };
+        #[cfg(target_os = "macos")]
+        {
+            let mut table = Vec::with_capacity(experts.len() * 8);
+            for w in experts {
+                let end = w
+                    .rows
+                    .checked_mul(w.row_bytes)
+                    .and_then(|b| b.checked_add(w.offset));
+                if end.is_none_or(|e| e > w.buf.len()) {
+                    return Err(shape(OP, "weights overrun their buffer".into()));
+                }
+                if !crate::offset_ok(w.dtype, w.offset) {
+                    return Err(shape(
+                        OP,
+                        format!("{} weights at unaligned offset {}", w.dtype, w.offset),
+                    ));
+                }
+                table.extend_from_slice(&(w.buf.address() + w.offset as u64).to_le_bytes());
+            }
+            for w in experts {
+                self.rec.use_read(&w.buf);
+            }
+            let pb = bytes_of(&p);
+            self.rec.dispatch(
+                // The routed kernels follow `routed_f32` in `DTYPES` order.
+                op("routed_f32") + pipeline,
+                &[
+                    xs.arg(),
+                    ys.arg(),
+                    idx.arg(),
+                    Arg::Bytes(&table),
+                    Arg::Bytes(&pb),
+                ],
+                [
+                    first.rows.div_ceil(crate::device::rows_per_group(pipeline)),
+                    entries,
+                    1,
+                ],
+                [crate::device::ROWS * crate::device::SIMD_WIDTH, 1, 1],
+            );
+        }
+        #[cfg(not(target_os = "macos"))]
+        let _ = (p, pipeline);
         Ok(())
     }
 }

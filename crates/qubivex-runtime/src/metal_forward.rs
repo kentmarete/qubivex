@@ -15,15 +15,19 @@
 //!
 //! [`Transformer::forward`]: qubivex_arch::Transformer::forward
 
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use qubivex_arch::ops::{Rope, route};
 use qubivex_arch::{ArchError, DenseWeights, KvCache, Logits, layer_name};
 use qubivex_backend_cpu::CpuBackend;
-use qubivex_backend_metal::{AttentionShape, DeviceVec, MetalBackend, MetalHost, MetalWeights};
+use qubivex_backend_metal::{
+    AttentionShape, Batch, DeviceVec, MAX_ROUTED_EXPERTS, MetalBackend, MetalHost, MetalWeights,
+    RoutedInput,
+};
 use qubivex_compute::{ComputeBackend, ComputeError, WeightView};
 use qubivex_core::{ExpertIdx, LayerIdx};
-use qubivex_expert_stream::{ExpertStore, Lease};
+use qubivex_expert_stream::{ExpertKey, ExpertStore, Held, Lease};
 use qubivex_model::arch::{MoeConfig, QkNorm};
 
 use crate::ModelExpertSource;
@@ -93,6 +97,8 @@ struct Bufs {
     weights: DeviceVec,
     xf: DeviceVec,
     logits: DeviceVec,
+    /// Per layer, the expert ids `moe_route` chose (u32 bits), `s × top_k` each.
+    routes: DeviceVec,
 }
 
 /// Model dimensions.
@@ -132,6 +138,10 @@ pub(crate) struct MetalForward {
     final_norm: DeviceVec,
     head: MetalWeights,
     max_context: usize,
+    /// Route on the GPU (one submission per token) when every expert is resident.
+    token: bool,
+    /// Forward passes run as one submission with routing on the GPU.
+    routed_passes: AtomicU64,
     work: Mutex<Work>,
     tensors: usize,
     bytes: u64,
@@ -188,6 +198,7 @@ impl MetalForward {
         cfg: &MoeConfig,
         dense: &dyn DenseWeights,
         max_context: usize,
+        token: bool,
     ) -> Result<Self, ArchError> {
         let c = cfg.clone();
         let dims = Dims {
@@ -254,6 +265,8 @@ impl MetalForward {
             final_norm,
             head,
             max_context,
+            token,
+            routed_passes: AtomicU64::new(0),
             work: Mutex::new(Work::default()),
             tensors: count.0,
             bytes: count.1,
@@ -263,6 +276,11 @@ impl MetalForward {
     /// The device name.
     pub(crate) fn device(&self) -> String {
         self.be.info().name
+    }
+
+    /// Forward passes so far that ran as one submission, routed on the GPU.
+    pub(crate) fn routed_passes(&self) -> u64 {
+        self.routed_passes.load(Ordering::Relaxed)
     }
 
     /// Dense weight matrices on the device, and their bytes.
@@ -361,6 +379,7 @@ impl MetalForward {
             weights: v(s * k_top)?,
             xf: v(s * h)?,
             logits: v(s * vocab)?,
+            routes: v(self.layers.len() * s * k_top)?,
         });
         work.tokens = s;
         work.span = span;
@@ -406,20 +425,300 @@ impl MetalForward {
         experts: &[(&ExpertOnMetal, &ExpertJob<'_>)],
     ) -> Result<(), ComputeError> {
         let (h, ffn) = (self.dims.h, self.dims.ffn);
-        for (e, j) in experts {
-            let n = j.tokens.len();
-            let xe = w.xe.span(j.base * h, n * h)?;
-            let g = w.g.span(j.base * ffn, n * ffn)?;
-            let u = w.u.span(j.base * ffn, n * ffn)?;
-            let ye = w.ye.span(j.base * h, n * h)?;
-            b.gather_rows(&xe, &w.x.all(), &j.tokens, h)?;
-            b.matmul(&e.gate, &xe, n, &g)?;
-            b.matmul(&e.up, &xe, n, &u)?;
-            b.swiglu(&g, &u, n * ffn)?;
-            b.matmul(&e.down, &g, n, &ye)?;
-            b.scatter_rows(&w.contrib.all(), &ye, &j.slots, h)?;
+        // Experts own disjoint rows of the scratch buffers and distinct contrib slots,
+        // so each stage runs for every expert at once.
+        let spans = experts
+            .iter()
+            .map(|(e, j)| {
+                let n = j.tokens.len();
+                Ok((
+                    *e,
+                    *j,
+                    n,
+                    w.xe.span(j.base * h, n * h)?,
+                    w.g.span(j.base * ffn, n * ffn)?,
+                    w.u.span(j.base * ffn, n * ffn)?,
+                    w.ye.span(j.base * h, n * h)?,
+                ))
+            })
+            .collect::<Result<Vec<_>, ComputeError>>()?;
+        b.concurrent(|b| {
+            for (_, j, _, xe, ..) in &spans {
+                b.gather_rows(xe, &w.x.all(), &j.tokens, h)?;
+            }
+            Ok(())
+        })?;
+        b.concurrent(|b| {
+            for (e, _, n, xe, g, u, _) in &spans {
+                b.matmul(&e.gate, xe, *n, g)?;
+                b.matmul(&e.up, xe, *n, u)?;
+            }
+            Ok(())
+        })?;
+        b.concurrent(|b| {
+            for (_, _, n, _, g, u, _) in &spans {
+                b.swiglu(g, u, n * ffn)?;
+            }
+            Ok(())
+        })?;
+        b.concurrent(|b| {
+            for (e, _, n, _, g, _, ye) in &spans {
+                b.matmul(&e.down, g, *n, ye)?;
+            }
+            Ok(())
+        })?;
+        b.concurrent(|b| {
+            for (_, j, _, _, _, _, ye) in &spans {
+                b.scatter_rows(&w.contrib.all(), ye, &j.slots, h)?;
+            }
+            Ok(())
+        })
+    }
+
+    /// Records layer `l`'s attention block (into the residual stream `hs`), then its
+    /// MoE norm (into `x`) and router (into `router`), for `attn.tokens` tokens.
+    fn record_attention(
+        &self,
+        b: &mut Batch<'_, '_>,
+        w: &Bufs,
+        kv: &GpuKv,
+        l: usize,
+        ly: &LayerOnMetal,
+        attn: AttentionShape,
+    ) -> Result<(), ComputeError> {
+        let c = &self.cfg;
+        let dm = self.dims;
+        let (s, h, d) = (attn.tokens, dm.h, dm.d);
+        #[allow(clippy::cast_possible_truncation)]
+        let clip = c.clip_qkv.map(|v| v as f32);
+        let x = w.x.span(0, s * h)?;
+        let (q, k, v) = (
+            w.q.span(0, s * dm.q_out)?,
+            w.k.span(0, s * dm.kv_out)?,
+            w.v.span(0, s * dm.kv_out)?,
+        );
+        b.copy(&x, &w.hs.all(), s * h)?;
+        b.rms_norm(&x, s, &ly.attn_norm.all(), c.rms_eps)?;
+        // q, k and v are independent until attention: each step runs as one group.
+        b.concurrent(|b| {
+            b.matmul(&ly.q, &x, s, &q)?;
+            b.matmul(&ly.k, &x, s, &k)?;
+            b.matmul(&ly.v, &x, s, &v)
+        })?;
+        if let Some(cl) = clip {
+            b.concurrent(|b| {
+                b.clamp(&q, q.len(), cl)?;
+                b.clamp(&k, k.len(), cl)?;
+                b.clamp(&v, v.len(), cl)
+            })?;
         }
-        Ok(())
+        match (c.qk_norm, &ly.q_norm, &ly.k_norm) {
+            (QkNorm::Full, Some(qn), Some(kn)) => b.concurrent(|b| {
+                b.rms_norm(&q, s, &qn.all(), c.rms_eps)?;
+                b.rms_norm(&k, s, &kn.all(), c.rms_eps)
+            })?,
+            (QkNorm::PerHead, Some(qn), Some(kn)) => b.concurrent(|b| {
+                b.rms_norm(&q, s * dm.heads, &qn.all(), c.rms_eps)?;
+                b.rms_norm(&k, s * dm.kvh, &kn.all(), c.rms_eps)
+            })?,
+            _ => {}
+        }
+        let tb = w.table.span(0, s * d)?;
+        b.concurrent(|b| {
+            b.rope(&q, s, dm.heads, d / 2, &tb)?;
+            b.rope(&k, s, dm.kvh, d / 2, &tb)
+        })?;
+        b.concurrent(|b| {
+            b.kv_store(&kv.k[l].all(), &k, attn)?;
+            b.kv_store(&kv.v[l].all(), &v, attn)
+        })?;
+        let att = w.att.span(0, s * dm.q_out)?;
+        b.attention(
+            &q,
+            &kv.k[l].all(),
+            &kv.v[l].all(),
+            &w.scores.all(),
+            &att,
+            attn,
+        )?;
+        let o = w.o.span(0, s * h)?;
+        b.matmul(&ly.o, &att, s, &o)?;
+        b.add(&w.hs.all(), &o, s * h)?;
+        // MoE norm and router.
+        b.copy(&x, &w.hs.all(), s * h)?;
+        b.rms_norm(&x, s, &ly.ffn_norm.all(), c.rms_eps)?;
+        b.matmul(&ly.router, &x, s, &w.router.span(0, s * dm.ne)?)
+    }
+
+    /// Records the final norm and the head on tokens `first..first + m` (into
+    /// `logits`).
+    fn record_head(
+        &self,
+        b: &mut Batch<'_, '_>,
+        w: &Bufs,
+        first: usize,
+        m: usize,
+    ) -> Result<(), ComputeError> {
+        let h = self.dims.h;
+        let xf = w.xf.span(0, m * h)?;
+        b.copy(&xf, &w.hs.span(first * h, m * h)?, m * h)?;
+        b.rms_norm(&xf, m, &self.final_norm.all(), self.cfg.rms_eps)?;
+        b.matmul(&self.head, &xf, m, &w.logits.span(0, m * self.dims.vocab)?)
+    }
+
+    /// Holds every expert of every layer for a token routed on the GPU, if all are
+    /// resident and fit the routed kernels. With I/O threads, missing experts are
+    /// queued as prefetches (this token takes the per-layer pass while they load);
+    /// without, they are loaded now.
+    fn hold_all<'s>(
+        &self,
+        store: &'s ExpertStore,
+    ) -> Result<Option<Vec<Vec<Lease<'s>>>>, ArchError> {
+        let dm = self.dims;
+        if !self.token || dm.ne > MAX_ROUTED_EXPERTS || dm.k_top == 0 || dm.k_top > dm.ne {
+            return Ok(None);
+        }
+        let ne = u32::try_from(dm.ne).unwrap_or(u32::MAX);
+        for attempt in 0..2 {
+            let mut held = Vec::with_capacity(self.layers.len());
+            let mut missing: Vec<Vec<ExpertKey>> = Vec::new();
+            for l in 0..self.layers.len() {
+                let li = LayerIdx(u32::try_from(l).unwrap_or(u32::MAX));
+                match store
+                    .hold_layer(li, ne)
+                    .map_err(|e| store_err(li, ExpertIdx(0), &e))?
+                {
+                    Held::All(v) => held.push(v),
+                    Held::TooSmall => return Ok(None),
+                    Held::Missing(m) => missing.push(m),
+                }
+            }
+            if missing.is_empty() {
+                return Ok(Some(held));
+            }
+            drop(held);
+            if attempt == 1 {
+                break;
+            }
+            if store.io_threads() > 0 {
+                let all: Vec<ExpertKey> = missing.concat();
+                store
+                    .prefetch(&all, false)
+                    .map_err(|e| store_err(LayerIdx(0), ExpertIdx(0), &e))?;
+                return Ok(None);
+            }
+            // Nobody reads ahead: load each layer's missing experts now (they count as
+            // uses, as any acquire does), then hold again.
+            for keys in missing {
+                let li = keys.first().map_or(LayerIdx(0), |k| k.0);
+                for lease in store
+                    .acquire_many(&keys)
+                    .map_err(|e| store_err(li, ExpertIdx(0), &e))?
+                {
+                    drop(lease.map_err(|e| store_err(li, ExpertIdx(0), &e))?);
+                }
+            }
+        }
+        Ok(None)
+    }
+
+    /// The whole forward pass in one submission, with routing on the GPU (ADR-011
+    /// amendment 4): per layer, attention, router, `moe_route`, the routed gate, up,
+    /// SwiGLU and down over every expert of the layer (`held`, in expert order), the
+    /// combine and the residual; then the final norm and head. Afterwards the store is
+    /// told which experts were used. `None` (nothing ran) if some layer's experts differ
+    /// in dtype or shape, which the routed kernels need to share.
+    #[allow(clippy::too_many_arguments)]
+    fn routed(
+        &self,
+        w: &Bufs,
+        kv: &GpuKv,
+        held: &[Vec<Lease<'_>>],
+        source: &ModelExpertSource,
+        store: &ExpertStore,
+        attn: AttentionShape,
+        first: usize,
+        m: usize,
+    ) -> Result<Option<Vec<f32>>, ArchError> {
+        type Table<'t> = (
+            Vec<&'t MetalWeights>,
+            Vec<&'t MetalWeights>,
+            Vec<&'t MetalWeights>,
+        );
+        let dm = self.dims;
+        let (s, h, ffn, k) = (attn.tokens, dm.h, dm.ffn, dm.k_top);
+        let shape = |w: &MetalWeights| (w.dtype(), w.rows(), w.cols(), w.row_bytes());
+        let mut tables: Vec<Table<'_>> = Vec::with_capacity(held.len());
+        for leases in held {
+            let on = leases
+                .iter()
+                .map(|l| self.expert(source, l))
+                .collect::<Result<Vec<_>, _>>()?;
+            let Some(e0) = on.first() else {
+                return Ok(None);
+            };
+            if !on.iter().all(|e| {
+                shape(&e.gate) == shape(&e0.gate)
+                    && shape(&e.up) == shape(&e0.up)
+                    && shape(&e.down) == shape(&e0.down)
+            }) {
+                return Ok(None);
+            }
+            tables.push((
+                on.iter().map(|e| &e.gate).collect(),
+                on.iter().map(|e| &e.up).collect(),
+                on.iter().map(|e| &e.down).collect(),
+            ));
+        }
+        let entries = s * k;
+        self.be
+            .submit(|b| {
+                let x = w.x.span(0, s * h)?;
+                let g = w.g.span(0, entries * ffn)?;
+                let u = w.u.span(0, entries * ffn)?;
+                let contrib = w.contrib.span(0, entries * h)?;
+                let wts = w.weights.span(0, entries)?;
+                let o = w.o.span(0, s * h)?;
+                let router = w.router.span(0, s * dm.ne)?;
+                for (l, ly) in self.layers.iter().enumerate() {
+                    self.record_attention(b, w, kv, l, ly, attn)?;
+                    let ids = w.routes.span(l * entries, entries)?;
+                    b.moe_route(&router, s, dm.ne, k, self.cfg.norm_topk_prob, &ids, &wts)?;
+                    let (gate, up, down) = &tables[l];
+                    b.concurrent(|b| {
+                        b.routed_matmul(gate, &ids, &x, RoutedInput::Token, s, k, &g)?;
+                        b.routed_matmul(up, &ids, &x, RoutedInput::Token, s, k, &u)
+                    })?;
+                    b.swiglu(&g, &u, entries * ffn)?;
+                    b.routed_matmul(down, &ids, &g, RoutedInput::Entry, s, k, &contrib)?;
+                    b.moe_combine(&contrib, &wts, &o, s, k, h)?;
+                    b.add(&w.hs.all(), &o, s * h)?;
+                }
+                self.record_head(b, w, first, m)
+            })
+            .map_err(dev)?;
+        // Tell the store what was used, as the per-layer pass's acquires would: per
+        // layer, its distinct experts in ascending order.
+        let mut ids = vec![0f32; self.layers.len() * entries];
+        self.be
+            .read(&w.routes.span(0, ids.len()).map_err(dev)?, &mut ids)
+            .map_err(dev)?;
+        let mut used = Vec::new();
+        for (l, chunk) in ids.chunks_exact(entries.max(1)).enumerate() {
+            let li = LayerIdx(u32::try_from(l).unwrap_or(u32::MAX));
+            let mut es: Vec<u32> = chunk.iter().map(|v| v.to_bits()).collect();
+            es.sort_unstable();
+            es.dedup();
+            used.extend(es.into_iter().map(|e| (li, ExpertIdx(e))));
+        }
+        store
+            .record_uses(&used)
+            .map_err(|e| store_err(LayerIdx(0), ExpertIdx(0), &e))?;
+        let mut out = vec![0f32; m * dm.vocab];
+        self.be
+            .read(&w.logits.span(0, m * dm.vocab).map_err(dev)?, &mut out)
+            .map_err(dev)?;
+        Ok(Some(out))
     }
 
     /// The device matrices of every job's expert.
@@ -510,13 +809,22 @@ impl MetalForward {
             p0,
             capacity: kv.capacity,
         };
-        #[allow(clippy::cast_possible_truncation)]
-        let clip = c.clip_qkv.map(|v| v as f32);
         let first = match logits {
             Logits::Last => s - 1,
             Logits::All => 0,
         };
         let m = s - first;
+
+        // Every expert resident: the whole token is one submission, routed on the GPU.
+        if let Some(held) = self.hold_all(store)? {
+            if let Some(out) = self.routed(w, kv, &held, source, store, attn, first, m)? {
+                self.routed_passes.fetch_add(1, Ordering::Relaxed);
+                drop(held);
+                drop(work);
+                cache.advance(s)?;
+                return Ok(out);
+            }
+        }
 
         // The previous layer's last wave of experts, recorded at the start of the next
         // submission together with the combine. `Some` (even if empty) once routed.
@@ -542,62 +850,10 @@ impl MetalForward {
                         b.moe_combine(&w.contrib.all(), &w.weights.all(), &o, s, dm.k_top, h)?;
                         b.add(&w.hs.all(), &o, s * h)?;
                     }
-                    let Some(ly) = layer else {
-                        // Final norm and head.
-                        let xf = w.xf.span(0, m * h)?;
-                        b.copy(&xf, &w.hs.span(first * h, m * h)?, m * h)?;
-                        b.rms_norm(&xf, m, &self.final_norm.all(), c.rms_eps)?;
-                        return b.matmul(&self.head, &xf, m, &w.logits.span(0, m * dm.vocab)?);
-                    };
-                    // Attention.
-                    let x = w.x.span(0, s * h)?;
-                    let (q, k, v) = (
-                        w.q.span(0, s * dm.q_out)?,
-                        w.k.span(0, s * dm.kv_out)?,
-                        w.v.span(0, s * dm.kv_out)?,
-                    );
-                    b.copy(&x, &w.hs.all(), s * h)?;
-                    b.rms_norm(&x, s, &ly.attn_norm.all(), c.rms_eps)?;
-                    b.matmul(&ly.q, &x, s, &q)?;
-                    b.matmul(&ly.k, &x, s, &k)?;
-                    b.matmul(&ly.v, &x, s, &v)?;
-                    if let Some(cl) = clip {
-                        b.clamp(&q, q.len(), cl)?;
-                        b.clamp(&k, k.len(), cl)?;
-                        b.clamp(&v, v.len(), cl)?;
+                    match layer {
+                        Some(ly) => self.record_attention(b, w, kv, l, ly, attn),
+                        None => self.record_head(b, w, first, m),
                     }
-                    match (c.qk_norm, &ly.q_norm, &ly.k_norm) {
-                        (QkNorm::Full, Some(qn), Some(kn)) => {
-                            b.rms_norm(&q, s, &qn.all(), c.rms_eps)?;
-                            b.rms_norm(&k, s, &kn.all(), c.rms_eps)?;
-                        }
-                        (QkNorm::PerHead, Some(qn), Some(kn)) => {
-                            b.rms_norm(&q, s * dm.heads, &qn.all(), c.rms_eps)?;
-                            b.rms_norm(&k, s * dm.kvh, &kn.all(), c.rms_eps)?;
-                        }
-                        _ => {}
-                    }
-                    let tb = w.table.span(0, s * d)?;
-                    b.rope(&q, s, dm.heads, d / 2, &tb)?;
-                    b.rope(&k, s, dm.kvh, d / 2, &tb)?;
-                    b.kv_store(&kv.k[l].all(), &k, attn)?;
-                    b.kv_store(&kv.v[l].all(), &v, attn)?;
-                    let att = w.att.span(0, s * dm.q_out)?;
-                    b.attention(
-                        &q,
-                        &kv.k[l].all(),
-                        &kv.v[l].all(),
-                        &w.scores.all(),
-                        &att,
-                        attn,
-                    )?;
-                    let o = w.o.span(0, s * h)?;
-                    b.matmul(&ly.o, &att, s, &o)?;
-                    b.add(&w.hs.all(), &o, s * h)?;
-                    // MoE norm and router.
-                    b.copy(&x, &w.hs.all(), s * h)?;
-                    b.rms_norm(&x, s, &ly.ffn_norm.all(), c.rms_eps)?;
-                    b.matmul(&ly.router, &x, s, &w.router.span(0, s * dm.ne)?)
                 })
                 .map_err(dev)?;
             drop(experts);

@@ -9,7 +9,7 @@
     clippy::cast_possible_truncation
 )]
 
-use qubivex_arch::ops::{Rope, attend, rms_norm, softmax, swiglu};
+use qubivex_arch::ops::{Rope, attend, rms_norm, route, softmax, swiglu};
 use qubivex_backend_metal::{AttentionShape, MetalBackend};
 use qubivex_compute::math;
 
@@ -405,4 +405,50 @@ fn async_submissions_are_ordered_and_keep_host_memory_alive() {
         .map(|r| qubivex_compute::reduce::dot(r, &x))
         .collect();
     same_bits("matmul over a released region", &y, &want);
+}
+
+/// `moe_route` gives `ops::route`'s experts, order and weights, with ties (equal logits
+/// pick the lower id), a -inf logit, and with and without renormalisation.
+#[test]
+fn moe_route_matches_ops_route() {
+    let Some(be) = backend() else { return };
+    let mut rng = Rng(37);
+    for (ne, k) in [(64usize, 8usize), (8, 2), (60, 4), (256, 8), (5, 5)] {
+        let s = 7;
+        let mut logits = rng.vec(s * ne, 6.0);
+        // Token 1: all equal; token 2: pairs of equal logits; token 3: a -inf.
+        logits[ne..2 * ne].fill(0.25);
+        for e in 0..ne / 2 {
+            logits[2 * ne + 2 * e + 1] = logits[2 * ne + 2 * e];
+        }
+        logits[3 * ne] = f32::NEG_INFINITY;
+        for norm in [false, true] {
+            let (dl, di, dw) = (
+                be.vec_from(&logits).unwrap(),
+                be.vec(s * k).unwrap(),
+                be.vec(s * k).unwrap(),
+            );
+            be.submit(|b| b.moe_route(&dl.all(), s, ne, k, norm, &di.all(), &dw.all()))
+                .unwrap();
+            let (mut gi, mut gw) = (vec![0f32; s * k], vec![0f32; s * k]);
+            be.read(&di.all(), &mut gi).unwrap();
+            be.read(&dw.all(), &mut gw).unwrap();
+            for t in 0..s {
+                let (idx, w) = route(&logits[t * ne..(t + 1) * ne], k, norm);
+                let got: Vec<u32> = gi[t * k..(t + 1) * k].iter().map(|v| v.to_bits()).collect();
+                assert_eq!(got, idx, "ne={ne} k={k} norm={norm} token {t}: experts");
+                same_bits(
+                    &format!("ne={ne} k={k} norm={norm} token {t}: weights"),
+                    &gw[t * k..(t + 1) * k],
+                    &w,
+                );
+            }
+        }
+    }
+    let (l, i) = (be.vec(300).unwrap(), be.vec(300).unwrap());
+    assert!(
+        be.submit(|b| b.moe_route(&l.all(), 1, 257, 2, true, &i.all(), &i.all()))
+            .is_err(),
+        "more than 256 experts are refused"
+    );
 }

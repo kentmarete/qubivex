@@ -140,9 +140,14 @@ fn engine_on_metal_gives_the_cpu_tokens() {
         router: true,
         head: true,
         layers: false,
+        token: false,
     };
-    let layers = MetalOps::default();
-    for ops in [matmuls, layers] {
+    let token = MetalOps::default();
+    let layers = MetalOps {
+        token: false,
+        ..token
+    };
+    for ops in [matmuls, layers, token] {
         let gpu = Engine::load(
             meta(),
             EngineOptions {
@@ -177,10 +182,16 @@ fn engine_on_metal_gives_the_cpu_tokens() {
             .unwrap();
         assert_eq!(ta, tb, "{}", ops.describe());
         eprintln!(
-            "{}: {} prompt tokens, {} generated tokens identical",
+            "{}: {} prompt tokens, {} generated tokens identical ({} passes routed on the GPU)",
             ops.describe(),
             prompt.len(),
-            ta.len()
+            ta.len(),
+            gpu.gpu_routed_passes()
         );
+        if ops.token {
+            // The experts load in the background; once they are all resident, every
+            // pass is one routed submission.
+            assert!(gpu.gpu_routed_passes() > 0, "nothing was routed on the GPU");
+        }
     }
 }

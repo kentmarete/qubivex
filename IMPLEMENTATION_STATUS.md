@@ -3,14 +3,20 @@
 Last updated: 2026-11-04
 
 ## Current phase
-**Phase 9 (serving) done (2026-11-04).** Phase 8 (GPU acceleration, Metal first): slices 1–4 done (2026-11-03); slice 5 is next, with the Phase 7 disk throttle. The improvement-plan backlog (MIGRATION_PLAN §3a) is cleared.
+**Phase 9 (serving) done (2026-11-04).** Phase 8 (GPU acceleration, Metal first): slices 1–5 done (2026-11-04). The improvement-plan backlog (MIGRATION_PLAN §3a) is cleared.
+
+**Phase 8 slice 5 done (2026-11-04): a token in one Metal submission; ADR-011 amendment 4.** Decode with every expert resident 44.9 → 59.2 tok/s (CPU 42.3); 10-token prefill 76 → 91 tok/s; tokens bit-identical.
+- Code: `moe_route` (GPU top-k routing with `ops::route`'s bits) and routed matmuls over an address table of every expert of a layer (`Batch::moe_route`, `Batch::routed_matmul`; one dispatch per gate/up/down, no gather or scatter); `ExpertStore::hold_layer`/`Held` (lease a whole resident layer without counting a use) and `record_uses` (count the GPU's choices afterwards as hits); `MetalOps::token` (`--metal-ops token`, the new default for `--backend metal`; `layers` keeps host routing), falling back per pass to whole layers while experts are missing (queued as prefetches) or pools are smaller than the expert count; `Engine::gpu_routed_passes`. A concurrent encoder: barriers between dispatches, and `Batch::concurrent` groups (q/k/v, RoPE, KV stores, gate/up, and each per-expert stage of the per-layer pass, which goes 44.9 → 53.1 tok/s).
+- Tests: new GPU route and routed-matmul parity tests, the store's hold/record test, the fixture invariant with `token` (every pass routed without I/O threads), the Metal fault test for both placements, and real OLMoE (prompt logits and 48 tokens bit-identical; 40 passes routed on the GPU).
+- Not better yet: 128-token prefill (CPU 115 tok/s, Metal 97): the GPU matmuls read each weight row once per token. Next for Metal: tile them over several tokens.
+- **Next:** the Phase 7 disk throttle, Metal prefill tiling, then Phase 10.
 
 **Phase 9 done (2026-11-04): the serving gateway; ADR-013.**
 - `qubivex-api` (Axum + Tokio at the edge only) and `qubivex serve`: `/v1/chat/completions` and `/v1/completions` (SSE or not), `/v1/models`, `/health`, `/metrics` (Prometheus text), `/v1/system`, admin load/unload behind `--admin-token`, optional `--api-key`, request ids, OpenAI-shaped errors without paths. Every generation on its own thread with bounded channels.
 - Runtime: `Engine::generate_with` (chunked prefill, cancellation flag checked per chunk and per token, `Finish` reasons), `Engine::reserve_kv` (KV of concurrent conversations admitted together against the plan; room sharing and the KV ledger charge use the total), forward passes take FIFO turns per engine (a ticket lock; concurrent passes on one-slot pools failed with "pool is full"), `StreamDecoder::finish` (a trailing incomplete character is no longer dropped).
 - Exit criteria: the official OpenAI Python SDK (`crates/qubivex-api/sdk/openai_client.py`) works against OLMoE-1B-7B (GGUF) and Qwen3-0.6B (SafeTensors) served together: chat, streamed chat equal to non-streamed, completions, two concurrent chats equal to their sequential results, SDK error types. Over HTTP on the fixtures (`tests/gateway.rs`): concurrent = sequential, cancellation of streamed and non-streamed requests frees the slot, the fifth of four-that-fit conversations gets 503, auth/admin/errors. A curl disconnect on the real model shows up as one cancelled generation.
 - Tests: 284 on 1.85 and stable; `cargo deny` passes with the new dependencies. OLMoE single-request decode unchanged (43.2 tok/s, tokens match).
-- **Next:** Metal slice 5 and the Phase 7 disk throttle (either order); then Phase 10 (batching across requests, KV prefix reuse, paged KV).
+- Next was Metal slice 5 (done, above).
 
 **Dense architecture and a real SafeTensors run done (2026-11-04), §3a item; ADR-003 amendment 1.**
 - `transformer_dense` registered beside `transformer_moe` (own config, presets `hf`/`gguf`, schema; refuses routed experts); shared config parsing in `qubivex-model/src/arch/common.rs`; new `TensorRole::Ffn` (planner group `dense FFN`). The forward pass (`qubivex_arch::Transformer`, renamed from `TransformerMoeModel`) shares embedding, attention, KV and head; the FFN is configuration. Whole-layer Metal and prefetch stay MoE-only; a dense model on Metal places its matmuls one by one (same bits).

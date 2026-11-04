@@ -14,9 +14,10 @@ use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
 use objc2_foundation::{NSError, NSString};
 use objc2_metal::{
-    MTLBuffer, MTLCommandBuffer, MTLCommandBufferStatus, MTLCommandEncoder, MTLCommandQueue,
-    MTLCompileOptions, MTLComputeCommandEncoder, MTLComputePipelineState,
-    MTLCreateSystemDefaultDevice, MTLDevice, MTLLibrary, MTLMathMode, MTLResourceOptions, MTLSize,
+    MTLBarrierScope, MTLBuffer, MTLCommandBuffer, MTLCommandBufferStatus, MTLCommandEncoder,
+    MTLCommandQueue, MTLCompileOptions, MTLComputeCommandEncoder, MTLComputePipelineState,
+    MTLCreateSystemDefaultDevice, MTLDevice, MTLDispatchType, MTLLibrary, MTLMathMode,
+    MTLResourceOptions, MTLResourceUsage, MTLSize,
 };
 
 use qubivex_compute::host::PageAligned;
@@ -94,6 +95,11 @@ unsafe impl Sync for Buffer {}
 impl Buffer {
     pub(crate) const fn len(&self) -> usize {
         self.len
+    }
+
+    /// The buffer's GPU virtual address (for tables of weights a kernel indexes).
+    pub(crate) fn address(&self) -> u64 {
+        self.raw.gpuAddress()
     }
 }
 
@@ -421,16 +427,60 @@ pub(crate) struct Recorder<'a> {
     /// memory alive until the GPU is done with it (the command buffer retains the
     /// Metal objects, but not the Rust allocation they wrap).
     keep: Vec<Buffer>,
+    /// Buffers declared with `useResource` on this encoder, by object address.
+    used: Vec<*const c_void>,
+    /// Whether anything has been dispatched yet.
+    any: bool,
+    /// Inside a concurrent group ([`Recorder::group`]): dispatches after the group's
+    /// first are not separated by barriers.
+    grouped: Option<usize>,
 }
 
 impl Recorder<'_> {
+    /// Declares that later dispatches read `b` through an address table (not a bound
+    /// argument), so the GPU makes it resident; wrapped host memory is kept alive as
+    /// for a bound buffer.
+    pub(crate) fn use_read(&mut self, b: &Buffer) {
+        let ptr = Retained::as_ptr(&b.raw).cast::<c_void>();
+        if self.used.contains(&ptr) {
+            return;
+        }
+        self.used.push(ptr);
+        self.keep_host(b);
+        self.enc
+            .useResource_usage(ProtocolObject::from_ref(&*b.raw), MTLResourceUsage::Read);
+    }
+
+    /// Records what `f` records with no barriers between its dispatches, so the GPU may
+    /// run them at once: they must not read what another of them writes, nor write
+    /// the same memory. The group as a whole stays ordered after earlier dispatches and
+    /// before later ones.
+    pub(crate) fn group<T>(&mut self, f: impl FnOnce(&mut Self) -> T) -> T {
+        let outer = self.grouped.replace(0);
+        let r = f(self);
+        self.grouped = outer;
+        r
+    }
+
+    fn keep_host(&mut self, b: &Buffer) {
+        if b._host.is_some()
+            && !self
+                .keep
+                .iter()
+                .any(|k| Retained::as_ptr(&k.raw) == Retained::as_ptr(&b.raw))
+        {
+            self.keep.push(b.clone());
+        }
+    }
+
     /// Records `pipeline` over `groups` threadgroups of `threads` threads, with `args`
     /// bound at indices `0..args.len()`.
     ///
     /// The caller (this crate's typed operations) has checked that every element the
     /// kernel reads or writes for these sizes lies inside its buffer, from its offset,
-    /// and that the arguments match the kernel's bindings. Dispatches run in recorded
-    /// order, each after the previous one has finished (a serial encoder).
+    /// and that the arguments match the kernel's bindings. Each dispatch starts after
+    /// every earlier one has finished, except that dispatches of one
+    /// [`Recorder::group`] may overlap each other.
     pub(crate) fn dispatch(
         &mut self,
         pipeline: usize,
@@ -438,18 +488,24 @@ impl Recorder<'_> {
         groups: [usize; 3],
         threads: [usize; 3],
     ) {
+        // The encoder is concurrent: a barrier before each dispatch orders it after
+        // every earlier one, except within a group.
+        let first_in_group = match &mut self.grouped {
+            Some(n) => {
+                *n += 1;
+                *n == 1
+            }
+            None => true,
+        };
+        if self.any && first_in_group {
+            self.enc.memoryBarrierWithScope(MTLBarrierScope::Buffers);
+        }
+        self.any = true;
         self.enc.setComputePipelineState(&self.pipelines[pipeline]);
         for (i, a) in args.iter().enumerate() {
             match a {
                 Arg::Buf(b, off) => {
-                    if b._host.is_some()
-                        && !self
-                            .keep
-                            .iter()
-                            .any(|k| Retained::as_ptr(&k.raw) == Retained::as_ptr(&b.raw))
-                    {
-                        self.keep.push((*b).clone());
-                    }
+                    self.keep_host(b);
                     // SAFETY: the Metal buffer is retained by the command buffer until it
                     // completes, and wrapped host memory by `keep` (held by the
                     // submission until it completes); the caller has checked the
@@ -534,14 +590,19 @@ impl Device {
             what: "command buffer",
             detail: None,
         })?;
-        let enc = cmd.computeCommandEncoder().ok_or(MetalError::Create {
-            what: "compute encoder",
-            detail: None,
-        })?;
+        let enc = cmd
+            .computeCommandEncoderWithDispatchType(MTLDispatchType::Concurrent)
+            .ok_or(MetalError::Create {
+                what: "compute encoder",
+                detail: None,
+            })?;
         let mut rec = Recorder {
             enc: &enc,
             pipelines: &self.pipelines,
             keep: Vec::new(),
+            used: Vec::new(),
+            any: false,
+            grouped: None,
         };
         let recorded = record(&mut rec);
         let keep = rec.keep;

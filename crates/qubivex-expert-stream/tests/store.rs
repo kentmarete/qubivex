@@ -7,7 +7,9 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use qubivex_core::{ExpertIdx, LayerIdx};
-use qubivex_expert_stream::{ExpertKey, ExpertSource, ExpertStore, Policy, PoolSpec, StoreError};
+use qubivex_expert_stream::{
+    ExpertKey, ExpertSource, ExpertStore, Held, Policy, PoolSpec, StoreError,
+};
 
 /// Experts whose bytes are a function of their key; sizes vary by layer.
 struct Source {
@@ -288,4 +290,59 @@ fn recording_captures_every_acquire() {
     s.record(false).unwrap();
     drop(s.acquire(key(0, 1)).unwrap());
     assert!(s.take_trace().unwrap().is_empty());
+}
+
+/// `hold_layer` holds a fully resident layer without counting a use; `record_uses`
+/// then counts the uses as hits, in the trace and for recency.
+#[test]
+fn holding_a_layer_is_not_a_use_and_recorded_uses_are() {
+    let s = ExpertStore::new(source(), &pools(2, 4), Policy::Lru);
+    assert!(matches!(
+        s.hold_layer(LayerIdx(0), 5).unwrap(),
+        Held::TooSmall
+    ));
+    drop(s.acquire(key(0, 1)).unwrap());
+    let Held::Missing(m) = s.hold_layer(LayerIdx(0), 4).unwrap() else {
+        panic!("experts 0, 2 and 3 are not resident");
+    };
+    assert_eq!(m, [key(0, 0), key(0, 2), key(0, 3)]);
+    for e in [3, 2, 0] {
+        drop(s.acquire(key(0, e)).unwrap()); // LRU order 1, 3, 2, 0
+    }
+    let before = s.stats();
+    s.record(true).unwrap();
+    let Held::All(held) = s.hold_layer(LayerIdx(0), 4).unwrap() else {
+        panic!("every expert is resident");
+    };
+    assert_eq!(held.len(), 4);
+    for (e, l) in held.iter().enumerate() {
+        assert_eq!(l.key(), key(0, e as u32));
+        check(l.bytes(), l.key());
+    }
+    // Held experts survive a shrink to zero slots.
+    s.set_pools(&[PoolSpec {
+        layer: LayerIdx(0),
+        slots: 0,
+        slot_bytes: 100,
+    }])
+    .unwrap();
+    assert_eq!(s.resident().unwrap().len(), 4);
+    s.set_pools(&pools(1, 4)).unwrap();
+    drop(held);
+    assert_eq!(s.stats().hits, before.hits, "holding is not a hit");
+    assert!(s.take_trace().unwrap().is_empty(), "nor traced");
+    // Recency is unchanged by holding: 1 is still the LRU victim...
+    s.record_uses(&[key(0, 3), key(1, 7)]).unwrap(); // (1, 7) is not resident: skipped
+    assert_eq!(s.stats().hits, before.hits + 1);
+    assert_eq!(s.take_trace().unwrap(), [key(0, 3)]);
+    s.set_pools(&pools(1, 3)).unwrap();
+    let mut r = s.resident().unwrap();
+    r.sort();
+    assert_eq!(r, [key(0, 0), key(0, 2), key(0, 3)]);
+    // ...and a recorded use makes an expert most recent: order 2, 0, 3 becomes 0, 3, 2.
+    s.record_uses(&[key(0, 2)]).unwrap();
+    s.set_pools(&pools(1, 2)).unwrap();
+    let mut r = s.resident().unwrap();
+    r.sort();
+    assert_eq!(r, [key(0, 2), key(0, 3)], "0 is now the least recent");
 }

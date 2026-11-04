@@ -394,9 +394,11 @@ pub(crate) struct DeviceArgs {
     /// CPU the rest). Output bits are the same on both.
     #[arg(long, default_value = "cpu")]
     backend: String,
-    /// With --backend metal: what runs on the GPU. layers (the default): whole layers,
-    /// experts included, one submission per layer. Or a comma-separated list of single
-    /// dense matmuls from attention, router and head (slower; kept for comparison).
+    /// With --backend metal: what runs on the GPU. token (the default): whole layers,
+    /// experts included, with routing on the GPU so a token is one submission while
+    /// every expert is resident. layers: whole layers with routing on the host, one
+    /// submission per layer. Or a comma-separated list of single dense matmuls from
+    /// attention, router and head (slower; kept for comparison).
     #[arg(long)]
     metal_ops: Option<String>,
 }
@@ -419,6 +421,7 @@ impl DeviceArgs {
             router: false,
             head: false,
             layers: false,
+            token: false,
         };
         for item in list.split(',').map(str::trim).filter(|i| !i.is_empty()) {
             match item {
@@ -426,9 +429,13 @@ impl DeviceArgs {
                 "router" => ops.router = true,
                 "head" => ops.head = true,
                 "layers" => ops.layers = true,
+                "token" => {
+                    ops.layers = true;
+                    ops.token = true;
+                }
                 other => {
                     return Err(format!(
-                        "unknown --metal-ops item {other:?}; use attention, router, head or layers"
+                        "unknown --metal-ops item {other:?}; use attention, router, head, layers or token"
                     ));
                 }
             }
