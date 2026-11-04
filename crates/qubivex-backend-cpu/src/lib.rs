@@ -8,6 +8,11 @@
 //!
 //! Supported dtypes: f32, f16, bf16, Q8_0, Q4_K and Q6_K.
 //!
+//! Paths, all with the same bits: one activation row (decode) uses a fused NEON row dot
+//! where there is one; six or more rows (prefill) use the register-blocked kernel in
+//! `tile`, which computes the same 64 lanes in a different grouping; everything else
+//! dequantises a row and takes one portable dot per output.
+//!
 //! On x86-64 the same portable source is also compiled with `avx2,fma` and selected
 //! at run time; `f32::mul_add` is correctly rounded either way, so both give the
 //! same bits. Hand-written NEON and AVX2 kernels come later, as a measured
@@ -21,6 +26,7 @@ pub mod formats;
 #[cfg(target_arch = "aarch64")]
 mod neon;
 pub mod reduce;
+mod tile;
 
 use qubivex_compute::{ComputeBackend, ComputeError, WeightView};
 use qubivex_core::DType;
@@ -131,7 +137,40 @@ fn rows(w: &WeightView<'_>, xs: &[f32], s: usize, r0: usize, out: &mut [f32], bu
     rows_portable(w, xs, s, r0, out, buf);
 }
 
-/// `rows` without run-time dispatch, for tests that compare the two paths.
+/// The tiled kernel compiled with AVX2 and hardware FMA.
+///
+/// # Safety
+/// The CPU must support `avx2` and `fma`.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn tiled_avx2(
+    w: &WeightView<'_>,
+    xp: &tile::PackedX,
+    r0: usize,
+    out: &mut [f32],
+    sc: &mut tile::Scratch,
+) {
+    tile::rows(w, xp, r0, out, sc);
+}
+
+fn tiled(
+    w: &WeightView<'_>,
+    xp: &tile::PackedX,
+    r0: usize,
+    out: &mut [f32],
+    sc: &mut tile::Scratch,
+) {
+    #[cfg(target_arch = "x86_64")]
+    if std::arch::is_x86_feature_detected!("avx2") && std::arch::is_x86_feature_detected!("fma") {
+        // SAFETY: both target features were detected on this CPU just above.
+        unsafe { tiled_avx2(w, xp, r0, out, sc) };
+        return;
+    }
+    tile::rows(w, xp, r0, out, sc);
+}
+
+/// The reference path: one dequantized row and one portable dot product per output,
+/// without the tiled kernel or run-time dispatch, for tests that compare the paths.
 #[doc(hidden)]
 pub fn matmul_portable(
     w: &WeightView<'_>,
@@ -139,7 +178,17 @@ pub fn matmul_portable(
     s: usize,
     ys: &mut [f32],
 ) -> Result<(), ComputeError> {
-    matmul_with(w, xs, s, ys, rows_portable)
+    matmul_with(w, xs, s, ys, Path::Rows(rows_portable))
+}
+
+/// How [`matmul_with`] computes a block of rows.
+#[derive(Clone, Copy)]
+enum Path {
+    /// One dot product per output.
+    Rows(RowsKernel),
+    /// The register-blocked kernel for several activation rows ([`tile`]), else
+    /// the given row kernel.
+    Tiled(RowsKernel),
 }
 
 fn matmul_with(
@@ -147,7 +196,7 @@ fn matmul_with(
     xs: &[f32],
     s: usize,
     ys: &mut [f32],
-    kernel: RowsKernel,
+    path: Path,
 ) -> Result<(), ComputeError> {
     check(w, "matmul")?;
     let (n, k) = (w.rows(), w.cols());
@@ -167,13 +216,24 @@ fn matmul_with(
         return Ok(());
     }
     // Rows are independent: compute them row-major (n × s), then transpose for s > 1.
-    let run = |yt: &mut [f32]| {
-        yt.par_chunks_mut(ROWS_PER_TASK * s)
-            .enumerate()
-            .for_each_init(
-                || vec![0f32; k],
-                |buf, (i, out)| kernel(w, xs, s, i * ROWS_PER_TASK, out, buf),
-            );
+    let run = |yt: &mut [f32]| match path {
+        Path::Tiled(_) if tile::applies(s) => {
+            let xp = tile::PackedX::new(xs, s, k);
+            yt.par_chunks_mut(ROWS_PER_TASK * s)
+                .enumerate()
+                .for_each_init(
+                    || tile::Scratch::new(k),
+                    |sc, (i, out)| tiled(w, &xp, i * ROWS_PER_TASK, out, sc),
+                );
+        }
+        Path::Rows(kernel) | Path::Tiled(kernel) => {
+            yt.par_chunks_mut(ROWS_PER_TASK * s)
+                .enumerate()
+                .for_each_init(
+                    || vec![0f32; k],
+                    |buf, (i, out)| kernel(w, xs, s, i * ROWS_PER_TASK, out, buf),
+                );
+        }
     };
     if s == 1 {
         run(ys);
@@ -205,7 +265,7 @@ impl ComputeBackend for CpuBackend {
         s: usize,
         ys: &mut [f32],
     ) -> Result<(), ComputeError> {
-        matmul_with(w, xs, s, ys, rows)
+        matmul_with(w, xs, s, ys, Path::Tiled(rows))
     }
 
     fn dequant_row(

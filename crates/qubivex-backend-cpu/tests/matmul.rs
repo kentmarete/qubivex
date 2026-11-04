@@ -89,59 +89,71 @@ fn batching_threads_and_isa_never_change_bits() {
         for &(n, k) in shapes(d) {
             let wb = weights(d, n, k, &mut rng);
             let w = WeightView::new(d, n, k, &wb).unwrap();
-            let s = 5;
-            let xs: Vec<f32> = (0..s * k).map(|_| rng.f()).collect();
-            let mut batch = vec![0f32; s * n];
-            be.matmul(&w, &xs, s, &mut batch).unwrap();
-            // One row at a time.
-            for t in 0..s {
-                let mut one = vec![0f32; n];
-                be.matmul(&w, &xs[t * k..(t + 1) * k], 1, &mut one).unwrap();
-                assert_eq!(
-                    bits(&one),
-                    bits(&batch[t * n..(t + 1) * n]),
-                    "{d} {n}x{k} token {t}"
-                );
+            // Batch sizes on both sides of the tiled kernel's threshold (6), and every
+            // width of its last tile (7 to 11 leave 1 to 5 rows; 12 and 13 two tiles).
+            for s in [2, 5, 6, 7, 8, 9, 10, 11, 13] {
+                check_batch(&be, d, &w, s, &mut rng);
             }
-            // Thread counts.
-            for threads in [1, 3, 7] {
-                let pool = rayon::ThreadPoolBuilder::new()
-                    .num_threads(threads)
-                    .build()
-                    .unwrap();
-                let mut y = vec![0f32; s * n];
-                pool.install(|| be.matmul(&w, &xs, s, &mut y)).unwrap();
-                assert_eq!(bits(&y), bits(&batch), "{d} {n}x{k} threads {threads}");
-            }
-            // Portable path against the dispatched one (AVX2+FMA on x86-64).
-            let mut p = vec![0f32; s * n];
-            matmul_portable(&w, &xs, s, &mut p).unwrap();
-            assert_eq!(bits(&p), bits(&batch), "{d} {n}x{k} portable vs dispatched");
+        }
+    }
+}
 
-            // f64 reference over the exact dequantized weights.
-            let mut row = vec![0f32; k];
-            for r in 0..n {
-                be.dequant_row(&w, r, &mut row).unwrap();
-                for t in 0..s {
-                    let x = &xs[t * k..(t + 1) * k];
-                    let want: f64 = row
-                        .iter()
-                        .zip(x)
-                        .map(|(a, b)| f64::from(*a) * f64::from(*b))
-                        .sum();
-                    let scale: f64 = row
-                        .iter()
-                        .zip(x)
-                        .map(|(a, b)| (f64::from(*a) * f64::from(*b)).abs())
-                        .sum::<f64>()
-                        .max(1e-30);
-                    let got = f64::from(batch[t * n + r]);
-                    assert!(
-                        (got - want).abs() / scale < 1e-6,
-                        "{d} {n}x{k} r{r} t{t}: {got} vs {want}"
-                    );
-                }
-            }
+fn check_batch(be: &CpuBackend, d: DType, w: &WeightView<'_>, s: usize, rng: &mut Rng) {
+    let (n, k) = (w.rows(), w.cols());
+    let xs: Vec<f32> = (0..s * k).map(|_| rng.f()).collect();
+    let mut batch = vec![0f32; s * n];
+    be.matmul(w, &xs, s, &mut batch).unwrap();
+    // One row at a time.
+    for t in 0..s {
+        let mut one = vec![0f32; n];
+        be.matmul(w, &xs[t * k..(t + 1) * k], 1, &mut one).unwrap();
+        assert_eq!(
+            bits(&one),
+            bits(&batch[t * n..(t + 1) * n]),
+            "{d} {n}x{k} s{s} token {t}"
+        );
+    }
+    // Thread counts.
+    for threads in [1, 3, 7] {
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(threads)
+            .build()
+            .unwrap();
+        let mut y = vec![0f32; s * n];
+        pool.install(|| be.matmul(w, &xs, s, &mut y)).unwrap();
+        assert_eq!(bits(&y), bits(&batch), "{d} {n}x{k} s{s} threads {threads}");
+    }
+    // Portable path against the dispatched one (AVX2+FMA on x86-64).
+    let mut p = vec![0f32; s * n];
+    matmul_portable(w, &xs, s, &mut p).unwrap();
+    assert_eq!(
+        bits(&p),
+        bits(&batch),
+        "{d} {n}x{k} s{s} portable vs dispatched"
+    );
+
+    // f64 reference over the exact dequantized weights.
+    let mut row = vec![0f32; k];
+    for r in 0..n {
+        be.dequant_row(w, r, &mut row).unwrap();
+        for t in 0..s {
+            let x = &xs[t * k..(t + 1) * k];
+            let want: f64 = row
+                .iter()
+                .zip(x)
+                .map(|(a, b)| f64::from(*a) * f64::from(*b))
+                .sum();
+            let scale: f64 = row
+                .iter()
+                .zip(x)
+                .map(|(a, b)| (f64::from(*a) * f64::from(*b)).abs())
+                .sum::<f64>()
+                .max(1e-30);
+            let got = f64::from(batch[t * n + r]);
+            assert!(
+                (got - want).abs() / scale < 1e-6,
+                "{d} {n}x{k} r{r} t{t}: {got} vs {want}"
+            );
         }
     }
 }

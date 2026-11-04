@@ -20,7 +20,10 @@
 //!   the group the EIP's "quantised GEMV ≥ 70% of STREAM" target is measured on.
 //! - `decode_portable`: the portable path at one row and one thread, for the dtypes
 //!   with a fused kernel on this CPU, so the fused gain stays visible.
-//! - `prefill`: 128 activation rows on the compute team.
+//! - `prefill_s128`: 128 activation rows on the compute team (attention projections of
+//!   a 128-token prompt; the register-blocked kernel).
+//! - `prefill_s16`: 16 activation rows, what one expert sees in a 128-token prompt
+//!   (128 tokens × 8 routed / 64 experts).
 //! - `dequant_row` and `dot`: the building blocks, one 2048-wide row.
 //!
 //! The team size is `QUBIVEX_BENCH_THREADS`, else the performance cores on macOS
@@ -270,6 +273,15 @@ fn prefill(c: &mut Criterion) {
         &[DType::F32, DType::BF16, Q8_0, Q4_K, Q6_K],
         &EXPERT,
         128,
+        t,
+        false,
+    );
+    matmul_group(
+        c,
+        &format!("prefill_s16_t{t}"),
+        &[Q4_K],
+        &EXPERT,
+        16,
         t,
         false,
     );
