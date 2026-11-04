@@ -13,7 +13,8 @@ name = "qubivex"
 path = "src/main.rs"
 
 [dependencies]
-clap = { workspace = true }
+clap = { workspace = true, features = ["env"] }
+qubivex-api = { workspace = true }
 qubivex-core = { workspace = true }
 qubivex-expert-stream = { workspace = true }
 qubivex-hardware = { workspace = true }
@@ -23,6 +24,7 @@ qubivex-runtime = { workspace = true }
 qubivex-tokenizer = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+tokio = { workspace = true }
 
 [lints]
 workspace = true
