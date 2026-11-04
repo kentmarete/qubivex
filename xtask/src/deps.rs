@@ -69,6 +69,7 @@ fn allowed_deps(krate: &str) -> Option<Vec<&'static str>> {
             "qubivex-runtime",
             "qubivex-memory",
             "qubivex-model",
+            "qubivex-tokenizer",
             "qubivex-hardware",
             "qubivex-core",
         ],
@@ -96,6 +97,11 @@ fn is_allowed(from: &str, to: &str, dev: bool, allowed: &[&str]) -> bool {
         return to.starts_with("qubivex-");
     }
     if dev && to == "qubivex-test-utils" && from != to {
+        return true;
+    }
+    // The gateway's tests slow expert reads with the fault-injection source, so a
+    // generation is still running when a test cancels it.
+    if dev && from == "qubivex-api" && to == "qubivex-expert-stream" {
         return true;
     }
     // A GPU backend's parity tests use the CPU backend's kernels and the forward

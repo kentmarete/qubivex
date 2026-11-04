@@ -12,8 +12,9 @@ mod metal_forward;
 mod placement;
 
 pub use engine::{
-    DEFAULT_IO_THREADS, DEFAULT_READ_RETRIES, Engine, EngineOptions, PredictionStats,
-    PrefetchOptions, PrefetchReport, Sampling, Verification, VerifyExperts,
+    DEFAULT_IO_THREADS, DEFAULT_READ_RETRIES, Engine, EngineOptions, Finish, GenerateOptions,
+    Generation, KvReservation, PredictionStats, PrefetchOptions, PrefetchReport, Sampling,
+    Verification, VerifyExperts,
 };
 pub use experts::{ExpertIo, ExpertLayout, IoPath, ModelExpertSource, PartLayout};
 pub use placement::{BackendKind, MetalOps, PlacementReport};

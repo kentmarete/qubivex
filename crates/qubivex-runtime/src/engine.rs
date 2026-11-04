@@ -3,7 +3,7 @@
 use std::collections::HashMap;
 use std::fs::File;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::thread::JoinHandle;
 use std::time::Duration;
@@ -478,6 +478,112 @@ impl Default for Sampling {
     }
 }
 
+/// A first-come-first-served turn queue (a ticket lock): each caller takes a ticket and
+/// waits until it is served. Unlike a plain mutex, no caller can be overtaken
+/// indefinitely.
+#[derive(Debug, Default)]
+struct StepQueue {
+    /// (next ticket to hand out, ticket being served).
+    state: Mutex<(u64, u64)>,
+    turn: std::sync::Condvar,
+}
+
+/// The current turn; the next ticket is served when it drops (also on panic).
+struct Turn<'q>(&'q StepQueue);
+
+impl StepQueue {
+    fn wait(&self) -> Turn<'_> {
+        let mut st = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        let ticket = st.0;
+        st.0 += 1;
+        while st.1 != ticket {
+            st = self.turn.wait(st).unwrap_or_else(PoisonError::into_inner);
+        }
+        Turn(self)
+    }
+}
+
+impl Drop for Turn<'_> {
+    fn drop(&mut self) {
+        let mut st = self.0.state.lock().unwrap_or_else(PoisonError::into_inner);
+        st.1 += 1;
+        drop(st);
+        self.0.turn.notify_all();
+    }
+}
+
+/// How [`Engine::generate_with`] generates.
+#[derive(Clone, Copy, Debug)]
+pub struct GenerateOptions {
+    /// Most tokens to generate.
+    pub max_new: usize,
+    /// Sampling.
+    pub sampling: Sampling,
+    /// Prompt tokens per forward pass. Smaller chunks let a cancellation land sooner;
+    /// the bits are the same for every size.
+    pub prefill_chunk: usize,
+}
+
+impl Default for GenerateOptions {
+    fn default() -> Self {
+        Self {
+            max_new: 128,
+            sampling: Sampling::default(),
+            prefill_chunk: 256,
+        }
+    }
+}
+
+/// Why a generation ended.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Finish {
+    /// The model produced an end-of-sequence token.
+    Eos,
+    /// `max_new` tokens were generated.
+    Length,
+    /// The context is full.
+    ContextFull,
+    /// The token callback asked to stop (a stop sequence, for example).
+    Stopped,
+    /// The cancellation flag was set.
+    Cancelled,
+}
+
+/// A finished generation.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Generation {
+    /// The generated ids (EOS excluded).
+    pub tokens: Vec<u32>,
+    /// Why it ended.
+    pub finish: Finish,
+    /// Prompt length in tokens.
+    pub prompt_tokens: usize,
+}
+
+/// KV room held for one conversation (see [`Engine::reserve_kv`]).
+#[derive(Debug)]
+pub struct KvReservation<'e> {
+    engine: &'e Engine,
+    positions: usize,
+}
+
+impl KvReservation<'_> {
+    /// Positions held (whole KV chunks).
+    #[must_use]
+    pub const fn positions(&self) -> usize {
+        self.positions
+    }
+}
+
+impl Drop for KvReservation<'_> {
+    fn drop(&mut self) {
+        // Relaxed: see `Engine::reserve_kv`.
+        self.engine
+            .kv_reserved
+            .fetch_sub(self.positions, Ordering::Relaxed);
+    }
+}
+
 /// The memory plan and the ledger of what is actually allocated.
 struct Memory {
     /// `None`: a fixed cache size was requested.
@@ -486,8 +592,8 @@ struct Memory {
     charges: Mutex<Charges>,
 }
 
-/// Ledger charges the engine holds. The KV charge follows the most recent sequence:
-/// the engine runs one at a time until the scheduler (Phase 9).
+/// Ledger charges the engine holds. The KV charge is the larger of the most recent
+/// sequence's cache and what live [`KvReservation`]s hold across conversations.
 struct Charges {
     _dense: Charge,
     experts: Charge,
@@ -572,6 +678,13 @@ pub struct Engine {
     layers: Vec<LayerExperts>,
     /// The byte budget the pools were last sized for.
     cache_target: AtomicU64,
+    /// KV positions reserved by live [`KvReservation`]s, across conversations.
+    kv_reserved: AtomicUsize,
+    /// Forward passes run one at a time, first come first served (see
+    /// [`Engine::forward`]).
+    steps: StepQueue,
+    /// KV bytes per position (keys and values of every layer).
+    kv_position_bytes: u64,
     model: Transformer,
     tokenizer: Tokenizer,
     backend: Placed,
@@ -847,6 +960,7 @@ impl Engine {
             }
             None => (backend, None),
         };
+        let kv_position_bytes = footprint.kv_bytes_per_token.0;
         let layers = footprint.layers;
         let io_threads = opts.io_threads.unwrap_or(DEFAULT_IO_THREADS);
         let store = ExpertStore::with_io_threads(
@@ -920,6 +1034,9 @@ impl Engine {
             store,
             layers,
             cache_target: AtomicU64::new(capacity),
+            kv_reserved: AtomicUsize::new(0),
+            steps: StepQueue::default(),
+            kv_position_bytes,
             verification: Verification::Off,
             model,
             tokenizer,
@@ -1098,7 +1215,9 @@ impl Engine {
         let Some(plan) = &self.memory.plan else {
             return Ok(());
         };
-        let projected = KvCache::reserved_for(cache.len() + tokens, cache.capacity());
+        // With concurrent conversations, the plan prices every reservation together.
+        let projected = KvCache::reserved_for(cache.len() + tokens, cache.capacity())
+            .max(self.kv_reserved.load(Ordering::Relaxed));
         let mut cap = plan
             .expert_cache_for(projected as u64)
             .map_err(|r| RuntimeError::Memory(r.to_string()))?;
@@ -1119,7 +1238,11 @@ impl Engine {
         // diagnostics, so skip rather than propagate.
         if let Ok(mut c) = self.memory.charges.lock() {
             c.experts.resize(Bytes(self.store.used().unwrap_or(0)));
-            c.kv.resize(Bytes(cache.allocated_bytes()));
+            let reserved = self.kv_reserved.load(Ordering::Relaxed) as u64;
+            let kv = cache
+                .allocated_bytes()
+                .max(reserved.saturating_mul(self.kv_position_bytes));
+            c.kv.resize(Bytes(kv));
         }
     }
 
@@ -1131,6 +1254,13 @@ impl Engine {
 
     /// One forward pass (see [`Transformer::forward`]).
     ///
+    /// Concurrent callers (conversations of a server) take turns, first come first
+    /// served: each pass already uses every compute thread, and passes running at
+    /// once would compete for expert-cache slots (two layers' worth of leases in a
+    /// one-slot pool fail instead of waiting). A conversation therefore waits at most
+    /// one pass of each conversation ahead of it; [`Engine::generate_with`] splits long
+    /// prompts into chunks so a prompt never holds the turn for long.
+    ///
     /// # Errors
     /// Architecture errors.
     pub fn forward(
@@ -1140,6 +1270,7 @@ impl Engine {
         logits: Logits,
         trace: Option<Tracer<'_>>,
     ) -> Result<Vec<f32>, RuntimeError> {
+        let _turn = self.steps.wait();
         // Memory pressure stops prefetch first (ADR-005): drop what is queued.
         let allowed = self.pressure().is_none_or(|d| d.prefetch);
         if !allowed && self.predictor.is_some() {
@@ -1200,29 +1331,138 @@ impl Engine {
         prompt: &[u32],
         max_new: usize,
         sampling: Sampling,
-        mut on_token: impl FnMut(u32) -> bool,
+        on_token: impl FnMut(u32) -> bool,
     ) -> Result<Vec<u32>, RuntimeError> {
+        let opts = GenerateOptions {
+            max_new,
+            sampling,
+            ..GenerateOptions::default()
+        };
+        Ok(self
+            .generate_with(prompt, &opts, &AtomicBool::new(false), on_token)?
+            .tokens)
+    }
+
+    /// [`Engine::generate`] for a server: the prompt runs in chunks of
+    /// `opts.prefill_chunk` tokens, and `cancel` is checked before every chunk and
+    /// every generated token, so a cancelled request stops within one chunk or one
+    /// token. Chunking never changes bits (a prompt's logits equal token-by-token
+    /// decoding, invariant 1). Reports why generation ended.
+    ///
+    /// # Errors
+    /// Architecture errors, or an empty prompt.
+    pub fn generate_with(
+        &self,
+        prompt: &[u32],
+        opts: &GenerateOptions,
+        cancel: &AtomicBool,
+        mut on_token: impl FnMut(u32) -> bool,
+    ) -> Result<Generation, RuntimeError> {
         if prompt.is_empty() {
             return Err(RuntimeError::Model("the prompt is empty".into()));
         }
         self.admit()?;
+        let done = |tokens, finish| {
+            self.end_turn();
+            Ok(Generation {
+                tokens,
+                finish,
+                prompt_tokens: prompt.len(),
+            })
+        };
         let mut cache = self.new_cache();
-        let mut rng = Rng(sampling.seed ^ 0x9e37_79b9_7f4a_7c15);
-        let mut logits = self.forward(prompt, &mut cache, Logits::Last, None)?;
+        if prompt.len() > cache.capacity() {
+            return Err(RuntimeError::Model(format!(
+                "the prompt has {} tokens; the context holds {}",
+                prompt.len(),
+                cache.capacity()
+            )));
+        }
+        let mut rng = Rng(opts.sampling.seed ^ 0x9e37_79b9_7f4a_7c15);
+        let mut logits = Vec::new();
+        for chunk in prompt.chunks(opts.prefill_chunk.max(1)) {
+            // Acquire: pairs with the canceller's Release store.
+            if cancel.load(Ordering::Acquire) {
+                return done(Vec::new(), Finish::Cancelled);
+            }
+            logits = self.forward(chunk, &mut cache, Logits::Last, None)?;
+        }
         let mut out = Vec::new();
-        while out.len() < max_new {
-            let next = sample(&logits, sampling, &mut rng);
+        loop {
+            if out.len() == opts.max_new {
+                return done(out, Finish::Length);
+            }
+            if cancel.load(Ordering::Acquire) {
+                return done(out, Finish::Cancelled);
+            }
+            let next = sample(&logits, opts.sampling, &mut rng);
             if self.tokenizer.eos_ids().contains(&next) {
-                break;
+                return done(out, Finish::Eos);
             }
             out.push(next);
-            if !on_token(next) || out.len() == max_new || cache.len() == cache.capacity() {
-                break;
+            if !on_token(next) {
+                return done(out, Finish::Stopped);
+            }
+            if out.len() == opts.max_new {
+                return done(out, Finish::Length);
+            }
+            if cache.len() == cache.capacity() {
+                return done(out, Finish::ContextFull);
             }
             logits = self.forward(&[next], &mut cache, Logits::Last, None)?;
         }
-        self.end_turn();
-        Ok(out)
+    }
+
+    /// Reserves KV room for a conversation of up to `positions` positions (prompt plus
+    /// generated tokens), alongside every other live reservation. Admission control
+    /// for concurrent conversations: the memory plan must still keep one expert slot
+    /// per layer with all reservations' KV in RAM (ADR-005). Without a plan (a fixed
+    /// expert cache) every reservation is granted. Dropping the reservation returns the
+    /// room.
+    ///
+    /// # Errors
+    /// [`RuntimeError::Memory`] if the reservations together would not fit.
+    pub fn reserve_kv(&self, positions: usize) -> Result<KvReservation<'_>, RuntimeError> {
+        let want = KvCache::reserved_for(positions.min(self.max_context), self.max_context);
+        let mut cur = self.kv_reserved.load(Ordering::Relaxed);
+        loop {
+            let total = cur.saturating_add(want);
+            if let Some(plan) = &self.memory.plan {
+                plan.expert_cache_for(total as u64).map_err(|r| {
+                    RuntimeError::Memory(format!(
+                        "no room for another conversation of {positions} positions while \
+                         {cur} are reserved: {r}"
+                    ))
+                })?;
+            }
+            // Relaxed: the counter only prices memory; no other data is published.
+            match self.kv_reserved.compare_exchange_weak(
+                cur,
+                total,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => {
+                    return Ok(KvReservation {
+                        engine: self,
+                        positions: want,
+                    });
+                }
+                Err(now) => cur = now,
+            }
+        }
+    }
+
+    /// KV positions reserved across live conversations.
+    #[must_use]
+    pub fn kv_reserved(&self) -> usize {
+        self.kv_reserved.load(Ordering::Relaxed)
+    }
+
+    /// The context limit of a conversation, in positions.
+    #[must_use]
+    pub const fn max_context(&self) -> usize {
+        self.max_context
     }
 
     /// Ends a turn: queued prefetches are dropped, since the next request starts

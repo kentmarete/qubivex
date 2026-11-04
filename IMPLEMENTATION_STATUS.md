@@ -3,7 +3,14 @@
 Last updated: 2026-11-04
 
 ## Current phase
-**Phase 8 (GPU acceleration, Metal first): slices 1–4 done (2026-11-03).** Metal slice 5 is paused while the improvement-plan backlog (MIGRATION_PLAN §3a and Addendum §4) is cleared first.
+**Phase 9 (serving) done (2026-11-04).** Phase 8 (GPU acceleration, Metal first): slices 1–4 done (2026-11-03); slice 5 is next, with the Phase 7 disk throttle. The improvement-plan backlog (MIGRATION_PLAN §3a) is cleared.
+
+**Phase 9 done (2026-11-04): the serving gateway; ADR-013.**
+- `qubivex-api` (Axum + Tokio at the edge only) and `qubivex serve`: `/v1/chat/completions` and `/v1/completions` (SSE or not), `/v1/models`, `/health`, `/metrics` (Prometheus text), `/v1/system`, admin load/unload behind `--admin-token`, optional `--api-key`, request ids, OpenAI-shaped errors without paths. Every generation on its own thread with bounded channels.
+- Runtime: `Engine::generate_with` (chunked prefill, cancellation flag checked per chunk and per token, `Finish` reasons), `Engine::reserve_kv` (KV of concurrent conversations admitted together against the plan; room sharing and the KV ledger charge use the total), forward passes take FIFO turns per engine (a ticket lock; concurrent passes on one-slot pools failed with "pool is full"), `StreamDecoder::finish` (a trailing incomplete character is no longer dropped).
+- Exit criteria: the official OpenAI Python SDK (`crates/qubivex-api/sdk/openai_client.py`) works against OLMoE-1B-7B (GGUF) and Qwen3-0.6B (SafeTensors) served together: chat, streamed chat equal to non-streamed, completions, two concurrent chats equal to their sequential results, SDK error types. Over HTTP on the fixtures (`tests/gateway.rs`): concurrent = sequential, cancellation of streamed and non-streamed requests frees the slot, the fifth of four-that-fit conversations gets 503, auth/admin/errors. A curl disconnect on the real model shows up as one cancelled generation.
+- Tests: 284 on 1.85 and stable; `cargo deny` passes with the new dependencies. OLMoE single-request decode unchanged (43.2 tok/s, tokens match).
+- **Next:** Metal slice 5 and the Phase 7 disk throttle (either order); then Phase 10 (batching across requests, KV prefix reuse, paged KV).
 
 **Dense architecture and a real SafeTensors run done (2026-11-04), §3a item; ADR-003 amendment 1.**
 - `transformer_dense` registered beside `transformer_moe` (own config, presets `hf`/`gguf`, schema; refuses routed experts); shared config parsing in `qubivex-model/src/arch/common.rs`; new `TensorRole::Ffn` (planner group `dense FFN`). The forward pass (`qubivex_arch::Transformer`, renamed from `TransformerMoeModel`) shares embedding, attention, KV and head; the FFN is configuration. Whole-layer Metal and prefetch stay MoE-only; a dense model on Metal places its matmuls one by one (same bits).
@@ -11,7 +18,6 @@ Last updated: 2026-11-04
 - Real run: `Qwen/Qwen3-0.6B` bf16 SafeTensors (1.4 GiB) imports with no edits and generates coherent text (plain and chat template). Against transformers f32: 32 greedy tokens identical, the top-32 logits of every prompt position within 1.2e-5 relative; prefill equals token by token and 1 vs 4 threads bit for bit (`tests/real_dense.rs`, env-gated `QUBIVEX_DENSE_SAFETENSORS_DIR`).
 - Measured (M3 Pro, 5 threads): decode 68.6 tok/s (about 77 GiB/s of bf16 weights per token, near the machine's bandwidth), prefill 157 tok/s (10 tokens) and 281 tok/s (128 tokens); Metal per-op 33 tok/s with identical tokens. Records `docs/performance/baselines/2026-11-04-m3pro-dense-cpu-*.json`. OLMoE unchanged (42.65 tok/s, tokens match).
 - Tests: 276 on 1.85 and stable. New: `dense-tiny` fixture (Llama-style, no q/k norm, GQA, tied head) against transformers per layer (5.2e-7), in the prefill/thread/Metal invariants, fixture import round trip, refusals (`num_experts`, `mlp_bias`, sliding window, attention bias).
-- **Next:** Phase 9 (API server), then Metal slice 5 and the Phase 7 disk throttle.
 
 **KV cache on `Tensor<f32>` done (2026-11-04), §3a item; ADR-009's next consumer.**
 - `qubivex-arch` `KvCache`: one `Tensor<f32>` per layer for keys and one for values, `[kv_head, pos, head_dim]`, with room for the reserved positions (still whole 256-position chunks, so the planner's KV charge is unchanged). A step writes each head's new rows through one `narrow` view; attention reads each head's positions `0..=p` as one contiguous `narrow` view; a failed step only resets the position count (rows past it are never read and are overwritten next). Per-layer tensors, so growing copies one layer at a time.
