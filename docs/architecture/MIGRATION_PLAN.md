@@ -239,7 +239,8 @@ paged KV, NUMA, multi-device; then a CLI UX catalogue and recommendations UI.
   amendment 1); a faster
   lossless Q4_K kernel (the EIP's quantised GEMV target is ≥ 70% of STREAM; the
   baseline measures Q4_K at 17 GiB/s, about 22% of the 80 GiB/s bf16 streams from DRAM
-  on the M3 Pro, and the kernel is limited by compute, not memory).
+  on the M3 Pro, and the kernel is limited by compute, not memory; done 2026-11-04 with
+  the same bits, 25–28 GiB/s and decode 30 → 42 tok/s: ADR-002 amendment 2).
 - **KV cache on `Tensor<f32>`** with `narrow` views: the next consumer of ADR-009, with
   its own benchmark.
 - **Extensibility:** a dense (non-MoE) architecture and a real SafeTensors run, alongside
