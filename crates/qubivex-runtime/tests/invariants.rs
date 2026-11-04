@@ -731,3 +731,103 @@ fn argmax(v: &[f32]) -> u32 {
     }
     u32::try_from(best).unwrap()
 }
+
+/// Serving (Phase 9): chunked prefill gives the tokens of one pass for every chunk
+/// size, a set cancellation flag stops generation before the first chunk, and the
+/// token callback can stop it.
+#[test]
+fn chunked_prefill_cancellation_and_stop() {
+    use qubivex_runtime::{Finish, GenerateOptions};
+    use std::sync::atomic::AtomicBool;
+    for id in ALL {
+        let e = engine(id, None);
+        let want = e
+            .generate(PROMPT, 10, Sampling::default(), |_| true)
+            .unwrap();
+        let keep = AtomicBool::new(false);
+        for chunk in [1, 3, 5, 6, 64] {
+            let opts = GenerateOptions {
+                max_new: 10,
+                prefill_chunk: chunk,
+                ..GenerateOptions::default()
+            };
+            let g = e.generate_with(PROMPT, &opts, &keep, |_| true).unwrap();
+            assert_eq!(g.tokens, want, "{id} chunk {chunk}");
+            assert_eq!(g.prompt_tokens, PROMPT.len());
+            assert!(matches!(g.finish, Finish::Length | Finish::Eos), "{id}");
+        }
+        let opts = GenerateOptions {
+            max_new: 10,
+            ..GenerateOptions::default()
+        };
+        let g = e
+            .generate_with(PROMPT, &opts, &AtomicBool::new(true), |_| true)
+            .unwrap();
+        assert_eq!((g.tokens.len(), g.finish), (0, Finish::Cancelled), "{id}");
+        if want.len() >= 3 {
+            let mut n = 0;
+            let g = e
+                .generate_with(PROMPT, &opts, &keep, |_| {
+                    n += 1;
+                    n < 3
+                })
+                .unwrap();
+            assert_eq!(
+                (g.tokens.as_slice(), g.finish),
+                (&want[..3], Finish::Stopped)
+            );
+        }
+    }
+}
+
+/// Admission (Phase 9): KV reservations of concurrent conversations add up against the
+/// memory plan, a reservation the plan cannot hold is refused, and dropping one returns
+/// its room.
+#[test]
+fn kv_reservations_add_up_against_the_plan() {
+    let meta =
+        ModelMetadata::load(&dir("olmoe-tiny"), &ArchitectureRegistry::with_builtins()).unwrap();
+    let fp = qubivex_memory::ModelFootprint::from_metadata(&meta).unwrap();
+    // Room for the dense weights, the activation reserve, one expert slot per layer
+    // and 1024 KV positions: four 256-position conversations, not five.
+    let budget = fp.dense_bytes().0
+        + qubivex_memory::ACTIVATION_RESERVE.0
+        + fp.cache_floor().0
+        + 1024 * fp.kv_bytes_per_token.0;
+    let e = Engine::load(
+        meta,
+        EngineOptions {
+            ram_budget: Some(budget),
+            max_context: Some(256),
+            pressure_interval_ms: Some(0),
+            ..EngineOptions::default()
+        },
+    )
+    .unwrap();
+    let a = e.reserve_kv(200).unwrap();
+    assert_eq!(a.positions(), 256);
+    assert_eq!(e.kv_reserved(), 256);
+    let mut held = vec![a];
+    let refused = loop {
+        match e.reserve_kv(256) {
+            Ok(r) => held.push(r),
+            Err(err) => break err,
+        }
+        assert!(held.len() < 100, "the plan never refused");
+    };
+    assert_eq!(held.len(), 4, "four conversations fit");
+    assert!(
+        refused
+            .to_string()
+            .contains("no room for another conversation")
+    );
+    let n = held.len();
+    held.pop();
+    assert_eq!(e.kv_reserved(), (n - 1) * 256);
+    assert!(
+        e.reserve_kv(256).is_ok(),
+        "dropping a reservation returns its room"
+    );
+    drop(held);
+    assert_eq!(e.kv_reserved(), 0);
+}

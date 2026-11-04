@@ -464,6 +464,21 @@ impl StreamDecoder<'_> {
         self.emitted = text.len();
         Ok(piece)
     }
+
+    /// Ends the stream: the text not yet returned, including a trailing incomplete
+    /// UTF-8 sequence (as U+FFFD), so the pieces join to `decode` of every id.
+    ///
+    /// # Errors
+    /// As [`Tokenizer::decode`].
+    pub fn finish(&mut self) -> Result<String, TokenizerError> {
+        let text = self.tok.decode(&self.ids, true)?;
+        let piece = text
+            .get(self.emitted..)
+            .map(str::to_owned)
+            .unwrap_or_default();
+        self.emitted = text.len();
+        Ok(piece)
+    }
 }
 
 #[cfg(test)]
