@@ -12,8 +12,8 @@
 //! checksum recorded from a known-good read ([`checksum`]).
 
 use std::collections::HashMap;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
 
 use qubivex_core::LayerIdx;
@@ -44,6 +44,9 @@ pub enum Fault {
     Panic,
     /// The read succeeds after a delay.
     Delay(Duration),
+    /// The read blocks, as on a failing drive or a lost network mount, until
+    /// [`FaultySource::release_hangs`]; then it succeeds.
+    Hang,
 }
 
 /// Which reads a rule watches.
@@ -119,6 +122,10 @@ pub struct FaultySource {
     rules: Vec<Armed>,
     reads: AtomicU64,
     injected: AtomicU64,
+    /// Set once hung reads may return.
+    released: Mutex<bool>,
+    release: Condvar,
+    hanging: AtomicU64,
 }
 
 impl std::fmt::Debug for FaultySource {
@@ -149,7 +156,25 @@ impl FaultySource {
                 .collect(),
             reads: AtomicU64::new(0),
             injected: AtomicU64::new(0),
+            released: Mutex::new(false),
+            release: Condvar::new(),
+            hanging: AtomicU64::new(0),
         }
+    }
+
+    /// Lets every hung read (and every later [`Fault::Hang`]) return.
+    pub fn release_hangs(&self) {
+        *self
+            .released
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = true;
+        self.release.notify_all();
+    }
+
+    /// Reads blocked in [`Fault::Hang`] now.
+    #[must_use]
+    pub fn hanging(&self) -> u64 {
+        self.hanging.load(Ordering::SeqCst)
     }
 
     /// Reads asked for so far.
@@ -231,6 +256,22 @@ impl ExpertSource for FaultySource {
             }
             Fault::Delay(d) => {
                 std::thread::sleep(d);
+                self.inner.read_expert(key, dst)
+            }
+            Fault::Hang => {
+                self.hanging.fetch_add(1, Ordering::SeqCst);
+                let mut released = self
+                    .released
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                while !*released {
+                    released = self
+                        .release
+                        .wait(released)
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                }
+                drop(released);
+                self.hanging.fetch_sub(1, Ordering::SeqCst);
                 self.inner.read_expert(key, dst)
             }
         }

@@ -18,8 +18,8 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use qubivex_arch::Logits;
-use qubivex_expert_stream::ExpertSource;
 use qubivex_expert_stream::fault::{Fault, FaultySource, Rule, Target, VerifiedSource};
+use qubivex_expert_stream::{ExpertSource, ReadTimeout};
 use qubivex_model::{ArchitectureRegistry, ModelMetadata};
 use qubivex_runtime::{BackendKind, Engine, EngineOptions, ModelExpertSource, Sampling};
 
@@ -64,6 +64,9 @@ fn options_on(m: &ModelMetadata, cache: Cache, io_threads: usize, metal: bool) -
         }),
         max_context: Some(64),
         io_threads: Some(io_threads),
+        // No retry, so each injected fault reaches the request (retries have their own
+        // test).
+        read_retries: Some(0),
         threads: Some(2),
         ..EngineOptions::default()
     }
@@ -337,6 +340,99 @@ fn metal_layers_survive_a_failed_read() {
                     ledger_matches_store(&e, &what);
                 }
             }
+        }
+    }
+}
+
+/// With the default retry, a read that fails once is read again and the request
+/// succeeds with the fault-free tokens.
+#[test]
+fn a_transient_failure_is_retried() {
+    quiet_injected_panics();
+    for id in IDS {
+        for io in [0, 4] {
+            let (want, prefill, _) = reference(id, Cache::Streaming, io);
+            for fault in [Fault::Eio, Fault::ShortRead { keep: 3 }, Fault::Panic] {
+                let m = meta(id);
+                let opts = EngineOptions {
+                    read_retries: None,
+                    ..options(&m, Cache::Streaming, io)
+                };
+                let e = Engine::load_with_source(m, opts, wrapped(&fault, prefill + 3)).unwrap();
+                let got = e.generate(PROMPT, NEW, Sampling::default(), |_| true);
+                assert_eq!(got.unwrap(), want, "{id} io {io} {fault:?}");
+                assert_eq!(e.store_stats().retried, 1, "{id} io {io} {fault:?}");
+            }
+        }
+    }
+}
+
+const QUICK: ReadTimeout = ReadTimeout {
+    floor: Duration::from_millis(150),
+    min_rate: 0,
+};
+
+/// A read that hangs mid-decode fails the request with a timeout (the tokens before it
+/// are the fault-free ones). With one I/O thread, that thread is then stuck and new
+/// requests are refused; once the read returns, requests succeed again.
+#[test]
+fn a_hung_read_times_out_and_the_engine_recovers() {
+    for id in IDS {
+        for io in [1, 4] {
+            let (want, prefill, total) = reference(id, Cache::Streaming, io);
+            let at = prefill + (total - prefill) / 2;
+            let what = format!("{id} io {io}");
+            let mut hook = None;
+            let m = meta(id);
+            let opts = EngineOptions {
+                read_timeout: Some(QUICK),
+                ..options(&m, Cache::Streaming, io)
+            };
+            let e = Engine::load_with_source(m, opts, |s| {
+                let f = Arc::new(FaultySource::new(
+                    s,
+                    [Rule::once_after(Target::Any, at, Fault::Hang)],
+                ));
+                hook = Some(Arc::clone(&f));
+                f
+            })
+            .unwrap();
+            let src = hook.unwrap();
+            let mut got = Vec::new();
+            let t = Instant::now();
+            let err = e
+                .generate(PROMPT, NEW, Sampling::default(), |tok| {
+                    got.push(tok);
+                    true
+                })
+                .expect_err(&what)
+                .to_string();
+            assert!(err.contains("not read after"), "{what}: {err}");
+            assert!(
+                t.elapsed() < Duration::from_secs(10),
+                "{what}: {:?}",
+                t.elapsed()
+            );
+            assert_eq!(got[..], want[..got.len()], "{what}: wrong tokens");
+            assert!(!got.is_empty(), "{what}");
+            // Wait until the hung read counts as stuck.
+            let t = Instant::now();
+            while e.store_occupancy().unwrap().stuck == 0 {
+                assert!(t.elapsed() < Duration::from_secs(5), "{what}: never stuck");
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            if io == 1 {
+                let refused = e.generate(PROMPT, NEW, Sampling::default(), |_| true);
+                let msg = refused.expect_err(&what).to_string();
+                assert!(msg.starts_with("storage:"), "{what}: {msg}");
+            }
+            src.release_hangs();
+            settled(&e, &what);
+            assert_eq!(e.store_occupancy().unwrap().stuck, 0, "{what}");
+            let again = e.generate(PROMPT, NEW, Sampling::default(), |_| true);
+            assert_eq!(again.unwrap(), want, "{what}: after the read returned");
+            settled(&e, &what);
+            ledger_matches_store(&e, &what);
         }
     }
 }

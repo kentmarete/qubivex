@@ -106,6 +106,8 @@ enum Command {
         #[command(flatten)]
         prefetch: PrefetchArgs,
         #[command(flatten)]
+        storage: StorageArgs,
+        #[command(flatten)]
         device: DeviceArgs,
         /// Context limit in tokens (default: the model's).
         #[arg(long)]
@@ -172,6 +174,8 @@ enum Command {
         direct_io: bool,
         #[command(flatten)]
         prefetch: PrefetchArgs,
+        #[command(flatten)]
+        storage: StorageArgs,
         #[command(flatten)]
         device: DeviceArgs,
         /// Context limit in tokens (default: the model's).
@@ -299,6 +303,8 @@ pub(crate) struct MemoryOptions {
     io_threads: Option<usize>,
     expert_io: qubivex_runtime::ExpertIo,
     prefetch: Option<qubivex_runtime::PrefetchOptions>,
+    read_timeout: Option<qubivex_expert_stream::ReadTimeout>,
+    read_retries: Option<u32>,
     backend: qubivex_runtime::BackendKind,
     metal_ops: qubivex_runtime::MetalOps,
 }
@@ -350,6 +356,41 @@ impl DeviceArgs {
             }
         }
         Ok((backend, ops))
+    }
+}
+
+/// Expert-read failure handling (ADR-006 amendment 4), shared by `run` and `bench`.
+#[derive(clap::Args, Clone, Debug)]
+pub(crate) struct StorageArgs {
+    /// Seconds to wait for one expert's read before failing the request (plus the
+    /// expert's size at 10 MB/s), or off. Default: 5.
+    #[arg(long)]
+    read_timeout: Option<String>,
+    /// Extra attempts after a failed expert read. Default: 1.
+    #[arg(long)]
+    read_retries: Option<u32>,
+}
+
+impl StorageArgs {
+    fn options(&self) -> Result<(Option<qubivex_expert_stream::ReadTimeout>, Option<u32>), String> {
+        let timeout = match self.read_timeout.as_deref() {
+            None => None,
+            Some("off") => Some(qubivex_expert_stream::ReadTimeout::NEVER),
+            Some(v) => {
+                let secs: f64 = v.parse().map_err(|_| {
+                    format!("--read-timeout {v:?} is not a number of seconds or off")
+                })?;
+                let floor = std::time::Duration::try_from_secs_f64(secs)
+                    .ok()
+                    .filter(|d| !d.is_zero())
+                    .ok_or_else(|| format!("--read-timeout {v} must be positive"))?;
+                Some(qubivex_expert_stream::ReadTimeout {
+                    floor,
+                    ..qubivex_expert_stream::ReadTimeout::DEFAULT
+                })
+            }
+        };
+        Ok((timeout, self.read_retries))
     }
 }
 
@@ -423,6 +464,16 @@ impl MemoryOptions {
         self
     }
 
+    /// The same options with these expert-read settings.
+    const fn with_storage(
+        mut self,
+        (timeout, retries): (Option<qubivex_expert_stream::ReadTimeout>, Option<u32>),
+    ) -> Self {
+        self.read_timeout = timeout;
+        self.read_retries = retries;
+        self
+    }
+
     /// The same options with this backend and placement.
     const fn with_device(
         mut self,
@@ -454,6 +505,8 @@ impl MemoryOptions {
             io_threads: self.io_threads,
             expert_io: self.expert_io,
             prefetch: self.prefetch,
+            read_timeout: self.read_timeout,
+            read_retries: self.read_retries,
             backend: self.backend,
             metal_ops: self.metal_ops,
             ..qubivex_runtime::EngineOptions::default()
@@ -472,6 +525,8 @@ fn memory_options(
 ) -> Result<MemoryOptions, String> {
     Ok(MemoryOptions {
         prefetch: None,
+        read_timeout: None,
+        read_retries: None,
         backend: qubivex_runtime::BackendKind::Cpu,
         metal_ops: qubivex_runtime::MetalOps::default(),
         io_threads,
@@ -575,6 +630,7 @@ fn execute(cmd: &Command) -> Result<(), String> {
             io_threads,
             direct_io,
             prefetch,
+            storage,
             device,
             context,
             threads,
@@ -600,6 +656,7 @@ fn execute(cmd: &Command) -> Result<(), String> {
                 *direct_io,
             )?
             .with_prefetch(prefetch.options()?)
+            .with_storage(storage.options()?)
             .with_device(device.options()?),
             context: *context,
             threads: *threads,
@@ -622,6 +679,7 @@ fn execute(cmd: &Command) -> Result<(), String> {
             io_threads,
             direct_io,
             prefetch,
+            storage,
             device,
             context,
             label,
@@ -648,6 +706,7 @@ fn execute(cmd: &Command) -> Result<(), String> {
                 *direct_io,
             )?
             .with_prefetch(prefetch.options()?)
+            .with_storage(storage.options()?)
             .with_device(device.options()?),
             context: *context,
             label: label.as_deref(),

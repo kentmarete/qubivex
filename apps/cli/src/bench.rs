@@ -252,6 +252,12 @@ struct Experts {
     /// (absent before Phase 6 slice 2).
     #[serde(default)]
     wait_ms_per_token: f64,
+    /// Failed reads attempted again, and waits that timed out, during the measured
+    /// runs (absent before ADR-006 amendment 4). Non-zero means the drive misbehaved.
+    #[serde(default)]
+    read_retries: u64,
+    #[serde(default)]
+    read_timeouts: u64,
     /// What prefetch did during the measured runs; absent when it is off.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     prefetch: Option<PrefetchRecord>,
@@ -724,6 +730,8 @@ pub(crate) fn bench(a: &BenchArgs<'_>) -> Result<String, String> {
             wait_ms_per_token: (after.wait_ns - before.wait_ns) as f64
                 / 1e6
                 / (a.runs * a.decode_tokens).max(1) as f64,
+            read_retries: after.retried - before.retried,
+            read_timeouts: after.timeouts - before.timeouts,
             prefetch: prefetch_before
                 .zip(prefetch_after)
                 .map(|(b, a)| prefetch_record(b, a)),

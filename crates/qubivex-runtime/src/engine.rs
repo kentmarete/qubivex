@@ -17,8 +17,8 @@ use qubivex_compute::tensor::TensorView;
 use qubivex_core::{Bytes, ExpertIdx, LayerIdx, Shape, TensorDesc};
 use qubivex_expert_stream::predict::{Lookahead, LookaheadConfig};
 use qubivex_expert_stream::{
-    ExpertKey, ExpertSource, ExpertStore, Occupancy, Policy, PoolSpec, PrefetchStats, StoreError,
-    StoreStats,
+    ExpertKey, ExpertSource, ExpertStore, Occupancy, Policy, PoolSpec, PrefetchStats, ReadTimeout,
+    StoreError, StoreStats,
 };
 use qubivex_hardware::{Host, Probed, ResourceProbe, SystemProbe};
 use qubivex_memory::{
@@ -58,6 +58,13 @@ pub struct EngineOptions {
     /// Dedicated threads reading experts (ADR-006). `None`: the default (see
     /// [`DEFAULT_IO_THREADS`]); `Some(0)`: the compute thread reads its own misses.
     pub io_threads: Option<usize>,
+    /// How long a forward pass waits for one expert's read before failing the request
+    /// (ADR-006 amendment 4). `None`: [`ReadTimeout::DEFAULT`]; [`ReadTimeout::NEVER`]
+    /// waits forever. Needs I/O threads: a compute thread reading its own miss cannot
+    /// time out.
+    pub read_timeout: Option<ReadTimeout>,
+    /// Extra attempts after a failed expert read. `None`: [`DEFAULT_READ_RETRIES`].
+    pub read_retries: Option<u32>,
     /// How experts are read: buffered (default) or bypassing the page cache
     /// (ADR-006 amendment 2).
     pub expert_io: ExpertIo,
@@ -137,6 +144,9 @@ struct Predictor {
 
 /// I/O threads when none are requested.
 pub const DEFAULT_IO_THREADS: usize = 4;
+
+/// Extra attempts after a failed expert read: one, for transient errors.
+pub const DEFAULT_READ_RETRIES: u32 = 1;
 
 /// The default thread count: the compute team, else every logical CPU.
 fn default_threads() -> usize {
@@ -649,6 +659,10 @@ impl Engine {
             io_threads,
         )
         .map_err(|e| RuntimeError::Model(format!("cannot start {io_threads} I/O threads: {e}")))?;
+        store
+            .set_read_timeout(opts.read_timeout.unwrap_or(ReadTimeout::DEFAULT))
+            .map_err(|e| RuntimeError::Model(e.to_string()))?;
+        store.set_read_retries(opts.read_retries.unwrap_or(DEFAULT_READ_RETRIES));
         let ledger = MemoryLedger::new(0);
         let charges = Charges {
             _dense: ledger.charge(Tier::Ram, Owner::Dense, Bytes(dense_bytes)),
@@ -843,12 +857,26 @@ impl Engine {
         }
     }
 
-    /// Refuses a new request under critical memory pressure (ADR-005). Active
-    /// requests are never stopped.
+    /// Refuses a new request under critical memory pressure (ADR-005), or when every
+    /// expert I/O thread is blocked in a read past its deadline. Active requests are
+    /// never stopped.
     ///
     /// # Errors
-    /// [`RuntimeError::Memory`] when the pressure monitor refuses admission.
+    /// [`RuntimeError::Memory`] when the pressure monitor refuses admission;
+    /// [`RuntimeError::Storage`] when every I/O thread is stuck.
     pub fn admit(&self) -> Result<(), RuntimeError> {
+        // Every I/O thread blocked in a read past its deadline: a new request would
+        // only queue behind them and time out.
+        let threads = self.store.io_threads();
+        if threads > 0 {
+            let stuck = self.store_occupancy()?.stuck;
+            if stuck >= threads {
+                return Err(RuntimeError::Storage(format!(
+                    "new request refused: all {threads} expert I/O threads are blocked in \
+                     reads past their deadline; the drive may have failed"
+                )));
+            }
+        }
         match self.pressure() {
             Some(d) if !d.admit => Err(RuntimeError::Memory(format!(
                 "new request refused: memory pressure is {:?}; the expert cache is at its floor",
