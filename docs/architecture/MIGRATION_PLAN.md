@@ -245,7 +245,8 @@ paged KV, NUMA, multi-device; then a CLI UX catalogue and recommendations UI.
   its own benchmark (done 2026-11-04: one tensor per layer, `[kv_head, pos, head_dim]`;
   tokens identical, speed within noise; TENSOR_ARCHITECTURE §7).
 - **Extensibility:** a dense (non-MoE) architecture and a real SafeTensors run, alongside
-  the existing MoE path.
+  the existing MoE path (done 2026-11-04: `transformer_dense`, `Qwen/Qwen3-0.6B` bf16
+  SafeTensors matches transformers; ADR-003 amendment 1).
 - **Precision (ADR-010):** lossless by default; lossy behaviour only as named opt-ins,
   never in a profile.
 - **Graph IR and compiler: deferred** until operator contracts exist and a second

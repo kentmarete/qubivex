@@ -1,0 +1,31 @@
+{
+  "architecture": {
+    "config": {
+      "qk_norm": "none",
+      "tensor_names": "hf"
+    },
+    "id": "transformer_dense",
+    "version": "1.0.0"
+  },
+  "model": {
+    "id": "dense-tiny",
+    "name": "dense-tiny"
+  },
+  "overrides": {},
+  "quantization": "bf16",
+  "schema_version": "1.0.0",
+  "tokenizer": {
+    "kind": "huggingface",
+    "path": "tokenizer.json"
+  },
+  "weights": {
+    "config": "config.json",
+    "format": "safetensors",
+    "shards": [
+      {
+        "path": "model.safetensors",
+        "size": 158352
+      }
+    ]
+  }
+}

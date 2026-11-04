@@ -91,7 +91,7 @@ What QUBIVEX adds over a straight port:
 | Storage | Sequential read throughput with and without the page cache (`O_DIRECT` / `F_NOCACHE`), random 4 MiB read latency (about one expert) |
 | Model files | SafeTensors (single or sharded) and GGUF v2/v3 readers, hardened against malformed and malicious headers |
 | Models | Manifest v1, architecture registry, the `transformer_moe` architecture, full cross-validation of manifest, config and tensors, discovery, automatic manifest import |
-| Inference | CPU forward pass for `transformer_moe` (OLMoE, Qwen3-MoE): lossless kernels for f32, f16, bf16, Q8_0, Q4_K and Q6_K; an expert cache of any size with leases and LRU eviction; KV cache; greedy, temperature and top-p sampling; chat templates |
+| Inference | CPU forward pass for `transformer_moe` (OLMoE, Qwen3-MoE) and `transformer_dense` (dense Qwen3, Llama-style): lossless kernels for f32, f16, bf16, Q8_0, Q4_K and Q6_K; an expert cache of any size with leases and LRU eviction; KV cache; greedy, temperature and top-p sampling; chat templates |
 | Tokenizers | Hugging Face `tokenizer.json`, or rebuilt from a GGUF file's vocabulary (verified identical to the official tokenizer) |
 | CLI | `qubivex run`, `qubivex system`, `qubivex doctor --storage`, `qubivex models list / inspect / import / architectures` |
 
@@ -312,9 +312,11 @@ Writes a `manifest.json` for a checkpoint:
 | `--force` | Replace an existing `manifest.json` |
 
 The importer finds the weight files: a `model.safetensors.index.json`, all
-`*.safetensors`, or a single `.gguf`. It then tries each tensor-name layout and
-q/k-norm mode, and keeps the first combination under which every tensor validates. If
-none does, it reports the problems of the closest candidate. It records shard sizes,
+`*.safetensors`, or a single `.gguf`. It then tries each architecture
+(`transformer_moe`, then `transformer_dense`), tensor-name layout and q/k-norm mode, and
+keeps the first combination under which every tensor validates. If none does, it
+reports the problems of the closest candidate. A tied output head reads the embedding;
+a copy of it stored under the head's name is listed in `overrides.ignore_tensors`. It records shard sizes,
 which are checked at every load, and the dominant dtype.
 
 ### `qubivex models architectures`
@@ -379,16 +381,23 @@ loudly instead of producing wrong numbers.
 
 ## Supported models and formats
 
-**Architecture:** `transformer_moe`, a decoder-only transformer with RMSNorm, RoPE
-attention (MHA, GQA or MQA, optional q/k norm) and routed SwiGLU experts in every layer,
-with softmax or sigmoid routing and optional top-K renormalisation.
+**Architectures:**
+- `transformer_moe`, a decoder-only transformer with RMSNorm, RoPE attention (MHA, GQA
+  or MQA, optional q/k norm) and routed SwiGLU experts in every layer, with softmax or
+  sigmoid routing and optional top-K renormalisation.
+- `transformer_dense`, the same attention with one dense SwiGLU FFN in every layer. The
+  forward pass shares the embedding, attention, KV cache and head with
+  `transformer_moe`; only the FFN differs. It runs on the CPU; on Metal its matmuls are
+  placed one by one (same bits, slower than the CPU for now).
 
 | Model family | Status |
 |---|---|
 | OLMoE (for example `allenai/OLMoE-1B-7B-0125-Instruct`) | Supported by configuration in per-expert SafeTensors, stacked SafeTensors and GGUF layouts. Validated on tiny checkpoints and on the full-size Q4_K_M GGUF |
 | Qwen3-MoE (for example `Qwen/Qwen3-30B-A3B`) | Supported by configuration in per-expert and stacked SafeTensors layouts. Tested on tiny checkpoints; not yet on a full-size one |
+| Dense Qwen3 (for example `Qwen/Qwen3-0.6B`) | `transformer_dense` by configuration (per-head q/k norm, GQA, tied head). Validated on the full-size bf16 SafeTensors checkpoint: 32 greedy tokens equal transformers', logits within 1.2e-5 |
+| Dense Llama-style (no q/k norm, GQA, tied or separate head) | `transformer_dense` by configuration. Tested on a tiny checkpoint against transformers |
 | Shared-expert or partly dense MoE (Qwen2-MoE, DeepSeek, GLM) | Refused with a clear message for now |
-| Attention biases, non-SiLU activations, RoPE scaling (YaRN and similar) | Refused with a clear message for now |
+| Attention or FFN biases, non-SiLU activations, RoPE scaling (YaRN and similar), sliding-window attention | Refused with a clear message for now |
 
 **Containers:** SafeTensors (single file or sharded with `model.safetensors.index.json`)
 and GGUF v2/v3, little-endian, single file.
@@ -397,7 +406,8 @@ and GGUF v2/v3, little-endian, single file.
 `Q5_1`, `Q8_0`, `Q8_1`, `Q2_K`, `Q3_K`, `Q4_K`, `Q5_K`, `Q6_K` and `Q8_K`. I-quants (`IQ*`)
 are not supported yet.
 
-Adding a model family that fits `transformer_moe` takes a manifest, not code. A new
+Adding a model family that fits `transformer_moe` or `transformer_dense` takes a
+manifest, not code. A new
 mechanism (for example multi-head latent attention) is a new architecture registered
 with `ArchitectureRegistry`, and runtime code does not change.
 

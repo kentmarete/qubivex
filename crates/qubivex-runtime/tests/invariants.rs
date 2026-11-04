@@ -34,13 +34,21 @@ fn bits(v: &[f32]) -> Vec<u32> {
 }
 
 const IDS: [&str; 3] = ["olmoe-tiny", "olmoe-tiny-gguf", "qwen3-moe-tiny"];
+/// The mixture-of-experts fixtures and the dense one, for invariants that do not
+/// involve routing.
+const ALL: [&str; 4] = [
+    "olmoe-tiny",
+    "olmoe-tiny-gguf",
+    "qwen3-moe-tiny",
+    "dense-tiny",
+];
 const PROMPT: &[u32] = &[
     72, 101, 108, 108, 111, 44, 32, 101, 120, 112, 101, 114, 116, 115,
 ];
 
 #[test]
 fn prefill_equals_token_by_token() {
-    for id in IDS {
+    for id in ALL {
         let e = engine(id, None);
         let mut c = e.new_cache();
         let batch = e.forward(PROMPT, &mut c, Logits::All, None).unwrap();
@@ -149,7 +157,7 @@ fn io_threads_never_change_bits() {
 /// where a layer has fewer slots than routed experts.
 #[test]
 fn compute_threads_never_change_bits() {
-    for id in IDS {
+    for id in ALL {
         let largest = engine(id, None).metadata().bytes().largest_expert;
         let mut want = None;
         for threads in [1, 3] {
@@ -589,7 +597,7 @@ fn metal_placement_never_changes_bits() {
         all,
         layers,
     ];
-    for id in IDS {
+    for id in ALL {
         let meta =
             || ModelMetadata::load(&dir(id), &ArchitectureRegistry::with_builtins()).unwrap();
         let opts = EngineOptions {

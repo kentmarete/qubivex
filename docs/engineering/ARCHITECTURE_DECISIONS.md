@@ -19,7 +19,7 @@ recorded in the ADR it affects, or in a new ADR numbered from 009.
 |---|---|---|---|---|
 | 001 | Rust workspace, phase-gated crates | Proposed | Implemented as written; enforced by lints, `xtask`, CI | **Accepted** (owner review pending since Phase 1) |
 | 002 | Hybrid compute, own kernels, no Candle | Accepted | Own kernels built, including the register-blocked prefill (amendment 1, instead of `gemm`, which breaks batch invariance) and a faster lossless Q4_K decode kernel with the same bits (amendment 2). Spinning pool **deferred** with measurements | Accepted, plus an "Implementation status" note listing the two unbuilt parts |
-| 003 | Architecture registry by manifest id | Proposed | Implemented; OLMoE and a Qwen3-MoE fixture load through one factory | **Accepted** |
+| 003 | Architecture registry by manifest id | Proposed | Implemented; OLMoE and a Qwen3-MoE fixture load through one factory; a second architecture, `transformer_dense`, runs a real SafeTensors checkpoint (amendment 1) | **Accepted** |
 | 004 | Versioned manifest, cross-validated | Proposed | Implemented (schema v1, import, cross-checks) | **Accepted** |
 | 005 | One measured, role-driven memory planner | Proposed | Not built (Phase 5) | Proposed; extended by §2.3 |
 | 006 | Synchronous lease-based expert store | Proposed | Leases, dedup, the priority I/O queue, I/O threads and `acquire_many` built (Phase 6 slice 2, amendment 1); direct I/O built, off by default (slice 3, amendment 2); io_uring deferred to a Linux host | **Accepted** for the lease and sync model; io_uring waits for a Linux measurement |
@@ -269,7 +269,7 @@ into it.
 | 1 Tensor foundations | (new, before Phase 5) | Scoped tensor-descriptor work (TENSOR_ARCHITECTURE) |
 | 2 Memory manager | Phase 5 (planner, ledger), Phase 6 (slabs, I/O) | Unchanged, with the §2.3 amendments |
 | 3 CPU compute | Phase 4 follow-ups | Add: in-workspace benchmarks first, then AVX2, `gemm` prefill and Q4_K speed-up, each measured |
-| 4 Model execution | Phase 4 (done for MoE) | Add: a dense architecture and a real SafeTensors run, as an extensibility test |
+| 4 Model execution | Phase 4 (done for MoE) | Add: a dense architecture and a real SafeTensors run, as an extensibility test (done 2026-11-04: ADR-003 amendment 1) |
 | 5 Graph IR | (none) | Deferred (§2.7) |
 | 6 GPU | Phase 8 | Metal first (§2.6) |
 | 7 Advanced execution | Phases 10–11 | Unchanged |
