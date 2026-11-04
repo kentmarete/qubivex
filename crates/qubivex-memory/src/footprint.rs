@@ -29,6 +29,8 @@ pub enum RoleGroup {
     Attention,
     /// MoE routers.
     Router,
+    /// Dense FFN projections.
+    Ffn,
 }
 
 impl RoleGroup {
@@ -41,6 +43,7 @@ impl RoleGroup {
             Self::Norms => "norms",
             Self::Attention => "attention",
             Self::Router => "routers",
+            Self::Ffn => "dense FFN",
         }
     }
 }
@@ -130,6 +133,7 @@ impl ModelFootprint {
                     RoleGroup::Attention
                 }
                 TensorRole::Router { .. } => RoleGroup::Router,
+                TensorRole::Ffn { .. } => RoleGroup::Ffn,
                 TensorRole::RoutedExpert { layer, expert, .. } => {
                     *experts.entry((layer, expert.0)).or_default() += bytes;
                     continue;

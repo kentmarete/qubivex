@@ -509,7 +509,7 @@ fn manifest_rules() {
 #[test]
 fn registry_rules() {
     let mut r = ArchitectureRegistry::with_builtins();
-    assert_eq!(r.list_supported().len(), 1);
+    assert_eq!(r.list_supported().len(), 2);
     assert!(
         r.register(Arc::new(TransformerMoe))
             .unwrap_err()
@@ -536,7 +536,7 @@ fn registry_rules() {
         r.resolve(&m("nonesuch", "1.0.0"))
             .unwrap_err()
             .to_string()
-            .contains("registered: transformer_moe")
+            .contains("registered: transformer_dense, transformer_moe")
     );
     assert!(r.unregister("transformer_moe").is_some());
     assert!(r.resolve(&m("transformer_moe", "1.0.0")).is_err());

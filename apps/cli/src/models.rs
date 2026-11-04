@@ -217,6 +217,7 @@ pub(crate) fn inspect(
             TensorRole::FinalNorm | TensorRole::Norm { .. } => "norms",
             TensorRole::Attention { .. } => "attention",
             TensorRole::Router { .. } => "router",
+            TensorRole::Ffn { .. } => "dense FFN",
             TensorRole::RoutedExpert { .. } | TensorRole::RoutedExpertStack { .. } => {
                 "routed experts"
             }
@@ -305,7 +306,10 @@ pub(crate) fn import_cmd(a: &ImportArgs<'_>) -> Result<String, String> {
     );
     if a.checksums {
         let m = ModelMetadata::load(&imp.dir, &reg).map_err(|e| chain(&e))?;
-        out.push_str(&record_sums(&m, 0)?);
+        // Checksums cover streamed experts; a dense model streams nothing.
+        if m.bytes().routed_experts > 0 {
+            out.push_str(&record_sums(&m, 0)?);
+        }
     }
     Ok(out)
 }
