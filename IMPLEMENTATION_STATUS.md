@@ -5,10 +5,16 @@ Last updated: 2026-11-04
 ## Current phase
 **Phase 8 (GPU acceleration, Metal first): slices 1–4 done (2026-11-03).** Metal slice 5 is paused while the improvement-plan backlog (MIGRATION_PLAN §3a and Addendum §4) is cleared first.
 
+**KV cache on `Tensor<f32>` done (2026-11-04), §3a item; ADR-009's next consumer.**
+- `qubivex-arch` `KvCache`: one `Tensor<f32>` per layer for keys and one for values, `[kv_head, pos, head_dim]`, with room for the reserved positions (still whole 256-position chunks, so the planner's KV charge is unchanged). A step writes each head's new rows through one `narrow` view; attention reads each head's positions `0..=p` as one contiguous `narrow` view; a failed step only resets the position count (rows past it are never read and are overwritten next). Per-layer tensors, so growing copies one layer at a time.
+- `qubivex-compute`: `TensorViewMut::{reborrow, narrow, select, contiguous_data_mut}`.
+- Measured against `main` (interleaved): 1024-token prompt + 300 generated, prefill 114.8 / 116.7 / 111.7 vs 111.3 / 110.6 / 117.5 tok/s, decode 32.5 / 33.4 / 33.1 vs 32.6 / 33.4 / 33.7; 10-token prompt decode 42.6 / 43.0 vs 42.5 / 42.2. Tokens identical in every run.
+- Tests: 274 on 1.85 and stable. New: KV growth across chunk boundaries (one 300-token step, then single tokens past 512) equals token by token, a refused step adds no positions, a cleared cache keeps its room and gives a fresh cache's bits; mutable tensor views.
+- **Next (§3a):** a dense architecture and a SafeTensors run, then Phase 9.
+
 **Faster lossless Q4_K done (2026-11-04), §3a item; ADR-002 amendment 2.** Decode 30.5 → 41.6–42.5 tok/s all resident and 19.0 → 22.4–22.7 at 1 GiB; prefill unchanged; tokens identical to every reference.
 - Kernel: `qubivex-backend-cpu/src/neon.rs`. `d1 · q` is exact in f32 (17-bit `d1`, 4-bit `q`), so `fma(d1, q, −m1)` rounds exactly where the portable multiply-then-subtract does. On FEAT_FHM CPUs (run-time detected; every Apple M-series) `fmlal` forms `d · (sc · q)` from f16 operands (`sc · q < 1024`, exact in f16) in one instruction. 23 → 13 vector instructions per 16 weights; `decode_t5` gate/up 62.1 → 38.8 µs (17.5 → 28 GiB/s).
 - Tests: 272 on 1.85 and stable. New: every f16 `d` and `dmin` (with random scales, nibbles, activations) bit-identical across the portable, baseline-NEON and FHM paths (NaN results only have to be NaN); multi-block rows; the block-scale unpacking against GGML's `get_scale_min_k4`. Records: `docs/performance/baselines/2026-11-04-m3pro-q4k-fhm-*.json`.
-- **Next (§3a):** the KV cache on `Tensor<f32>`, a dense architecture and a SafeTensors run, then Phase 9.
 
 **Prefill done (2026-11-04), §3a item; ADR-002 amendment 1.** 128-token prefill 44.7 → 113–117 tok/s (faster than Metal whole layers' 77); decode 25 → 30 tok/s; tokens identical to every reference.
 - Kernel: `qubivex-backend-cpu/src/tile.rs`, a register-blocked matmul (4 weight rows × 6 activation rows, one 4-lane quad of the 64-lane reduction at a time, lane-major packed operands) that reproduces the decode dot product's bits exactly. It is used from 6 activation rows (the measured crossover); below that the row path stays. The `gemm` crate is not used: its accumulation order breaks invariant 1 (prefill equals token-by-token). Kernel 2.1× (`prefill_s128_t5` Q4_K gate/up 3.44 → 1.66 ms).

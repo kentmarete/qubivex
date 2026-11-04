@@ -16,7 +16,9 @@
 
 pub mod ops;
 
+use qubivex_compute::tensor::{Tensor, TensorView, TensorViewMut};
 use qubivex_compute::{ComputeBackend, ComputeError, MatMul, WeightView};
+use qubivex_core::{DType, Shape};
 use qubivex_core::{ExpertIdx, LayerIdx};
 use qubivex_model::ArchConfig;
 use qubivex_model::arch::{MoeConfig, QkNorm, RouterScoring};
@@ -203,14 +205,21 @@ pub type DeviceKv = Box<dyn std::any::Any + Send + Sync>;
 
 /// Keys and values of past positions, per layer and KV head.
 ///
-/// The CPU forward pass keeps them in host vectors. A device forward pass (Phase 8)
+/// The CPU forward pass keeps them in host tensors, one per layer for keys and one for
+/// values, each `[kv_head, position, head_dim]` f32 with room for the reserved
+/// positions (ADR-009). A step writes its rows through `narrow` views and attention
+/// reads each head's filled positions as one contiguous `narrow` view. A device
+/// forward pass (Phase 8)
 /// keeps them in its own buffers, in [`KvCache::device_mut`], and advances the
 /// position count with [`KvCache::advance`]; one cache is only ever used by one of the
 /// two, since an engine's placement is fixed at load.
 pub struct KvCache {
-    /// `[layer][kv_head]` → `len × head_dim`.
-    k: Vec<Vec<Vec<f32>>>,
-    v: Vec<Vec<Vec<f32>>>,
+    /// Per layer, `[kv_head, reserved positions, head_dim]`; positions `0..len` are
+    /// filled.
+    k: Vec<Tensor<f32>>,
+    v: Vec<Tensor<f32>>,
+    kv_heads: u64,
+    head_dim: u64,
     len: usize,
     max: usize,
     device: Option<DeviceKv>,
@@ -247,8 +256,7 @@ impl KvCache {
         self.k
             .iter()
             .chain(&self.v)
-            .flatten()
-            .map(|h| h.capacity() as u64 * 4)
+            .map(|t| t.view().storage().len() as u64 * 4)
             .sum::<u64>()
             + self.device_bytes
     }
@@ -297,26 +305,103 @@ impl KvCache {
         self.max
     }
 
-    /// Forgets the host keys and values past `positions` (of `head_dim` floats per
-    /// head), and the count of them. Reserved capacity is kept.
-    fn rollback_host(&mut self, positions: usize, head_dim: usize) {
-        for heads in self.k.iter_mut().chain(self.v.iter_mut()) {
-            for h in heads {
-                h.truncate(positions * head_dim);
-            }
+    /// Forgets the positions past `positions`. Reserved capacity is kept; rows past
+    /// the count are never read, and the next step overwrites them.
+    const fn rollback(&mut self, positions: usize) {
+        if positions < self.len {
+            self.len = positions;
         }
-        self.len = self.len.min(positions);
     }
 
     /// Forgets every position.
-    pub fn clear(&mut self) {
-        for heads in self.k.iter_mut().chain(self.v.iter_mut()) {
-            for h in heads {
-                h.clear();
-            }
-        }
+    pub const fn clear(&mut self) {
         self.len = 0;
     }
+
+    /// An empty layer tensor with room for `positions`.
+    fn layer_tensor(&self, positions: usize) -> Result<Tensor<f32>, ArchError> {
+        let shape = Shape::new(&[self.kv_heads, positions as u64, self.head_dim])
+            .map_err(ComputeError::from)?;
+        Ok(Tensor::zeros(DType::F32, shape)?)
+    }
+
+    /// Positions layer `l` has room for.
+    fn room(&self, l: usize) -> usize {
+        usize::try_from(self.k[l].desc().dims()[1]).unwrap_or(usize::MAX)
+    }
+
+    /// Makes room in layer `l` for `positions`, growing by whole chunks
+    /// ([`Self::reserved_for`]) and keeping the filled positions. One layer is copied
+    /// at a time, so growing never holds two copies of the whole cache.
+    fn reserve(&mut self, l: usize, positions: usize) -> Result<(), ArchError> {
+        if self.room(l) >= positions {
+            return Ok(());
+        }
+        let filled = self.len as u64;
+        let room = Self::reserved_for(positions, self.max);
+        for old in [&mut self.k[l], &mut self.v[l]] {
+            let shape = Shape::new(&[self.kv_heads, room as u64, self.head_dim])
+                .map_err(ComputeError::from)?;
+            let mut new = Tensor::zeros(DType::F32, shape)?;
+            let mut dst = new.view_mut()?;
+            for g in 0..self.kv_heads {
+                let from = old.view().select(0, g)?.narrow(0, 0, filled)?;
+                let to = dst.reborrow().select(0, g)?.narrow(0, 0, filled)?;
+                contiguous_mut(to)?.copy_from_slice(contiguous(from)?);
+            }
+            *old = new;
+        }
+        Ok(())
+    }
+
+    /// Writes the keys and values of `s` new positions, from `self.len` on, into layer
+    /// `l` (room already reserved): `k` and `v` hold `s` rows of every KV head's
+    /// `head_dim` values. One `narrow` view per head covers the whole step.
+    fn store(&mut self, l: usize, s: usize, k: &[f32], v: &[f32]) -> Result<(), ArchError> {
+        let d = usize::try_from(self.head_dim).map_err(|_| ArchError::Input("head_dim".into()))?;
+        let row = k.len() / s.max(1);
+        let (p0, n) = (self.len as u64, s as u64);
+        for (t, src) in [(&mut self.k[l], k), (&mut self.v[l], v)] {
+            let mut all = t.view_mut()?;
+            for g in 0..self.kv_heads {
+                let dst = contiguous_mut(all.reborrow().select(0, g)?.narrow(0, p0, n)?)?;
+                let off = usize::try_from(g).unwrap_or(usize::MAX) * d;
+                for (to, from) in dst.chunks_exact_mut(d).zip(src.chunks_exact(row)) {
+                    to.copy_from_slice(&from[off..off + d]);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Per KV head of layer `l`, the keys and the values of positions `0..positions`,
+    /// each `positions × head_dim` contiguous floats.
+    #[allow(clippy::type_complexity)]
+    fn heads(&self, l: usize, positions: usize) -> Result<(Vec<&[f32]>, Vec<&[f32]>), ArchError> {
+        let n = positions as u64;
+        let rows = |t| head_rows(t, self.kv_heads, n);
+        Ok((rows(&self.k[l])?, rows(&self.v[l])?))
+    }
+}
+
+/// Positions `0..n` of every KV head of one layer tensor.
+fn head_rows(t: &Tensor<f32>, kv_heads: u64, n: u64) -> Result<Vec<&[f32]>, ArchError> {
+    (0..kv_heads)
+        .map(|g| contiguous(t.view().select(0, g)?.narrow(0, 0, n)?))
+        .collect()
+}
+
+/// The elements of a view the KV cache built as contiguous.
+fn contiguous(v: TensorView<'_, f32>) -> Result<&[f32], ArchError> {
+    v.contiguous_data()?
+        .ok_or_else(|| ArchError::Input(format!("KV cache view {:?} is not contiguous", v.desc())))
+}
+
+/// The elements of a mutable view the KV cache built as contiguous.
+fn contiguous_mut(v: TensorViewMut<'_, f32>) -> Result<&mut [f32], ArchError> {
+    let desc = *v.desc();
+    v.contiguous_data_mut()?
+        .ok_or_else(|| ArchError::Input(format!("KV cache view {desc:?} is not contiguous")))
 }
 
 struct LayerNorms {
@@ -465,15 +550,22 @@ impl TransformerMoeModel {
     /// An empty KV cache for up to `max_positions` positions.
     #[must_use]
     pub fn new_cache(&self, max_positions: usize) -> KvCache {
-        let empty = || vec![vec![Vec::new(); self.kv_heads]; self.norms.len()];
-        KvCache {
-            k: empty(),
-            v: empty(),
+        let mut cache = KvCache {
+            k: Vec::new(),
+            v: Vec::new(),
+            kv_heads: self.kv_heads as u64,
+            head_dim: self.cfg.head_dim,
             len: 0,
             max: max_positions,
             device: None,
             device_bytes: 0,
+        };
+        // Zero-sized, so the layers can share it; the first step replaces each.
+        if let Ok(empty) = cache.layer_tensor(0) {
+            cache.k = vec![empty.clone(); self.norms.len()];
+            cache.v = cache.k.clone();
         }
+        cache
     }
 
     /// Runs `tokens` (at positions `cache.len()..`) through the model and appends their
@@ -498,10 +590,7 @@ impl TransformerMoeModel {
         let p0 = cache.len;
         let out = self.forward_unchecked(tokens, cache, src, logits, trace);
         if out.is_err() {
-            // A head_dim that does not fit fails before any position is written.
-            if let Ok(d) = usize_of(self.cfg.head_dim) {
-                cache.rollback_host(p0, d);
-            }
+            cache.rollback(p0);
         }
         out
     }
@@ -522,6 +611,13 @@ impl TransformerMoeModel {
             return Ok(Vec::new());
         }
         let p0 = cache.len;
+        if cache.k.len() != self.norms.len() || cache.v.len() != self.norms.len() {
+            return Err(ArchError::Input(format!(
+                "KV cache has {} layers, the model {}",
+                cache.k.len(),
+                self.norms.len()
+            )));
+        }
         if p0 + s > cache.max {
             return Err(ArchError::Input(format!(
                 "context full: {} positions + {s} new > {}",
@@ -634,12 +730,7 @@ impl TransformerMoeModel {
                 }
                 _ => {}
             }
-            let reserve = KvCache::reserved_for(p0 + s, cache.max) * d;
-            for h in cache.k[l].iter_mut().chain(cache.v[l].iter_mut()) {
-                if h.capacity() < (p0 + s) * d {
-                    h.reserve_exact(reserve - h.len());
-                }
-            }
+            cache.reserve(l, p0 + s)?;
             for t in 0..s {
                 self.rope.table(p0 + t, &mut rope_cs);
                 q[t * q_out..(t + 1) * q_out]
@@ -648,22 +739,18 @@ impl TransformerMoeModel {
                 k[t * kv_out..(t + 1) * kv_out]
                     .chunks_exact_mut(d)
                     .for_each(|hd| Rope::rotate(hd, &rope_cs));
-                for g in 0..kvh {
-                    let src = t * kv_out + g * d;
-                    cache.k[l][g].extend_from_slice(&k[src..src + d]);
-                    cache.v[l][g].extend_from_slice(&v[src..src + d]);
-                }
             }
+            cache.store(l, s, &k, &v)?;
             // Every (token, head) pair is independent once the cache holds the whole
             // batch, so they run in parallel; each is the same sequential `attend`.
-            let (kl, vl) = (&cache.k[l], &cache.v[l]);
+            let (kl, vl) = cache.heads(l, p0 + s)?;
             att.par_chunks_mut(d)
                 .enumerate()
                 .for_each_init(Vec::new, |scores, (i, out)| {
                     let (t, hd) = (i / heads, i % heads);
                     let g = hd / group;
                     let qs = &q[t * q_out + hd * d..t * q_out + (hd + 1) * d];
-                    attend(qs, &kl[g], &vl[g], p0 + t, out, scores);
+                    attend(qs, kl[g], vl[g], p0 + t, out, scores);
                 });
             be.matmul(&dense.view(&n(&c.names.o))?, &att, s, &mut o)?;
             for t in 0..s {

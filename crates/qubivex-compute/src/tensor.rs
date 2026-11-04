@@ -333,6 +333,46 @@ impl<'a, T: Element> TensorViewMut<'a, T> {
         }
     }
 
+    /// A shorter-lived mutable view of the same elements, so a view can be narrowed
+    /// more than once.
+    pub fn reborrow(&mut self) -> TensorViewMut<'_, T> {
+        TensorViewMut {
+            desc: self.desc,
+            data: self.data,
+        }
+    }
+
+    /// See [`TensorDesc::narrow`]; the view keeps the storage borrow.
+    ///
+    /// # Errors
+    /// As [`TensorDesc::narrow`].
+    pub fn narrow(self, dim: usize, start: u64, len: u64) -> Result<Self, ComputeError> {
+        let desc = self.desc.narrow(dim, start, len)?;
+        Self::new(desc, self.data)
+    }
+
+    /// See [`TensorDesc::select`]; the view keeps the storage borrow.
+    ///
+    /// # Errors
+    /// As [`TensorDesc::select`].
+    pub fn select(self, dim: usize, index: u64) -> Result<Self, ComputeError> {
+        let desc = self.desc.select(dim, index)?;
+        Self::new(desc, self.data)
+    }
+
+    /// The elements in row-major order, mutably and without copying, if the view is
+    /// contiguous.
+    ///
+    /// # Errors
+    /// As [`DType::storage_bytes`].
+    pub fn contiguous_data_mut(self) -> Result<Option<&'a mut [T]>, ComputeError> {
+        if !self.desc.is_contiguous() {
+            return Ok(None);
+        }
+        let range = contiguous_range::<T>(&self.desc)?;
+        Ok(Some(&mut self.data[range]))
+    }
+
     /// Sets one element. Same rules as [`TensorView::get`].
     ///
     /// # Errors
@@ -637,6 +677,28 @@ mod tests {
             (-1f32).to_bits()
         );
         assert_eq!(t.view().get(&[1, 0]).unwrap().to_bits(), (-1f32).to_bits());
+    }
+
+    #[test]
+    fn mutable_views_narrow_and_expose_contiguous_runs() {
+        let mut t = iota(&[2, 4, 3]);
+        let mut m = t.view_mut().unwrap();
+        // Row 1 of head 1: contiguous, written through a slice.
+        let run = m.reborrow().select(0, 1).unwrap().narrow(0, 1, 1).unwrap();
+        run.contiguous_data_mut()
+            .unwrap()
+            .unwrap()
+            .copy_from_slice(&[-1., -2., -3.]);
+        // A column is strided: no slice.
+        let col = m.reborrow().narrow(2, 0, 1).unwrap();
+        assert!(col.contiguous_data_mut().unwrap().is_none());
+        assert!(m.reborrow().narrow(1, 3, 2).is_err());
+        let v = t.view();
+        for (j, want) in [-1f32, -2., -3.].into_iter().enumerate() {
+            assert_eq!(v.get(&[1, 1, j as u64]).unwrap().to_bits(), want.to_bits());
+        }
+        assert_eq!(v.get(&[1, 0, 2]).unwrap().to_bits(), 14f32.to_bits());
+        assert_eq!(v.get(&[1, 2, 0]).unwrap().to_bits(), 18f32.to_bits());
     }
 
     #[test]
