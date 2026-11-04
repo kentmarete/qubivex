@@ -3,13 +3,17 @@
 Last updated: 2026-11-04
 
 ## Current phase
-**Phase 9 (serving) done (2026-11-04).** Phase 8 (GPU acceleration, Metal first): slices 1–5 done (2026-11-04). The improvement-plan backlog (MIGRATION_PLAN §3a) is cleared.
+**Phase 9 (serving) done (2026-11-04).** Phase 8 (GPU acceleration, Metal first): slices 1–6 done (2026-11-05). The improvement-plan backlog (MIGRATION_PLAN §3a) is cleared.
+
+**Phase 8 slice 6 done (2026-11-05): token tiles for Metal prefill; ADR-011 amendment 5.** Prefill with every expert resident: 128 tokens 97 → 239 tok/s, 1024 tokens 235 tok/s (CPU 115 for both), 10 tokens 91 → 102; decode unchanged (59.6); tokens bit-identical.
+- Code: token-tiled matmul kernels (`matmul_<dtype>_t`, up to 8 activation rows per weight load, per-(row, token) accumulators in the one-token order; row bodies are templates shared by every kernel), used from 4 rows; `moe_group` (GPU counting sort of routed entries by expert) and `Routing::Grouped` / `routed_<dtype>_g`, used by the one-submission pass from 2 entries per expert.
+- Tests: tile sizes 1–17 for every format, grouped routing with multi-tile experts, the fixtures' prompt through the grouped path, and the real-model prompt re-run as one grouped submission (bit-identical).
+- **Next:** the Phase 7 disk throttle, Metal in the small-cache regime, then Phase 10.
 
 **Phase 8 slice 5 done (2026-11-04): a token in one Metal submission; ADR-011 amendment 4.** Decode with every expert resident 44.9 → 59.2 tok/s (CPU 42.3); 10-token prefill 76 → 91 tok/s; tokens bit-identical.
 - Code: `moe_route` (GPU top-k routing with `ops::route`'s bits) and routed matmuls over an address table of every expert of a layer (`Batch::moe_route`, `Batch::routed_matmul`; one dispatch per gate/up/down, no gather or scatter); `ExpertStore::hold_layer`/`Held` (lease a whole resident layer without counting a use) and `record_uses` (count the GPU's choices afterwards as hits); `MetalOps::token` (`--metal-ops token`, the new default for `--backend metal`; `layers` keeps host routing), falling back per pass to whole layers while experts are missing (queued as prefetches) or pools are smaller than the expert count; `Engine::gpu_routed_passes`. A concurrent encoder: barriers between dispatches, and `Batch::concurrent` groups (q/k/v, RoPE, KV stores, gate/up, and each per-expert stage of the per-layer pass, which goes 44.9 → 53.1 tok/s).
 - Tests: new GPU route and routed-matmul parity tests, the store's hold/record test, the fixture invariant with `token` (every pass routed without I/O threads), the Metal fault test for both placements, and real OLMoE (prompt logits and 48 tokens bit-identical; 40 passes routed on the GPU).
-- Not better yet: 128-token prefill (CPU 115 tok/s, Metal 97): the GPU matmuls read each weight row once per token. Next for Metal: tile them over several tokens.
-- **Next:** the Phase 7 disk throttle, Metal prefill tiling, then Phase 10.
+- Not better yet: 128-token prefill (CPU 115 tok/s, Metal 97): the GPU matmuls read each weight row once per token. Next was tiling them (slice 6, above).
 
 **Phase 9 done (2026-11-04): the serving gateway; ADR-013.**
 - `qubivex-api` (Axum + Tokio at the edge only) and `qubivex serve`: `/v1/chat/completions` and `/v1/completions` (SSE or not), `/v1/models`, `/health`, `/metrics` (Prometheus text), `/v1/system`, admin load/unload behind `--admin-token`, optional `--api-key`, request ids, OpenAI-shaped errors without paths. Every generation on its own thread with bounded channels.

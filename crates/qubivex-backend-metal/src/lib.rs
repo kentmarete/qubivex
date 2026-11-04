@@ -27,7 +27,8 @@ mod device;
 mod program;
 
 pub use program::{
-    AttentionShape, Batch, DeviceVec, MAX_ROUTED_EXPERTS, Pending, RoutedInput, Span,
+    AttentionShape, Batch, DeviceVec, GROUPED_ENTRIES_PER_EXPERT, MAX_ROUTED_EXPERTS, Pending,
+    RoutedInput, Routing, Span,
 };
 
 use std::sync::Arc;

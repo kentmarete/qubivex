@@ -1,6 +1,6 @@
 # ADR-011: Device execution, buffer lifetimes and GPU parity
 
-- Status: Proposed (Phase 8 slice 1, 2026-11-03; amendments 1–4, slices 2–5). Owner review pending.
+- Status: Proposed (Phase 8 slice 1, 2026-11-03; amendments 1–5, slices 2–6). Owner review pending.
 - Date: 2026-11-03
 - Related: ADR-007 (backends; amendment 2026-11-03), ADR-010 (lossless by default),
   `docs/engineering/ARCHITECTURE_DECISIONS.md` §2.4–2.5, TENSOR_ARCHITECTURE §6.
@@ -392,4 +392,64 @@ each weight load across six tokens.
 - Next for Metal: tile the GPU matmuls over several tokens per weight load (keeping each
   output's reduction order), so prefill beats the CPU's; then the small-cache regime
   again, now that a token can be one submission that waits on expert availability.
+
+## Amendment 5 (2026-11-05): token tiles for prefill, Phase 8 slice 6
+
+### The question
+Amendment 4 left long prompts to the CPU: at 128 tokens the CPU's tiled kernel (ADR-002
+amendment 1) gave 115 tok/s and Metal 97, because every GPU matmul ran one token per
+threadgroup row and so loaded and dequantised each weight once per token.
+
+### What was built
+- **Token-tiled matmuls** (`matmul_<dtype>_t`): one SIMD group computes its rows for up
+  to 8 activation rows (`TILE`), loading and dequantising each weight once and keeping a
+  separate pair of lane accumulators per (row, token). Every output gets the same fused
+  multiply-adds in the same order and the same tree as the one-token kernel, so the bits
+  do not change. The row bodies of every format (generic, Q4_K, Q6_K) are now templates
+  over the tile width, shared by the one-token, tiled and routed kernels. `Batch::matmul`
+  and the batched path switch to the tiled kernel from 4 rows (`TILE_MIN`).
+- **Grouped routing** (`moe_group`, `Routing::Grouped`, kernels `routed_<dtype>_g`):
+  routed entries are sorted by expert on the GPU (a counting sort in one thread), and
+  each threadgroup row computes one tile of up to 8 entries of one expert. The grid
+  covers `experts × ⌈tokens / 8⌉` tiles, because `moe_route` never picks an expert twice
+  for one token; unused tiles return at once. `Batch::routed_matmul` now takes a
+  `Routing` (`Ids` as in amendment 4, or `Grouped`). The one-submission pass groups when
+  there are at least 2 entries per expert on average (`GROUPED_ENTRIES_PER_EXPERT`; on
+  OLMoE from 16 tokens). The per-layer pass needs nothing new: it already gathers each
+  expert's tokens, so its matmuls tile.
+
+### Parity
+`metal_matches_cpu_bit_for_bit` now covers 1, 3, 4, 8, 9, 13 and 17 activation rows
+(full and partial tiles) for every format. `routed_matmuls_give_each_experts_cpu_bits`
+runs 20 tokens with every token routed to one expert (tiles of 8, 8 and 4) through both
+routings and both input kinds. The fixtures' 14-token prompt takes the grouped path. On
+real OLMoE the env-gated test re-runs the prompt once every expert is resident, as one
+routed submission with grouping, and gets the CPU's logits bit for bit. Every benchmark
+run's tokens match the CPU's.
+
+### Measurements (M3 Pro, OLMoE Q4_K_M, all experts resident)
+Records: `docs/performance/baselines/2026-11-05-m3pro-tiles-*.json`.
+
+| prefill | cpu | metal token, amendment 4 | **metal token** | metal layers |
+|---|---|---|---|---|
+| 10 tokens | 38.7 tok/s | 91.3 | **102.3** | 100.9 |
+| 128 tokens | 115.3 | 97.1 | **239.0** | 248.0 |
+| 1024 tokens | 114.6 | | **234.9** | |
+
+Decode is unchanged (token 59.6 tok/s, layers 52.9). Thresholds, measured on prefill:
+- plain tiles from 4 rows: at 6 tokens 68.5 → 62.3 ms; at 2–3 tokens tiles cost 3–7%;
+- grouped routing from 2 entries per expert: at 10 tokens (1.25 per expert) grouping
+  cost 25% (99 → 125 ms); at 16 tokens it gains 3%, at 32 tokens 287 → 194 ms, and at 64
+  tokens 569 → 301 ms.
+
+At 128 tokens the per-layer pass is 4% faster than the one-submission pass: its host
+grouping is exact, while the grouped grid also launches the tiles of experts with fewer
+entries. Both are about twice the CPU.
+
+### Decision
+- Metal prefill now beats the CPU at every prompt length measured, as decode already
+  did. `token` stays the Metal default. The CPU stays the default backend until the owner
+  reviews amendments 2–5.
+- Next for Metal: the small-cache regime (pools smaller than top-k), now that a token
+  can be one submission; then CUDA.
 

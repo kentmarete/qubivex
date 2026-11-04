@@ -137,7 +137,7 @@ tokens must match. Kernel-level numbers come from the Criterion groups of
 with no per-call overhead). Measure Metal both with every expert resident and under a
 small `--ram-budget`: the two regimes rank the backends differently. When the plan's
 pools are smaller than top-k, `--backend metal` runs the CPU pass, and the record's
-`config.device.fallback` says so. Results: ADR-011 amendments 1–4.
+`config.device.fallback` says so. Measure prefill at several prompt lengths (`--prompt-tokens`): the token-tiled and grouped kernels switch on at 4 tokens and at 2 routed entries per expert. Results: ADR-011 amendments 1–5.
 
 ### How to read the numbers
 

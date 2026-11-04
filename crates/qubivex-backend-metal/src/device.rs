@@ -30,6 +30,28 @@ pub(crate) const ROWS: usize = 8;
 /// `kernels.metal`.
 pub(crate) const KQ_ROWS: usize = 2;
 
+/// Activation rows per threadgroup of the token-tiled kernels; must equal `TILE` in
+/// `kernels.metal`.
+pub(crate) const TILE: usize = 8;
+/// Activation rows from which a matmul uses the token-tiled kernel (ADR-011 amendment 5).
+/// Measured on OLMoE (M3 Pro): from 4 rows the tiles win (6 tokens: 68.5 → 62.3 ms),
+/// below they lose a little.
+pub(crate) const TILE_MIN: usize = 4;
+
+/// The pipeline to run a matmul of `s` activation rows with (`pipeline` is the
+/// one-token kernel's `DTYPES` index), and its threadgroup rows: the token-tiled kernel
+/// from [`TILE_MIN`] rows. Both give the same bits.
+pub(crate) fn matmul_pipeline(pipeline: usize, s: usize) -> (usize, usize) {
+    if s >= TILE_MIN {
+        (
+            crate::program::op("matmul_f32_t") + pipeline,
+            s.div_ceil(TILE),
+        )
+    } else {
+        (pipeline, s)
+    }
+}
+
 /// Output rows one threadgroup of matmul `pipeline` (a `DTYPES` index) covers.
 pub(crate) fn rows_per_group(pipeline: usize) -> usize {
     use qubivex_core::{DType, GgmlType};
@@ -343,7 +365,8 @@ impl Device {
             detail: None,
         })?;
         for (i, op) in ops.iter().enumerate() {
-            enc.setComputePipelineState(&self.pipelines[op.pipeline]);
+            let (pipeline, height) = matmul_pipeline(op.pipeline, op.params.s as usize);
+            enc.setComputePipelineState(&self.pipelines[pipeline]);
             let params = NonNull::from(&op.params).cast::<c_void>();
             // SAFETY: indices 0..=3 match the kernel's [[buffer(n)]] bindings and types
             // (bytes, f32, f32, Params). All three buffers live until
@@ -359,7 +382,7 @@ impl Device {
             }
             let groups = MTLSize {
                 width: (op.params.n as usize).div_ceil(rows_per_group(op.pipeline)),
-                height: op.params.s as usize,
+                height,
                 depth: 1,
             };
             let threads = MTLSize {

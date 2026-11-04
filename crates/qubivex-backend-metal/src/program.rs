@@ -17,7 +17,7 @@ use crate::device::{Arg, Buffer, Recorder, bytes_of};
 
 /// The forward-pass kernels, after the six matmul kernels in the pipeline list.
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
-pub(crate) const OP_KERNELS: [&str; 21] = [
+pub(crate) const OP_KERNELS: [&str; 34] = [
     "gather_rows",
     "scatter_rows",
     "exp_in_place",
@@ -39,10 +39,23 @@ pub(crate) const OP_KERNELS: [&str; 21] = [
     "routed_q8_0",
     "routed_q4_k",
     "routed_q6_k",
+    "matmul_f32_t",
+    "matmul_f16_t",
+    "matmul_bf16_t",
+    "matmul_q8_0_t",
+    "matmul_q4_k_t",
+    "matmul_q6_k_t",
+    "routed_f32_g",
+    "routed_f16_g",
+    "routed_bf16_g",
+    "routed_q8_0_g",
+    "routed_q4_k_g",
+    "routed_q6_k_g",
+    "moe_group",
 ];
 
 #[cfg(target_os = "macos")]
-fn op(name: &str) -> usize {
+pub(crate) fn op(name: &str) -> usize {
     crate::DTYPES.len()
         + OP_KERNELS
             .iter()
@@ -216,6 +229,15 @@ struct RoutedParams {
     top_k: u32,
     ne: u32,
     per_entry: u32,
+    entries: u32,
+    tiles: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct GroupParams {
+    entries: u32,
+    ne: u32,
 }
 
 /// Which input row a routed entry reads (see [`Batch::routed_matmul`]).
@@ -226,6 +248,27 @@ pub enum RoutedInput {
     /// Entry `j` reads row `j` (the experts' down, after SwiGLU).
     Entry,
 }
+
+/// How a routed matmul finds each entry's expert (see [`Batch::routed_matmul`]).
+#[derive(Clone, Copy, Debug)]
+pub enum Routing<'s, 'a> {
+    /// Entry by entry: `ids[j]` is entry `j`'s expert (as [`Batch::moe_route`] writes
+    /// them). Best for a few tokens.
+    Ids(&'s Span<'a>),
+    /// Expert by expert, up to 8 entries per weight load: the entries sorted by expert
+    /// as [`Batch::moe_group`] writes them. Each token's experts must be distinct (as
+    /// `moe_route` chooses them), so no expert has more entries than there are tokens.
+    Grouped {
+        /// Entries sorted by expert.
+        order: &'s Span<'a>,
+        /// `ne + 1` offsets into `order`.
+        offsets: &'s Span<'a>,
+    },
+}
+
+/// Mean entries per expert from which [`Routing::Grouped`] beats [`Routing::Ids`]
+/// (ADR-011 amendment 5; on OLMoE, 64 experts and top 8: from 16 tokens).
+pub const GROUPED_ENTRIES_PER_EXPERT: usize = 2;
 
 /// Experts one routed table may hold: the address table is passed inline (`setBytes`
 /// takes at most 4 KiB), and `moe_route` keeps a 256-bit mask.
@@ -502,8 +545,9 @@ impl Batch<'_, '_> {
             }
             let params = crate::device::Params::new(w.rows, w.cols, s, w.row_bytes)?;
             let pb = bytes_of(&params);
+            let (kernel, height) = crate::device::matmul_pipeline(pipeline, s);
             self.rec.dispatch(
-                pipeline,
+                kernel,
                 &[
                     Arg::Buf(&w.buf, w.offset),
                     xs.arg(),
@@ -512,7 +556,7 @@ impl Batch<'_, '_> {
                 ],
                 [
                     w.rows.div_ceil(crate::device::rows_per_group(pipeline)),
-                    s,
+                    height,
                     1,
                 ],
                 [crate::device::ROWS * crate::device::SIMD_WIDTH, 1, 1],
@@ -982,8 +1026,7 @@ impl Batch<'_, '_> {
     }
 
     /// Routed matmuls: for each entry `j` of `tokens × top_k`, `ys[j] = W_e · x` with
-    /// `e = idx[j]` (u32 bits, as [`Batch::moe_route`] writes them) and `x` the row
-    /// `input` names. `experts[e]` is expert `e`'s matrix; all must share a dtype and
+    /// `e` entry `j`'s expert (found as `routing` says) and `x` the row `input` names. `experts[e]` is expert `e`'s matrix; all must share a dtype and
     /// shape. Every output has the bits of [`Batch::matmul`] on the same row, so one
     /// dispatch replaces a gather, a matmul and a scatter per expert.
     ///
@@ -998,7 +1041,7 @@ impl Batch<'_, '_> {
     pub fn routed_matmul(
         &mut self,
         experts: &[&MetalWeights],
-        idx: &Span<'_>,
+        routing: Routing<'_, '_>,
         xs: &Span<'_>,
         input: RoutedInput,
         tokens: usize,
@@ -1031,7 +1074,13 @@ impl Batch<'_, '_> {
             RoutedInput::Token => tokens,
             RoutedInput::Entry => entries,
         };
-        need(OP, "ids", idx, entries)?;
+        match routing {
+            Routing::Ids(idx) => need(OP, "ids", idx, entries)?,
+            Routing::Grouped { order, offsets } => {
+                need(OP, "order", order, entries)?;
+                need(OP, "offsets", offsets, experts.len() + 1)?;
+            }
+        }
         need(OP, "input", xs, rows_in * first.cols)?;
         need(OP, "output", ys, entries * first.rows)?;
         if entries == 0 || first.rows == 0 {
@@ -1044,6 +1093,8 @@ impl Batch<'_, '_> {
             top_k: u32_of(top_k, OP)?,
             ne: u32_of(experts.len(), OP)?,
             per_entry: u32::from(input == RoutedInput::Entry),
+            entries: u32_of(entries, OP)?,
+            tiles: u32_of(tokens.div_ceil(crate::device::TILE), OP)?,
         };
         #[cfg(target_os = "macos")]
         {
@@ -1068,26 +1119,83 @@ impl Batch<'_, '_> {
                 self.rec.use_read(&w.buf);
             }
             let pb = bytes_of(&p);
-            self.rec.dispatch(
-                // The routed kernels follow `routed_f32` in `DTYPES` order.
-                op("routed_f32") + pipeline,
-                &[
-                    xs.arg(),
-                    ys.arg(),
-                    idx.arg(),
-                    Arg::Bytes(&table),
-                    Arg::Bytes(&pb),
-                ],
-                [
-                    first.rows.div_ceil(crate::device::rows_per_group(pipeline)),
-                    entries,
-                    1,
-                ],
-                [crate::device::ROWS * crate::device::SIMD_WIDTH, 1, 1],
-            );
+            let width = first.rows.div_ceil(crate::device::rows_per_group(pipeline));
+            match routing {
+                Routing::Ids(idx) => self.rec.dispatch(
+                    // The routed kernels follow `routed_f32` in `DTYPES` order.
+                    op("routed_f32") + pipeline,
+                    &[
+                        xs.arg(),
+                        ys.arg(),
+                        idx.arg(),
+                        Arg::Bytes(&table),
+                        Arg::Bytes(&pb),
+                    ],
+                    [width, entries, 1],
+                    [crate::device::ROWS * crate::device::SIMD_WIDTH, 1, 1],
+                ),
+                Routing::Grouped { order, offsets } => self.rec.dispatch(
+                    op("routed_f32_g") + pipeline,
+                    &[
+                        xs.arg(),
+                        ys.arg(),
+                        order.arg(),
+                        Arg::Bytes(&table),
+                        Arg::Bytes(&pb),
+                        offsets.arg(),
+                    ],
+                    [width, experts.len() * p.tiles as usize, 1],
+                    [crate::device::ROWS * crate::device::SIMD_WIDTH, 1, 1],
+                ),
+            }
         }
         #[cfg(not(target_os = "macos"))]
         let _ = (p, pipeline);
+        Ok(())
+    }
+
+    /// Sorts the routed entries by expert for [`Routing::Grouped`]: `order` receives the
+    /// `entries` entry indices grouped by expert (ascending within each), and `offsets`
+    /// the `ne + 1` group boundaries (u32 bits). `ids` as [`Batch::moe_route`] writes
+    /// them; an id past `ne` counts as the last expert.
+    ///
+    /// # Errors
+    /// [`ComputeError::Shape`] if a span is too short or `ne` exceeds
+    /// [`MAX_ROUTED_EXPERTS`].
+    pub fn moe_group(
+        &mut self,
+        ids: &Span<'_>,
+        entries: usize,
+        ne: usize,
+        order: &Span<'_>,
+        offsets: &Span<'_>,
+    ) -> Result<(), ComputeError> {
+        const OP: &str = "moe_group";
+        if ne == 0 || ne > MAX_ROUTED_EXPERTS {
+            return Err(shape(
+                OP,
+                format!("{ne} experts (1 to {MAX_ROUTED_EXPERTS})"),
+            ));
+        }
+        need(OP, "ids", ids, entries)?;
+        need(OP, "order", order, entries)?;
+        need(OP, "offsets", offsets, ne + 1)?;
+        let p = GroupParams {
+            entries: u32_of(entries, OP)?,
+            ne: u32_of(ne, OP)?,
+        };
+        #[cfg(target_os = "macos")]
+        {
+            let pb = bytes_of(&p);
+            self.rec.dispatch(
+                op(OP),
+                &[ids.arg(), order.arg(), offsets.arg(), Arg::Bytes(&pb)],
+                [1, 1, 1],
+                [1, 1, 1],
+            );
+        }
+        #[cfg(not(target_os = "macos"))]
+        let _ = p;
         Ok(())
     }
 }

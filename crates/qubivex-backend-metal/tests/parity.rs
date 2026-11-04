@@ -187,7 +187,8 @@ fn metal_matches_cpu_bit_for_bit() {
             for &(n, k) in shapes(d) {
                 let wb = weights(d, n, k, fill, &mut rng);
                 let w = WeightView::new(d, n, k, &wb).unwrap();
-                for s in [1, 3, 8] {
+                // 1..3: one-token kernel; 4 and up: token tiles of 8, full and partial.
+                for s in [1, 3, 4, 8, 9, 13, 17] {
                     let xs = activations(s * k, fill, &mut rng);
                     let mut want = vec![0f32; s * n];
                     let mut got = vec![f32::NAN; s * n];
@@ -464,11 +465,11 @@ fn batch_shape_errors_run_nothing() {
 /// table clamped to the last expert.
 #[test]
 fn routed_matmuls_give_each_experts_cpu_bits() {
-    use qubivex_backend_metal::RoutedInput;
+    use qubivex_backend_metal::{RoutedInput, Routing};
     let Some(gpu) = metal() else { return };
     let cpu = CpuBackend::new();
     let mut rng = Rng(41);
-    let (ne, s, top_k) = (6usize, 3usize, 2usize);
+    let (ne, top_k) = (6usize, 2usize);
     for d in DTYPES {
         for &(n, k) in shapes(d) {
             for fill in [Fill::Typical, Fill::Wild] {
@@ -504,7 +505,20 @@ fn routed_matmuls_give_each_experts_cpu_bits() {
                     })
                     .collect();
                 let table: Vec<_> = on.iter().collect();
-                let ids: Vec<u32> = vec![5, 0, 2, 2, 9, 1]; // 9 clamps to expert 5
+                // 20 tokens × 2 ranks (distinct per token, as moe_route chooses). Every
+                // token routes to expert 0, so the grouped kernel runs it in tiles of 8,
+                // 8 and 4; one id past the table clamps to expert 5.
+                let (s, top_k) = (20usize, top_k);
+                let ids: Vec<u32> = (0..s)
+                    .flat_map(|t| {
+                        let b = if t == 4 {
+                            9
+                        } else {
+                            1 + ((t * 7 + t % 3) % (ne - 1)) as u32
+                        };
+                        [0, b]
+                    })
+                    .collect();
                 let ids_f: Vec<f32> = ids.iter().map(|i| f32::from_bits(*i)).collect();
                 let tok = activations(s * k, fill, &mut rng);
                 let ent = activations(s * top_k * k, fill, &mut rng);
@@ -513,52 +527,56 @@ fn routed_matmuls_give_each_experts_cpu_bits() {
                     gpu.vec_from(&tok).unwrap(),
                     gpu.vec_from(&ent).unwrap(),
                 );
-                let (yt, ye) = (
-                    gpu.vec(s * top_k * n).unwrap(),
-                    gpu.vec(s * top_k * n).unwrap(),
-                );
+                let (order, offsets) = (gpu.vec(s * top_k).unwrap(), gpu.vec(ne + 1).unwrap());
+                let outs: Vec<_> = (0..4).map(|_| gpu.vec(s * top_k * n).unwrap()).collect();
                 gpu.submit(|b| {
-                    b.routed_matmul(
-                        &table,
-                        &di.all(),
-                        &dt.all(),
-                        RoutedInput::Token,
-                        s,
-                        top_k,
-                        &yt.all(),
-                    )?;
-                    b.routed_matmul(
-                        &table,
-                        &di.all(),
-                        &de.all(),
-                        RoutedInput::Entry,
-                        s,
-                        top_k,
-                        &ye.all(),
-                    )
+                    b.moe_group(&di.all(), s * top_k, ne, &order.all(), &offsets.all())?;
+                    let (order, offsets, ids) = (order.all(), offsets.all(), di.all());
+                    let grouped = Routing::Grouped {
+                        order: &order,
+                        offsets: &offsets,
+                    };
+                    let by_id = Routing::Ids(&ids);
+                    for (o, (r, x, inp)) in outs.iter().zip([
+                        (by_id, &dt, RoutedInput::Token),
+                        (by_id, &de, RoutedInput::Entry),
+                        (grouped, &dt, RoutedInput::Token),
+                        (grouped, &de, RoutedInput::Entry),
+                    ]) {
+                        b.routed_matmul(&table, r, &x.all(), inp, s, top_k, &o.all())?;
+                    }
+                    Ok(())
                 })
                 .unwrap();
-                let (mut got_t, mut got_e) = (vec![0f32; s * top_k * n], vec![0f32; s * top_k * n]);
-                gpu.read(&yt.all(), &mut got_t).unwrap();
-                gpu.read(&ye.all(), &mut got_e).unwrap();
+                let got: Vec<Vec<f32>> = outs
+                    .iter()
+                    .map(|o| {
+                        let mut v = vec![0f32; s * top_k * n];
+                        gpu.read(&o.all(), &mut v).unwrap();
+                        v
+                    })
+                    .collect();
                 for (j, &id) in ids.iter().enumerate() {
                     let w = &views[(id as usize).min(ne - 1)];
-                    let mut want = vec![0f32; n];
                     let t = j / top_k;
-                    cpu.matmul(w, &tok[t * k..(t + 1) * k], 1, &mut want)
+                    let mut want_t = vec![0f32; n];
+                    let mut want_e = vec![0f32; n];
+                    cpu.matmul(w, &tok[t * k..(t + 1) * k], 1, &mut want_t)
                         .unwrap();
-                    assert_eq!(
-                        bits(&got_t[j * n..(j + 1) * n]),
-                        bits(&want),
-                        "{d} {n}x{k} {fill:?} token input, entry {j}"
-                    );
-                    cpu.matmul(w, &ent[j * k..(j + 1) * k], 1, &mut want)
+                    cpu.matmul(w, &ent[j * k..(j + 1) * k], 1, &mut want_e)
                         .unwrap();
-                    assert_eq!(
-                        bits(&got_e[j * n..(j + 1) * n]),
-                        bits(&want),
-                        "{d} {n}x{k} {fill:?} entry input, entry {j}"
-                    );
+                    for (g, (want, what)) in got.iter().zip([
+                        (&want_t, "ids, token input"),
+                        (&want_e, "ids, entry input"),
+                        (&want_t, "grouped, token input"),
+                        (&want_e, "grouped, entry input"),
+                    ]) {
+                        assert_eq!(
+                            bits(&g[j * n..(j + 1) * n]),
+                            bits(want),
+                            "{d} {n}x{k} {fill:?} {what}, entry {j}"
+                        );
+                    }
                 }
             }
         }
@@ -580,7 +598,7 @@ fn routed_matmuls_give_each_experts_cpu_bits() {
     assert!(
         gpu.submit(|bt| bt.routed_matmul(
             &[&wa, &wb],
-            &i.all(),
+            Routing::Ids(&i.all()),
             &x.all(),
             RoutedInput::Token,
             1,
@@ -592,7 +610,7 @@ fn routed_matmuls_give_each_experts_cpu_bits() {
     assert!(
         gpu.submit(|bt| bt.routed_matmul(
             &[&wa],
-            &i.all(),
+            Routing::Ids(&i.all()),
             &x.all(),
             RoutedInput::Token,
             2,
