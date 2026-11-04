@@ -72,47 +72,98 @@ static inline float tree(float a) {
 // Rows per threadgroup (one SIMD group each).
 constant uint ROWS = 8;
 
+// Routed matmuls (Phase 8 slice 5, ADR-011 amendment 4): entry j of `s * top_k` routes
+// one token to one expert. Its expert is idx[j] (u32 bits in a float buffer, from
+// `moe_route`), whose weights start at ptrs[expert]; its input row is xs[j] (per
+// entry) or xs[j / top_k] (the token's row), and its output row ys[j]. Each output is
+// the same dot product, in the same order, as the plain matmul's: the bits match.
+struct RoutedParams {
+    uint n;         // output rows
+    uint k;         // input columns
+    uint row_bytes; // bytes per weight row
+    uint top_k;     // entries per token
+    uint ne;        // experts in the table
+    uint per_entry; // 1: input row j; 0: input row j / top_k
+};
+
+// One expert's weights: a device address, written by the host from the buffer's
+// gpuAddress plus the matrix's offset (the buffer is declared with useResource).
+struct ExpertPtr {
+    device const uchar *w;
+};
+
+// The routed entry's weights, input row and output row.
+#define ROUTED_SETUP                                                                   \
+    uint j = tg.y;                                                                     \
+    uint e = min(as_type<uint>(idx[j]), p.ne - 1);                                     \
+    device const uchar *w = ptrs[e].w;                                                 \
+    device const float *x = xs + ulong(p.per_entry != 0 ? j : j / p.top_k) * p.k;      \
+    device float *y = ys + ulong(j) * p.n;
+
+#define ROUTED_ARGS                                                                    \
+    device const float *xs [[buffer(0)]],                                              \
+    device float *ys [[buffer(1)]],                                                    \
+    device const float *idx [[buffer(2)]],                                             \
+    constant ExpertPtr *ptrs [[buffer(3)]],                                            \
+    constant RoutedParams &p [[buffer(4)]],                                            \
+    uint2 tg [[threadgroup_position_in_grid]],                                         \
+    uint sg [[simdgroup_index_in_threadgroup]],                                        \
+    uint lane [[thread_index_in_simdgroup]]
+
 #define MATMUL_KERNEL(NAME, WFN)                                                       \
-kernel void NAME(device const uchar *w [[buffer(0)]],                                  \
-                 device const float *xs [[buffer(1)]],                                 \
-                 device float *ys [[buffer(2)]],                                       \
-                 constant Params &p [[buffer(3)]],                                     \
-                 uint2 tg [[threadgroup_position_in_grid]],                            \
-                 uint sg [[simdgroup_index_in_threadgroup]],                           \
-                 uint lane [[thread_index_in_simdgroup]]) {                            \
-    uint r = tg.x * ROWS + sg;                                                         \
-    uint t = tg.y;                                                                     \
-    if (r >= p.n) {                                                                    \
-        return;                                                                        \
-    }                                                                                  \
-    device const uchar *row = w + ulong(r) * p.row_bytes;                              \
-    device const float *x = xs + ulong(t) * p.k;                                       \
+static inline float dot_##NAME(device const uchar *row, device const float *x,         \
+                               uint k, uint lane) {                                    \
     float a0 = 0.0f;                                                                   \
     float a1 = 0.0f;                                                                   \
-    uint full = p.k / 64 * 64;                                                         \
+    uint full = k / 64 * 64;                                                           \
     for (uint c = 0; c < full; c += 64) {                                              \
         uint j0 = c + lane;                                                            \
         uint j1 = j0 + 32;                                                             \
         a0 = fma(WFN(row, j0), x[j0], a0);                                             \
         a1 = fma(WFN(row, j1), x[j1], a1);                                             \
     }                                                                                  \
-    uint rem = p.k - full;                                                             \
+    uint rem = k - full;                                                               \
     if (lane < rem) {                                                                  \
         a0 = fma(WFN(row, full + lane), x[full + lane], a0);                           \
     }                                                                                  \
     if (lane + 32 < rem) {                                                             \
         a1 = fma(WFN(row, full + lane + 32), x[full + lane + 32], a1);                 \
     }                                                                                  \
-    float y = tree(a0 + a1);                                                           \
+    return tree(a0 + a1);                                                              \
+}                                                                                      \
+kernel void matmul_##NAME(device const uchar *w [[buffer(0)]],                         \
+                          device const float *xs [[buffer(1)]],                        \
+                          device float *ys [[buffer(2)]],                              \
+                          constant Params &p [[buffer(3)]],                            \
+                          uint2 tg [[threadgroup_position_in_grid]],                   \
+                          uint sg [[simdgroup_index_in_threadgroup]],                  \
+                          uint lane [[thread_index_in_simdgroup]]) {                   \
+    uint r = tg.x * ROWS + sg;                                                         \
+    uint t = tg.y;                                                                     \
+    if (r >= p.n) {                                                                    \
+        return;                                                                        \
+    }                                                                                  \
+    float y = dot_##NAME(w + ulong(r) * p.row_bytes, xs + ulong(t) * p.k, p.k, lane);  \
     if (lane == 0) {                                                                   \
         ys[ulong(t) * p.n + r] = y;                                                    \
     }                                                                                  \
+}                                                                                      \
+kernel void routed_##NAME(ROUTED_ARGS) {                                               \
+    uint r = tg.x * ROWS + sg;                                                         \
+    if (r >= p.n) {                                                                    \
+        return;                                                                        \
+    }                                                                                  \
+    ROUTED_SETUP                                                                       \
+    float v = dot_##NAME(w + ulong(r) * p.row_bytes, x, p.k, lane);                    \
+    if (lane == 0) {                                                                   \
+        y[r] = v;                                                                      \
+    }                                                                                  \
 }
 
-MATMUL_KERNEL(matmul_f32, w_f32)
-MATMUL_KERNEL(matmul_f16, w_f16)
-MATMUL_KERNEL(matmul_bf16, w_bf16)
-MATMUL_KERNEL(matmul_q8_0, w_q8_0)
+MATMUL_KERNEL(f32, w_f32)
+MATMUL_KERNEL(f16, w_f16)
+MATMUL_KERNEL(bf16, w_bf16)
+MATMUL_KERNEL(q8_0, w_q8_0)
 // ---- Block-wise K-quant matmuls. ----
 //
 // The same lanes and order as MATMUL_KERNEL, and each weight's value is computed with
@@ -148,33 +199,24 @@ static inline uint2 scale_min_h(uint j, uint4 h) {
                  (hbyte(h, 8 + j) >> 4) | ((hbyte(h, 4 + j) >> 6) << 4));
 }
 
-// Q4_K, with each block's 16-byte header (d, dmin, 12 scale bytes) loaded once as a
+// Q4_K rows r0.. (up to NR, n rows in all) of `w` against the input row `x`, into
+// y[r0..]. Each block's 16-byte header (d, dmin, 12 scale bytes) is loaded once as a
 // uint4: the weights must start 16-byte aligned (the host checks, `offset_ok`).
-kernel void matmul_q4_k(device const uchar *w [[buffer(0)]],
-                        device const float *xs [[buffer(1)]],
-                        device float *ys [[buffer(2)]],
-                        constant Params &p [[buffer(3)]],
-                        uint2 tg [[threadgroup_position_in_grid]],
-                        uint sg [[simdgroup_index_in_threadgroup]],
-                        uint lane [[thread_index_in_simdgroup]]) {
-    uint r0 = (tg.x * ROWS + sg) * NR;
-    uint t = tg.y;
-    if (r0 >= p.n) {
-        return;
-    }
-    uint nr = min(NR, p.n - r0);
+static inline void rows_q4_k(device const uchar *w, device const float *x,
+                             device float *y, uint n, uint k, uint row_bytes,
+                             uint r0, uint lane) {
+    uint nr = min(NR, n - r0);
     device const uchar *rows[NR];
     for (uint i = 0; i < NR; i++) {
-        rows[i] = w + ulong(r0 + min(i, nr - 1)) * p.row_bytes;
+        rows[i] = w + ulong(r0 + min(i, nr - 1)) * row_bytes;
     }
-    device const float *x = xs + ulong(t) * p.k;
     float a0[NR];
     float a1[NR];
     for (uint i = 0; i < NR; i++) {
         a0[i] = 0.0f;
         a1[i] = 0.0f;
     }
-    uint blocks = p.k / 256;
+    uint blocks = k / 256;
     for (uint b = 0; b < blocks; b++) {
         device const float *xb = x + 256 * b;
         uint4 hd[NR];
@@ -206,38 +248,29 @@ kernel void matmul_q4_k(device const uchar *w [[buffer(0)]],
         }
     }
     for (uint i = 0; i < NR; i++) {
-        float y = tree(a0[i] + a1[i]);
+        float v = tree(a0[i] + a1[i]);
         if (lane == 0 && i < nr) {
-            ys[ulong(t) * p.n + r0 + i] = y;
+            y[r0 + i] = v;
         }
     }
 }
 
-kernel void matmul_q6_k(device const uchar *w [[buffer(0)]],
-                        device const float *xs [[buffer(1)]],
-                        device float *ys [[buffer(2)]],
-                        constant Params &p [[buffer(3)]],
-                        uint2 tg [[threadgroup_position_in_grid]],
-                        uint sg [[simdgroup_index_in_threadgroup]],
-                        uint lane [[thread_index_in_simdgroup]]) {
-    uint r0 = (tg.x * ROWS + sg) * NR;
-    uint t = tg.y;
-    if (r0 >= p.n) {
-        return;
-    }
-    uint nr = min(NR, p.n - r0);
+// Q6_K rows r0.. (up to NR, n rows in all) of `w` against `x`, into y[r0..].
+static inline void rows_q6_k(device const uchar *w, device const float *x,
+                             device float *y, uint n, uint k, uint row_bytes,
+                             uint r0, uint lane) {
+    uint nr = min(NR, n - r0);
     device const uchar *rows[NR];
     for (uint i = 0; i < NR; i++) {
-        rows[i] = w + ulong(r0 + min(i, nr - 1)) * p.row_bytes;
+        rows[i] = w + ulong(r0 + min(i, nr - 1)) * row_bytes;
     }
-    device const float *x = xs + ulong(t) * p.k;
     float a0[NR];
     float a1[NR];
     for (uint i = 0; i < NR; i++) {
         a0[i] = 0.0f;
         a1[i] = 0.0f;
     }
-    uint blocks = p.k / 256;
+    uint blocks = k / 256;
     uint is = lane / 16;
     for (uint b = 0; b < blocks; b++) {
         device const float *xb = x + 256 * b;
@@ -272,12 +305,40 @@ kernel void matmul_q6_k(device const uchar *w [[buffer(0)]],
         }
     }
     for (uint i = 0; i < NR; i++) {
-        float y = tree(a0[i] + a1[i]);
+        float v = tree(a0[i] + a1[i]);
         if (lane == 0 && i < nr) {
-            ys[ulong(t) * p.n + r0 + i] = y;
+            y[r0 + i] = v;
         }
     }
 }
+
+#define KQUANT_KERNELS(NAME)                                                           \
+kernel void matmul_##NAME(device const uchar *w [[buffer(0)]],                         \
+                          device const float *xs [[buffer(1)]],                        \
+                          device float *ys [[buffer(2)]],                              \
+                          constant Params &p [[buffer(3)]],                            \
+                          uint2 tg [[threadgroup_position_in_grid]],                   \
+                          uint sg [[simdgroup_index_in_threadgroup]],                  \
+                          uint lane [[thread_index_in_simdgroup]]) {                   \
+    uint r0 = (tg.x * ROWS + sg) * NR;                                                 \
+    uint t = tg.y;                                                                     \
+    if (r0 >= p.n) {                                                                   \
+        return;                                                                        \
+    }                                                                                  \
+    rows_##NAME(w, xs + ulong(t) * p.k, ys + ulong(t) * p.n, p.n, p.k, p.row_bytes,    \
+                r0, lane);                                                             \
+}                                                                                      \
+kernel void routed_##NAME(ROUTED_ARGS) {                                               \
+    uint r0 = (tg.x * ROWS + sg) * NR;                                                 \
+    if (r0 >= p.n) {                                                                   \
+        return;                                                                        \
+    }                                                                                  \
+    ROUTED_SETUP                                                                       \
+    rows_##NAME(w, x, y, p.n, p.k, p.row_bytes, r0, lane);                             \
+}
+
+KQUANT_KERNELS(q4_k)
+KQUANT_KERNELS(q6_k)
 
 // ---- Forward-pass operations (Phase 8 slice 3). ----
 //
@@ -608,4 +669,77 @@ kernel void scatter_rows(device float *dst [[buffer(0)]],
         return;
     }
     dst[ulong(idx[gid.y]) * p.h + gid.x] = src[ulong(gid.y) * p.h + gid.x];
+}
+
+struct RouteParams {
+    uint s;     // tokens
+    uint ne;    // experts
+    uint k;     // experts per token
+    uint norm;  // 1: renormalise the top k to sum to 1
+};
+
+// The order of `f32::total_cmp`, as a signed integer key.
+static inline int total_key(float f) {
+    int i = as_type<int>(f);
+    return i ^ int(uint(i >> 31) >> 1);
+}
+
+// `ops::route` for each token (one thread per token): the softmax of its logits (in
+// place: the logits become probabilities), the top k by probability (ties: the lower
+// id) in rank order, and their probabilities, renormalised when `norm`. Writes ids as
+// u32 bits into `idx` and probabilities into `wts`, k per token. ne <= 256 (the host
+// checks).
+kernel void moe_route(device float *logits [[buffer(0)]],
+                      device float *idx [[buffer(1)]],
+                      device float *wts [[buffer(2)]],
+                      constant RouteParams &p [[buffer(3)]],
+                      uint t [[thread_position_in_grid]]) {
+    if (t >= p.s) {
+        return;
+    }
+    device float *x = logits + ulong(t) * p.ne;
+    float m = -INFINITY;
+    for (uint e = 0; e < p.ne; e++) {
+        m = fmax(m, x[e]);
+    }
+    float sum = 0.0f;
+    for (uint e = 0; e < p.ne; e++) {
+        float v = qexp(x[e] - m);
+        x[e] = v;
+        sum += v;
+    }
+    for (uint e = 0; e < p.ne; e++) {
+        x[e] = precise::divide(x[e], sum);
+    }
+    uint taken[8] = {0, 0, 0, 0, 0, 0, 0, 0};
+    device float *oi = idx + ulong(t) * p.k;
+    device float *ow = wts + ulong(t) * p.k;
+    for (uint r = 0; r < p.k; r++) {
+        uint best = 0;
+        int key = 0;
+        bool found = false;
+        for (uint e = 0; e < p.ne; e++) {
+            if ((taken[e / 32] >> (e % 32)) & 1) {
+                continue;
+            }
+            int ke = total_key(x[e]);
+            if (!found || ke > key) {
+                best = e;
+                key = ke;
+                found = true;
+            }
+        }
+        taken[best / 32] |= 1u << (best % 32);
+        oi[r] = as_type<float>(best);
+        ow[r] = x[best];
+    }
+    if (p.norm != 0) {
+        float s = -0.0f;
+        for (uint r = 0; r < p.k; r++) {
+            s += ow[r];
+        }
+        for (uint r = 0; r < p.k; r++) {
+            ow[r] = precise::divide(ow[r], s);
+        }
+    }
 }

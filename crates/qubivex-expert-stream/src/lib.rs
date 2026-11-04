@@ -539,6 +539,9 @@ pub struct Lease<'a> {
     store: &'a ExpertStore,
     key: ExpertKey,
     data: Arc<Slab>,
+    /// Held by [`ExpertStore::hold_layer`]: not a use, so releasing it leaves the
+    /// expert's recency alone.
+    quiet: bool,
 }
 
 impl fmt::Debug for Lease<'_> {
@@ -583,11 +586,24 @@ impl Drop for Lease<'_> {
                 }) = pool.entries.get_mut(&expert.0)
                 {
                     *leases = leases.saturating_sub(1);
-                    *last_use = now;
+                    if !self.quiet {
+                        *last_use = now;
+                    }
                 }
             }
         }
     }
+}
+
+/// What [`ExpertStore::hold_layer`] found.
+#[derive(Debug)]
+pub enum Held<'a> {
+    /// A lease on every expert of the layer, in expert order.
+    All(Vec<Lease<'a>>),
+    /// These experts are not resident (loading or absent); nothing is held.
+    Missing(Vec<ExpertKey>),
+    /// The layer's pool has fewer slots than experts; nothing is held.
+    TooSmall,
 }
 
 /// What claiming one expert of a batch gave.
@@ -1134,7 +1150,84 @@ impl ExpertStore {
             store: self,
             key,
             data,
+            quiet: false,
         }
+    }
+
+    /// Holds every expert `0..experts` of `layer` for a pass that chooses among them
+    /// itself (the Metal pass routing on the GPU, ADR-011 amendment 4), if the layer
+    /// holds them all now.
+    ///
+    /// Holding is not a use: heat, recency, hit counts and the trace are left alone,
+    /// and the pass reports what it used with [`ExpertStore::record_uses`] afterwards.
+    /// The leases keep every expert resident until they are dropped.
+    ///
+    /// # Errors
+    /// [`StoreError::NoPool`] or [`StoreError::Poisoned`].
+    pub fn hold_layer(&self, layer: LayerIdx, experts: u32) -> Result<Held<'_>, StoreError> {
+        let mut g = self.lock()?;
+        let pool = g.pools.get_mut(&layer).ok_or(StoreError::NoPool(layer))?;
+        if pool.slots < experts {
+            return Ok(Held::TooSmall);
+        }
+        let missing: Vec<ExpertKey> = (0..experts)
+            .filter(|e| !matches!(pool.entries.get(e), Some(Entry::Ready { .. })))
+            .map(|e| (layer, ExpertIdx(e)))
+            .collect();
+        if !missing.is_empty() {
+            return Ok(Held::Missing(missing));
+        }
+        let mut out = Vec::with_capacity(experts as usize);
+        for e in 0..experts {
+            if let Some(Entry::Ready { data, leases, .. }) = pool.entries.get_mut(&e) {
+                *leases += 1;
+                out.push(Lease {
+                    store: self,
+                    key: (layer, ExpertIdx(e)),
+                    data: Arc::clone(data),
+                    quiet: true,
+                });
+            }
+        }
+        drop(g);
+        Ok(Held::All(out))
+    }
+
+    /// Records uses of resident experts that a pass chose without acquiring them
+    /// (see [`ExpertStore::hold_layer`]): each counts as an [`ExpertStore::acquire`]
+    /// hit would (heat, recency, hits, the trace and prefetch accounting). Keys that
+    /// are not resident are skipped.
+    ///
+    /// # Errors
+    /// [`StoreError::Poisoned`].
+    pub fn record_uses(&self, keys: &[ExpertKey]) -> Result<(), StoreError> {
+        let mut g = self.lock()?;
+        let g = &mut *g;
+        let policy = g.policy;
+        let mut hits = 0;
+        for &key in keys {
+            let Some(pool) = g.pools.get_mut(&key.0) else {
+                continue;
+            };
+            let Some(Entry::Ready { last_use, spec, .. }) = pool.entries.get_mut(&key.1.0) else {
+                continue;
+            };
+            pool.tick += 1;
+            *last_use = pool.tick;
+            if let Some(t) = spec.take() {
+                g.prefetch.ready += 1;
+                g.prefetch.lead_ns += elapsed_ns(t);
+            }
+            if let Policy::Lfru { decay_window } = policy {
+                pool.heat.touch(key.1.0, decay_window);
+            }
+            if let Some(t) = g.trace.as_mut() {
+                t.push(key);
+            }
+            hits += 1;
+        }
+        self.shared.hits.fetch_add(hits, Ordering::Relaxed);
+        Ok(())
     }
 
     /// Holds an expert, loading it if needed.

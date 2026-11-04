@@ -952,7 +952,7 @@ impl Engine {
                 let cfg = model.moe_config().ok_or_else(|| {
                     RuntimeError::Model("whole Metal layers need routed experts".into())
                 })?;
-                let g = MetalForward::new(be, host, cfg, &dense, max_context)
+                let g = MetalForward::new(be, host, cfg, &dense, max_context, opts.metal_ops.token)
                     .map_err(|e| metal_err(&e))?;
                 let (tensors, bytes) = g.placed();
                 let p = Placed::layers(g.device(), tensors, bytes, opts.metal_ops);
@@ -1042,6 +1042,13 @@ impl Engine {
             tokenizer,
             backend,
         })
+    }
+
+    /// Forward passes so far that ran as one Metal submission with routing on the GPU
+    /// ([`MetalOps::token`], ADR-011 amendment 4); 0 on any other placement.
+    #[must_use]
+    pub fn gpu_routed_passes(&self) -> u64 {
+        self.gpu.as_ref().map_or(0, MetalForward::routed_passes)
     }
 
     /// What the execution plan placed on a device.

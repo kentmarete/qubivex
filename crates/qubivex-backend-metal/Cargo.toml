@@ -16,7 +16,7 @@ thiserror = { workspace = true }
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2 = "0.6"
 objc2-foundation = { version = "0.3", default-features = false, features = ["std", "NSString", "NSError"] }
-objc2-metal = { version = "0.3", default-features = false, features = ["std", "MTLDevice", "MTLLibrary", "MTLBuffer", "MTLResource", "MTLCommandQueue", "MTLCommandBuffer", "MTLComputeCommandEncoder", "MTLCommandEncoder", "MTLComputePipeline", "MTLTypes", "MTLAllocation", "block2"] }
+objc2-metal = { version = "0.3", default-features = false, features = ["std", "MTLDevice", "MTLLibrary", "MTLBuffer", "MTLResource", "MTLCommandQueue", "MTLCommandBuffer", "MTLComputeCommandEncoder", "MTLCommandEncoder", "MTLComputePipeline", "MTLTypes", "MTLAllocation", "MTLGPUAddress", "block2"] }
 
 [dev-dependencies]
 criterion = { workspace = true }

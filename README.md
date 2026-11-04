@@ -476,7 +476,7 @@ These invariants are enforced by tests and CI
 | 5 | Memory planner: fits the model to RAM, VRAM and cgroup limits | Done |
 | 6 | Full expert streaming: tiered cache, I/O pool, packed expert files | Done |
 | 7 | Predictive expert prefetching | Slice 1 done (router lookahead); the disk-saturation throttle is parked |
-| 8 | GPU backends: CUDA, Vulkan, Metal | Metal slices 1–4 done (whole layers, bit-identical); slice 5 and CUDA next |
+| 8 | GPU backends: CUDA, Vulkan, Metal | Metal slices 1–5 done (a token in one submission, bit-identical, 1.4× the CPU at decode); CUDA next |
 | 9 | OpenAI-compatible HTTP server and serving | Done: `qubivex serve` (ADR-013); the OpenAI SDK works against real models |
 | 10–11 | Hardening, packaging, documentation | Planned |
 

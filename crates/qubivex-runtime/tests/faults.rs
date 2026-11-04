@@ -21,7 +21,7 @@ use qubivex_arch::Logits;
 use qubivex_expert_stream::fault::{Fault, FaultySource, Rule, Target, VerifiedSource};
 use qubivex_expert_stream::{ExpertSource, ReadTimeout};
 use qubivex_model::{ArchitectureRegistry, ModelMetadata};
-use qubivex_runtime::{BackendKind, Engine, EngineOptions, ModelExpertSource, Sampling};
+use qubivex_runtime::{BackendKind, Engine, EngineOptions, MetalOps, ModelExpertSource, Sampling};
 
 const IDS: [&str; 3] = ["olmoe-tiny", "olmoe-tiny-gguf", "qwen3-moe-tiny"];
 const PROMPT: &[u32] = &[
@@ -47,17 +47,23 @@ enum Cache {
 }
 
 fn options(m: &ModelMetadata, cache: Cache, io_threads: usize) -> EngineOptions {
-    options_on(m, cache, io_threads, false)
+    options_on(m, cache, io_threads, None)
 }
 
-fn options_on(m: &ModelMetadata, cache: Cache, io_threads: usize, metal: bool) -> EngineOptions {
+fn options_on(
+    m: &ModelMetadata,
+    cache: Cache,
+    io_threads: usize,
+    metal: Option<MetalOps>,
+) -> EngineOptions {
     let b = m.bytes();
     EngineOptions {
-        backend: if metal {
+        backend: if metal.is_some() {
             BackendKind::Metal
         } else {
             BackendKind::Cpu
         },
+        metal_ops: metal.unwrap_or_default(),
         expert_cache_bytes: Some(match cache {
             Cache::Resident => b.routed_experts,
             Cache::Streaming => b.largest_expert * u64::from(m.config.dims.layers),
@@ -78,20 +84,20 @@ fn engine(
     io_threads: usize,
     wrap: impl FnOnce(Arc<ModelExpertSource>) -> Arc<dyn ExpertSource>,
 ) -> Engine {
-    engine_on(id, cache, io_threads, false, wrap)
+    engine_on(id, cache, io_threads, None, wrap)
 }
 
 fn engine_on(
     id: &str,
     cache: Cache,
     io_threads: usize,
-    metal: bool,
+    metal: Option<MetalOps>,
     wrap: impl FnOnce(Arc<ModelExpertSource>) -> Arc<dyn ExpertSource>,
 ) -> Engine {
     let m = meta(id);
     let opts = options_on(&m, cache, io_threads, metal);
     let e = Engine::load_with_source(m, opts, wrap).unwrap();
-    if metal {
+    if metal.is_some() {
         let p = e.placement();
         assert!(
             p.fallback.is_none() && p.tensors > 0,
@@ -104,10 +110,15 @@ fn engine_on(
 /// The fault-free tokens, and how many expert reads the prefill and the whole request
 /// take.
 fn reference(id: &str, cache: Cache, io_threads: usize) -> (Vec<u32>, u64, u64) {
-    reference_on(id, cache, io_threads, false)
+    reference_on(id, cache, io_threads, None)
 }
 
-fn reference_on(id: &str, cache: Cache, io_threads: usize, metal: bool) -> (Vec<u32>, u64, u64) {
+fn reference_on(
+    id: &str,
+    cache: Cache,
+    io_threads: usize,
+    metal: Option<MetalOps>,
+) -> (Vec<u32>, u64, u64) {
     let mut probe = None;
     let e = engine_on(id, cache, io_threads, metal, |s| {
         let f = Arc::new(FaultySource::new(s, []));
@@ -304,6 +315,10 @@ fn a_failed_step_can_be_retried_on_the_same_cache() {
 
 /// The same on Metal whole layers (the model resident, so the plan keeps the GPU pass):
 /// a failed read fails the request, and the next one gives the fault-free tokens.
+///
+/// With routing on the GPU (`token`), experts not yet resident are prefetched in the
+/// background and a failed prefetch is read again later, so the request may succeed;
+/// either way its tokens are the fault-free ones, and so are the next request's.
 #[test]
 fn metal_layers_survive_a_failed_read() {
     match qubivex_backend_metal::MetalBackend::new() {
@@ -315,29 +330,43 @@ fn metal_layers_survive_a_failed_read() {
         Ok(_) => {}
     }
     quiet_injected_panics();
-    for id in IDS {
-        for io in [0, 4] {
-            let (want, prefill, total) = reference_on(id, Cache::Resident, io, true);
-            let mut points = vec![prefill / 2];
-            if total > prefill + 1 {
-                points.push(prefill + (total - prefill) / 2);
-            }
-            for fault in faults() {
-                for &at in &points {
-                    let what = format!("{id} metal io {io} {fault:?} at read {at}");
-                    let e = engine_on(id, Cache::Resident, io, true, wrapped(&fault, at));
-                    let mut got = Vec::new();
-                    let r = e.generate(PROMPT, NEW, Sampling::default(), |t| {
-                        got.push(t);
-                        true
-                    });
-                    assert!(r.is_err(), "{what}");
-                    assert_eq!(got[..], want[..got.len()], "{what}: wrong tokens");
-                    settled(&e, &what);
-                    let again = e.generate(PROMPT, NEW, Sampling::default(), |_| true);
-                    assert_eq!(again.unwrap(), want, "{what}: the next request");
-                    settled(&e, &what);
-                    ledger_matches_store(&e, &what);
+    let token = MetalOps::default();
+    let layers = MetalOps {
+        token: false,
+        ..token
+    };
+    for ops in [layers, token] {
+        for id in IDS {
+            for io in [0, 4] {
+                let (want, prefill, total) = reference_on(id, Cache::Resident, io, Some(ops));
+                let mut points = vec![prefill / 2];
+                if total > prefill + 1 {
+                    points.push(prefill + (total - prefill) / 2);
+                }
+                for fault in faults() {
+                    for &at in &points {
+                        let what = format!(
+                            "{id} metal {} io {io} {fault:?} at read {at}",
+                            ops.describe()
+                        );
+                        let e = engine_on(id, Cache::Resident, io, Some(ops), wrapped(&fault, at));
+                        let mut got = Vec::new();
+                        let r = e.generate(PROMPT, NEW, Sampling::default(), |t| {
+                            got.push(t);
+                            true
+                        });
+                        let may_succeed = ops.token && io > 0;
+                        match r {
+                            Ok(t) if may_succeed => assert_eq!(t, want, "{what}: wrong tokens"),
+                            r => assert!(r.is_err(), "{what}"),
+                        }
+                        assert_eq!(got[..], want[..got.len()], "{what}: wrong tokens");
+                        settled(&e, &what);
+                        let again = e.generate(PROMPT, NEW, Sampling::default(), |_| true);
+                        assert_eq!(again.unwrap(), want, "{what}: the next request");
+                        settled(&e, &what);
+                        ledger_matches_store(&e, &what);
+                    }
                 }
             }
         }

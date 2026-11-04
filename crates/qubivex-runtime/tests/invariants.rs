@@ -572,30 +572,42 @@ fn metal_placement_never_changes_bits() {
         router: true,
         head: true,
         layers: false,
+        token: false,
     };
-    let layers = MetalOps::default();
-    assert!(layers.layers, "whole layers are the default placement");
+    let token = MetalOps::default();
+    assert!(
+        token.layers && token.token,
+        "whole tokens (whole layers, routing on the GPU) are the default placement"
+    );
+    let layers = MetalOps {
+        token: false,
+        ..token
+    };
     let placements = [
         MetalOps {
             attention: false,
             router: false,
             head: true,
             layers: false,
+            token: false,
         },
         MetalOps {
             attention: true,
             router: false,
             head: false,
             layers: false,
+            token: false,
         },
         MetalOps {
             attention: false,
             router: true,
             head: false,
             layers: false,
+            token: false,
         },
         all,
         layers,
+        token,
     ];
     for id in ALL {
         let meta =
@@ -639,6 +651,37 @@ fn metal_placement_never_changes_bits() {
             if ops == all || ops == layers {
                 assert!(p.tensors > 0, "{id}: something was placed");
             }
+            if ops == layers {
+                assert_eq!(e.gpu_routed_passes(), 0, "{id}: layers route on the host");
+            }
+        }
+        // Routing on the GPU: without I/O threads every expert is loaded before the
+        // first pass, so every pass is one routed submission.
+        let e = Engine::load(
+            meta(),
+            EngineOptions {
+                backend: BackendKind::Metal,
+                metal_ops: token,
+                io_threads: Some(0),
+                ..opts
+            },
+        )
+        .unwrap();
+        let mut c = e.new_cache();
+        let got = bits(&e.forward(PROMPT, &mut c, Logits::All, None).unwrap());
+        assert_eq!(got, want, "{id} token, no I/O threads: prompt logits");
+        let toks = e
+            .generate(PROMPT, 12, Sampling::default(), |_| true)
+            .unwrap();
+        assert_eq!(toks, want_toks, "{id} token, no I/O threads: tokens");
+        if IDS.contains(&id) {
+            assert!(
+                e.gpu_routed_passes() >= 12,
+                "{id}: {} passes routed on the GPU",
+                e.gpu_routed_passes()
+            );
+        } else {
+            assert_eq!(e.gpu_routed_passes(), 0, "{id}: dense");
         }
     }
 }

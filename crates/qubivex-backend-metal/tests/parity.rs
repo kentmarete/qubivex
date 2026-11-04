@@ -457,3 +457,148 @@ fn batch_shape_errors_run_nothing() {
     assert_eq!(a, [7.0; 4], "nothing ran");
     gpu.matmul_many_resident(&mut []).unwrap();
 }
+
+/// Routed matmuls (ADR-011 amendment 4): each entry's output is the CPU matmul of its
+/// expert on its input row, bit for bit, for every dtype, with experts in their own
+/// wrapped regions or uploaded, with token or per-entry inputs, and an id past the
+/// table clamped to the last expert.
+#[test]
+fn routed_matmuls_give_each_experts_cpu_bits() {
+    use qubivex_backend_metal::RoutedInput;
+    let Some(gpu) = metal() else { return };
+    let cpu = CpuBackend::new();
+    let mut rng = Rng(41);
+    let (ne, s, top_k) = (6usize, 3usize, 2usize);
+    for d in DTYPES {
+        for &(n, k) in shapes(d) {
+            for fill in [Fill::Typical, Fill::Wild] {
+                let bytes: Vec<Vec<u8>> =
+                    (0..ne).map(|_| weights(d, n, k, fill, &mut rng)).collect();
+                // Even experts in their own page-aligned region, odd ones uploaded.
+                let regions: Vec<Arc<PageAligned>> = bytes
+                    .iter()
+                    .map(|b| {
+                        let mut r = PageAligned::zeroed(b.len());
+                        r.as_mut_slice().copy_from_slice(b);
+                        Arc::new(r)
+                    })
+                    .collect();
+                let views: Vec<WeightView<'_>> = regions
+                    .iter()
+                    .map(|r| WeightView::new(d, n, k, r.as_slice()).unwrap())
+                    .collect();
+                let on: Vec<_> = views
+                    .iter()
+                    .zip(&regions)
+                    .enumerate()
+                    .map(|(e, (v, r))| {
+                        if e % 2 == 0 {
+                            gpu.map_host(Arc::clone(r))
+                                .unwrap()
+                                .weights(v)
+                                .unwrap()
+                                .unwrap()
+                        } else {
+                            gpu.upload(v).unwrap()
+                        }
+                    })
+                    .collect();
+                let table: Vec<_> = on.iter().collect();
+                let ids: Vec<u32> = vec![5, 0, 2, 2, 9, 1]; // 9 clamps to expert 5
+                let ids_f: Vec<f32> = ids.iter().map(|i| f32::from_bits(*i)).collect();
+                let tok = activations(s * k, fill, &mut rng);
+                let ent = activations(s * top_k * k, fill, &mut rng);
+                let (di, dt, de) = (
+                    gpu.vec_from(&ids_f).unwrap(),
+                    gpu.vec_from(&tok).unwrap(),
+                    gpu.vec_from(&ent).unwrap(),
+                );
+                let (yt, ye) = (
+                    gpu.vec(s * top_k * n).unwrap(),
+                    gpu.vec(s * top_k * n).unwrap(),
+                );
+                gpu.submit(|b| {
+                    b.routed_matmul(
+                        &table,
+                        &di.all(),
+                        &dt.all(),
+                        RoutedInput::Token,
+                        s,
+                        top_k,
+                        &yt.all(),
+                    )?;
+                    b.routed_matmul(
+                        &table,
+                        &di.all(),
+                        &de.all(),
+                        RoutedInput::Entry,
+                        s,
+                        top_k,
+                        &ye.all(),
+                    )
+                })
+                .unwrap();
+                let (mut got_t, mut got_e) = (vec![0f32; s * top_k * n], vec![0f32; s * top_k * n]);
+                gpu.read(&yt.all(), &mut got_t).unwrap();
+                gpu.read(&ye.all(), &mut got_e).unwrap();
+                for (j, &id) in ids.iter().enumerate() {
+                    let w = &views[(id as usize).min(ne - 1)];
+                    let mut want = vec![0f32; n];
+                    let t = j / top_k;
+                    cpu.matmul(w, &tok[t * k..(t + 1) * k], 1, &mut want)
+                        .unwrap();
+                    assert_eq!(
+                        bits(&got_t[j * n..(j + 1) * n]),
+                        bits(&want),
+                        "{d} {n}x{k} {fill:?} token input, entry {j}"
+                    );
+                    cpu.matmul(w, &ent[j * k..(j + 1) * k], 1, &mut want)
+                        .unwrap();
+                    assert_eq!(
+                        bits(&got_e[j * n..(j + 1) * n]),
+                        bits(&want),
+                        "{d} {n}x{k} {fill:?} entry input, entry {j}"
+                    );
+                }
+            }
+        }
+    }
+    // Mixed shapes and short spans are refused before anything runs.
+    let a = weights(DType::F32, 4, 32, Fill::Typical, &mut rng);
+    let b = weights(DType::F32, 5, 32, Fill::Typical, &mut rng);
+    let wa = gpu
+        .upload(&WeightView::new(DType::F32, 4, 32, &a).unwrap())
+        .unwrap();
+    let wb = gpu
+        .upload(&WeightView::new(DType::F32, 5, 32, &b).unwrap())
+        .unwrap();
+    let (i, x, y) = (
+        gpu.vec(2).unwrap(),
+        gpu.vec(64).unwrap(),
+        gpu.vec(10).unwrap(),
+    );
+    assert!(
+        gpu.submit(|bt| bt.routed_matmul(
+            &[&wa, &wb],
+            &i.all(),
+            &x.all(),
+            RoutedInput::Token,
+            1,
+            2,
+            &y.all()
+        ))
+        .is_err()
+    );
+    assert!(
+        gpu.submit(|bt| bt.routed_matmul(
+            &[&wa],
+            &i.all(),
+            &x.all(),
+            RoutedInput::Token,
+            2,
+            2,
+            &y.all()
+        ))
+        .is_err()
+    );
+}

@@ -1,6 +1,6 @@
 # ADR-011: Device execution, buffer lifetimes and GPU parity
 
-- Status: Proposed (Phase 8 slice 1, 2026-11-03; amendments 1–3, slices 2–4). Owner review pending.
+- Status: Proposed (Phase 8 slice 1, 2026-11-03; amendments 1–4, slices 2–5). Owner review pending.
 - Date: 2026-11-03
 - Related: ADR-007 (backends; amendment 2026-11-03), ADR-010 (lossless by default),
   `docs/engineering/ARCHITECTURE_DECISIONS.md` §2.4–2.5, TENSOR_ARCHITECTURE §6.
@@ -290,3 +290,106 @@ is fastest.
   GPU work needs routing on the GPU first (no host round trip per layer). With that, a
   token could be one submission that waits on expert availability, which is the next
   step for this regime.
+
+## Amendment 4 (2026-11-04): a token in one submission, Phase 8 slice 5
+
+### The question
+With every expert resident, whole layers (amendment 2) still made one submission per
+layer, because routing ran on the host: each layer's router logits came back, the host
+chose the experts, and the next submission computed them. Amendment 3 named routing on
+the GPU as the step that removes those round trips, and amendment 2 named a concurrent
+encoder for independent dispatches.
+
+### What was built
+- **`moe_route`** (`Batch::moe_route`): one thread per token runs `ops::route` with the
+  same operations in the same order: the softmax (max, `qexp`, a sequential sum,
+  `precise::divide`), then the top k by `f32::total_cmp` order with ties to the lower id
+  (selection instead of a sort; the order it defines is the same), then the optional
+  renormalisation (a sequential sum from −0.0, as `Iterator::sum` starts). Ids are
+  written as u32 bits in an f32 buffer. Up to 256 experts (`MAX_ROUTED_EXPERTS`).
+- **Routed matmuls** (`Batch::routed_matmul`, kernels `routed_<dtype>`): one dispatch over
+  every (token, rank) entry. Entry `j` reads its expert id from the route buffer, takes
+  that expert's weights from an address table passed inline (each matrix's
+  `gpuAddress` plus its offset, as a struct of device pointers), and computes the same
+  dot product as the plain matmul kernel, which now shares its row body with it. The
+  input row is the token's (gate and up) or the entry's (down); the output row is the
+  entry's, which is exactly the `contrib` layout the combine reads, so the gather and
+  scatter disappear. Buffers reached only through the table are declared with
+  `useResource` (read), and wrapped host memory is kept alive as for bound buffers (§3).
+  An id past the table is clamped to the last expert: wrong numbers, never an
+  out-of-bounds read.
+- **Holding experts without using them.** The GPU chooses experts after the host has
+  committed, so the host must guarantee that every expert it could choose stays
+  resident: `ExpertStore::hold_layer` leases all of a layer's experts when they are all
+  resident (`Held::All`), and otherwise says which are missing or that the pool is too
+  small. Holding is not a use: heat, recency, hit counts and the trace are untouched, and
+  releasing a hold does not refresh recency. After the submission the host reads the ids
+  back and calls `ExpertStore::record_uses`, which counts each layer's distinct experts as
+  hits exactly as the per-layer pass's acquires would (same hit totals on the benchmark:
+  84 375 in both).
+- **`MetalOps::token`** (`--metal-ops token`, now the default; `layers` keeps host
+  routing). Per forward pass: if every layer's pool holds all its experts and they are
+  resident, the whole pass (all layers, routing, routed experts, final norm and head) is
+  one submission. If some are missing, they are queued as prefetches (with I/O threads;
+  without, they are read at once) and this pass takes the per-layer path, so the first
+  token does not wait for the whole model. Pools smaller than the expert count (the
+  amendment 3 regime, or pressure shrinking pools after load) keep the per-layer path.
+  `Engine::gpu_routed_passes` counts the passes that ran as one submission.
+- **A concurrent encoder.** Command buffers now use `MTLDispatchType::Concurrent` with a
+  buffer barrier before each dispatch, which keeps the serial order (measured: no cost).
+  `Batch::concurrent` records a group of independent operations without barriers between
+  them: q/k/v projections, their clamps and norms, the two RoPEs, the two KV stores,
+  routed gate and up, and in the per-layer path each stage (gather, gate and up, SwiGLU,
+  down, scatter) across all of a wave's experts.
+
+### Parity
+New tests: `moe_route_matches_ops_route` (64/8, 8/2, 60/4, 256/8 and 5/5 experts, with
+equal logits, pairs of equal logits and a −inf logit, with and without renormalisation)
+and `routed_matmuls_give_each_experts_cpu_bits` (every dtype and shape, typical and wild
+values, wrapped and uploaded experts, token and entry inputs, a clamped id). The fixture
+invariant runs `token` with and without I/O threads (with none, every one of the 12+
+passes is routed on the GPU) and checks `layers` routes none. On real OLMoE (env-gated),
+the 10 × 50 304 prompt logits and the 48 generated tokens are bit-identical; 40 of the
+passes ran as one submission (the first ones took the per-layer path while experts
+loaded in the background). The fault suite runs both placements: with `token` and I/O
+threads, a failed prefetch is read again later, so the request may succeed, and its
+tokens are the fault-free ones either way.
+
+### Measurements (M3 Pro, OLMoE Q4_K_M, all experts resident, 5 runs)
+Records: `docs/performance/baselines/2026-11-04-m3pro-phase8s5-*.json`. Every run's
+tokens match the CPU's.
+
+| 10 prompt + 128 generated | decode tok/s (median step) | P95 step | prefill (10 tokens) |
+|---|---|---|---|
+| cpu | 42.3 | 29.0 ms | 38.7 tok/s |
+| metal layers, serial encoder (slice 3 code) | 44.9 | 23.4 ms | 75.8 tok/s |
+| metal token, serial encoder | 57.1 | 18.2 ms | 89.9 tok/s |
+| metal layers, concurrent groups | 53.1 | 19.7 ms | 86.5 tok/s |
+| **metal token, concurrent groups** | **59.2** | 17.5 ms | 91.3 tok/s |
+
+| 128 prompt + 32 generated | prefill tok/s |
+|---|---|
+| cpu (tiled, ADR-002 amendment 1) | **115.3** |
+| metal token | 97.1 |
+| metal layers | 95.9 |
+
+One submission per token is 1.32× the per-layer pass and 1.40× the CPU at decode. The
+concurrent groups add 4% to it and 18% to the per-layer pass, whose expert chains now
+overlap. For long prompts the CPU is faster: the GPU matmul kernels read each weight row
+once per token row (one threadgroup row per token), while the CPU's tiled kernel reuses
+each weight load across six tokens.
+
+### Decision
+- **`--backend metal` defaults to whole tokens (`token`).** Routing on the GPU needs every
+  expert resident, which is the regime where Metal wins; otherwise the pass falls back
+  per pass to whole layers, and at load to the CPU pass as amendment 3 decided.
+- **The CPU stays the default backend** until the owner reviews amendments 2–4.
+- Consequence: with `token`, every expert of the model is read into the cache in the
+  background after the first pass (on OLMoE, 1 024 experts and 3.63 GiB, against about
+  760 and 3.47 GiB that a 128-token run touches), so resident memory reaches the plan's
+  full expert budget sooner. The plan already budgets for it: `token` only routes on the
+  GPU when every pool holds every expert.
+- Next for Metal: tile the GPU matmuls over several tokens per weight load (keeping each
+  output's reduction order), so prefill beats the CPU's; then the small-cache regime
+  again, now that a token can be one submission that waits on expert availability.
+

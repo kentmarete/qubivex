@@ -38,9 +38,10 @@ impl BackendKind {
 
 /// What runs on Metal with [`BackendKind::Metal`].
 ///
-/// The default is whole layers ([`MetalOps::layers`]): one submission per layer, with
-/// the norms, attention and the routed experts on the GPU (ADR-011 amendment 2). That
-/// is the only placement that beats the CPU: a submission costs about 110 µs on the M3
+/// The default is whole tokens ([`MetalOps::token`]): whole layers, with routing on the
+/// GPU so a token is one submission whenever every expert is resident (ADR-011
+/// amendment 4), and one submission per layer otherwise ([`MetalOps::layers`],
+/// amendment 2). Whole layers are the only placement that beats the CPU: a submission costs about 110 µs on the M3
 /// Pro, so placing single dense matmuls (attention, router, head) only adds
 /// submissions while the GPU idles in between (amendment 1). Those placements remain
 /// for comparison.
@@ -55,6 +56,9 @@ pub struct MetalOps {
     /// Whole layers: every dense weight, the norms, attention and the routed experts,
     /// one submission per layer (ADR-011 amendment 2). Implies the other three.
     pub layers: bool,
+    /// With `layers`: route on the GPU, so a token is one submission, whenever every
+    /// layer's experts are all resident (ADR-011 amendment 4).
+    pub token: bool,
 }
 
 impl Default for MetalOps {
@@ -64,6 +68,7 @@ impl Default for MetalOps {
             router: false,
             head: false,
             layers: true,
+            token: true,
         }
     }
 }
@@ -82,10 +87,13 @@ impl MetalOps {
             }
     }
 
-    /// The selected kinds, comma-separated (`head`, `attention,router,head`, `layers`
-    /// or `none`).
+    /// The selected kinds, comma-separated (`head`, `attention,router,head`, `token`,
+    /// `layers` or `none`).
     #[must_use]
     pub fn describe(self) -> String {
+        if self.layers && self.token {
+            return "token".to_owned();
+        }
         if self.layers {
             return "layers".to_owned();
         }

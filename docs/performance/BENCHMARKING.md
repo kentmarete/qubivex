@@ -125,8 +125,10 @@ decode rate says whether that mattered. Results: ADR-008 amendment 2.
 
 ### Device placement (Phase 8)
 
-`--backend metal` runs whole layers on the Apple GPU (`--metal-ops layers`, the
-default), or with `--metal-ops attention,router,head` only those dense matmuls, and adds
+`--backend metal` runs whole tokens on the Apple GPU (`--metal-ops token`, the default:
+whole layers with routing on the GPU, one submission per pass while every expert is
+resident), whole layers with routing on the host (`--metal-ops layers`), or with
+`--metal-ops attention,router,head` only those dense matmuls, and adds
 `config.device` to the record: backend, device, placed kinds, tensor count and bytes.
 Placement never changes bits, so always pass `--reference` with a CPU record: the
 tokens must match. Kernel-level numbers come from the Criterion groups of
@@ -135,7 +137,7 @@ tokens must match. Kernel-level numbers come from the Criterion groups of
 with no per-call overhead). Measure Metal both with every expert resident and under a
 small `--ram-budget`: the two regimes rank the backends differently. When the plan's
 pools are smaller than top-k, `--backend metal` runs the CPU pass, and the record's
-`config.device.fallback` says so. Results: ADR-011 amendments 1–3.
+`config.device.fallback` says so. Results: ADR-011 amendments 1–4.
 
 ### How to read the numbers
 
