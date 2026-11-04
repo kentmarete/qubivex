@@ -2,7 +2,8 @@
 
 - Status: Proposed (Phase 0). **This deviates from the specification's async trait.**
   The queue, I/O threads and `acquire_many` were built in Phase 6 (amendment 1), and
-  direct I/O in slice 3 (amendment 2); io_uring is deferred. Awaiting acceptance.
+  direct I/O in slice 3 (amendment 2); io_uring is deferred. Failure behaviour and the
+  fault-injection suite: amendment 3. Awaiting acceptance.
 - Date: 2026-11-01
 
 ## Context
@@ -161,3 +162,62 @@ condvar, plus a loader pool, with no async runtime.
   - cross-expert coalescing: in GGUF, an expert's parts are spread over three stacked
     tensors, so neighbouring experts are adjacent only within a part. A layer's misses
     are rarely neighbours (10.6% hits, top-8 of 64).
+
+## Amendment 3 (2026-11-04): failure behaviour and the fault-injection suite
+
+IMPROVEMENTS_EVALUATION §10 asks for an `ExpertSource` wrapper that injects faults, and
+a suite showing that in every case nothing panics, no wrong token is emitted, the ledger
+returns to baseline and the next request succeeds. Planned for Phase 3, built now.
+
+- **`qubivex_expert_stream::fault`.** `FaultySource` wraps any source and applies
+  `Rule`s (a target: any read, a layer or one expert; reads to let through first; reads
+  to fail) with a `Fault`: `Eio`; `ShortRead { keep }` (the rest of the buffer is
+  garbage, the read reports end of file); `Corrupt { offset, xor }` (reported as a
+  success); `Panic` (after writing half the buffer); `Delay`. `VerifiedSource` checks
+  every read against a checksum recorded from a known-good read (`checksum`: four
+  multiply-rotate lanes, so any change within one 8-byte word always changes it), and
+  refuses an expert it has no checksum for. `Engine::load_with_source` puts any wrapper
+  between the model's source and the store.
+- **Behaviour (unchanged except where noted):**
+  - A failed read fails every waiter with `StoreError::Load`, is never published, and
+    leaves no entry: the next acquire reads again. A failed prefetch has no waiter, and
+    the demand that follows reads again.
+  - **New:** a panicking source is caught in the load (`catch_unwind`) and becomes a
+    load error. Before, it killed the I/O thread with the load unresolved, so its
+    waiters waited forever; without I/O threads it unwound through the caller.
+  - **New:** slab allocation is fallible (`PageAligned::try_zeroed`): a slot the
+    allocator refuses is a load error, not an abort.
+  - **New:** a forward pass that fails rolls the host KV cache back to the positions it
+    held (`TransformerMoeModel::forward`). Before, the layers before the failing one
+    kept that step's keys and values, so the next step on the same cache attended to
+    them. Generation drops its cache on error anyway; a server reusing a conversation's
+    cache needs the rollback. The Metal pass advances the cache only on success.
+  - **New:** the ledger is updated after a failed pass too.
+  - Corrupt bytes that a read reports as good are invisible to a plain store (the size
+    is right). Only `VerifiedSource` catches them. It is not on by default: recording
+    reads every expert once, which only makes sense where the checksums are stored, at
+    install time. That is a Phase 11 `models` item.
+- **Tests.** Store (`qubivex-expert-stream/tests/fault.rs`, 0 and 4 I/O threads): EIO,
+  short read and panic each fail one acquire, and the next succeeds; one failure in a
+  layer spares the rest, whether the batch is consumed or dropped at the error; every
+  waiter on a failed read gets the error; corruption gets through unverified and is
+  caught verified; allocation failure (a 4 PiB slot) is an error and other layers keep
+  working; dropping a batch mid-layer cancels queued loads and leaks nothing; a failed
+  prefetch does not fail the demand. Each ends with no lease, load or failed entry, and
+  `used` equal to the resident bytes (`ExpertStore::occupancy`). Engine
+  (`qubivex-runtime/tests/faults.rs`, the three fixtures, CPU with every expert
+  resident and with one slot per layer, 0 and 4 I/O threads, faults mid-prefill and
+  mid-decode, EIO, short read, panic and checksummed corruption): the request fails
+  naming the expert, the tokens emitted before it are the fault-free ones, nothing is
+  held, the ledger matches the store, and the next request gives the fault-free tokens.
+  With every expert resident, the ledger and occupancy after recovery equal a
+  fault-free engine's. A decode step that fails can be followed on the same cache by a
+  different token, and gives the fault-free logits bit for bit. This test fails
+  without the rollback. The same suite runs on Metal whole layers. Removing
+  `catch_unwind` fails the store panic test.
+- **Speed: unchanged.** Real OLMoE Q4_K_M, M3 Pro, 128 tokens, 1 warm-up + 3 runs,
+  warm: at `--expert-cache-mb 1024`, 21.1 tok/s (main) against 21.5 (this change); with
+  the planned cache, 22.5 against 21.6. The run-to-run spread is larger than the
+  difference (17.9–23.9). The tokens are identical in every run.
+- **Not covered yet:** mirrors (retrying on another drive; none exist), a read that
+  hangs forever (no read timeout), and per-request isolation in the server (Phase 9).

@@ -293,6 +293,17 @@ impl KvCache {
         self.max
     }
 
+    /// Forgets the host keys and values past `positions` (of `head_dim` floats per
+    /// head), and the count of them. Reserved capacity is kept.
+    fn rollback_host(&mut self, positions: usize, head_dim: usize) {
+        for heads in self.k.iter_mut().chain(self.v.iter_mut()) {
+            for h in heads {
+                h.truncate(positions * head_dim);
+            }
+        }
+        self.len = self.len.min(positions);
+    }
+
     /// Forgets every position.
     pub fn clear(&mut self) {
         for heads in self.k.iter_mut().chain(self.v.iter_mut()) {
@@ -465,11 +476,34 @@ impl TransformerMoeModel {
     /// keys and values to `cache`. Returns logits: the last token's, or every token's
     /// (`tokens.len() × vocab`, row-major).
     ///
+    /// On an error the cache is rolled back to the positions it held before the call,
+    /// so the same tokens can be run again on it (a failed expert read must not leave
+    /// half a step of keys and values behind).
+    ///
     /// # Errors
     /// [`ArchError::Input`] for an out-of-range token or a full context; any kernel,
     /// weight or expert error.
-    #[allow(clippy::too_many_lines)]
     pub fn forward(
+        &self,
+        tokens: &[u32],
+        cache: &mut KvCache,
+        src: Sources<'_>,
+        logits: Logits,
+        trace: Option<Tracer<'_>>,
+    ) -> Result<Vec<f32>, ArchError> {
+        let p0 = cache.len;
+        let out = self.forward_unchecked(tokens, cache, src, logits, trace);
+        if out.is_err() {
+            // A head_dim that does not fit fails before any position is written.
+            if let Ok(d) = usize_of(self.cfg.head_dim) {
+                cache.rollback_host(p0, d);
+            }
+        }
+        out
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn forward_unchecked(
         &self,
         tokens: &[u32],
         cache: &mut KvCache,
