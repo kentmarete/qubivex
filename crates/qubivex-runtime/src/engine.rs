@@ -17,7 +17,8 @@ use qubivex_compute::tensor::TensorView;
 use qubivex_core::{Bytes, ExpertIdx, LayerIdx, Shape, TensorDesc};
 use qubivex_expert_stream::predict::{Lookahead, LookaheadConfig};
 use qubivex_expert_stream::{
-    ExpertKey, ExpertStore, Policy, PoolSpec, PrefetchStats, StoreError, StoreStats,
+    ExpertKey, ExpertSource, ExpertStore, Occupancy, Policy, PoolSpec, PrefetchStats, StoreError,
+    StoreStats,
 };
 use qubivex_hardware::{Host, Probed, ResourceProbe, SystemProbe};
 use qubivex_memory::{
@@ -481,6 +482,23 @@ impl Engine {
     /// I/O, tokenizer and architecture errors; [`RuntimeError::Memory`] if the model
     /// does not fit the budget or available RAM cannot be measured.
     pub fn load(meta: ModelMetadata, opts: EngineOptions) -> Result<Self, RuntimeError> {
+        Self::load_with_source(meta, opts, |s| s)
+    }
+
+    /// As [`Engine::load`], with the expert store reading through `wrap(source)`
+    /// instead of the model's own source: for fault injection
+    /// ([`qubivex_expert_stream::fault::FaultySource`]), checksums
+    /// ([`qubivex_expert_stream::fault::VerifiedSource`]) or instrumentation. The
+    /// wrapper must return the inner source's bytes for a read it reports as good;
+    /// expert layouts still come from the model.
+    ///
+    /// # Errors
+    /// As [`Engine::load`].
+    pub fn load_with_source(
+        meta: ModelMetadata,
+        opts: EngineOptions,
+        wrap: impl FnOnce(Arc<ModelExpertSource>) -> Arc<dyn ExpertSource>,
+    ) -> Result<Self, RuntimeError> {
         let files = meta
             .tensors
             .files()
@@ -625,7 +643,7 @@ impl Engine {
         let layers = footprint.layers;
         let io_threads = opts.io_threads.unwrap_or(DEFAULT_IO_THREADS);
         let store = ExpertStore::with_io_threads(
-            source.clone(),
+            wrap(Arc::clone(&source)),
             &pools_for(&layers, capacity),
             opts.cache_policy,
             io_threads,
@@ -737,6 +755,17 @@ impl Engine {
     #[must_use]
     pub fn store_stats(&self) -> StoreStats {
         self.store.stats()
+    }
+
+    /// What the expert store holds now, by state (all-zero `leased`, `loading` and
+    /// `failed` between requests, whatever the reads did).
+    ///
+    /// # Errors
+    /// [`RuntimeError::Model`] if the store's lock is poisoned.
+    pub fn store_occupancy(&self) -> Result<Occupancy, RuntimeError> {
+        self.store
+            .occupancy()
+            .map_err(|e| RuntimeError::Model(e.to_string()))
     }
 
     /// Prefetch counters, if prefetch is on.
@@ -903,9 +932,9 @@ impl Engine {
                 &self.store,
                 &self.source,
                 logits,
-            )?;
+            );
             self.account(cache);
-            return Ok(out);
+            return Ok(out?);
         }
         let provider = StoreProvider {
             store: &self.store,
@@ -920,9 +949,10 @@ impl Engine {
         self.fit_room(cache, tokens.len())?;
         let out = self
             .pool
-            .install(|| self.model.forward(tokens, cache, src, logits, trace))?;
+            .install(|| self.model.forward(tokens, cache, src, logits, trace));
+        // Failed passes too: the ledger follows what the store and cache hold.
         self.account(cache);
-        Ok(out)
+        Ok(out?)
     }
 
     /// Generates up to `max_new` tokens after `prompt`, calling `on_token` for each;

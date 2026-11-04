@@ -277,6 +277,11 @@ impl ModelExpertSource {
         self.experts.get(&(layer, expert))
     }
 
+    /// Every expert, in key order.
+    pub fn keys(&self) -> impl Iterator<Item = ExpertKey> + '_ {
+        self.experts.keys().copied()
+    }
+
     /// Number of experts.
     #[must_use]
     pub fn len(&self) -> usize {

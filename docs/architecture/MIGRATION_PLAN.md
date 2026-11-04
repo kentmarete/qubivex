@@ -268,7 +268,10 @@ paged KV, NUMA, multi-device; then a CLI UX catalogue and recommendations UI.
 [IMPROVEMENTS_EVALUATION.md](IMPROVEMENTS_EVALUATION.md) maps each addendum item to
 Colibri evidence, a verdict and a phase. It changes the phases above as follows:
 - **Phase 3:** typed failure paths, plus the start of a fault-injection `ExpertSource`
-  wrapper (EIO, short reads, corrupt bytes).
+  wrapper (EIO, short reads, corrupt bytes). **Done 2026-11-04** (ADR-006 amendment 3):
+  `fault::FaultySource` and `VerifiedSource`, store and engine fault suites. Panicking
+  sources, allocation failure and KV rollback after a failed pass were fixed along the
+  way.
 - **Phase 5:** an admission-logic unit test (projected KV must not push the expert
   cache below the floor), and an external RAM-hog pressure test.
 - **Phase 6:** the I/O strategy benchmark matrix (mmap, pread pool, io_uring,

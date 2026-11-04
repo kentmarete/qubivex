@@ -42,6 +42,40 @@ impl PageAligned {
         }
     }
 
+    /// As [`PageAligned::zeroed`], but reports an allocation failure instead of
+    /// aborting.
+    ///
+    /// # Errors
+    /// The allocator's refusal (or a length that overflows).
+    pub fn try_zeroed(len: usize) -> Result<Self, std::collections::TryReserveError> {
+        let padded = len.max(1).div_ceil(DEVICE_PAGE) * DEVICE_PAGE;
+        let mut buf = Vec::new();
+        buf.try_reserve_exact(padded.saturating_add(DEVICE_PAGE))?;
+        buf.resize(padded + DEVICE_PAGE, 0);
+        let start = buf.as_ptr().align_offset(DEVICE_PAGE);
+        debug_assert!(start < DEVICE_PAGE);
+        Ok(Self {
+            buf,
+            start,
+            len,
+            padded,
+        })
+    }
+
+    /// As [`PageAligned::resized`], but reports an allocation failure instead of
+    /// aborting.
+    ///
+    /// # Errors
+    /// The allocator's refusal (or a length that overflows).
+    pub fn try_resized(mut self, len: usize) -> Result<Self, std::collections::TryReserveError> {
+        if len <= self.padded {
+            self.len = len;
+            Ok(self)
+        } else {
+            Self::try_zeroed(len)
+        }
+    }
+
     /// The region holding `len` bytes, reusing this allocation when its padded length
     /// is large enough (the address stays the same) and allocating a zeroed one
     /// otherwise. Reused bytes keep their old contents; callers overwrite them.

@@ -1,9 +1,15 @@
 # QUBIVEX Implementation Status
 
-Last updated: 2026-11-03
+Last updated: 2026-11-04
 
 ## Current phase
-**Phase 8 (GPU acceleration, Metal first): slices 1–4 done (2026-11-03).**
+**Phase 8 (GPU acceleration, Metal first): slices 1–4 done (2026-11-03).** Metal slice 5 is paused while the improvement-plan backlog (MIGRATION_PLAN §3a and Addendum §4) is cleared first.
+
+**Fault injection done (2026-11-04), Addendum §4 Phase 3 item; ADR-006 amendment 3.**
+- Code: `qubivex_expert_stream::fault` (`FaultySource` with `Rule`/`Target`/`Fault`: EIO, short read, corrupt bytes, panic, delay; `VerifiedSource` and `checksum`); `ExpertStore::occupancy`; `Engine::load_with_source` and `Engine::store_occupancy`; `ModelExpertSource::keys`; `PageAligned::try_zeroed`/`try_resized`.
+- Fixes found by the suite: a panicking source killed an I/O thread and left its waiters hanging (now a load error); slab allocation aborted on failure (now a load error); a failed forward pass left partial keys and values in the KV cache (now rolled back); the ledger was not updated after a failed pass.
+- Tests: 253 pass on 1.99.1 and 1.85 (7 store and 4 engine fault tests are new, including Metal whole layers). Speed is unchanged within noise (21.1 → 21.5 tok/s at 1 GiB; tokens identical).
+- **Next (§3a):** `gemm` prefill and the spinning thread pool (ADR-002), then a faster lossless CPU Q4_K, the KV cache on `Tensor<f32>`, a dense architecture and a SafeTensors run, then Phase 9.
 
 **Phase 8 slice 4 done (2026-11-03): small expert caches.**
 - Code: `MetalBackend::submit_async` and `Pending` (keeps wrapped host memory alive until the GPU is done; dropping waits; host reads and writes drain outstanding work). `PlacementReport::fallback`: with `--backend metal`, a plan whose pools are smaller than top-k runs the CPU pass and says why (`run` prints it; `bench` records it).

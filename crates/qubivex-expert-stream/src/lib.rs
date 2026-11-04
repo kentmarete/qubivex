@@ -37,6 +37,7 @@
 //! The store has no `unsafe` code. Lease, dedup and eviction are model-checked with
 //! `loom` (`RUSTFLAGS="--cfg loom"`), without I/O threads.
 
+pub mod fault;
 pub mod policy;
 pub mod predict;
 pub mod replay;
@@ -1228,6 +1229,14 @@ impl ExpertStore {
     }
 }
 
+/// The message of a caught panic, if it has one.
+fn panic_message(p: &(dyn std::any::Any + Send)) -> &str {
+    p.downcast_ref::<&str>()
+        .copied()
+        .or_else(|| p.downcast_ref::<String>().map(String::as_str))
+        .unwrap_or("(no message)")
+}
+
 /// Nanoseconds since `t`, saturating.
 fn elapsed_ns(t: Instant) -> u64 {
     u64::try_from(t.elapsed().as_nanos()).unwrap_or(u64::MAX)
@@ -1245,13 +1254,29 @@ fn execute(s: &Shared, req: Request) {
             capacity: size,
         })
         .and_then(|len| {
-            let mut buf = if let Some(b) = slab {
-                b.resized(len)
+            let buf = if let Some(b) = slab {
+                b.try_resized(len)
             } else {
                 s.slab_allocs.fetch_add(1, Ordering::Relaxed);
-                PageAligned::zeroed(len)
+                PageAligned::try_zeroed(len)
             };
-            s.source.read_expert(key, buf.as_mut_slice()).map(|()| buf)
+            let mut buf = buf.map_err(|e| StoreError::Load {
+                key,
+                detail: format!("cannot allocate a {len}-byte slab: {e}"),
+            })?;
+            // A panicking source must not take the I/O thread (or the caller) down
+            // with the load unresolved: its waiters would wait forever. The buffer is
+            // discarded, so a half-written one is never published.
+            let read = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                s.source.read_expert(key, buf.as_mut_slice())
+            }));
+            match read {
+                Ok(r) => r.map(|()| buf),
+                Err(p) => Err(StoreError::Load {
+                    key,
+                    detail: format!("the expert source panicked: {}", panic_message(&*p)),
+                }),
+            }
         });
     let Ok(mut g) = s.inner.lock() else {
         return;
@@ -1354,6 +1379,50 @@ impl ExpertStore {
             })
             .collect())
     }
+
+    /// What the pools hold now, by state. After every caller has dropped its leases
+    /// and batches, and every queued or in-flight read has finished, `leased`,
+    /// `loading`, `failed` and `queued` are all 0, whatever the reads did.
+    ///
+    /// # Errors
+    /// [`StoreError::Poisoned`].
+    pub fn occupancy(&self) -> Result<Occupancy, StoreError> {
+        let g = self.lock()?;
+        let mut o = Occupancy {
+            queued: g.queue.len(),
+            used: g.used,
+            ..Occupancy::default()
+        };
+        for e in g.pools.values().flat_map(|p| p.entries.values()) {
+            match e {
+                Entry::Ready { leases: 0, .. } => o.resident += 1,
+                Entry::Ready { .. } => {
+                    o.resident += 1;
+                    o.leased += 1;
+                }
+                Entry::Loading { .. } => o.loading += 1,
+                Entry::Failed { .. } => o.failed += 1,
+            }
+        }
+        Ok(o)
+    }
+}
+
+/// A snapshot of the store's entries ([`ExpertStore::occupancy`]).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Occupancy {
+    /// Experts resident (leased or not).
+    pub resident: usize,
+    /// Resident experts with at least one lease.
+    pub leased: usize,
+    /// Loads queued or in flight.
+    pub loading: usize,
+    /// Failed loads whose error some waiter has not taken yet.
+    pub failed: usize,
+    /// Requests in the I/O queue.
+    pub queued: usize,
+    /// Bytes resident or loading ([`ExpertStore::used`]).
+    pub used: u64,
 }
 
 #[cfg(test)]
