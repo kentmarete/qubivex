@@ -419,7 +419,7 @@ These invariants are enforced by tests and CI
 
 | Phase | Scope | Status |
 |---|---|---|
-| 1 | Rust workspace, core types, CI. ADR-002 tensor-engine decision: own kernels plus the `gemm` crate, no Candle | Done |
+| 1 | Rust workspace, core types, CI. ADR-002 tensor-engine decision: own kernels, no Candle | Done |
 | 2 | Hardware detection, `qubivex system`, `qubivex doctor --storage` | Done |
 | 3 | Model containers, manifest, architecture registry, validation, `qubivex models` | Done (checked on the real OLMoE-1B-7B Q4_K_M GGUF) |
 | 4 | CPU inference prototype: kernels, tokenizer, a minimal expert store, generation | Done: matches `transformers` to under 1e-6 relative; identical output at every expert-cache size |
