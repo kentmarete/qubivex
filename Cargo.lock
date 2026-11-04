@@ -854,6 +854,7 @@ dependencies = [
 name = "qubivex-expert-stream"
 version = "0.1.0"
 dependencies = [
+ "criterion",
  "loom",
  "qubivex-compute",
  "qubivex-core",

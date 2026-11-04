@@ -37,6 +37,12 @@ pub(crate) fn run(a: &RunArgs<'_>) -> Result<(), String> {
     .map_err(|e| chain(&e))?;
     let engine = Engine::load_mirrored(meta, a.memory.engine(a.context, a.threads), a.mirrors)
         .map_err(|e| chain(&e))?;
+    if let qubivex_runtime::Verification::Stale(why) = engine.verification() {
+        eprintln!(
+            "qubivex: warning: expert reads are not verified: {why}; run `qubivex models verify {}`",
+            a.model
+        );
+    }
     let load = t0.elapsed();
     let tok = engine.tokenizer();
     let text = if a.chat {

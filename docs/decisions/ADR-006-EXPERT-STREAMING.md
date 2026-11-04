@@ -3,7 +3,8 @@
 - Status: Proposed (Phase 0). **This deviates from the specification's async trait.**
   The queue, I/O threads and `acquire_many` were built in Phase 6 (amendment 1), and
   direct I/O in slice 3 (amendment 2); io_uring is deferred. Failure behaviour and the
-  fault-injection suite: amendment 3. Awaiting acceptance.
+  fault-injection suite: amendment 3; deadlines, retries, mirrors and recorded
+  checksums: amendment 4. Awaiting acceptance.
 - Date: 2026-11-01
 
 ## Context
@@ -221,3 +222,81 @@ returns to baseline and the next request succeeds. Planned for Phase 3, built no
   difference (17.9–23.9). The tokens are identical in every run.
 - **Not covered yet:** mirrors (retrying on another drive; none exist), a read that
   hangs forever (no read timeout), and per-request isolation in the server (Phase 9).
+
+## Amendment 4 (2026-11-04): read deadlines, retries, mirrors and recorded checksums
+
+Amendment 3 left three gaps: a read that never returns, no second copy to read from, and
+checksums that existed but were never on. All three are closed here.
+
+- **Deadlines (`ReadTimeout`, `StoreError::Timeout`).** A blocked `pread` cannot be
+  interrupted, so the deadline belongs to the waiter. A caller waits for one expert at
+  most `floor + size / min_rate`, counted from when it starts waiting (the engine's
+  default is 5 s + size at 10 MB/s; `--read-timeout SECS|off`). Then:
+  - the caller gets `StoreError::Timeout`, and the request fails naming the expert;
+  - a queued read nobody waits for any more is cancelled;
+  - a read already started is left to finish, and if it succeeds its bytes are
+    published: a late good read is still good;
+  - a later caller of the same expert joins the stuck read and times out in turn.
+
+  Reads running past their deadline are counted (`Occupancy::stuck`). When every I/O
+  thread is stuck, `Engine::admit` refuses new requests (`RuntimeError::Storage`)
+  instead of queueing them behind a dead drive. Dropping the store detaches stuck
+  threads instead of joining them, so shutdown does not hang. Without I/O threads the
+  compute thread reads its own misses and cannot time out on those; the store's own
+  default is no deadline, and the engine sets one.
+- **Retries.** A failed read is attempted again inside the load before any waiter sees
+  the error (`set_read_retries`). The engine retries once by default
+  (`--read-retries N`). Every source error is retried, including a panic and a
+  checksum mismatch; an allocation failure is not.
+- **Mirrors (`mirror::MirroredSource`).** Reads go to the first healthy copy of the
+  weight files and fail over to the next on an error or a panic. A copy that fails 3
+  reads in a row is skipped for 30 s, then tried again; a success clears its count.
+  When every copy is skipped, all are tried anyway. `ModelExpertSource::mirror_at`
+  opens a copy under another directory (same relative paths; sizes must match the
+  index). `Engine::load_mirrored` and `--mirror DIR` (repeatable) wire it up.
+  Each copy is verified separately, so corrupt bytes on one copy fail over too. A hung
+  read on one copy is not failed over: it blocks its thread, and the deadline above
+  handles it. Hedged reads (asking a second copy after a delay) would fix that and are
+  left until a second drive can be measured, together with per-device queues.
+- **Recorded checksums (`qubivex_runtime::checksums`).** `qubivex models verify`
+  records every expert's checksum in `experts.qvxsum` next to the model when there is
+  none, and otherwise re-reads every expert and lists the ones that differ (an offline
+  scrub). `qubivex models import --write` records them as well (`--no-checksums`
+  skips it). The file also records each weight file's size and modification time.
+  When they no longer match, the checksums are **stale**: they are reported (`run`
+  warns) and not used, because a deliberately replaced model would fail every read.
+  Silent corruption leaves size and time alone, so it is caught. The engine's default,
+  `--verify-experts auto`, verifies every read when fresh checksums exist; `off`
+  never does; `require` refuses to load without them. Bench records the mode.
+- **The checksum** moved from four lanes to eight. One M3 Pro core, on one OLMoE
+  expert (3.4 MiB): four lanes did 21 GiB/s, eight do 39 GiB/s (84 µs per expert);
+  `memcpy` does 54 GiB/s. Bench: `qubivex-expert-stream/benches/checksum.rs`.
+- **Measured** (OLMoE Q4_K_M, M3 Pro, 128 tokens, 1 warm-up + 3 runs, 3 alternating
+  rounds, warm). Recording all 1024 experts (3.63 GiB) took 0.9 s and a full check
+  0.4 s, both from the page cache. Decode, verified against unverified:
+
+  | Cache | Verified tok/s | Unverified tok/s | Blocked per token |
+  |---|---|---|---|
+  | 1 GiB (streaming) | 22.3 / 23.2 / 23.0 | 23.2 / 23.5 / 23.4 | 2.0–6.6 / 2.2–3.0 ms |
+  | Planned (resident) | 24.6 / 25.7 / 26.3 | 25.2 / 24.8 / 25.8 | 0.0–0.1 ms |
+
+  Verification costs about 2–3% when every token streams experts, and nothing
+  measurable when they stay resident. The tokens are identical in every run. **It is
+  on by default**; `--verify-experts off` remains for streaming at the edge.
+- **Tests.** Store: a hung read times out while the layer's other experts load; a
+  second caller joins the stuck read; the late read is published; with every thread
+  stuck, queued reads time out and are cancelled and the drop does not wait; retries
+  recover a failed read, and the error counts the attempts. Mirrors: a failing copy is
+  skipped, then tried again after the cooldown and preferred once it reads well;
+  every copy failing gives one error naming each; corrupt bytes on one copy fail over
+  through the store. Engine: a transient failure is retried with fault-free tokens; a
+  hung read mid-decode fails the request with a timeout, a lone stuck thread makes the
+  engine refuse new requests, and requests succeed again once the read returns; the
+  model's files truncated under a running engine are read from a mirror with fault-free
+  tokens, while the same engine without a mirror fails, and a mirror of the wrong size
+  is refused. Checksums: record, save and load round-trip; the scrub of a clean model
+  is empty; silent corruption of one expert (mtime kept) is named by the scrub,
+  fails a verified request, and is read through a mirror with the right tokens;
+  touching a weight file makes the checksums stale, and `require` then refuses to load.
+- **Still open:** hedged reads and per-device queues (need a second drive), and a
+  read timeout for a compute thread that reads its own misses (0 I/O threads).

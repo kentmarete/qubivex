@@ -134,6 +134,10 @@ struct Config {
     /// Phase 6 slice 3).
     #[serde(default)]
     expert_io: Option<String>,
+    /// Whether expert reads were verified against recorded checksums: `verified`,
+    /// `off`, `missing` or `stale` (absent before ADR-006 amendment 4).
+    #[serde(default)]
+    verification: Option<String>,
     /// Router-lookahead prefetch settings; absent when prefetch is off (and before
     /// Phase 7).
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -668,6 +672,15 @@ pub(crate) fn bench(a: &BenchArgs<'_>) -> Result<String, String> {
             cache_policy: Some(format!("{:?}", a.memory.cache_policy())),
             io_threads: Some(engine.io_threads()),
             expert_io: Some(engine.expert_io().name().to_owned()),
+            verification: Some(
+                match engine.verification() {
+                    qubivex_runtime::Verification::Verified(_) => "verified",
+                    qubivex_runtime::Verification::Off => "off",
+                    qubivex_runtime::Verification::Missing => "missing",
+                    qubivex_runtime::Verification::Stale(_) => "stale",
+                }
+                .to_owned(),
+            ),
             prefetch: a.memory.prefetch().map(|p| PrefetchConfig {
                 guard: p.guard,
                 smooth: p.lookahead.smooth,

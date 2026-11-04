@@ -5,6 +5,7 @@
 //! GGUF file; and the routed experts as byte extents ([`ModelExpertSource`]) for the
 //! expert store.
 
+pub mod checksums;
 mod engine;
 mod experts;
 mod metal_forward;
@@ -12,7 +13,7 @@ mod placement;
 
 pub use engine::{
     DEFAULT_IO_THREADS, DEFAULT_READ_RETRIES, Engine, EngineOptions, PredictionStats,
-    PrefetchOptions, PrefetchReport, Sampling,
+    PrefetchOptions, PrefetchReport, Sampling, Verification, VerifyExperts,
 };
 pub use experts::{ExpertIo, ExpertLayout, IoPath, ModelExpertSource, PartLayout};
 pub use placement::{BackendKind, MetalOps, PlacementReport};
