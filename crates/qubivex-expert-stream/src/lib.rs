@@ -636,10 +636,44 @@ impl<'a> Iterator for Batch<'a> {
     /// the others), [`StoreError::Full`] if the deferred experts can get no slot
     /// because other callers hold them all, or [`StoreError::Poisoned`].
     fn next(&mut self) -> Option<Self::Item> {
+        match self.step(true) {
+            Next::Lease(l) => Some(l),
+            // A blocking step never answers `Later`.
+            Next::Done | Next::Later => None,
+        }
+    }
+}
+
+/// What [`Batch::try_next`] found.
+#[derive(Debug)]
+pub enum Next<'a> {
+    /// An expert that was ready, or an error for one (as [`Batch::next`]).
+    Lease(Result<Lease<'a>, StoreError>),
+    /// Nothing is ready yet: a load is in flight, or the remaining experts need slots
+    /// that leases (possibly the caller's own) still hold.
+    Later,
+    /// Every expert has been handed out.
+    Done,
+}
+
+impl<'a> Batch<'a> {
+    /// [`Batch::next`] without waiting: an expert that is ready now, [`Next::Later`]
+    /// where `next` would wait for a load or fail with [`StoreError::Full`], or
+    /// [`Next::Done`].
+    ///
+    /// This lets a caller hold several leases at once (to compute them concurrently)
+    /// and release them before it blocks: the blocking `next` may need their slots.
+    pub fn try_next(&mut self) -> Next<'a> {
+        self.step(false)
+    }
+
+    /// One step of [`Batch::next`]; with `block` false it answers [`Next::Later`]
+    /// instead of waiting, failing with `Full`, or reading on the caller's thread.
+    fn step(&mut self, block: bool) -> Next<'a> {
         let shared = &self.store.shared;
         let mut g = match shared.inner.lock() {
             Ok(g) => g,
-            Err(_) => return Some(Err(StoreError::Poisoned)),
+            Err(_) => return Next::Lease(Err(StoreError::Poisoned)),
         };
         let mut waited: Option<std::time::Instant> = None;
         let out = loop {
@@ -673,18 +707,18 @@ impl<'a> Iterator for Batch<'a> {
                 }
             }
             if let Some(e) = err {
-                break Some(Err(e));
+                break Next::Lease(Err(e));
             }
             if let Some(l) = self.ready.pop_front() {
-                break Some(Ok(l));
+                break Next::Lease(Ok(l));
             }
             // A finished load of ours?
             if let Some(r) = self.take_finished(&mut g) {
-                break Some(r);
+                break Next::Lease(r);
             }
             // One we have waited too long for?
             if let Some(e) = self.expire(&mut g) {
-                break Some(Err(e));
+                break Next::Lease(Err(e));
             }
             // A deferred expert whose layer is full of prefetches still loading gets a
             // slot when they land: wait for them instead of failing.
@@ -693,11 +727,17 @@ impl<'a> Iterator for Batch<'a> {
                 .iter()
                 .any(|k| g.pools.get(&k.0).is_some_and(Pool::speculating));
             if self.pending.is_empty() && !speculating {
-                break self.deferred.first().map(|&key| {
-                    let (leased, slots) =
-                        g.pools.get(&key.0).map_or((0, 0), |p| (p.busy(), p.slots));
-                    Err(StoreError::Full { key, leased, slots })
-                });
+                let Some(&key) = self.deferred.first() else {
+                    break Next::Done;
+                };
+                if !block {
+                    break Next::Later;
+                }
+                let (leased, slots) = g.pools.get(&key.0).map_or((0, 0), |p| (p.busy(), p.slots));
+                break Next::Lease(Err(StoreError::Full { key, leased, slots }));
+            }
+            if !block {
+                break Next::Later;
             }
             waited.get_or_insert_with(std::time::Instant::now);
             // Nothing ready: read something ourselves without I/O threads, else wait.
@@ -707,7 +747,7 @@ impl<'a> Iterator for Batch<'a> {
                     self.store.execute(req);
                     g = match shared.inner.lock() {
                         Ok(g) => g,
-                        Err(_) => break Some(Err(StoreError::Poisoned)),
+                        Err(_) => break Next::Lease(Err(StoreError::Poisoned)),
                     };
                     continue;
                 }
@@ -718,7 +758,7 @@ impl<'a> Iterator for Batch<'a> {
             };
             g = match woke {
                 Some(g) => g,
-                None => break Some(Err(StoreError::Poisoned)),
+                None => break Next::Lease(Err(StoreError::Poisoned)),
             };
         };
         if let Some(t) = waited {

@@ -144,6 +144,45 @@ fn io_threads_never_change_bits() {
     }
 }
 
+/// Compute threads never change bits, including one thread, where experts computed
+/// concurrently (ADR-002 amendment 1) must not wait on each other, and tight caches,
+/// where a layer has fewer slots than routed experts.
+#[test]
+fn compute_threads_never_change_bits() {
+    for id in IDS {
+        let largest = engine(id, None).metadata().bytes().largest_expert;
+        let mut want = None;
+        for threads in [1, 3] {
+            for (io, cap) in [(0, Some(1)), (2, Some(1)), (2, Some(3)), (2, None)] {
+                let meta =
+                    ModelMetadata::load(&dir(id), &ArchitectureRegistry::with_builtins()).unwrap();
+                let e = Engine::load(
+                    meta,
+                    EngineOptions {
+                        expert_cache_bytes: cap.map(|n: u64| n * largest),
+                        max_context: Some(256),
+                        io_threads: Some(io),
+                        threads: Some(threads),
+                        ..EngineOptions::default()
+                    },
+                )
+                .unwrap();
+                let mut c = e.new_cache();
+                let mut logits = bits(&e.forward(PROMPT, &mut c, Logits::All, None).unwrap());
+                for &t in &PROMPT[..4] {
+                    logits.extend(bits(&e.forward(&[t], &mut c, Logits::Last, None).unwrap()));
+                }
+                match &want {
+                    None => want = Some(logits),
+                    Some(w) => {
+                        assert_eq!(&logits, w, "{id} threads {threads} io {io} slots {cap:?}")
+                    }
+                }
+            }
+        }
+    }
+}
+
 #[test]
 fn sampling_is_reproducible() {
     let e = engine("qwen3-moe-tiny", None);

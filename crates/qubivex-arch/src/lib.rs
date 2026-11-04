@@ -20,6 +20,7 @@ use qubivex_compute::{ComputeBackend, ComputeError, MatMul, WeightView};
 use qubivex_core::{ExpertIdx, LayerIdx};
 use qubivex_model::ArchConfig;
 use qubivex_model::arch::{MoeConfig, QkNorm, RouterScoring};
+use rayon::prelude::*;
 use thiserror::Error;
 
 use crate::ops::{Rope, attend, rms_norm, route, swiglu};
@@ -94,17 +95,20 @@ pub trait ExpertProvider: Sync {
         f: &mut dyn FnMut(&ExpertWeights<'_>) -> Result<(), ArchError>,
     ) -> Result<(), ArchError>;
 
-    /// Calls `f` once for each of `experts` (distinct) of one layer, in any order. A
-    /// provider that can read several experts at once overrides this to start every
-    /// load before handing out the first; callers must not depend on the order.
+    /// Calls `f` once for each of `experts` (distinct) of one layer, in any order and
+    /// possibly concurrently from several threads. A provider that can read several
+    /// experts at once overrides this to start every load before handing out the
+    /// first, and may compute ready experts in parallel; callers must not depend on
+    /// the order.
     ///
     /// # Errors
-    /// As [`ExpertProvider::with_expert`].
+    /// As [`ExpertProvider::with_expert`]. When several calls of `f` fail, which error
+    /// is returned is unspecified.
     fn with_experts(
         &self,
         layer: LayerIdx,
         experts: &[ExpertIdx],
-        f: &mut dyn FnMut(ExpertIdx, &ExpertWeights<'_>) -> Result<(), ArchError>,
+        f: &(dyn Fn(ExpertIdx, &ExpertWeights<'_>) -> Result<(), ArchError> + Sync),
     ) -> Result<(), ArchError> {
         for &e in experts {
             self.with_expert(layer, e, &mut |w| f(e, w))?;
@@ -567,7 +571,6 @@ impl TransformerMoeModel {
         let mut att = vec![0f32; s * q_out];
         let mut o = vec![0f32; s * h];
         let mut router = vec![0f32; s * ne];
-        let mut scores = Vec::new();
         let mut rope_cs = vec![0f32; 2 * self.rope.half()];
         // The lookahead router runs during decode only: a prompt batch routes to most
         // experts of every layer, so there is nothing to predict.
@@ -651,15 +654,17 @@ impl TransformerMoeModel {
                     cache.v[l][g].extend_from_slice(&v[src..src + d]);
                 }
             }
-            for t in 0..s {
-                let pos = p0 + t;
-                for hd in 0..heads {
+            // Every (token, head) pair is independent once the cache holds the whole
+            // batch, so they run in parallel; each is the same sequential `attend`.
+            let (kl, vl) = (&cache.k[l], &cache.v[l]);
+            att.par_chunks_mut(d)
+                .enumerate()
+                .for_each_init(Vec::new, |scores, (i, out)| {
+                    let (t, hd) = (i / heads, i % heads);
                     let g = hd / group;
                     let qs = &q[t * q_out + hd * d..t * q_out + (hd + 1) * d];
-                    let out = &mut att[t * q_out + hd * d..t * q_out + (hd + 1) * d];
-                    attend(qs, &cache.k[l][g], &cache.v[l][g], pos, out, &mut scores);
-                }
-            }
+                    attend(qs, &kl[g], &vl[g], p0 + t, out, scores);
+                });
             be.matmul(&dense.view(&n(&c.names.o))?, &att, s, &mut o)?;
             for t in 0..s {
                 emit(
@@ -709,18 +714,20 @@ impl TransformerMoeModel {
                 }
             }
             // Every routed expert of the layer is requested at once, so the provider can
-            // start all its loads first. Each writes its own rank slots of `contrib`, so
-            // the order they come back in cannot change the result.
+            // start all its loads first, and may compute several at once. Each writes
+            // only its own rank slots of `contrib`, so neither the order they come back
+            // in nor concurrency can change the result.
             let used: Vec<ExpertIdx> = by_expert
                 .iter()
                 .enumerate()
                 .filter(|(_, u)| !u.is_empty())
                 .map(|(e, _)| ExpertIdx(u32::try_from(e).unwrap_or(u32::MAX)))
                 .collect();
+            let slots = std::sync::Mutex::new(&mut contrib);
             experts.with_experts(
                 LayerIdx(li),
                 &used,
-                &mut |ei: ExpertIdx, w: &ExpertWeights<'_>| {
+                &|ei: ExpertIdx, w: &ExpertWeights<'_>| {
                     let users = &by_expert[ei.0 as usize];
                     let n_t = users.len();
                     let mut xe = vec![0f32; n_t * h];
@@ -747,6 +754,11 @@ impl TransformerMoeModel {
                     swiglu(&mut g, &u);
                     let mut y = vec![0f32; n_t * h];
                     be.matmul(&w.down, &g, n_t, &mut y)?;
+                    // A poisoned lock means another expert panicked mid-copy; its slots
+                    // are not ours, so ours are still written correctly.
+                    let mut contrib = slots
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
                     for (j, &(t, r)) in users.iter().enumerate() {
                         let dst = (t * k_top + r) * h;
                         contrib[dst..dst + h].copy_from_slice(&y[j * h..(j + 1) * h]);
