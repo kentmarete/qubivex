@@ -1,6 +1,6 @@
 # ADR-002: Hybrid compute; the tensor engine is chosen by a benchmark spike
 
-- Status: **Accepted (2026-11-02): option 3, hybrid, without Candle.** The decision rule was met against the Colibri `0a5504a1` baseline. Amendment 1 (2026-11-04): prefill uses an own register-blocked kernel instead of the `gemm` crate; the spinning pool is deferred.
+- Status: **Accepted (2026-11-02): option 3, hybrid, without Candle.** The decision rule was met against the Colibri `0a5504a1` baseline. Amendment 1 (2026-11-04): prefill uses an own register-blocked kernel instead of the `gemm` crate; the spinning pool is deferred. Amendment 2 (2026-11-04): a faster lossless Q4_K decode kernel (fused NEON, FEAT_FHM), same bits.
 - Date: 2026-11-01
 
 ## Context
@@ -67,7 +67,7 @@ measurements that justify it. The engine keeps its dedicated rayon pool.
 attention, on a persistent spinning pool), and own dequantize plus the `gemm` crate for
 prefill, with Accelerate as an additive macOS feature. Candle is not a dependency.
 Follow-ups that don't block the decision: an AVX2 measurement on Linux x86-64 against
-Colibri, and optional lossless Q4_K speed-up work.
+Colibri, and optional lossless Q4_K speed-up work (done: amendment 2).
 
 ## Amendment 1 (2026-11-04): an own register-blocked prefill kernel; the spinning pool deferred
 
@@ -148,3 +148,49 @@ experts rely on, which means replacing rayon in the CPU backend, the forward pas
 provider. That is too large a change for at most 5–8%. The pool is deferred until a
 profile shows wake-up latency costing more than that, for example at higher thread
 counts or for a dense model with fewer, larger products.
+
+## Amendment 2 (2026-11-04): a faster lossless Q4_K decode kernel
+
+The kernel baseline showed Q4_K decode limited by compute at 17 GiB/s (about 22% of what
+this machine streams, against a target of 70%). Q4_K dequantisation is `d1 · q − m1`
+with `d1 = d · sc` and `m1 = dmin · m`, as a separate multiply and subtract. The fused
+NEON kernel did exactly that per weight, plus a 6-step widening conversion: about 23
+vector instructions per 16 weights.
+
+**The same bits with fewer operations.** `d` is an f16 (11 significant bits) and `sc` a
+6-bit integer, so `d1` has at most 17 bits and `d1 · q` (4-bit `q`) at most 21: both
+products are exact in f32, with no underflow (every nonzero product is at least 2⁻²⁴).
+The only rounding is the subtraction's, so one `fma(d1, q, −m1)` gives the same bits,
+signed zeros included (`a − b = a + (−b)` exactly). Two kernels use this
+(`qubivex-backend-cpu/src/neon.rs`):
+- **Baseline NEON** (`q4_k_impl`): nibbles widened to u32 lanes by `tbl`, `ucvtf`, then
+  the fused dequantisation; scales and mins unpacked once per block with three masks;
+  17 vector instructions per 16 weights.
+- **FEAT_FHM** (`q4_k_fhm_impl`, every Apple M-series and Armv8.4+ cores; detected at run
+  time): `sc · q < 1024` is exact in f16, so a widening `umull` and an f16 `ucvtf` give
+  it, and `fmlal` forms `d · (sc · q)` from the two f16 operands, exactly, and adds
+  `−m1` with one rounding. 13 vector instructions per 16 weights. `fmlal` and the f16
+  `ucvtf` are emitted with `asm!` because their Rust intrinsics are unstable.
+
+With a NaN block scale both kernels return NaN but not necessarily the portable path's
+NaN (a fused add propagates its addend's payload and sign). The tests compare bits for
+every non-NaN result: every f16 value of `d` and of `dmin` with random scales, nibbles
+and activations, plus multi-block rows; a one-ulp change to a scale fails them.
+
+Tried and dropped: the hardware f16 conversion of the block scales (under 1%: the kernel
+is bound by vector throughput, and the scalar work overlaps it).
+
+Results (M3 Pro, 5 threads, tokens identical to the references):
+
+| | before | after |
+|---|---|---|
+| `decode_1t` Q4_K gate/up | 244 µs | 141–144 µs |
+| `decode_t5` Q4_K gate/up | 62.1 µs (17.5 GiB/s) | 38.8–42.2 µs (26–28 GiB/s) |
+| `decode_stream_t5` Q4_K gate/up | 63.0 µs | 43.4 µs (25 GiB/s) |
+| decode, 160 tokens, all resident | 29.9–30.5 tok/s | 41.6–42.5 tok/s |
+| decode, `--ram-budget 1GiB` | 18.9–19.0 tok/s | 22.4–22.7 tok/s |
+| prefill (row path and `tile` unchanged) | 114 tok/s | 114–115 tok/s |
+
+Q4_K is now about 33% of the bandwidth bf16 demonstrates, still short of the 70% target.
+The remaining cost is the f32 conversion the lossless path needs per weight (quantising
+the activations to Q8, as ggml's fast path does, is faster but lossy and out of scope).

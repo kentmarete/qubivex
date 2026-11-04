@@ -192,7 +192,8 @@ q8_0 559 ns, q6_k 877 ns, f16 995 ns.
   `decode_stream` (DRAM) matches `decode_t5` (in cache), and bf16 pulls 80 GiB/s from
   DRAM. Q4_K reaches 17 GiB/s and Q6_K 24 GiB/s: roughly 22% and 30% of what this
   machine demonstrably streams. The EIP's quantised-GEMV target is at least 70% of STREAM.
-  A faster lossless Q4_K kernel is the largest available decode gain.
+  A faster lossless Q4_K kernel is the largest available decode gain. (Done 2026-11-04:
+  17 → 25–28 GiB/s, see below and ADR-002 amendment 2.)
 - **Prefill does not use batching yet.** At 128 rows every dtype takes about 3.5 ms per
   expert projection, so the per-row scalar dot dominates, and end-to-end prefill is
   44 tok/s. (Done 2026-11-04 with an own kernel instead of `gemm`: see below and
@@ -237,3 +238,32 @@ Notes:
 - At `--ram-budget 1GiB` a 10-token prompt is I/O-bound and within noise of the previous
   build (main measured 320–326 ms in interleaved runs); a 128-token prompt at 1 GiB went
   48–49 → 98–100 tok/s.
+
+## 2026-11-04: lossless Q4_K decode kernel (ADR-002 amendment 2)
+
+Build `e06fa21` plus the change, same machine and flags, 5 threads, 1 warm-up and 5
+measured runs. Every record's tokens match its reference record.
+
+| Operating point | Record | Prefill tok/s | Decode tok/s (median step) |
+|---|---|---|---|
+| 10-token prompt, 160 generated | `2026-11-04-m3pro-q4k-fhm-decode.json` (ref. `…-tiled-decode.json`) | 43.1 | 41.65 (24.01 ms; was 30.50) |
+| 128-token prompt, 32 generated | `2026-11-04-m3pro-q4k-fhm-prefill128.json` (ref. `…-tiled-prefill128.json`) | 114.4 | 42.49 (23.54 ms; was 30.20) |
+| 10-token prompt, 160 generated, `--ram-budget 1GiB` | `2026-11-04-m3pro-q4k-fhm-1gib.json` (ref. `…-tiled-1gib.json`) | 33.0 | 22.39 (44.66 ms; was 19.12) |
+
+Interleaved against a `main` build (two rounds each): 128-token prompt, prefill 113.8 /
+113.8 vs 113.9 / 115.0 tok/s, decode 30.2 / 29.9 vs 42.2 / 42.5; at 1 GiB, decode
+18.98 / 18.92 vs 22.70 / 22.58. One unrecorded run of the branch gave 101.5 tok/s
+prefill after a long benchmark session; the interleaved runs show prefill unchanged, as
+expected (prefill does not use the single-row kernel).
+
+Kernels, Q4_K (Criterion medians; baseline `q4before` in brackets):
+
+| group | gate/up | down |
+|---|---|---|
+| `decode_1t` | 141–144 µs (244) | 145–153 µs (235) |
+| `decode_t5` | 38.8–42.2 µs (62.1) | 40.0–41.9 µs (66.1) |
+| `decode_stream_t5` | 43.4 µs (63.0) | 45.4 µs (64.2) |
+| `prefill_s128_t5` | 1.66–1.76 ms (1.66) | 1.83–1.89 ms (1.83) |
+
+The ranges are two sessions; the second ran warm after the end-to-end benchmarks.
+`decode_t5` gate/up moves 1.125 MiB per call, so 38.8 µs is 28.3 GiB/s.

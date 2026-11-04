@@ -5,12 +5,16 @@ Last updated: 2026-11-04
 ## Current phase
 **Phase 8 (GPU acceleration, Metal first): slices 1–4 done (2026-11-03).** Metal slice 5 is paused while the improvement-plan backlog (MIGRATION_PLAN §3a and Addendum §4) is cleared first.
 
+**Faster lossless Q4_K done (2026-11-04), §3a item; ADR-002 amendment 2.** Decode 30.5 → 41.6–42.5 tok/s all resident and 19.0 → 22.4–22.7 at 1 GiB; prefill unchanged; tokens identical to every reference.
+- Kernel: `qubivex-backend-cpu/src/neon.rs`. `d1 · q` is exact in f32 (17-bit `d1`, 4-bit `q`), so `fma(d1, q, −m1)` rounds exactly where the portable multiply-then-subtract does. On FEAT_FHM CPUs (run-time detected; every Apple M-series) `fmlal` forms `d · (sc · q)` from f16 operands (`sc · q < 1024`, exact in f16) in one instruction. 23 → 13 vector instructions per 16 weights; `decode_t5` gate/up 62.1 → 38.8 µs (17.5 → 28 GiB/s).
+- Tests: 272 on 1.85 and stable. New: every f16 `d` and `dmin` (with random scales, nibbles, activations) bit-identical across the portable, baseline-NEON and FHM paths (NaN results only have to be NaN); multi-block rows; the block-scale unpacking against GGML's `get_scale_min_k4`. Records: `docs/performance/baselines/2026-11-04-m3pro-q4k-fhm-*.json`.
+- **Next (§3a):** the KV cache on `Tensor<f32>`, a dense architecture and a SafeTensors run, then Phase 9.
+
 **Prefill done (2026-11-04), §3a item; ADR-002 amendment 1.** 128-token prefill 44.7 → 113–117 tok/s (faster than Metal whole layers' 77); decode 25 → 30 tok/s; tokens identical to every reference.
 - Kernel: `qubivex-backend-cpu/src/tile.rs`, a register-blocked matmul (4 weight rows × 6 activation rows, one 4-lane quad of the 64-lane reduction at a time, lane-major packed operands) that reproduces the decode dot product's bits exactly. It is used from 6 activation rows (the measured crossover); below that the row path stays. The `gemm` crate is not used: its accumulation order breaks invariant 1 (prefill equals token-by-token). Kernel 2.1× (`prefill_s128_t5` Q4_K gate/up 3.44 → 1.66 ms).
 - Concurrency: `ExpertProvider::with_experts` takes an `Fn + Sync` callback; `StoreProvider` computes ready experts concurrently in a rayon scope and starts newly ready ones as each finishes (new `Batch::try_next` / `Next` in the store; the blocking `next` runs only with no lease held). Attention runs on the pool per (token, head).
 - Spinning pool: deferred. After these changes workers are asleep 3–5% and spinning 1–5% of the time, so a pool could recover at most that, while replacing rayon's nested work stealing.
 - Tests: 269 on 1.85 (debug), all env-gated real-model tests (Metal parity, transformers, Colibri tokens, ledger) pass. New: `compute_threads_never_change_bits` (1 and 3 threads × one-slot pools × I/O threads), `try_next` store tests, matmul bit identity at s = 2, 5–11, 13. Records: `docs/performance/baselines/2026-11-04-m3pro-tiled-*.json`; numbers in BENCHMARKING.md.
-- **Next (§3a):** a faster lossless CPU Q4_K, the KV cache on `Tensor<f32>`, a dense architecture and a SafeTensors run, then Phase 9.
 
 **Read hardening done (2026-11-04): the three gaps fault injection left; ADR-006 amendment 4.**
 - Hung reads: a per-waiter deadline (`ReadTimeout`; engine default 5 s + size at 10 MB/s; `--read-timeout`), `StoreError::Timeout`, `Occupancy::stuck`, `Engine::admit` refuses when every I/O thread is stuck (`RuntimeError::Storage`), and the store's drop detaches stuck threads. Retries: once by default (`--read-retries`).
