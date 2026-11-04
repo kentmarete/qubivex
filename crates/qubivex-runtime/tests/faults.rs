@@ -436,3 +436,65 @@ fn a_hung_read_times_out_and_the_engine_recovers() {
         }
     }
 }
+
+/// Copies a fixture model directory (flat) to a fresh temporary directory.
+fn copy_model(id: &str, tag: &str) -> PathBuf {
+    let src = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../fixtures/models")
+        .join(id);
+    let dst =
+        std::env::temp_dir().join(format!("qubivex-faults-{}-{id}-{tag}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dst);
+    std::fs::create_dir_all(&dst).unwrap();
+    for f in std::fs::read_dir(&src).unwrap() {
+        let f = f.unwrap();
+        if f.file_type().unwrap().is_file() {
+            std::fs::copy(f.path(), dst.join(f.file_name())).unwrap();
+        }
+    }
+    dst
+}
+
+/// The model's weight files fail under a running engine (truncated to half): reads
+/// fail over to a mirror on another directory, and the tokens are the fault-free ones.
+/// A mirror whose files differ in size is refused at load.
+#[test]
+fn a_mirror_serves_reads_when_the_model_files_fail() {
+    for id in IDS {
+        let (want, _, _) = reference(id, Cache::Streaming, 4);
+        let primary = copy_model(id, "primary");
+        let mirror = copy_model(id, "mirror");
+        let m = ModelMetadata::load(&primary, &ArchitectureRegistry::with_builtins()).unwrap();
+        let weights: Vec<PathBuf> = m.tensors.files().iter().map(|f| f.path.clone()).collect();
+        let opts = options(&m, Cache::Streaming, 4);
+        let e = Engine::load_mirrored(m, opts, std::slice::from_ref(&mirror)).unwrap();
+        // The same files without a mirror: the truncation must break it.
+        let m = ModelMetadata::load(&primary, &ArchitectureRegistry::with_builtins()).unwrap();
+        let opts = options(&m, Cache::Streaming, 4);
+        let alone = Engine::load(m, opts).unwrap();
+        for w in &weights {
+            let f = std::fs::OpenOptions::new().write(true).open(w).unwrap();
+            f.set_len(f.metadata().unwrap().len() / 2).unwrap();
+        }
+        let got = e.generate(PROMPT, NEW, Sampling::default(), |_| true);
+        assert_eq!(got.unwrap(), want, "{id}: through the mirror");
+        let broken = alone.generate(PROMPT, NEW, Sampling::default(), |_| true);
+        assert!(
+            broken.is_err(),
+            "{id}: the truncation did not break the primary"
+        );
+        settled(&e, id);
+
+        // The truncated copy is now the mirror of a good one: refused.
+        let good = copy_model(id, "good");
+        let m = ModelMetadata::load(&good, &ArchitectureRegistry::with_builtins()).unwrap();
+        let opts = options(&m, Cache::Streaming, 4);
+        let err = Engine::load_mirrored(m, opts, std::slice::from_ref(&primary))
+            .expect_err("a mirror of the wrong size must be refused")
+            .to_string();
+        assert!(err.contains("bytes; the model's copy has"), "{id}: {err}");
+        for d in [primary, mirror, good] {
+            let _ = std::fs::remove_dir_all(d);
+        }
+    }
+}

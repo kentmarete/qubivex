@@ -2,6 +2,7 @@
 
 use std::collections::HashMap;
 use std::fs::File;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
@@ -15,6 +16,7 @@ use qubivex_compute::WeightView;
 use qubivex_compute::host::PageAligned;
 use qubivex_compute::tensor::TensorView;
 use qubivex_core::{Bytes, ExpertIdx, LayerIdx, Shape, TensorDesc};
+use qubivex_expert_stream::mirror::{MirrorPolicy, MirroredSource};
 use qubivex_expert_stream::predict::{Lookahead, LookaheadConfig};
 use qubivex_expert_stream::{
     ExpertKey, ExpertSource, ExpertStore, Occupancy, Policy, PoolSpec, PrefetchStats, ReadTimeout,
@@ -493,6 +495,38 @@ impl Engine {
     /// does not fit the budget or available RAM cannot be measured.
     pub fn load(meta: ModelMetadata, opts: EngineOptions) -> Result<Self, RuntimeError> {
         Self::load_with_source(meta, opts, |s| s)
+    }
+
+    /// As [`Engine::load`], reading experts from the model's files and, when a read
+    /// fails, from copies of them under each of `mirrors` in turn
+    /// ([`MirroredSource`], ADR-006 amendment 4). No mirrors: [`Engine::load`].
+    ///
+    /// # Errors
+    /// As [`Engine::load`], and [`ModelExpertSource::mirror_at`]'s errors.
+    pub fn load_mirrored(
+        meta: ModelMetadata,
+        opts: EngineOptions,
+        mirrors: &[PathBuf],
+    ) -> Result<Self, RuntimeError> {
+        if mirrors.is_empty() {
+            return Self::load(meta, opts);
+        }
+        let copies = mirrors
+            .iter()
+            .map(|d| {
+                let s: Arc<dyn ExpertSource> =
+                    Arc::new(ModelExpertSource::mirror_at(&meta, opts.expert_io, d)?);
+                Ok((d.display().to_string(), s))
+            })
+            .collect::<Result<Vec<_>, RuntimeError>>()?;
+        let primary = meta.dir.display().to_string();
+        Self::load_with_source(meta, opts, move |s| {
+            let first: (String, Arc<dyn ExpertSource>) = (primary, s);
+            Arc::new(MirroredSource::new(
+                std::iter::once(first).chain(copies),
+                MirrorPolicy::default(),
+            ))
+        })
     }
 
     /// As [`Engine::load`], with the expert store reading through `wrap(source)`

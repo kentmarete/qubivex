@@ -38,6 +38,7 @@
 //! `loom` (`RUSTFLAGS="--cfg loom"`), without I/O threads.
 
 pub mod fault;
+pub mod mirror;
 pub mod policy;
 pub mod predict;
 pub mod replay;

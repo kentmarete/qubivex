@@ -39,6 +39,8 @@ pub(crate) struct BenchArgs<'a> {
     pub(crate) runs: usize,
     pub(crate) threads: Option<usize>,
     pub(crate) memory: MemoryOptions,
+    /// Copies of the weight files to fail over to (`--mirror`).
+    pub(crate) mirrors: &'a [PathBuf],
     pub(crate) context: Option<usize>,
     pub(crate) label: Option<&'a str>,
     pub(crate) reference: Option<&'a Path>,
@@ -552,8 +554,8 @@ pub(crate) fn bench(a: &BenchArgs<'_>) -> Result<String, String> {
         architecture: meta.manifest.architecture.id.clone(),
         dir: home_relative(&meta.dir),
     };
-    let engine =
-        Engine::load(meta, a.memory.engine(a.context, a.threads)).map_err(|e| chain(&e))?;
+    let engine = Engine::load_mirrored(meta, a.memory.engine(a.context, a.threads), a.mirrors)
+        .map_err(|e| chain(&e))?;
     let mut peak = PeakRss::new(host);
     let rss_after_load = peak.sample();
 

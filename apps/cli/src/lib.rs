@@ -369,6 +369,10 @@ pub(crate) struct StorageArgs {
     /// Extra attempts after a failed expert read. Default: 1.
     #[arg(long)]
     read_retries: Option<u32>,
+    /// A directory holding a copy of the model's weight files (same names), read when
+    /// a read from the model's own files fails. Repeatable; tried in order.
+    #[arg(long = "mirror")]
+    mirrors: Vec<PathBuf>,
 }
 
 impl StorageArgs {
@@ -658,6 +662,7 @@ fn execute(cmd: &Command) -> Result<(), String> {
             .with_prefetch(prefetch.options()?)
             .with_storage(storage.options()?)
             .with_device(device.options()?),
+            mirrors: &storage.mirrors,
             context: *context,
             threads: *threads,
             quiet: *quiet,
@@ -708,6 +713,7 @@ fn execute(cmd: &Command) -> Result<(), String> {
             .with_prefetch(prefetch.options()?)
             .with_storage(storage.options()?)
             .with_device(device.options()?),
+            mirrors: &storage.mirrors,
             context: *context,
             label: label.as_deref(),
             reference: reference.as_deref(),

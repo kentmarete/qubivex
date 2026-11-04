@@ -10,7 +10,7 @@
 use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::fs::File;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use qubivex_core::{DType, ExpertIdx, LayerIdx};
 use qubivex_expert_stream::{ExpertKey, ExpertSource, StoreError};
@@ -170,12 +170,62 @@ impl ModelExpertSource {
     /// As [`ModelExpertSource::new`], and [`RuntimeError::Model`] when direct I/O is
     /// asked for on a system or filesystem without it.
     pub fn with_io(meta: &ModelMetadata, io: ExpertIo) -> Result<Self, RuntimeError> {
+        let paths: Vec<PathBuf> = meta
+            .tensors
+            .files()
+            .iter()
+            .map(|f| f.path.clone())
+            .collect();
+        Self::open_files(meta, io, &paths)
+    }
+
+    /// The same experts, read from a copy of the model's weight files under `dir` (a
+    /// mirror on another drive): each file at the same path relative to the model's
+    /// directory. Each copy must have the indexed size; its bytes are not checked here
+    /// (wrap the source in a `VerifiedSource` for that).
+    ///
+    /// # Errors
+    /// [`RuntimeError::Model`] for a missing file or one of another size, and as
+    /// [`ModelExpertSource::with_io`].
+    pub fn mirror_at(meta: &ModelMetadata, io: ExpertIo, dir: &Path) -> Result<Self, RuntimeError> {
+        let mut paths = Vec::new();
+        for f in meta.tensors.files() {
+            let rel = f
+                .path
+                .strip_prefix(&meta.dir)
+                .ok()
+                .map(Path::to_path_buf)
+                .or_else(|| f.path.file_name().map(PathBuf::from))
+                .ok_or_else(|| {
+                    RuntimeError::Model(format!("{} has no file name", f.path.display()))
+                })?;
+            let p = dir.join(rel);
+            let len = std::fs::metadata(&p)
+                .map_err(|e| RuntimeError::Model(format!("mirror {}: {e}", p.display())))?
+                .len();
+            if len != f.size {
+                return Err(RuntimeError::Model(format!(
+                    "mirror {} has {len} bytes; the model's copy has {}",
+                    p.display(),
+                    f.size
+                )));
+            }
+            paths.push(p);
+        }
+        Self::open_files(meta, io, &paths)
+    }
+
+    fn open_files(
+        meta: &ModelMetadata,
+        io: ExpertIo,
+        paths: &[PathBuf],
+    ) -> Result<Self, RuntimeError> {
         let mut path = IoPath::Buffered;
         let mut files = Vec::new();
-        for f in meta.tensors.files() {
+        for f in paths {
             let (file, p) = match io {
-                ExpertIo::Buffered => (open(&f.path)?, IoPath::Buffered),
-                ExpertIo::Direct => open_direct(&f.path)?,
+                ExpertIo::Buffered => (open(f)?, IoPath::Buffered),
+                ExpertIo::Direct => open_direct(f)?,
             };
             path = p;
             files.push(file);
