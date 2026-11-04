@@ -4,7 +4,8 @@
   The queue, I/O threads and `acquire_many` were built in Phase 6 (amendment 1), and
   direct I/O in slice 3 (amendment 2); io_uring is deferred. Failure behaviour and the
   fault-injection suite: amendment 3; deadlines, retries, mirrors and recorded
-  checksums: amendment 4. Awaiting acceptance.
+  checksums: amendment 4; holding several leases of a batch: amendment 5. Awaiting
+  acceptance.
 - Date: 2026-11-01
 
 ## Context
@@ -300,3 +301,22 @@ checksums that existed but were never on. All three are closed here.
   touching a weight file makes the checksums stale, and `require` then refuses to load.
 - **Still open:** hedged reads and per-device queues (need a second drive), and a
   read timeout for a compute thread that reads its own misses (0 I/O threads).
+
+## Amendment 5 (2026-11-04): holding several leases of one batch
+
+The compute side now computes the experts of a layer concurrently (ADR-002 amendment 1),
+so a caller can hold several leases of one `Batch` at once. The blocking `Batch::next`
+still fails with `StoreError::Full` when the remaining experts need slots that leases
+hold and no load is in flight; with the caller's own leases out, that would be a false
+failure (or, on one compute thread, a deadlock).
+
+`Batch::try_next` is `next` without waiting. It returns `Next::Lease` for an expert that
+is ready (or an error for one), `Next::Later` where `next` would wait for a load or fail
+with `Full`, and `Next::Done` at the end. Without I/O threads it never reads on the
+caller's thread. The protocol is: take what `try_next` gives, compute and release, and
+call the blocking `next` only while holding nothing. `StoreProvider::with_experts` does
+this: each finished expert releases its lease and immediately starts whatever has become
+ready, so loads into freed slots begin as soon as a slot frees, as they did when experts
+ran one at a time. Tests: `try_next_lets_a_caller_hold_several_leases` and
+`try_next_does_not_wait_for_loads` (store), and `compute_threads_never_change_bits`
+(engine, one-slot pools, 1 and 3 threads).

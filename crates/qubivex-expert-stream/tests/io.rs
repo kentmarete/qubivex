@@ -9,7 +9,9 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use qubivex_core::{ExpertIdx, LayerIdx};
-use qubivex_expert_stream::{ExpertKey, ExpertSource, ExpertStore, Policy, PoolSpec, StoreError};
+use qubivex_expert_stream::{
+    ExpertKey, ExpertSource, ExpertStore, Next, Policy, PoolSpec, StoreError,
+};
 
 /// Experts whose bytes are a function of their key; reads can be slowed down, and the
 /// source tracks how many run at once.
@@ -139,6 +141,57 @@ fn a_batch_never_evicts_its_own_hits() {
         2 + 3,
         "each miss read once"
     );
+}
+
+/// `try_next` hands out what is ready without waiting, answers `Later` (never `Full`)
+/// while the caller's own leases hold every slot, and continues once they are released.
+#[test]
+fn try_next_lets_a_caller_hold_several_leases() {
+    for threads in [0, 2] {
+        let src = Arc::new(Slow::default());
+        let s = store(&src, 2, threads, Policy::Lru);
+        for e in [0, 1] {
+            drop(s.acquire(key(0, e)).unwrap());
+        }
+        let mut b = s.acquire_many(&[key(0, 0), key(0, 1), key(0, 2)]).unwrap();
+        let mut held = Vec::new();
+        while let Next::Lease(l) = b.try_next() {
+            held.push(l.unwrap());
+        }
+        assert_eq!(held.len(), 2, "threads {threads}: both hits at once");
+        // Expert 2 needs a slot that our leases hold: not ready, and not an error.
+        assert!(matches!(b.try_next(), Next::Later), "threads {threads}");
+        drop(held);
+        // With the slots free, the blocking `next` loads it (on this thread without I/O
+        // threads); `try_next` then reports the end.
+        let l = b.next().unwrap().unwrap();
+        assert_eq!(l.key(), key(0, 2));
+        check(l.bytes(), key(0, 2));
+        drop(l);
+        assert!(matches!(b.try_next(), Next::Done), "threads {threads}");
+        assert!(b.next().is_none());
+    }
+}
+
+/// `try_next` reports a load in flight as `Later`, then hands it out once it lands.
+#[test]
+fn try_next_does_not_wait_for_loads() {
+    let src = Arc::new(Slow::default());
+    src.gate.store(true, Ordering::SeqCst);
+    let s = store(&src, 4, 1, Policy::Lru);
+    let mut b = s.acquire_many(&[key(0, 0)]).unwrap();
+    assert!(matches!(b.try_next(), Next::Later));
+    src.gate.store(false, Ordering::SeqCst);
+    let lease = loop {
+        match b.try_next() {
+            Next::Lease(l) => break l.unwrap(),
+            Next::Later => std::thread::sleep(Duration::from_millis(1)),
+            Next::Done => panic!("the expert was never handed out"),
+        }
+    };
+    check(lease.bytes(), key(0, 0));
+    drop(lease);
+    assert!(matches!(b.try_next(), Next::Done));
 }
 
 #[test]

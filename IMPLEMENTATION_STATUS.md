@@ -5,6 +5,13 @@ Last updated: 2026-11-04
 ## Current phase
 **Phase 8 (GPU acceleration, Metal first): slices 1–4 done (2026-11-03).** Metal slice 5 is paused while the improvement-plan backlog (MIGRATION_PLAN §3a and Addendum §4) is cleared first.
 
+**Prefill done (2026-11-04), §3a item; ADR-002 amendment 1.** 128-token prefill 44.7 → 113–117 tok/s (faster than Metal whole layers' 77); decode 25 → 30 tok/s; tokens identical to every reference.
+- Kernel: `qubivex-backend-cpu/src/tile.rs`, a register-blocked matmul (4 weight rows × 6 activation rows, one 4-lane quad of the 64-lane reduction at a time, lane-major packed operands) that reproduces the decode dot product's bits exactly. It is used from 6 activation rows (the measured crossover); below that the row path stays. The `gemm` crate is not used: its accumulation order breaks invariant 1 (prefill equals token-by-token). Kernel 2.1× (`prefill_s128_t5` Q4_K gate/up 3.44 → 1.66 ms).
+- Concurrency: `ExpertProvider::with_experts` takes an `Fn + Sync` callback; `StoreProvider` computes ready experts concurrently in a rayon scope and starts newly ready ones as each finishes (new `Batch::try_next` / `Next` in the store; the blocking `next` runs only with no lease held). Attention runs on the pool per (token, head).
+- Spinning pool: deferred. After these changes workers are asleep 3–5% and spinning 1–5% of the time, so a pool could recover at most that, while replacing rayon's nested work stealing.
+- Tests: 269 on 1.85 (debug), all env-gated real-model tests (Metal parity, transformers, Colibri tokens, ledger) pass. New: `compute_threads_never_change_bits` (1 and 3 threads × one-slot pools × I/O threads), `try_next` store tests, matmul bit identity at s = 2, 5–11, 13. Records: `docs/performance/baselines/2026-11-04-m3pro-tiled-*.json`; numbers in BENCHMARKING.md.
+- **Next (§3a):** a faster lossless CPU Q4_K, the KV cache on `Tensor<f32>`, a dense architecture and a SafeTensors run, then Phase 9.
+
 **Read hardening done (2026-11-04): the three gaps fault injection left; ADR-006 amendment 4.**
 - Hung reads: a per-waiter deadline (`ReadTimeout`; engine default 5 s + size at 10 MB/s; `--read-timeout`), `StoreError::Timeout`, `Occupancy::stuck`, `Engine::admit` refuses when every I/O thread is stuck (`RuntimeError::Storage`), and the store's drop detaches stuck threads. Retries: once by default (`--read-retries`).
 - Mirrors: `mirror::MirroredSource` (failover, skip after 3 failures for 30 s), `ModelExpertSource::mirror_at`, `Engine::load_mirrored`, `--mirror DIR`.
@@ -15,7 +22,7 @@ Last updated: 2026-11-04
 - Code: `qubivex_expert_stream::fault` (`FaultySource` with `Rule`/`Target`/`Fault`: EIO, short read, corrupt bytes, panic, delay; `VerifiedSource` and `checksum`); `ExpertStore::occupancy`; `Engine::load_with_source` and `Engine::store_occupancy`; `ModelExpertSource::keys`; `PageAligned::try_zeroed`/`try_resized`.
 - Fixes found by the suite: a panicking source killed an I/O thread and left its waiters hanging (now a load error); slab allocation aborted on failure (now a load error); a failed forward pass left partial keys and values in the KV cache (now rolled back); the ledger was not updated after a failed pass.
 - Tests: 253 pass on 1.99.1 and 1.85 (7 store and 4 engine fault tests are new, including Metal whole layers). Speed is unchanged within noise (21.1 → 21.5 tok/s at 1 GiB; tokens identical).
-- **Next (§3a):** `gemm` prefill and the spinning thread pool (ADR-002), then a faster lossless CPU Q4_K, the KV cache on `Tensor<f32>`, a dense architecture and a SafeTensors run, then Phase 9.
+- Next was prefill (done, above).
 
 **Phase 8 slice 4 done (2026-11-03): small expert caches.**
 - Code: `MetalBackend::submit_async` and `Pending` (keeps wrapped host memory alive until the GPU is done; dropping waits; host reads and writes drain outstanding work). `PlacementReport::fallback`: with `--backend metal`, a plan whose pools are smaller than top-k runs the CPU pass and says why (`run` prints it; `bench` records it).
@@ -410,6 +417,6 @@ ADR-002 spike, M3 Pro: [`docs/performance/ADR-002-SPIKE.md`](docs/performance/AD
 
 ## Architectural decisions
 Register and proposed status changes: `docs/engineering/ARCHITECTURE_DECISIONS.md` §1.
-- Accepted: ADR-002 (hybrid, no Candle; the spinning pool and `gemm` prefill are not built yet), ADR-009 (tensor descriptors), ADR-010 (numerical precision).
+- Accepted: ADR-002 (hybrid, no Candle; amendment 1: own register-blocked prefill instead of `gemm`, spinning pool deferred), ADR-009 (tensor descriptors), ADR-010 (numerical precision).
 - Amended: ADR-007 (Metal first; device assignment fixed per execution plan).
 - Proposed: ADR-001, 003, 004 and 006 are implemented and proposed for Accepted, awaiting owner review. ADR-005 and ADR-008 are not built yet.

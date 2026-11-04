@@ -12,6 +12,7 @@ publish.workspace = true
 qubivex-compute = { workspace = true }
 qubivex-core = { workspace = true }
 qubivex-model = { workspace = true }
+rayon = { workspace = true }
 thiserror = { workspace = true }
 
 [lints]

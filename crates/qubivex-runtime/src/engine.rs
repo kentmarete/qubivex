@@ -4,7 +4,7 @@ use std::collections::HashMap;
 use std::fs::File;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, PoisonError};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
@@ -20,8 +20,8 @@ use qubivex_expert_stream::fault::VerifiedSource;
 use qubivex_expert_stream::mirror::{MirrorPolicy, MirroredSource};
 use qubivex_expert_stream::predict::{Lookahead, LookaheadConfig};
 use qubivex_expert_stream::{
-    ExpertKey, ExpertSource, ExpertStore, Occupancy, Policy, PoolSpec, PrefetchStats, ReadTimeout,
-    StoreError, StoreStats,
+    Batch, ExpertKey, ExpertSource, ExpertStore, Lease, Next, Occupancy, Policy, PoolSpec,
+    PrefetchStats, ReadTimeout, StoreError, StoreStats,
 };
 use qubivex_hardware::{Host, Probed, ResourceProbe, SystemProbe};
 use qubivex_memory::{
@@ -305,6 +305,89 @@ pub(crate) fn store_err(layer: LayerIdx, expert: ExpertIdx, e: &StoreError) -> A
     }
 }
 
+/// The experts of one [`StoreProvider::with_experts`] call in flight: the batch they
+/// come from, and the first error any of them hit.
+struct Wave<'p, 's, 'f> {
+    provider: &'p StoreProvider<'s>,
+    layer: LayerIdx,
+    first: ExpertIdx,
+    f: &'f (dyn Fn(ExpertIdx, &ExpertWeights<'_>) -> Result<(), ArchError> + Sync),
+    batch: Mutex<Batch<'p>>,
+    error: Mutex<Option<ArchError>>,
+}
+
+impl<'p> Wave<'p, '_, '_> {
+    fn lock_batch(&self) -> std::sync::MutexGuard<'_, Batch<'p>> {
+        // The batch's own state is consistent between calls; a panic elsewhere does not
+        // corrupt it.
+        self.batch.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    fn lease_err(&self, e: StoreError) -> ArchError {
+        let at = match &e {
+            StoreError::Load { key, .. } | StoreError::Full { key, .. } => key.1,
+            _ => self.first,
+        };
+        store_err(self.layer, at, &e)
+    }
+
+    fn fail(&self, e: ArchError) {
+        self.error
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get_or_insert(e);
+    }
+
+    fn failed(&self) -> bool {
+        self.error
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .is_some()
+    }
+
+    fn take_error(&self) -> Option<ArchError> {
+        self.error
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take()
+    }
+
+    /// Computes `lease`'s expert on the pool, releases it, then starts whatever has
+    /// become ready.
+    fn spawn<'scope>(&'scope self, sc: &rayon::Scope<'scope>, lease: Lease<'p>) {
+        sc.spawn(move |sc| {
+            if self.failed() {
+                return;
+            }
+            let expert = lease.key().1;
+            let r = self
+                .provider
+                .weights(self.layer, expert, lease.bytes())
+                .and_then(|w| (self.f)(expert, &w));
+            drop(lease);
+            match r {
+                Ok(()) => self.start_ready(sc),
+                Err(e) => self.fail(e),
+            }
+        });
+    }
+
+    /// Spawns every expert of the batch that is ready now, without waiting.
+    fn start_ready<'scope>(&'scope self, sc: &rayon::Scope<'scope>) {
+        loop {
+            if self.failed() {
+                return;
+            }
+            let next = self.lock_batch().try_next();
+            match next {
+                Next::Lease(Ok(lease)) => self.spawn(sc, lease),
+                Next::Lease(Err(e)) => return self.fail(self.lease_err(e)),
+                Next::Later | Next::Done => return,
+            }
+        }
+    }
+}
+
 impl ExpertProvider for StoreProvider<'_> {
     fn with_expert(
         &self,
@@ -319,14 +402,17 @@ impl ExpertProvider for StoreProvider<'_> {
         f(&self.weights(layer, expert, lease.bytes())?)
     }
 
-    /// Starts every miss of the layer before waiting on any, and computes each expert
-    /// as soon as it is ready (hits first). Each lease is released before the next is
-    /// taken, so a layer with fewer slots than routed experts pipelines through them.
+    /// Starts every miss of the layer before waiting on any, and computes experts as
+    /// they become ready (hits first), several at once on the current rayon pool.
+    /// Whenever an expert finishes, its lease is released and whatever has become
+    /// ready since is started, so loads into the freed slots begin at once. The
+    /// blocking wait happens only while no lease is held, so a layer with fewer slots
+    /// than routed experts still pipelines through them.
     fn with_experts(
         &self,
         layer: LayerIdx,
         experts: &[ExpertIdx],
-        f: &mut dyn FnMut(ExpertIdx, &ExpertWeights<'_>) -> Result<(), ArchError>,
+        f: &(dyn Fn(ExpertIdx, &ExpertWeights<'_>) -> Result<(), ArchError> + Sync),
     ) -> Result<(), ArchError> {
         let keys: Vec<_> = experts.iter().map(|&e| (layer, e)).collect();
         let first = experts.first().copied().unwrap_or(ExpertIdx(0));
@@ -335,18 +421,28 @@ impl ExpertProvider for StoreProvider<'_> {
             .acquire_many(&keys)
             .map_err(|e| store_err(layer, first, &e))?;
         self.after_demand(layer, experts);
-        for lease in batch {
-            let lease = lease.map_err(|e| {
-                let at = match &e {
-                    StoreError::Load { key, .. } | StoreError::Full { key, .. } => key.1,
-                    _ => first,
-                };
-                store_err(layer, at, &e)
-            })?;
-            let expert = lease.key().1;
-            f(expert, &self.weights(layer, expert, lease.bytes())?)?;
+        let wave = Wave {
+            provider: self,
+            layer,
+            first,
+            f,
+            batch: Mutex::new(batch),
+            error: Mutex::new(None),
+        };
+        loop {
+            // Holding nothing: wait for the next expert (or fail as `next` does).
+            let lease = match wave.lock_batch().next() {
+                None => return Ok(()),
+                Some(lease) => lease.map_err(|e| wave.lease_err(e))?,
+            };
+            rayon::scope(|sc| {
+                wave.spawn(sc, lease);
+                wave.start_ready(sc);
+            });
+            if let Some(e) = wave.take_error() {
+                return Err(e);
+            }
         }
-        Ok(())
     }
 
     fn wants_lookahead(&self) -> bool {

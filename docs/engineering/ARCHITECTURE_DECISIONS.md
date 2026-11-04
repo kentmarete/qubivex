@@ -18,7 +18,7 @@ recorded in the ADR it affects, or in a new ADR numbered from 009.
 | ADR | Title | Recorded status | Actual state | Proposed status |
 |---|---|---|---|---|
 | 001 | Rust workspace, phase-gated crates | Proposed | Implemented as written; enforced by lints, `xtask`, CI | **Accepted** (owner review pending since Phase 1) |
-| 002 | Hybrid compute, own kernels, no Candle | Accepted | Own kernels built. Spinning pool and dequantise + `gemm` prefill **not built** | Accepted, plus an "Implementation status" note listing the two unbuilt parts |
+| 002 | Hybrid compute, own kernels, no Candle | Accepted | Own kernels built, including the register-blocked prefill (amendment 1, instead of `gemm`, which breaks batch invariance). Spinning pool **deferred** with measurements | Accepted, plus an "Implementation status" note listing the two unbuilt parts |
 | 003 | Architecture registry by manifest id | Proposed | Implemented; OLMoE and a Qwen3-MoE fixture load through one factory | **Accepted** |
 | 004 | Versioned manifest, cross-validated | Proposed | Implemented (schema v1, import, cross-checks) | **Accepted** |
 | 005 | One measured, role-driven memory planner | Proposed | Not built (Phase 5) | Proposed; extended by §2.3 |

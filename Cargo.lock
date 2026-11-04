@@ -786,6 +786,7 @@ dependencies = [
  "qubivex-compute",
  "qubivex-core",
  "qubivex-model",
+ "rayon",
  "thiserror",
 ]
 

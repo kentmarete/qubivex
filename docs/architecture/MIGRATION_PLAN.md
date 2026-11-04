@@ -234,8 +234,9 @@ paged KV, NUMA, multi-device; then a CLI UX catalogue and recommendations UI.
   flags, threads, warm-up, median and P95, peak memory, and a token check as the error
   field). Protocol and the 2026-11-03 baseline: `docs/performance/BENCHMARKING.md`.
   Every later kernel change is measured before and after against these.
-- **Phase 4 follow-ups, each measured:** AVX2 kernels; the dequantise + `gemm` prefill
-  and the spinning pool that ADR-002 accepted but which are not built yet; a faster
+- **Phase 4 follow-ups, each measured:** AVX2 kernels; prefill (done 2026-11-04 with an
+  own register-blocked kernel instead of `gemm`, and the spinning pool deferred: ADR-002
+  amendment 1); a faster
   lossless Q4_K kernel (the EIP's quantised GEMV target is ≥ 70% of STREAM; the
   baseline measures Q4_K at 17 GiB/s, about 22% of the 80 GiB/s bf16 streams from DRAM
   on the M3 Pro, and the kernel is limited by compute, not memory).

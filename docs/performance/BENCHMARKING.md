@@ -30,7 +30,8 @@ numbers do not depend on their values.
 | `decode_t<N>` | One row on the compute team; the matrix stays in cache |
 | `decode_stream_t<N>` | One row on the team, cycling through 512 MiB of copies so every call reads from DRAM, as a decode step reads each expert once per token. **Bandwidth targets are measured here.** |
 | `decode_portable_1t` | The portable path for the dtypes that have a fused kernel on this CPU, so the fused gain stays visible |
-| `prefill_s128_t<N>` | 128 activation rows on the team |
+| `prefill_s128_t<N>` | 128 activation rows on the team (the register-blocked kernel) |
+| `prefill_s16_t<N>` | 16 rows, Q4_K: what one expert sees in a 128-token prompt |
 | `dequant_row`, `dot` | The building blocks, one 2048-wide row |
 
 The team size `N` is `QUBIVEX_BENCH_THREADS`, else the performance cores on macOS, else
@@ -194,8 +195,8 @@ q8_0 559 ns, q6_k 877 ns, f16 995 ns.
   A faster lossless Q4_K kernel is the largest available decode gain.
 - **Prefill does not use batching yet.** At 128 rows every dtype takes about 3.5 ms per
   expert projection, so the per-row scalar dot dominates, and end-to-end prefill is
-  44 tok/s. This is the dequantise + `gemm` prefill that ADR-002 accepted but nobody has
-  built.
+  44 tok/s. (Done 2026-11-04 with an own kernel instead of `gemm`: see below and
+  ADR-002 amendment 1.)
 - **f16 has no fused kernel** and is 5–7× slower than bf16. No current reference-model
   tensor is f16, so this is low priority.
 - **Decode jitter:** the step P95 is 20–30% above the median in both end-to-end runs,
@@ -203,3 +204,36 @@ q8_0 559 ns, q6_k 877 ns, f16 995 ns.
   kernel, compare medians over interleaved runs.
 - No STREAM number was recorded on this machine. bf16's 80 GiB/s is a measured lower
   bound for achievable bandwidth.
+
+## 2026-11-04: prefill (ADR-002 amendment 1)
+
+Build `f2ff9d5` plus the change (`-dirty`), same machine and flags as the baseline,
+5 threads, 1 warm-up and 5 measured runs. Every record's tokens match its reference
+record (`--reference`).
+
+| Operating point | Record | Prefill median | Prefill tok/s | Decode tok/s (median step) |
+|---|---|---|---|---|
+| 10-token prompt, 160 generated | `2026-11-04-m3pro-tiled-decode.json` (ref. `…-decode.json`) | 244.7 ms (was 323.8) | 40.9 (was 30.9) | 30.50 (was 25.76) |
+| 128-token prompt, 32 generated | `2026-11-04-m3pro-tiled-prefill128.json` (ref. `…-prefill128.json`) | 1132.6 ms (was 2908.6) | 113.0 (was 44.0) | 30.20 (was 25.34) |
+| 10-token prompt, 160 generated, `--ram-budget 1GiB` | `2026-11-04-m3pro-tiled-1gib.json` (ref. `…-phase6-exit-1gib.json`) | 307.6 ms | 32.5 | 19.12 |
+
+Kernel, `prefill_s128_t5` (Criterion medians; baseline in brackets):
+
+| dtype | gate/up | down |
+|---|---|---|
+| f32 | 1.65 ms (3.49) | 1.81 ms |
+| bf16 | 1.64 ms (3.51) | 1.82 ms |
+| q8_0 | 1.72 ms (3.56) | 1.89 ms |
+| q4_k | 1.66 ms (3.44) | 1.84 ms |
+| q6_k | 1.81 ms (3.59) | 2.03 ms |
+
+`prefill_s16_t5` Q4_K: gate/up 356 µs, down 377 µs.
+
+Notes:
+- The end-to-end gain is more than the kernel's 2.1×: experts now run concurrently and
+  attention runs on the pool (it was single-threaded), so the compute team went from about
+  50% to 95% busy in a profile.
+- Decode gains 15–20% from computing the 8 routed experts concurrently.
+- At `--ram-budget 1GiB` a 10-token prompt is I/O-bound and within noise of the previous
+  build (main measured 320–326 ms in interleaved runs); a 128-token prompt at 1 GiB went
+  48–49 → 98–100 tok/s.
