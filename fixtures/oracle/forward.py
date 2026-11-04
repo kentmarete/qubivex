@@ -3,8 +3,9 @@
     ~/.qubivex/oracle/bin/python -I fixtures/oracle/forward.py > fixtures/oracle/forward.json
 
 For each SafeTensors fixture: per-layer attention output (after o_proj), router logits,
-selected experts and their routing weights (rank order), MoE output and layer output,
-then the final logits, for every position of a 14-token prompt; and 12 greedy tokens
+selected experts and their routing weights (rank order), MoE output and layer output
+(a dense fixture: attention, FFN and layer output), then the final logits, for every
+position of a 14-token prompt; and 12 greedy tokens
 (full forward each step, no end-of-sequence stop). Values are f32 bit patterns.
 Checked by crates/qubivex-runtime/tests/oracle.rs.
 """
@@ -26,15 +27,17 @@ def bits(t):
 
 out = {"generator": "fixtures/oracle/forward.py", "transformers": transformers.__version__,
        "torch": torch.__version__, "prompt": PROMPT, "models": {}}
-for name in ["olmoe-tiny", "qwen3-moe-tiny"]:
+for name in ["olmoe-tiny", "qwen3-moe-tiny", "dense-tiny"]:
     model, info = AutoModelForCausalLM.from_pretrained(
         f"fixtures/models/{name}", dtype=torch.float32, output_loading_info=True)
     assert not any(info.values()), f"{name}: weights not loaded cleanly: {info}"
     model.eval()
     cap = {}
+    dense = not hasattr(model.model.layers[0].mlp, "gate")
     for i, layer in enumerate(model.model.layers):
         layer.self_attn.register_forward_hook(lambda m, a, o, i=i: cap.__setitem__(("attn", i), o[0]))
-        layer.mlp.gate.register_forward_hook(lambda m, a, o, i=i: cap.__setitem__(("gate", i), o))
+        if not dense:
+            layer.mlp.gate.register_forward_hook(lambda m, a, o, i=i: cap.__setitem__(("gate", i), o))
         layer.mlp.register_forward_hook(lambda m, a, o, i=i: cap.__setitem__(("moe", i), o))
         layer.register_forward_hook(
             lambda m, a, o, i=i: cap.__setitem__(("hidden", i), o[0] if isinstance(o, tuple) else o))
@@ -42,6 +45,13 @@ for name in ["olmoe-tiny", "qwen3-moe-tiny"]:
         logits = model(torch.tensor([PROMPT])).logits[0]
     layers = []
     for i in range(len(model.model.layers)):
+        if dense:
+            layers.append({
+                "attention": bits(cap[("attn", i)][0]),
+                "ffn": bits(cap[("moe", i)][0]),
+                "hidden": bits(cap[("hidden", i)][0]),
+            })
+            continue
         router_logits, weights, idx = cap[("gate", i)]
         layers.append({
             "attention": bits(cap[("attn", i)][0]),

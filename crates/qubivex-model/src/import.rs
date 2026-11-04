@@ -218,36 +218,81 @@ pub fn import(
 
     let tensors = index_files(&dir, &base)?;
     let hf_config = read_config(&dir, &base)?;
+    // A tied output head reads the embedding. Some checkpoints still store a copy
+    // under the head's name; it is not needed, so it is ignored rather than loaded.
+    let mut base = base;
+    let tied = opts
+        .set
+        .get("tie_word_embeddings")
+        .or_else(|| hf_config.as_ref()?.get("tie_word_embeddings"))
+        .and_then(Value::as_bool)
+        == Some(true);
+    let head = match format {
+        ManifestFormat::Gguf => "output.weight",
+        ManifestFormat::Safetensors => "lm_head.weight",
+    };
+    if tied && tensors.get(head).is_some() {
+        base.overrides.ignore_tensors.push(head.to_owned());
+        warnings.push(format!(
+            "the output head is tied to the embedding; the stored {head:?} is ignored"
+        ));
+    }
+    // Each built-in architecture in turn; a config it refuses (a dense checkpoint has
+    // no experts for `transformer_moe`) moves on to the next.
     let mut best: Option<(usize, ModelError)> = None;
-    for tensor_names in candidates(format) {
-        for qk in ["none", "full", "per_head"] {
-            let mut m = base.clone();
-            m.architecture
-                .config
-                .insert("tensor_names".into(), tensor_names.clone());
-            m.architecture.config.insert("qk_norm".into(), json!(qk));
-            match check(&m, &tensors, hf_config.as_ref(), registry) {
-                Ok(_) => {
-                    let mut m = m;
-                    m.quantization = dominant_dtype(&tensors);
-                    return Ok(Imported {
-                        dir,
-                        manifest: m,
-                        warnings,
-                    });
-                }
-                // Config errors do not depend on the layout: report them directly.
-                Err(e @ (ModelError::Config(_) | ModelError::Registry(_))) => return Err(e),
-                Err(ModelError::Validation { model, problems }) => {
-                    if best.as_ref().is_none_or(|(n, _)| problems.len() < *n) {
-                        best = Some((problems.len(), ModelError::Validation { model, problems }));
+    let mut refused: Vec<String> = Vec::new();
+    'arch: for (arch, names) in [
+        ("transformer_moe", candidates(format)),
+        ("transformer_dense", dense_candidates(format)),
+    ] {
+        for tensor_names in names {
+            for qk in ["none", "full", "per_head"] {
+                let mut m = base.clone();
+                m.architecture.id = arch.to_owned();
+                m.architecture
+                    .config
+                    .insert("tensor_names".into(), tensor_names.clone());
+                m.architecture.config.insert("qk_norm".into(), json!(qk));
+                match check(&m, &tensors, hf_config.as_ref(), registry) {
+                    Ok(_) => {
+                        let mut m = m;
+                        m.quantization = dominant_dtype(&tensors);
+                        return Ok(Imported {
+                            dir,
+                            manifest: m,
+                            warnings,
+                        });
                     }
+                    // Config errors do not depend on the layout: try the next architecture.
+                    Err(ModelError::Config(e)) => {
+                        refused.push(format!("{arch}: {e}"));
+                        continue 'arch;
+                    }
+                    Err(e @ ModelError::Registry(_)) => return Err(e),
+                    Err(ModelError::Validation { model, problems }) => {
+                        if best.as_ref().is_none_or(|(n, _)| problems.len() < *n) {
+                            best =
+                                Some((problems.len(), ModelError::Validation { model, problems }));
+                        }
+                    }
+                    Err(e) => return Err(e),
                 }
-                Err(e) => return Err(e),
             }
         }
     }
-    Err(best.map_or_else(|| import_err(&dir, "no layout candidates"), |(_, e)| e))
+    match best {
+        Some((_, e)) => Err(e),
+        None if !refused.is_empty() => Err(ModelError::Config(refused.join("; "))),
+        None => Err(import_err(&dir, "no layout candidates")),
+    }
+}
+
+/// Tensor-name presets to try for `transformer_dense`.
+fn dense_candidates(format: ManifestFormat) -> Vec<Value> {
+    match format {
+        ManifestFormat::Gguf => vec![json!("gguf")],
+        ManifestFormat::Safetensors => vec![json!("hf")],
+    }
 }
 
 /// Tensor-name presets to try, most common first, with known alternative router names.

@@ -10,7 +10,7 @@ use std::time::Duration;
 
 use qubivex_arch::{
     ArchError, DenseWeights, ExpertProvider, ExpertWeights, KvCache, Logits, Sources, Tracer,
-    TransformerMoeModel,
+    Transformer,
 };
 use qubivex_compute::WeightView;
 use qubivex_compute::host::PageAligned;
@@ -572,7 +572,7 @@ pub struct Engine {
     layers: Vec<LayerExperts>,
     /// The byte budget the pools were last sized for.
     cache_target: AtomicU64,
-    model: TransformerMoeModel,
+    model: Transformer,
     tokenizer: Tokenizer,
     backend: Placed,
     max_context: usize,
@@ -768,12 +768,14 @@ impl Engine {
             arena: Arc::new(arena),
             tensors,
         };
-        let model = TransformerMoeModel::new(&meta.config, &dense, &Placed::cpu())?;
+        let model = Transformer::new(&meta.config, &dense, &Placed::cpu())?;
         // The whole-layer pass is built once the context limit is known (below).
         let mut layers_on = None;
         let backend = match opts.backend {
             BackendKind::Cpu => Placed::cpu(),
-            BackendKind::Metal if opts.metal_ops.layers => {
+            // Whole layers exist for routed experts only; a dense model places its
+            // matmuls one by one instead (below), with the same bits.
+            BackendKind::Metal if opts.metal_ops.layers && model.is_moe() => {
                 let be = MetalBackend::new().map_err(|e| metal_err(&e))?;
                 let host = be
                     .map_host(Arc::clone(&dense.arena))
@@ -817,7 +819,7 @@ impl Engine {
         // experts: with fewer slots, experts stream through the pool and every layer's
         // GPU round trip costs more than the GPU saves (ADR-011 amendment 3). The plan
         // then runs the CPU pass.
-        let top_k = model.config().top_k as usize;
+        let top_k = model.moe_config().map_or(0, |c| c.top_k as usize);
         let short = pools_for(&footprint.layers, capacity)
             .into_iter()
             .find(|p| (p.slots as usize) < top_k);
@@ -834,7 +836,10 @@ impl Engine {
                 )
             }
             Some((be, host)) => {
-                let g = MetalForward::new(be, host, model.config(), &dense, max_context)
+                let cfg = model.moe_config().ok_or_else(|| {
+                    RuntimeError::Model("whole Metal layers need routed experts".into())
+                })?;
+                let g = MetalForward::new(be, host, cfg, &dense, max_context)
                     .map_err(|e| metal_err(&e))?;
                 let (tensors, bytes) = g.placed();
                 let p = Placed::layers(g.device(), tensors, bytes, opts.metal_ops);
@@ -887,8 +892,8 @@ impl Engine {
             .map_err(|e| {
                 RuntimeError::Model(format!("cannot start {threads} compute threads: {e}"))
             })?;
-        let predictor = opts.prefetch.map(|o| {
-            let c = model.config();
+        // Prefetch predicts routed experts; a dense model has none to predict.
+        let predictor = opts.prefetch.zip(model.moe_config()).map(|(o, c)| {
             Mutex::new(Predictor {
                 lookahead: Lookahead::new(o.lookahead, c.layers as usize, c.top_k as usize),
                 guard: o.guard,
@@ -1124,7 +1129,7 @@ impl Engine {
         self.model.new_cache(self.max_context)
     }
 
-    /// One forward pass (see [`TransformerMoeModel::forward`]).
+    /// One forward pass (see [`Transformer::forward`]).
     ///
     /// # Errors
     /// Architecture errors.

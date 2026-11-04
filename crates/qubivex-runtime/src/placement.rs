@@ -77,6 +77,8 @@ impl MetalOps {
                 DenseMatmul::Attention => self.attention,
                 DenseMatmul::Router => self.router,
                 DenseMatmul::Head => self.head,
+                // A dense FFN is placed with whole layers only.
+                DenseMatmul::Ffn => false,
             }
     }
 

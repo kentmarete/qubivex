@@ -1,0 +1,255 @@
+{
+  "schema": 1,
+  "label": "dense-cpu-prefill128",
+  "started": "2026-11-04T19:47:07Z",
+  "build": {
+    "version": "0.1.0",
+    "git": "92dec96bce37-dirty",
+    "rustc": "rustc 1.99.1 (58cf8f9c3 2026-10-13)",
+    "profile": "release",
+    "opt_level": "3",
+    "debug_assertions": false,
+    "target": "aarch64-apple-darwin",
+    "target_features": "aes,crc,dit,dotprod,dpb,dpb2,fcma,fhm,flagm,fp16,frintts,jsconv,lor,lse,neon,paca,pacg,pan,pmuv3,ras,rcpc,rcpc2,rdm,sb,sha2,sha3,ssbs,vh",
+    "rustflags": ""
+  },
+  "hardware": {
+    "cpu": {
+      "arch": "aarch64",
+      "vendor": {
+        "known": "Apple"
+      },
+      "model": {
+        "known": "Apple M3 Pro"
+      },
+      "logical_cores": {
+        "known": 11
+      },
+      "physical_cores": {
+        "known": 11
+      },
+      "tiers": {
+        "known": [
+          {
+            "name": "Performance",
+            "physical": 5,
+            "logical": 5
+          },
+          {
+            "name": "Efficiency",
+            "physical": 6,
+            "logical": 6
+          }
+        ]
+      },
+      "simd": [
+        "neon",
+        "fp16",
+        "dotprod",
+        "i8mm",
+        "bf16"
+      ],
+      "numa_nodes": {
+        "known": 1
+      }
+    },
+    "memory": {
+      "total": {
+        "known": 19327352832
+      },
+      "cgroup_limit": {
+        "known": "none"
+      }
+    },
+    "os": {
+      "family": "macos",
+      "name": {
+        "known": "macOS 27.2 (26B123)"
+      },
+      "kernel": {
+        "known": "27.2.0"
+      }
+    }
+  },
+  "model": {
+    "id": "qwen3-0.6b",
+    "name": "Qwen3-0.6B",
+    "architecture": "transformer_dense",
+    "dir": "~/.qubivex/models/qwen3-0.6b"
+  },
+  "config": {
+    "threads": 5,
+    "expert_cache": 0,
+    "expert_slots": [],
+    "cache_policy": "Lfru { decay_window: 256 }",
+    "io_threads": 4,
+    "expert_io": "buffered",
+    "verification": "missing",
+    "context": 21851,
+    "prompt": "Write a long story about a lighthouse keeper.",
+    "prompt_tokens": 128,
+    "generated_tokens": 32,
+    "warmup_runs": 1,
+    "measured_runs": 5
+  },
+  "prefill": {
+    "ms": {
+      "n": 5,
+      "min": 453.33020899999997,
+      "median": 454.824084,
+      "p95": 455.90437499999996,
+      "max": 455.90437499999996,
+      "mean": 454.83005860000003
+    },
+    "tok_s_at_median": 281.4274892268018
+  },
+  "decode": {
+    "step_ms": {
+      "n": 155,
+      "min": 14.722416,
+      "median": 15.153542000000002,
+      "p95": 16.593375,
+      "max": 18.488333,
+      "mean": 15.369515883870962
+    },
+    "tok_s_at_median": 65.99117222890858,
+    "run_tok_s": [
+      64.46125432688632,
+      64.62305497112224,
+      65.27899622837543,
+      65.42544150137898,
+      65.5454289394888
+    ]
+  },
+  "memory": {
+    "rss_after_load": {
+      "known": 1343012864
+    },
+    "peak_rss": {
+      "known": 1426948096
+    },
+    "peak_source": "sampled",
+    "plan_budget": 6741139128,
+    "ledger": {
+      "dense": 1192099840,
+      "expert_cache": 0,
+      "kv": 58720256,
+      "total": 1250820096
+    }
+  },
+  "experts": {
+    "hits": 0,
+    "loads": 0,
+    "bytes_read": 0,
+    "evictions": 0,
+    "hit_rate": 0.0,
+    "bytes_per_token": 0,
+    "slab_allocs": 0,
+    "wait_ms_per_token": 0.0,
+    "read_retries": 0,
+    "read_timeouts": 0
+  },
+  "check": {
+    "deterministic": true,
+    "first_divergence": null,
+    "reference": null,
+    "reference_match": null,
+    "reference_divergence": null
+  },
+  "runs": [
+    {
+      "prefill_ms": 453.33020899999997,
+      "decode_step_ms": {
+        "n": 31,
+        "min": 14.862958,
+        "median": 15.182958,
+        "p95": 17.131292,
+        "max": 17.56025,
+        "mean": 15.513194870967734
+      },
+      "decode_tok_s": 64.46125432688632
+    },
+    {
+      "prefill_ms": 454.38666700000005,
+      "decode_step_ms": {
+        "n": 31,
+        "min": 14.778625,
+        "median": 15.22725,
+        "p95": 16.823,
+        "max": 18.488333,
+        "mean": 15.4743535483871
+      },
+      "decode_tok_s": 64.62305497112224
+    },
+    {
+      "prefill_ms": 455.704958,
+      "decode_step_ms": {
+        "n": 31,
+        "min": 14.83925,
+        "median": 15.123458,
+        "p95": 16.370583,
+        "max": 16.472375,
+        "mean": 15.318862999999999
+      },
+      "decode_tok_s": 65.27899622837543
+    },
+    {
+      "prefill_ms": 454.824084,
+      "decode_step_ms": {
+        "n": 31,
+        "min": 14.778875000000001,
+        "median": 15.096416,
+        "p95": 16.319875,
+        "max": 16.593375,
+        "mean": 15.284573967741936
+      },
+      "decode_tok_s": 65.42544150137898
+    },
+    {
+      "prefill_ms": 455.90437499999996,
+      "decode_step_ms": {
+        "n": 31,
+        "min": 14.722416,
+        "median": 15.16875,
+        "p95": 16.28325,
+        "max": 16.889292,
+        "mean": 15.256594032258064
+      },
+      "decode_tok_s": 65.5454289394888
+    }
+  ],
+  "tokens": [
+    53416,
+    13,
+    9645,
+    264,
+    1293,
+    3364,
+    911,
+    264,
+    326,
+    57909,
+    53416,
+    13,
+    9645,
+    264,
+    1293,
+    3364,
+    911,
+    264,
+    326,
+    57909,
+    53416,
+    13,
+    9645,
+    264,
+    1293,
+    3364,
+    911,
+    264,
+    326,
+    57909,
+    53416,
+    13
+  ]
+}

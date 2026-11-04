@@ -190,7 +190,7 @@ returns to baseline and the next request succeeds. Planned for Phase 3, built no
   - **New:** slab allocation is fallible (`PageAligned::try_zeroed`): a slot the
     allocator refuses is a load error, not an abort.
   - **New:** a forward pass that fails rolls the host KV cache back to the positions it
-    held (`TransformerMoeModel::forward`). Before, the layers before the failing one
+    held (`Transformer::forward`). Before, the layers before the failing one
     kept that step's keys and values, so the next step on the same cache attended to
     them. Generation drops its cache on error anyway; a server reusing a conversation's
     cache needs the rollback. The Metal pass advances the cache only on success.

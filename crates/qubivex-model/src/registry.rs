@@ -25,6 +25,18 @@ pub enum ExpertPart {
     Down,
 }
 
+/// One part of a dense (always active) SwiGLU FFN.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FfnPart {
+    /// Gate projection, `[ffn, hidden]`.
+    Gate,
+    /// Up projection, `[ffn, hidden]`.
+    Up,
+    /// Down projection, `[hidden, ffn]`.
+    Down,
+}
+
 /// Attention tensors.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -65,6 +77,13 @@ pub enum TensorRole {
         layer: LayerIdx,
         /// Which.
         part: AttentionPart,
+    },
+    /// A dense FFN tensor (resident, used by every token).
+    Ffn {
+        /// Layer.
+        layer: LayerIdx,
+        /// Which part.
+        part: FfnPart,
     },
     /// The MoE router (gate) weights.
     Router {
@@ -224,6 +243,7 @@ impl ArchitectureRegistry {
         let mut r = Self::new();
         // Built-in ids are distinct by construction.
         let _ = r.register(Arc::new(crate::arch::TransformerMoe));
+        let _ = r.register(Arc::new(crate::arch::TransformerDense));
         r
     }
 

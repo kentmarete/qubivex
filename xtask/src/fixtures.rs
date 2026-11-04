@@ -403,6 +403,47 @@ fn weight_files() -> BTreeMap<&'static str, BTreeMap<String, Vec<u8>>> {
         t.push(tensor(&mut rng, "lm_head.weight".into(), vec![vocab, h]));
         all.insert("qwen3-moe-tiny", safetensors_files(&t, &cfg, vocab));
     }
+
+    // Dense (transformer_dense), Llama-style: no q/k norm, grouped-query attention,
+    // the output head tied to the embedding.
+    {
+        let mut rng = Rng(0x0f1e_2d3c_4b5a_6978);
+        let hd = 16u64;
+        let (heads, kv, dffn) = (4u64, 2u64, 96u64);
+        let cfg = json!({
+            "architectures": ["LlamaForCausalLM"], "model_type": "llama",
+            "hidden_size": h, "intermediate_size": dffn, "num_hidden_layers": layers,
+            "num_attention_heads": heads, "num_key_value_heads": kv, "head_dim": hd,
+            "rms_norm_eps": 1e-5, "rope_theta": 500000.0, "rope_scaling": null,
+            "hidden_act": "silu", "attention_bias": false, "mlp_bias": false,
+            "attention_dropout": 0.0, "max_position_embeddings": 2048, "vocab_size": vocab,
+            "tie_word_embeddings": true, "torch_dtype": "bfloat16", "bos_token_id": 0,
+            "eos_token_id": 1
+        });
+        let mut t = vec![tensor(
+            &mut rng,
+            "model.embed_tokens.weight".into(),
+            vec![vocab, h],
+        )];
+        for l in 0..layers {
+            let p = |s: &str| format!("model.layers.{l}.{s}");
+            for (n, d) in [
+                ("input_layernorm.weight", vec![h]),
+                ("self_attn.q_proj.weight", vec![heads * hd, h]),
+                ("self_attn.k_proj.weight", vec![kv * hd, h]),
+                ("self_attn.v_proj.weight", vec![kv * hd, h]),
+                ("self_attn.o_proj.weight", vec![h, heads * hd]),
+                ("post_attention_layernorm.weight", vec![h]),
+                ("mlp.gate_proj.weight", vec![dffn, h]),
+                ("mlp.up_proj.weight", vec![dffn, h]),
+                ("mlp.down_proj.weight", vec![h, dffn]),
+            ] {
+                t.push(tensor(&mut rng, p(n), d));
+            }
+        }
+        t.push(tensor(&mut rng, "model.norm.weight".into(), vec![h]));
+        all.insert("dense-tiny", safetensors_files(&t, &cfg, vocab));
+    }
     all
 }
 

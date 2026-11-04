@@ -8,12 +8,12 @@
 //! chosen experts; their slabs are wrapped in place once per load (ADR-011 §4) and
 //! cached in the slab's attachment. The last submission adds the final norm and the
 //! head. Every kernel reproduces the CPU pass's bits (ADR-011 §1), so the logits are
-//! bit-identical to [`TransformerMoeModel::forward`]'s.
+//! bit-identical to [`Transformer::forward`]'s.
 //!
 //! Keys and values live in device buffers held in the [`KvCache`]'s device slot,
 //! position-major and grown by whole chunks like the host cache.
 //!
-//! [`TransformerMoeModel::forward`]: qubivex_arch::TransformerMoeModel::forward
+//! [`Transformer::forward`]: qubivex_arch::Transformer::forward
 
 use std::sync::{Arc, Mutex};
 
@@ -434,9 +434,9 @@ impl MetalForward {
     }
 
     /// Runs `tokens` at positions `cache.len()..` and returns logits as
-    /// [`TransformerMoeModel::forward`] does, with the same bits.
+    /// [`Transformer::forward`] does, with the same bits.
     ///
-    /// [`TransformerMoeModel::forward`]: qubivex_arch::TransformerMoeModel::forward
+    /// [`Transformer::forward`]: qubivex_arch::Transformer::forward
     #[allow(clippy::too_many_lines)]
     pub(crate) fn forward(
         &self,

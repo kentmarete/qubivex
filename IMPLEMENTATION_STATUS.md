@@ -5,12 +5,19 @@ Last updated: 2026-11-04
 ## Current phase
 **Phase 8 (GPU acceleration, Metal first): slices 1–4 done (2026-11-03).** Metal slice 5 is paused while the improvement-plan backlog (MIGRATION_PLAN §3a and Addendum §4) is cleared first.
 
+**Dense architecture and a real SafeTensors run done (2026-11-04), §3a item; ADR-003 amendment 1.**
+- `transformer_dense` registered beside `transformer_moe` (own config, presets `hf`/`gguf`, schema; refuses routed experts); shared config parsing in `qubivex-model/src/arch/common.rs`; new `TensorRole::Ffn` (planner group `dense FFN`). The forward pass (`qubivex_arch::Transformer`, renamed from `TransformerMoeModel`) shares embedding, attention, KV and head; the FFN is configuration. Whole-layer Metal and prefetch stay MoE-only; a dense model on Metal places its matmuls one by one (same bits).
+- Importer tries both architectures; a tied head stored anyway goes to `overrides.ignore_tensors`; no expert checksums for a dense model. Also refused now by every architecture: `mlp_bias`, `use_sliding_window`.
+- Real run: `Qwen/Qwen3-0.6B` bf16 SafeTensors (1.4 GiB) imports with no edits and generates coherent text (plain and chat template). Against transformers f32: 32 greedy tokens identical, the top-32 logits of every prompt position within 1.2e-5 relative; prefill equals token by token and 1 vs 4 threads bit for bit (`tests/real_dense.rs`, env-gated `QUBIVEX_DENSE_SAFETENSORS_DIR`).
+- Measured (M3 Pro, 5 threads): decode 68.6 tok/s (about 77 GiB/s of bf16 weights per token, near the machine's bandwidth), prefill 157 tok/s (10 tokens) and 281 tok/s (128 tokens); Metal per-op 33 tok/s with identical tokens. Records `docs/performance/baselines/2026-11-04-m3pro-dense-cpu-*.json`. OLMoE unchanged (42.65 tok/s, tokens match).
+- Tests: 276 on 1.85 and stable. New: `dense-tiny` fixture (Llama-style, no q/k norm, GQA, tied head) against transformers per layer (5.2e-7), in the prefill/thread/Metal invariants, fixture import round trip, refusals (`num_experts`, `mlp_bias`, sliding window, attention bias).
+- **Next:** Phase 9 (API server), then Metal slice 5 and the Phase 7 disk throttle.
+
 **KV cache on `Tensor<f32>` done (2026-11-04), §3a item; ADR-009's next consumer.**
 - `qubivex-arch` `KvCache`: one `Tensor<f32>` per layer for keys and one for values, `[kv_head, pos, head_dim]`, with room for the reserved positions (still whole 256-position chunks, so the planner's KV charge is unchanged). A step writes each head's new rows through one `narrow` view; attention reads each head's positions `0..=p` as one contiguous `narrow` view; a failed step only resets the position count (rows past it are never read and are overwritten next). Per-layer tensors, so growing copies one layer at a time.
 - `qubivex-compute`: `TensorViewMut::{reborrow, narrow, select, contiguous_data_mut}`.
 - Measured against `main` (interleaved): 1024-token prompt + 300 generated, prefill 114.8 / 116.7 / 111.7 vs 111.3 / 110.6 / 117.5 tok/s, decode 32.5 / 33.4 / 33.1 vs 32.6 / 33.4 / 33.7; 10-token prompt decode 42.6 / 43.0 vs 42.5 / 42.2. Tokens identical in every run.
 - Tests: 274 on 1.85 and stable. New: KV growth across chunk boundaries (one 300-token step, then single tokens past 512) equals token by token, a refused step adds no positions, a cleared cache keeps its room and gives a fresh cache's bits; mutable tensor views.
-- **Next (§3a):** a dense architecture and a SafeTensors run, then Phase 9.
 
 **Faster lossless Q4_K done (2026-11-04), §3a item; ADR-002 amendment 2.** Decode 30.5 → 41.6–42.5 tok/s all resident and 19.0 → 22.4–22.7 at 1 GiB; prefill unchanged; tokens identical to every reference.
 - Kernel: `qubivex-backend-cpu/src/neon.rs`. `d1 · q` is exact in f32 (17-bit `d1`, 4-bit `q`), so `fma(d1, q, −m1)` rounds exactly where the portable multiply-then-subtract does. On FEAT_FHM CPUs (run-time detected; every Apple M-series) `fmlal` forms `d · (sc · q)` from f16 operands (`sc · q < 1024`, exact in f16) in one instruction. 23 → 13 vector instructions per 16 weights; `decode_t5` gate/up 62.1 → 38.8 µs (17.5 → 28 GiB/s).

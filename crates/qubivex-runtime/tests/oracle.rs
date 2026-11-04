@@ -1,4 +1,4 @@
-//! QUBIVEX against transformers (f32) on the tiny fixtures
+//! QUBIVEX against transformers (f32) on the tiny fixtures, mixture-of-experts and dense
 //! (`fixtures/oracle/forward.json`, from `fixtures/oracle/forward.py`).
 
 #![allow(
@@ -74,12 +74,23 @@ fn fixtures_match_transformers() {
         let mut worst = 0f64;
         for (l, lw) in want["layers"].as_array().unwrap().iter().enumerate() {
             let l32 = Some(l as u32);
-            for (point, key) in [
-                (TracePoint::Attention, "attention"),
-                (TracePoint::RouterLogits, "router_logits"),
-                (TracePoint::Moe, "moe"),
-                (TracePoint::Hidden, "hidden"),
-            ] {
+            // A dense fixture records its FFN output instead of routing.
+            let dense = lw.get("ffn").is_some();
+            let points: &[(TracePoint, &str)] = if dense {
+                &[
+                    (TracePoint::Attention, "attention"),
+                    (TracePoint::Ffn, "ffn"),
+                    (TracePoint::Hidden, "hidden"),
+                ]
+            } else {
+                &[
+                    (TracePoint::Attention, "attention"),
+                    (TracePoint::RouterLogits, "router_logits"),
+                    (TracePoint::Moe, "moe"),
+                    (TracePoint::Hidden, "hidden"),
+                ]
+            };
+            for &(point, key) in points {
                 let w = floats(&lw[key]);
                 let ours: Vec<f32> = (0..s)
                     .flat_map(|t| got[&(point, l32, t)].0.clone())
@@ -87,6 +98,9 @@ fn fixtures_match_transformers() {
                 let r = rel(&ours, &w);
                 worst = worst.max(r);
                 assert!(r < TOL, "{name} layer {l} {key}: relative error {r:.2e}");
+            }
+            if dense {
+                continue;
             }
             let experts = lw["experts"].as_array().unwrap();
             let weights = floats(&lw["routing_weights"]);

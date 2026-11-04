@@ -267,3 +267,19 @@ Kernels, Q4_K (Criterion medians; baseline `q4before` in brackets):
 
 The ranges are two sessions; the second ran warm after the end-to-end benchmarks.
 `decode_t5` gate/up moves 1.125 MiB per call, so 38.8 µs is 28.3 GiB/s.
+
+## 2026-11-04: a dense model (`transformer_dense`, ADR-003 amendment 1)
+
+`Qwen/Qwen3-0.6B`, the official bf16 SafeTensors checkpoint (1.11 GiB resident with the
+tied head; no experts). Same machine and flags, 5 threads, 1 warm-up and 5 runs.
+
+| Operating point | Record | Prefill tok/s | Decode tok/s (median step) |
+|---|---|---|---|
+| 10-token prompt, 160 generated, CPU | `2026-11-04-m3pro-dense-cpu-decode.json` | 156.8 | 68.57 (14.58 ms) |
+| 128-token prompt, 32 generated, CPU | `2026-11-04-m3pro-dense-cpu-prefill128.json` | 281.4 | 65.99 (15.15 ms) |
+| 10-token prompt, 160 generated, `--backend metal` | not recorded (tokens match the CPU record) | 194.9 | 33.44 (29.90 ms) |
+
+Each decode step reads every weight once (about 1.13 GiB including the head), so 68.6
+tok/s is about 77 GiB/s, close to the 80 GiB/s bf16 streams in the kernel benchmarks.
+On Metal a dense model's matmuls are placed one by one (about 196 synchronisations per
+token), which is why it is slower than the CPU; a dense whole-layer pass is future work.

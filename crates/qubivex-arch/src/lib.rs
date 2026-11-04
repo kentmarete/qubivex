@@ -1,6 +1,6 @@
 //! Architectures: the forward pass of a validated model (QUBIVEX_DESIGN §3).
 //!
-//! [`TransformerMoeModel`] runs `transformer_moe`, the architecture whose config
+//! [`Transformer`] runs `transformer_moe`, the architecture whose config
 //! [`qubivex_model::arch::TransformerMoe`] parses. Weights arrive through two traits so
 //! that this crate knows neither files nor caches:
 //!
@@ -21,7 +21,7 @@ use qubivex_compute::{ComputeBackend, ComputeError, MatMul, WeightView};
 use qubivex_core::{DType, Shape};
 use qubivex_core::{ExpertIdx, LayerIdx};
 use qubivex_model::ArchConfig;
-use qubivex_model::arch::{MoeConfig, QkNorm, RouterScoring};
+use qubivex_model::arch::{DenseConfig, MoeConfig, QkNorm, RouterScoring};
 use rayon::prelude::*;
 use thiserror::Error;
 
@@ -53,7 +53,7 @@ pub enum ArchError {
 }
 
 /// The kinds of dense matmul in the forward pass (see
-/// [`TransformerMoeModel::dense_matmuls`]).
+/// [`Transformer::dense_matmuls`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum DenseMatmul {
     /// The q, k, v and output projections of attention.
@@ -62,6 +62,8 @@ pub enum DenseMatmul {
     Router,
     /// The output head (the embedding when tied).
     Head,
+    /// A dense FFN's gate, up and down projections.
+    Ffn,
 }
 
 /// The resident weights, by tensor name.
@@ -147,6 +149,8 @@ pub enum TracePoint {
     RoutingWeights,
     /// MoE block output (before the residual).
     Moe,
+    /// Dense FFN block output (before the residual).
+    Ffn,
     /// Hidden state after the layer.
     Hidden,
     /// Output logits.
@@ -411,18 +415,150 @@ struct LayerNorms {
     k: Option<Vec<f32>>,
 }
 
-/// The `transformer_moe` forward pass.
-pub struct TransformerMoeModel {
-    cfg: MoeConfig,
+/// Tensor-name patterns the forward pass reads, the same for every FFN kind.
+#[derive(Clone, Debug)]
+struct Names {
+    embedding: String,
+    output: String,
+    final_norm: String,
+    attn_norm: String,
+    q: String,
+    k: String,
+    v: String,
+    o: String,
+    q_norm: String,
+    k_norm: String,
+    ffn_norm: String,
+}
+
+/// What the forward pass reads from a config, the same for every FFN kind.
+#[derive(Clone, Debug)]
+struct DecoderConfig {
+    hidden: u64,
+    layers: u32,
+    heads: u64,
+    kv_heads: u64,
+    head_dim: u64,
+    vocab: u64,
+    rms_eps: f64,
+    rope_theta: f64,
+    clip_qkv: Option<f64>,
+    tie_embeddings: bool,
+    qk_norm: QkNorm,
+    names: Names,
+}
+
+/// Each layer's FFN.
+#[derive(Clone, Debug)]
+enum Ffn {
+    /// Routed SwiGLU experts (`transformer_moe`).
+    Moe {
+        experts: u32,
+        top_k: u32,
+        norm_topk_prob: bool,
+        router: String,
+    },
+    /// One dense SwiGLU (`transformer_dense`).
+    Dense {
+        gate: String,
+        up: String,
+        down: String,
+    },
+}
+
+impl DecoderConfig {
+    fn from_moe(c: &MoeConfig) -> (Self, Ffn) {
+        let n = &c.names;
+        (
+            Self {
+                hidden: c.hidden,
+                layers: c.layers,
+                heads: c.heads,
+                kv_heads: c.kv_heads,
+                head_dim: c.head_dim,
+                vocab: c.vocab,
+                rms_eps: c.rms_eps,
+                rope_theta: c.rope_theta,
+                clip_qkv: c.clip_qkv,
+                tie_embeddings: c.tie_embeddings,
+                qk_norm: c.qk_norm,
+                names: Names {
+                    embedding: n.embedding.clone(),
+                    output: n.output.clone(),
+                    final_norm: n.final_norm.clone(),
+                    attn_norm: n.attn_norm.clone(),
+                    q: n.q.clone(),
+                    k: n.k.clone(),
+                    v: n.v.clone(),
+                    o: n.o.clone(),
+                    q_norm: n.q_norm.clone(),
+                    k_norm: n.k_norm.clone(),
+                    ffn_norm: n.ffn_norm.clone(),
+                },
+            },
+            Ffn::Moe {
+                experts: c.experts,
+                top_k: c.top_k,
+                norm_topk_prob: c.norm_topk_prob,
+                router: n.router.clone(),
+            },
+        )
+    }
+
+    fn from_dense(c: &DenseConfig) -> (Self, Ffn) {
+        let n = &c.names;
+        (
+            Self {
+                hidden: c.hidden,
+                layers: c.layers,
+                heads: c.heads,
+                kv_heads: c.kv_heads,
+                head_dim: c.head_dim,
+                vocab: c.vocab,
+                rms_eps: c.rms_eps,
+                rope_theta: c.rope_theta,
+                clip_qkv: c.clip_qkv,
+                tie_embeddings: c.tie_embeddings,
+                qk_norm: c.qk_norm,
+                names: Names {
+                    embedding: n.embedding.clone(),
+                    output: n.output.clone(),
+                    final_norm: n.final_norm.clone(),
+                    attn_norm: n.attn_norm.clone(),
+                    q: n.q.clone(),
+                    k: n.k.clone(),
+                    v: n.v.clone(),
+                    o: n.o.clone(),
+                    q_norm: n.q_norm.clone(),
+                    k_norm: n.k_norm.clone(),
+                    ffn_norm: n.ffn_norm.clone(),
+                },
+            },
+            Ffn::Dense {
+                gate: n.gate.clone(),
+                up: n.up.clone(),
+                down: n.down.clone(),
+            },
+        )
+    }
+}
+
+/// The forward pass of the built-in decoder-only transformers: `transformer_moe`
+/// (routed SwiGLU experts) and `transformer_dense` (one dense SwiGLU per layer). The
+/// embedding, attention, KV cache and head are shared; only the FFN differs.
+pub struct Transformer {
+    cfg: DecoderConfig,
+    ffn: Ffn,
+    moe: Option<MoeConfig>,
     kv_heads: usize,
     rope: Rope,
     norms: Vec<LayerNorms>,
     final_norm: Vec<f32>,
 }
 
-impl std::fmt::Debug for TransformerMoeModel {
+impl std::fmt::Debug for Transformer {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("TransformerMoeModel")
+        f.debug_struct("Transformer")
             .field("layers", &self.cfg.layers)
             .field("hidden", &self.cfg.hidden)
             .finish_non_exhaustive()
@@ -460,28 +596,34 @@ fn vector(
     Ok(out)
 }
 
-impl TransformerMoeModel {
+impl Transformer {
     /// Prepares the model: parses nothing (the config is already validated) but
     /// dequantizes the norm weights once.
     ///
     /// # Errors
-    /// [`ArchError::Input`] if `cfg` is not a `transformer_moe` config, and
-    /// [`ArchError::Missing`] for absent weights.
+    /// [`ArchError::Input`] if `cfg` is neither a `transformer_moe` nor a
+    /// `transformer_dense` config, and [`ArchError::Missing`] for absent weights.
     pub fn new(
         cfg: &ArchConfig,
         dense: &dyn DenseWeights,
         be: &dyn ComputeBackend,
     ) -> Result<Self, ArchError> {
-        let c = cfg
-            .specific
-            .downcast_ref::<MoeConfig>()
-            .ok_or_else(|| ArchError::Input("config is not a transformer_moe config".into()))?
-            .clone();
-        if c.router_scoring != RouterScoring::Softmax {
+        let (c, ffn, moe) = if let Some(m) = cfg.specific.downcast_ref::<MoeConfig>() {
+            if m.router_scoring != RouterScoring::Softmax {
+                return Err(ArchError::Input(
+                    "sigmoid router scoring is not implemented yet".into(),
+                ));
+            }
+            let (c, ffn) = DecoderConfig::from_moe(m);
+            (c, ffn, Some(m.clone()))
+        } else if let Some(d) = cfg.specific.downcast_ref::<DenseConfig>() {
+            let (c, ffn) = DecoderConfig::from_dense(d);
+            (c, ffn, None)
+        } else {
             return Err(ArchError::Input(
-                "sigmoid router scoring is not implemented yet".into(),
+                "config is neither a transformer_moe nor a transformer_dense config".into(),
             ));
-        }
+        };
         let h = usize_of(c.hidden)?;
         let d = usize_of(c.head_dim)?;
         let (q_out, kv_out) = (
@@ -516,11 +658,14 @@ impl TransformerMoeModel {
             norms,
             final_norm,
             cfg: c,
+            ffn,
+            moe,
         })
     }
 
     /// Every dense matmul weight of the forward pass, by kind: what an execution plan
-    /// can place on a device (ADR-007, ADR-011 §5). Routed experts are not listed.
+    /// can place on a device (ADR-007, ADR-011 §5). Routed experts are not listed; a
+    /// dense FFN is.
     #[must_use]
     pub fn dense_matmuls(&self) -> Vec<(DenseMatmul, String)> {
         let c = &self.cfg;
@@ -530,7 +675,14 @@ impl TransformerMoeModel {
             for p in [&c.names.q, &c.names.k, &c.names.v, &c.names.o] {
                 v.push((DenseMatmul::Attention, n(p)));
             }
-            v.push((DenseMatmul::Router, n(&c.names.router)));
+            match &self.ffn {
+                Ffn::Moe { router, .. } => v.push((DenseMatmul::Router, n(router))),
+                Ffn::Dense { gate, up, down } => {
+                    for p in [gate, up, down] {
+                        v.push((DenseMatmul::Ffn, n(p)));
+                    }
+                }
+            }
         }
         let head = if c.tie_embeddings {
             &c.names.embedding
@@ -541,10 +693,16 @@ impl TransformerMoeModel {
         v
     }
 
-    /// The config.
+    /// The `transformer_moe` config, if this is a mixture of experts.
     #[must_use]
-    pub const fn config(&self) -> &MoeConfig {
-        &self.cfg
+    pub const fn moe_config(&self) -> Option<&MoeConfig> {
+        self.moe.as_ref()
+    }
+
+    /// Whether each layer's FFN is routed experts (else one dense SwiGLU).
+    #[must_use]
+    pub const fn is_moe(&self) -> bool {
+        matches!(self.ffn, Ffn::Moe { .. })
     }
 
     /// An empty KV cache for up to `max_positions` positions.
@@ -630,8 +788,15 @@ impl TransformerMoeModel {
         let kvh = usize_of(c.kv_heads)?;
         let group = heads / kvh;
         let (q_out, kv_out) = (heads * d, kvh * d);
-        let ne = c.experts as usize;
-        let k_top = c.top_k as usize;
+        let (ne, k_top, norm_topk_prob) = match &self.ffn {
+            Ffn::Moe {
+                experts,
+                top_k,
+                norm_topk_prob,
+                ..
+            } => (*experts as usize, *top_k as usize, *norm_topk_prob),
+            Ffn::Dense { .. } => (0, 0, false),
+        };
         let vocab = usize_of(c.vocab)?;
         let mut emit =
             |point, layer: Option<u32>, token: usize, values: &[f32], experts: &[u32]| {
@@ -670,7 +835,7 @@ impl TransformerMoeModel {
         let mut rope_cs = vec![0f32; 2 * self.rope.half()];
         // The lookahead router runs during decode only: a prompt batch routes to most
         // experts of every layer, so there is nothing to predict.
-        let lookahead = s == 1 && experts.wants_lookahead();
+        let lookahead = s == 1 && self.is_moe() && experts.wants_lookahead();
         let mut ahead = if lookahead {
             vec![0f32; ne]
         } else {
@@ -768,101 +933,135 @@ impl TransformerMoeModel {
 
             // Lookahead: the next layer's MoE norm and router on this state. Its logits
             // only go to the provider as a hint; routing below uses this layer's own.
-            if let Some(next) = self.norms.get(l + 1).filter(|_| lookahead) {
+            if let (Some(next), Ffn::Moe { router, .. }) =
+                (self.norms.get(l + 1).filter(|_| lookahead), &self.ffn)
+            {
                 ahead_x.copy_from_slice(&hs);
                 rms_norm(&mut ahead_x, &next.ffn, c.rms_eps);
-                let ln = layer_name(&c.names.router, li + 1);
+                let ln = layer_name(router, li + 1);
                 be.matmul(&dense.view(&ln)?, &ahead_x, 1, &mut ahead)?;
                 experts.lookahead(LayerIdx(li + 1), &ahead);
             }
 
-            // MoE.
+            // FFN.
             x.copy_from_slice(&hs);
             for xt in x.chunks_exact_mut(h) {
                 rms_norm(xt, &norms.ffn, c.rms_eps);
             }
-            be.matmul(&dense.view(&n(&c.names.router))?, &x, s, &mut router)?;
-            // Per token: top-K experts by probability (ties: lower id), in rank order.
-            let mut picks: Vec<(Vec<u32>, Vec<f32>)> = Vec::with_capacity(s);
-            for t in 0..s {
-                let logits_t = &router[t * ne..(t + 1) * ne];
-                emit(TracePoint::RouterLogits, Some(li), t, logits_t, &[]);
-                let (idx, w) = route(logits_t, k_top, c.norm_topk_prob);
-                emit(TracePoint::RoutingWeights, Some(li), t, &w, &idx);
-                picks.push((idx, w));
-            }
-            // Expert-major: each expert once, over every token routed to it, then each
-            // token's outputs combined in rank order.
-            let mut contrib = vec![0f32; s * k_top * h];
-            let mut by_expert: Vec<Vec<(usize, usize)>> = vec![Vec::new(); ne];
-            for (t, (idx, _)) in picks.iter().enumerate() {
-                for (r, &e) in idx.iter().enumerate() {
-                    by_expert[e as usize].push((t, r));
-                }
-            }
-            // Every routed expert of the layer is requested at once, so the provider can
-            // start all its loads first, and may compute several at once. Each writes
-            // only its own rank slots of `contrib`, so neither the order they come back
-            // in nor concurrency can change the result.
-            let used: Vec<ExpertIdx> = by_expert
-                .iter()
-                .enumerate()
-                .filter(|(_, u)| !u.is_empty())
-                .map(|(e, _)| ExpertIdx(u32::try_from(e).unwrap_or(u32::MAX)))
-                .collect();
-            let slots = std::sync::Mutex::new(&mut contrib);
-            experts.with_experts(
-                LayerIdx(li),
-                &used,
-                &|ei: ExpertIdx, w: &ExpertWeights<'_>| {
-                    let users = &by_expert[ei.0 as usize];
-                    let n_t = users.len();
-                    let mut xe = vec![0f32; n_t * h];
-                    for (j, &(t, _)) in users.iter().enumerate() {
-                        xe[j * h..(j + 1) * h].copy_from_slice(&x[t * h..(t + 1) * h]);
-                    }
-                    let ffn = w.gate.rows();
-                    let mut g = vec![0f32; n_t * ffn];
-                    let mut u = vec![0f32; n_t * ffn];
+            match &self.ffn {
+                Ffn::Dense { gate, up, down } => {
+                    let (wg, wu) = (dense.view(&n(gate))?, dense.view(&n(up))?);
+                    let ffn = wg.rows();
+                    let mut g = vec![0f32; s * ffn];
+                    let mut u = vec![0f32; s * ffn];
                     be.matmul_many(&mut [
                         MatMul {
-                            w: w.gate,
-                            xs: &xe,
-                            s: n_t,
+                            w: wg,
+                            xs: &x,
+                            s,
                             ys: &mut g,
                         },
                         MatMul {
-                            w: w.up,
-                            xs: &xe,
-                            s: n_t,
+                            w: wu,
+                            xs: &x,
+                            s,
                             ys: &mut u,
                         },
                     ])?;
                     swiglu(&mut g, &u);
-                    let mut y = vec![0f32; n_t * h];
-                    be.matmul(&w.down, &g, n_t, &mut y)?;
-                    // A poisoned lock means another expert panicked mid-copy; its slots
-                    // are not ours, so ours are still written correctly.
-                    let mut contrib = slots
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner);
-                    for (j, &(t, r)) in users.iter().enumerate() {
-                        let dst = (t * k_top + r) * h;
-                        contrib[dst..dst + h].copy_from_slice(&y[j * h..(j + 1) * h]);
-                    }
-                    Ok(())
-                },
-            )?;
-            for (t, (_, w)) in picks.iter().enumerate() {
-                let out = &mut o[t * h..(t + 1) * h];
-                out.fill(0.0);
-                for (r, wr) in w.iter().enumerate() {
-                    let src = &contrib[(t * k_top + r) * h..(t * k_top + r + 1) * h];
-                    for (a, b) in out.iter_mut().zip(src) {
-                        *a = wr.mul_add(*b, *a);
+                    be.matmul(&dense.view(&n(down))?, &g, s, &mut o)?;
+                    for t in 0..s {
+                        emit(TracePoint::Ffn, Some(li), t, &o[t * h..(t + 1) * h], &[]);
                     }
                 }
-                emit(TracePoint::Moe, Some(li), t, out, &[]);
+                Ffn::Moe {
+                    router: router_name,
+                    ..
+                } => {
+                    be.matmul(&dense.view(&n(router_name))?, &x, s, &mut router)?;
+                    // Per token: top-K experts by probability (ties: lower id), in rank order.
+                    let mut picks: Vec<(Vec<u32>, Vec<f32>)> = Vec::with_capacity(s);
+                    for t in 0..s {
+                        let logits_t = &router[t * ne..(t + 1) * ne];
+                        emit(TracePoint::RouterLogits, Some(li), t, logits_t, &[]);
+                        let (idx, w) = route(logits_t, k_top, norm_topk_prob);
+                        emit(TracePoint::RoutingWeights, Some(li), t, &w, &idx);
+                        picks.push((idx, w));
+                    }
+                    // Expert-major: each expert once, over every token routed to it, then each
+                    // token's outputs combined in rank order.
+                    let mut contrib = vec![0f32; s * k_top * h];
+                    let mut by_expert: Vec<Vec<(usize, usize)>> = vec![Vec::new(); ne];
+                    for (t, (idx, _)) in picks.iter().enumerate() {
+                        for (r, &e) in idx.iter().enumerate() {
+                            by_expert[e as usize].push((t, r));
+                        }
+                    }
+                    // Every routed expert of the layer is requested at once, so the provider can
+                    // start all its loads first, and may compute several at once. Each writes
+                    // only its own rank slots of `contrib`, so neither the order they come back
+                    // in nor concurrency can change the result.
+                    let used: Vec<ExpertIdx> = by_expert
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, u)| !u.is_empty())
+                        .map(|(e, _)| ExpertIdx(u32::try_from(e).unwrap_or(u32::MAX)))
+                        .collect();
+                    let slots = std::sync::Mutex::new(&mut contrib);
+                    experts.with_experts(
+                        LayerIdx(li),
+                        &used,
+                        &|ei: ExpertIdx, w: &ExpertWeights<'_>| {
+                            let users = &by_expert[ei.0 as usize];
+                            let n_t = users.len();
+                            let mut xe = vec![0f32; n_t * h];
+                            for (j, &(t, _)) in users.iter().enumerate() {
+                                xe[j * h..(j + 1) * h].copy_from_slice(&x[t * h..(t + 1) * h]);
+                            }
+                            let ffn = w.gate.rows();
+                            let mut g = vec![0f32; n_t * ffn];
+                            let mut u = vec![0f32; n_t * ffn];
+                            be.matmul_many(&mut [
+                                MatMul {
+                                    w: w.gate,
+                                    xs: &xe,
+                                    s: n_t,
+                                    ys: &mut g,
+                                },
+                                MatMul {
+                                    w: w.up,
+                                    xs: &xe,
+                                    s: n_t,
+                                    ys: &mut u,
+                                },
+                            ])?;
+                            swiglu(&mut g, &u);
+                            let mut y = vec![0f32; n_t * h];
+                            be.matmul(&w.down, &g, n_t, &mut y)?;
+                            // A poisoned lock means another expert panicked mid-copy; its slots
+                            // are not ours, so ours are still written correctly.
+                            let mut contrib = slots
+                                .lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner);
+                            for (j, &(t, r)) in users.iter().enumerate() {
+                                let dst = (t * k_top + r) * h;
+                                contrib[dst..dst + h].copy_from_slice(&y[j * h..(j + 1) * h]);
+                            }
+                            Ok(())
+                        },
+                    )?;
+                    for (t, (_, w)) in picks.iter().enumerate() {
+                        let out = &mut o[t * h..(t + 1) * h];
+                        out.fill(0.0);
+                        for (r, wr) in w.iter().enumerate() {
+                            let src = &contrib[(t * k_top + r) * h..(t * k_top + r + 1) * h];
+                            for (a, b) in out.iter_mut().zip(src) {
+                                *a = wr.mul_add(*b, *a);
+                            }
+                        }
+                        emit(TracePoint::Moe, Some(li), t, out, &[]);
+                    }
+                }
             }
             for (a, b) in hs.iter_mut().zip(&o) {
                 *a += b;

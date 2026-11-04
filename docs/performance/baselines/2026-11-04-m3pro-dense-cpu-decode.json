@@ -1,0 +1,383 @@
+{
+  "schema": 1,
+  "label": "dense-cpu-decode",
+  "started": "2026-11-04T19:46:52Z",
+  "build": {
+    "version": "0.1.0",
+    "git": "92dec96bce37-dirty",
+    "rustc": "rustc 1.99.1 (58cf8f9c3 2026-10-13)",
+    "profile": "release",
+    "opt_level": "3",
+    "debug_assertions": false,
+    "target": "aarch64-apple-darwin",
+    "target_features": "aes,crc,dit,dotprod,dpb,dpb2,fcma,fhm,flagm,fp16,frintts,jsconv,lor,lse,neon,paca,pacg,pan,pmuv3,ras,rcpc,rcpc2,rdm,sb,sha2,sha3,ssbs,vh",
+    "rustflags": ""
+  },
+  "hardware": {
+    "cpu": {
+      "arch": "aarch64",
+      "vendor": {
+        "known": "Apple"
+      },
+      "model": {
+        "known": "Apple M3 Pro"
+      },
+      "logical_cores": {
+        "known": 11
+      },
+      "physical_cores": {
+        "known": 11
+      },
+      "tiers": {
+        "known": [
+          {
+            "name": "Performance",
+            "physical": 5,
+            "logical": 5
+          },
+          {
+            "name": "Efficiency",
+            "physical": 6,
+            "logical": 6
+          }
+        ]
+      },
+      "simd": [
+        "neon",
+        "fp16",
+        "dotprod",
+        "i8mm",
+        "bf16"
+      ],
+      "numa_nodes": {
+        "known": 1
+      }
+    },
+    "memory": {
+      "total": {
+        "known": 19327352832
+      },
+      "cgroup_limit": {
+        "known": "none"
+      }
+    },
+    "os": {
+      "family": "macos",
+      "name": {
+        "known": "macOS 27.2 (26B123)"
+      },
+      "kernel": {
+        "known": "27.2.0"
+      }
+    }
+  },
+  "model": {
+    "id": "qwen3-0.6b",
+    "name": "Qwen3-0.6B",
+    "architecture": "transformer_dense",
+    "dir": "~/.qubivex/models/qwen3-0.6b"
+  },
+  "config": {
+    "threads": 5,
+    "expert_cache": 0,
+    "expert_slots": [],
+    "cache_policy": "Lfru { decay_window: 256 }",
+    "io_threads": 4,
+    "expert_io": "buffered",
+    "verification": "missing",
+    "context": 22270,
+    "prompt": "Write a long story about a lighthouse keeper.",
+    "prompt_tokens": 10,
+    "generated_tokens": 160,
+    "warmup_runs": 1,
+    "measured_runs": 5
+  },
+  "prefill": {
+    "ms": {
+      "n": 5,
+      "min": 63.379625,
+      "median": 63.781791000000005,
+      "p95": 64.26683299999999,
+      "max": 64.26683299999999,
+      "mean": 63.827082999999995
+    },
+    "tok_s_at_median": 156.78455940505026
+  },
+  "decode": {
+    "step_ms": {
+      "n": 795,
+      "min": 13.302417,
+      "median": 14.58375,
+      "p95": 16.192459,
+      "max": 22.914875000000002,
+      "mean": 14.689897012578617
+    },
+    "tok_s_at_median": 68.56946944373018,
+    "run_tok_s": [
+      68.37348703895043,
+      68.2905550186954,
+      68.37387176757973,
+      67.76536782830476,
+      67.57510417884873
+    ]
+  },
+  "memory": {
+    "rss_after_load": {
+      "known": 1343160320
+    },
+    "peak_rss": {
+      "known": 1405288448
+    },
+    "peak_source": "sampled",
+    "plan_budget": 6837335490,
+    "ledger": {
+      "dense": 1192099840,
+      "expert_cache": 0,
+      "kv": 58720256,
+      "total": 1250820096
+    }
+  },
+  "experts": {
+    "hits": 0,
+    "loads": 0,
+    "bytes_read": 0,
+    "evictions": 0,
+    "hit_rate": 0.0,
+    "bytes_per_token": 0,
+    "slab_allocs": 0,
+    "wait_ms_per_token": 0.0,
+    "read_retries": 0,
+    "read_timeouts": 0
+  },
+  "check": {
+    "deterministic": true,
+    "first_divergence": null,
+    "reference": null,
+    "reference_match": null,
+    "reference_divergence": null
+  },
+  "runs": [
+    {
+      "prefill_ms": 63.781791000000005,
+      "decode_step_ms": {
+        "n": 159,
+        "min": 13.3485,
+        "median": 14.574583,
+        "p95": 15.928208999999999,
+        "max": 16.791667,
+        "mean": 14.62555214465408
+      },
+      "decode_tok_s": 68.37348703895043
+    },
+    {
+      "prefill_ms": 63.99175,
+      "decode_step_ms": {
+        "n": 159,
+        "min": 13.348791,
+        "median": 14.564833,
+        "p95": 16.115750000000002,
+        "max": 17.328583000000002,
+        "mean": 14.643313408805044
+      },
+      "decode_tok_s": 68.2905550186954
+    },
+    {
+      "prefill_ms": 63.379625,
+      "decode_step_ms": {
+        "n": 159,
+        "min": 13.312958,
+        "median": 14.638417,
+        "p95": 16.115042,
+        "max": 16.693625,
+        "mean": 14.625469849056604
+      },
+      "decode_tok_s": 68.37387176757973
+    },
+    {
+      "prefill_ms": 64.26683299999999,
+      "decode_step_ms": {
+        "n": 159,
+        "min": 13.302417,
+        "median": 14.504542,
+        "p95": 16.5455,
+        "max": 22.914875000000002,
+        "mean": 14.756800295597483
+      },
+      "decode_tok_s": 67.76536782830476
+    },
+    {
+      "prefill_ms": 63.715416,
+      "decode_step_ms": {
+        "n": 159,
+        "min": 13.437,
+        "median": 14.67625,
+        "p95": 16.365625,
+        "max": 21.355334,
+        "mean": 14.798349364779867
+      },
+      "decode_tok_s": 67.57510417884873
+    }
+  ],
+  "tokens": [
+    576,
+    3364,
+    1265,
+    387,
+    304,
+    279,
+    1707,
+    315,
+    264,
+    11416,
+    11514,
+    11,
+    448,
+    264,
+    3746,
+    11,
+    1632,
+    47961,
+    291,
+    3668,
+    11,
+    323,
+    264,
+    3746,
+    11,
+    1632,
+    47961,
+    291,
+    7089,
+    13,
+    576,
+    3364,
+    1265,
+    387,
+    5326,
+    304,
+    264,
+    1156,
+    28045,
+    19221,
+    11,
+    323,
+    279,
+    3364,
+    1265,
+    387,
+    5326,
+    304,
+    264,
+    1616,
+    429,
+    374,
+    4135,
+    311,
+    1349,
+    323,
+    702,
+    264,
+    3746,
+    11,
+    1632,
+    47961,
+    291,
+    3668,
+    13,
+    576,
+    3364,
+    1265,
+    387,
+    5326,
+    304,
+    264,
+    1616,
+    429,
+    374,
+    4135,
+    311,
+    1349,
+    323,
+    702,
+    264,
+    3746,
+    11,
+    1632,
+    47961,
+    291,
+    3668,
+    13,
+    576,
+    3364,
+    1265,
+    387,
+    5326,
+    304,
+    264,
+    1616,
+    429,
+    374,
+    4135,
+    311,
+    1349,
+    323,
+    702,
+    264,
+    3746,
+    11,
+    1632,
+    47961,
+    291,
+    3668,
+    13,
+    576,
+    3364,
+    1265,
+    387,
+    5326,
+    304,
+    264,
+    1616,
+    429,
+    374,
+    4135,
+    311,
+    1349,
+    323,
+    702,
+    264,
+    3746,
+    11,
+    1632,
+    47961,
+    291,
+    3668,
+    13,
+    576,
+    3364,
+    1265,
+    387,
+    5326,
+    304,
+    264,
+    1616,
+    429,
+    374,
+    4135,
+    311,
+    1349,
+    323,
+    702,
+    264,
+    3746,
+    11,
+    1632,
+    47961,
+    291,
+    3668,
+    13,
+    576,
+    3364,
+    1265
+  ]
+}

@@ -42,6 +42,6 @@ pub use manifest::Manifest;
 pub use metadata::{ByteSummary, MANIFEST_FILE, ModelMetadata};
 pub use registry::{
     ArchConfig, ArchDescriptor, ArchitectureFactory, ArchitectureRegistry, AttentionPart,
-    ConfigSource, ExpertPart, ModelDims, TensorRole, TensorSchema, TensorSpec,
+    ConfigSource, ExpertPart, FfnPart, ModelDims, TensorRole, TensorSchema, TensorSpec,
 };
 pub use safetensors::SafetensorsHeader;
