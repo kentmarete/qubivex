@@ -242,7 +242,8 @@ paged KV, NUMA, multi-device; then a CLI UX catalogue and recommendations UI.
   on the M3 Pro, and the kernel is limited by compute, not memory; done 2026-11-04 with
   the same bits, 25–28 GiB/s and decode 30 → 42 tok/s: ADR-002 amendment 2).
 - **KV cache on `Tensor<f32>`** with `narrow` views: the next consumer of ADR-009, with
-  its own benchmark.
+  its own benchmark (done 2026-11-04: one tensor per layer, `[kv_head, pos, head_dim]`;
+  tokens identical, speed within noise; TENSOR_ARCHITECTURE §7).
 - **Extensibility:** a dense (non-MoE) architecture and a real SafeTensors run, alongside
   the existing MoE path.
 - **Precision (ADR-010):** lossless by default; lossy behaviour only as named opt-ins,

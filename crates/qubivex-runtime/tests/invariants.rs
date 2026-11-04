@@ -205,6 +205,66 @@ fn sampling_is_reproducible() {
     assert_eq!(one.len(), 1);
 }
 
+/// The KV cache grows by whole chunks, copying its filled positions into a larger
+/// tensor per layer. Growing across chunk boundaries (in one prompt or token by token),
+/// a step refused before any layer runs, and reusing a cleared cache never change bits.
+/// A step that fails partway through the layers is `faults.rs`'s
+/// `a_failed_step_can_be_retried_on_the_same_cache`.
+#[test]
+fn kv_growth_failure_and_reuse_never_change_bits() {
+    let meta =
+        ModelMetadata::load(&dir("olmoe-tiny"), &ArchitectureRegistry::with_builtins()).unwrap();
+    let e = Engine::load(
+        meta,
+        EngineOptions {
+            max_context: Some(600),
+            ..EngineOptions::default()
+        },
+    )
+    .unwrap();
+    let toks: Vec<u32> = (0..560u32).map(|i| 32 + (i * 7) % 90).collect();
+    let chunk = qubivex_runtime::KvCache::CHUNK;
+    // A 300-token prompt (one step crossing the first boundary), then single tokens
+    // across the second.
+    let mut a = e.new_cache();
+    let mut got = vec![e.forward(&toks[..300], &mut a, Logits::Last, None).unwrap()];
+    for t in &toks[300..] {
+        got.push(e.forward(&[*t], &mut a, Logits::Last, None).unwrap());
+    }
+    assert_eq!(a.len(), 560);
+    assert_eq!(a.allocated_bytes() % (3 * chunk as u64), 0);
+    // Token by token from the start, with a failed step at each boundary.
+    let mut b = e.new_cache();
+    let mut want = Vec::new();
+    for (i, t) in toks.iter().enumerate() {
+        if i % chunk == chunk - 1 {
+            let before = b.len();
+            assert!(e.forward(&[*t, 9999], &mut b, Logits::Last, None).is_err());
+            assert_eq!(b.len(), before, "a failed step adds no positions");
+        }
+        let out = e.forward(&[*t], &mut b, Logits::Last, None).unwrap();
+        if i >= 299 {
+            want.push(out);
+        }
+    }
+    assert_eq!(got.len(), want.len());
+    for (i, (g, w)) in got.iter().zip(&want).enumerate() {
+        assert_eq!(bits(g), bits(w), "position {}", 299 + i);
+    }
+    // A cleared cache keeps its room and gives a fresh cache's bits.
+    let room = a.allocated_bytes();
+    a.clear();
+    assert_eq!(a.allocated_bytes(), room);
+    let mut fresh = e.new_cache();
+    let x = e
+        .forward(&toks[100..140], &mut a, Logits::All, None)
+        .unwrap();
+    let y = e
+        .forward(&toks[100..140], &mut fresh, Logits::All, None)
+        .unwrap();
+    assert_eq!(bits(&x), bits(&y));
+}
+
 #[test]
 fn errors_are_reported() {
     let e = engine("olmoe-tiny", None);

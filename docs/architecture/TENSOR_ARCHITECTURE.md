@@ -249,7 +249,7 @@ touching the descriptor. CPU↔device transfers are explicit backend calls (`upl
 | `qubivex_runtime` private `Tensor { dtype, rows, cols, bytes }` | `Tensor<u8>` | None; dense weights load exactly as before |
 | `WeightView::new(dtype, rows, cols, data)` | Unchanged, plus `TryFrom<TensorView<'_, u8>>` | None |
 | Expert slice of a stacked tensor (`rows_slice`) | `select(0, expert)` on the stacked descriptor (later, when the store hands out views) | None |
-| `KvCache` (`Vec<Vec<Vec<f32>>>`) | Not changed in this step. A later candidate: one `Tensor<f32>` `[layer, kv_head, pos, head_dim]` with `narrow` views per step | Planned separately, with its own benchmark |
+| `KvCache` (`Vec<Vec<Vec<f32>>>`) | Done 2026-11-04: one `Tensor<f32>` per layer for keys and one for values, `[kv_head, pos, head_dim]`. A step writes each head's new rows through one `narrow` view (`TensorViewMut::select`/`narrow`/`contiguous_data_mut`), and attention reads each head's filled positions as one contiguous `narrow` view. Per layer rather than one `[layer, …]` tensor, so growing by a chunk copies one layer at a time instead of briefly holding two whole caches | None: tokens identical; prefill and decode within noise at 10 and 1024-token prompts |
 
 ## 8. Acceptance tests
 
