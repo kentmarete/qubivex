@@ -217,7 +217,7 @@ Axum gateway: `/health`, `/v1/models`, `/v1/chat/completions` and `/v1/completio
 control from the planner's KV accounting, cancellation, timeouts, request ids, and
 structured errors with no paths leaked.
 **Exit:** an OpenAI SDK client works, concurrent conversations get independent KV,
-and a cancellation test passes.
+and a cancellation test passes. (Done 2026-11-04: ADR-013.)
 
 ### Phases 10–11
 As in the specification: batched expert execution across requests, KV prefix reuse,

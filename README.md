@@ -90,13 +90,13 @@ What QUBIVEX adds over a straight port:
 | Hardware | CPU model, core tiers (performance/efficiency) and compute-team size, SIMD set, NUMA nodes, RAM, **cgroup memory limits** in containers, GPUs per backend (CUDA, Vulkan, Metal), filesystems with SSD/HDD/network and free space, OS |
 | Storage | Sequential read throughput with and without the page cache (`O_DIRECT` / `F_NOCACHE`), random 4 MiB read latency (about one expert) |
 | Model files | SafeTensors (single or sharded) and GGUF v2/v3 readers, hardened against malformed and malicious headers |
-| Models | Manifest v1, architecture registry, the `transformer_moe` architecture, full cross-validation of manifest, config and tensors, discovery, automatic manifest import |
+| Models | Manifest v1, architecture registry, the `transformer_moe` and `transformer_dense` architectures, full cross-validation of manifest, config and tensors, discovery, automatic manifest import |
 | Inference | CPU forward pass for `transformer_moe` (OLMoE, Qwen3-MoE) and `transformer_dense` (dense Qwen3, Llama-style): lossless kernels for f32, f16, bf16, Q8_0, Q4_K and Q6_K; an expert cache of any size with leases and LRU eviction; KV cache; greedy, temperature and top-p sampling; chat templates |
 | Tokenizers | Hugging Face `tokenizer.json`, or rebuilt from a GGUF file's vocabulary (verified identical to the official tokenizer) |
-| CLI | `qubivex run`, `qubivex system`, `qubivex doctor --storage`, `qubivex models list / inspect / import / architectures` |
+| Serving | `qubivex serve`: OpenAI-compatible `/v1/chat/completions` and `/v1/completions` (streaming or not), `/v1/models`, `/health`, `/metrics`, `/v1/system`, admin load and unload; independent KV per conversation, admission against the memory plan, cancellation when a client disconnects |
+| CLI | `qubivex run`, `qubivex serve`, `qubivex bench`, `qubivex system`, `qubivex doctor --storage`, `qubivex models list / inspect / import / verify / architectures` |
 
-Not yet: optimised SIMD kernels, the memory planner, prefetching, GPU backends and the
-HTTP server. See the [Roadmap](#roadmap).
+See the [Roadmap](#roadmap) for what is next.
 
 ## Installation
 
@@ -122,7 +122,7 @@ cargo install --path apps/cli
 
 ## Quick start
 
-The repository ships three tiny models in [`fixtures/models/`](fixtures/models), so
+The repository ships four tiny models in [`fixtures/models/`](fixtures/models), so
 you can try everything without downloading anything.
 
 ```sh
@@ -245,6 +245,46 @@ generation speed and expert-cache counters to standard error.
 | `--dir DIR` | Model directories to search for the id (as for `models list`) |
  Commands exit with 0 on success, 1 on a runtime error,
 and 2 on a usage error.
+
+### `qubivex serve [--model <ID|DIR>]... [options]`
+
+Serves models over an OpenAI-compatible HTTP API (ADR-013). Any OpenAI client works:
+
+```sh
+qubivex serve --model olmoe-1b-7b-0125-instruct --model qwen3-0.6b --api-key sk-local
+```
+
+```python
+from openai import OpenAI
+client = OpenAI(base_url="http://127.0.0.1:8080/v1", api_key="sk-local")
+r = client.chat.completions.create(model="qwen3-0.6b",
+        messages=[{"role": "user", "content": "Hello"}], stream=True)
+```
+
+| Endpoint | |
+|---|---|
+| `POST /v1/chat/completions`, `POST /v1/completions` | Streaming (SSE, `stream_options.include_usage`) or not; `max_tokens`, `temperature`, `top_p`, `seed`, `stop`. Refused, not ignored: `n > 1`, tools, logprobs, penalties |
+| `GET /v1/models`, `GET /v1/models/{id}` | The loaded models |
+| `GET /health`, `GET /metrics` | Liveness; Prometheus counters (requests, tokens, cancellations, reserved KV) |
+| `GET /v1/system` | Hardware and each model's memory (plan, ledger, reserved KV, free slots) |
+| `POST /v1/admin/models` `{"model": ID}`, `DELETE /v1/admin/models/{id}` | Load and unload, with `--admin-token` only |
+
+| Option | Default | |
+|---|---|---|
+| `--listen ADDR` | `127.0.0.1:8080` | |
+| `--api-key KEY` | `$QUBIVEX_API_KEY` | Required as a bearer token on `/v1` when set |
+| `--admin-token T` | `$QUBIVEX_ADMIN_TOKEN` | Enables the admin endpoints |
+| `--max-concurrent N` | 4 | Generations per model at once; more wait up to `--queue-timeout` (30 s), then 429 |
+| `--default-max-tokens N` | 512 | When a request does not set `max_tokens` |
+| `--request-timeout S` | 600 | A generation then ends with `finish_reason: "length"` |
+| memory, device, `--context`, `--threads` | as `qubivex run` | Per model |
+
+Each conversation has its own KV cache and is admitted only if the memory plan can hold
+every live conversation's KV with one expert slot per layer (503 otherwise). Forward
+passes of concurrent conversations take turns, first come first served, and long
+prompts run in chunks, so one request cannot hold the others up for long. A client
+that disconnects cancels its generation within one chunk or one token. Errors follow
+OpenAI's shape, carry the `x-request-id`, and never contain file paths.
 
 ### `qubivex system [--json]`
 
@@ -433,11 +473,11 @@ These invariants are enforced by tests and CI
 | 2 | Hardware detection, `qubivex system`, `qubivex doctor --storage` | Done |
 | 3 | Model containers, manifest, architecture registry, validation, `qubivex models` | Done (checked on the real OLMoE-1B-7B Q4_K_M GGUF) |
 | 4 | CPU inference prototype: kernels, tokenizer, a minimal expert store, generation | Done: matches `transformers` to under 1e-6 relative; identical output at every expert-cache size |
-| 5 | Memory planner: fits the model to RAM, VRAM and cgroup limits | Next (with optimised kernels) |
-| 6 | Full expert streaming: tiered cache, I/O pool, packed expert files | Planned |
-| 7 | Predictive expert prefetching | Planned |
-| 8 | GPU backends: CUDA, Vulkan, Metal | Planned |
-| 9 | OpenAI-compatible HTTP server and serving | Planned |
+| 5 | Memory planner: fits the model to RAM, VRAM and cgroup limits | Done |
+| 6 | Full expert streaming: tiered cache, I/O pool, packed expert files | Done |
+| 7 | Predictive expert prefetching | Slice 1 done (router lookahead); the disk-saturation throttle is parked |
+| 8 | GPU backends: CUDA, Vulkan, Metal | Metal slices 1–4 done (whole layers, bit-identical); slice 5 and CUDA next |
+| 9 | OpenAI-compatible HTTP server and serving | Done: `qubivex serve` (ADR-013); the OpenAI SDK works against real models |
 | 10–11 | Hardening, packaging, documentation | Planned |
 
 The phase plan, exit criteria and risks are in
@@ -452,7 +492,15 @@ apps/cli/                 the `qubivex` binary (logic in lib.rs; main.rs is thin
 crates/qubivex-core/      ids, Bytes, DType and GGML block sizes, Shape, config types
 crates/qubivex-hardware/  hardware profile, resource snapshots, storage measurement
 crates/qubivex-model/     SafeTensors/GGUF readers, tensor index, manifest,
-                          architecture registry, transformer_moe, discovery, import
+                          architecture registry, transformer_moe/dense, discovery, import
+crates/qubivex-tokenizer/ tokenizers and chat templates
+crates/qubivex-compute/   tensors, views, the backend trait
+crates/qubivex-backend-*/ CPU (lossless SIMD kernels) and Metal backends
+crates/qubivex-arch/      the forward pass (shared decoder, MoE or dense FFN), KV cache
+crates/qubivex-expert-stream/  expert store: pools, leases, I/O threads, prefetch
+crates/qubivex-memory/    footprint, memory planner, ledger, pressure monitor
+crates/qubivex-runtime/   the engine: loading, generation, admission
+crates/qubivex-api/       the OpenAI-compatible HTTP gateway (`qubivex serve`)
 xtask/                    repository checks and fixture generator (`cargo xtask ...`)
 fixtures/models/          tiny generated models used by tests and the quick start
 spikes/                   standalone experiments (ADR-002 tensor-engine benchmark)
