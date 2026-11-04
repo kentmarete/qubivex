@@ -2,6 +2,7 @@
 
 use std::collections::HashMap;
 use std::fs::File;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
@@ -15,10 +16,12 @@ use qubivex_compute::WeightView;
 use qubivex_compute::host::PageAligned;
 use qubivex_compute::tensor::TensorView;
 use qubivex_core::{Bytes, ExpertIdx, LayerIdx, Shape, TensorDesc};
+use qubivex_expert_stream::fault::VerifiedSource;
+use qubivex_expert_stream::mirror::{MirrorPolicy, MirroredSource};
 use qubivex_expert_stream::predict::{Lookahead, LookaheadConfig};
 use qubivex_expert_stream::{
-    ExpertKey, ExpertSource, ExpertStore, Occupancy, Policy, PoolSpec, PrefetchStats, StoreError,
-    StoreStats,
+    ExpertKey, ExpertSource, ExpertStore, Occupancy, Policy, PoolSpec, PrefetchStats, ReadTimeout,
+    StoreError, StoreStats,
 };
 use qubivex_hardware::{Host, Probed, ResourceProbe, SystemProbe};
 use qubivex_memory::{
@@ -28,6 +31,7 @@ use qubivex_memory::{
 use qubivex_model::{ExpertPart, ModelMetadata, TensorRole};
 use qubivex_tokenizer::Tokenizer;
 
+use crate::checksums::{ExpertSums, SUMS_FILE, SumsState};
 use crate::metal_forward::MetalForward;
 use crate::placement::{BackendKind, MetalOps, Placed, PlacementReport};
 use crate::{ExpertIo, IoPath, ModelExpertSource, RuntimeError, load_tokenizer};
@@ -58,6 +62,16 @@ pub struct EngineOptions {
     /// Dedicated threads reading experts (ADR-006). `None`: the default (see
     /// [`DEFAULT_IO_THREADS`]); `Some(0)`: the compute thread reads its own misses.
     pub io_threads: Option<usize>,
+    /// How long a forward pass waits for one expert's read before failing the request
+    /// (ADR-006 amendment 4). `None`: [`ReadTimeout::DEFAULT`]; [`ReadTimeout::NEVER`]
+    /// waits forever. Needs I/O threads: a compute thread reading its own miss cannot
+    /// time out.
+    pub read_timeout: Option<ReadTimeout>,
+    /// Extra attempts after a failed expert read. `None`: [`DEFAULT_READ_RETRIES`].
+    pub read_retries: Option<u32>,
+    /// Whether expert reads are checked against the model's recorded checksums
+    /// ([`crate::checksums`]).
+    pub verify: VerifyExperts,
     /// How experts are read: buffered (default) or bypassing the page cache
     /// (ADR-006 amendment 2).
     pub expert_io: ExpertIo,
@@ -137,6 +151,34 @@ struct Predictor {
 
 /// I/O threads when none are requested.
 pub const DEFAULT_IO_THREADS: usize = 4;
+
+/// Whether expert reads are checked against recorded checksums.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum VerifyExperts {
+    /// When the model has a checksum file that matches its weights (the default).
+    #[default]
+    Auto,
+    /// Never.
+    Off,
+    /// Always: loading fails without a matching checksum file.
+    Require,
+}
+
+/// Whether this engine verifies expert reads, and why ([`Engine::verification`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Verification {
+    /// Every read is checked against this many recorded checksums.
+    Verified(usize),
+    /// Turned off ([`VerifyExperts::Off`]).
+    Off,
+    /// The model has no checksum file.
+    Missing,
+    /// The checksum file does not match the weight files (why).
+    Stale(String),
+}
+
+/// Extra attempts after a failed expert read: one, for transient errors.
+pub const DEFAULT_READ_RETRIES: u32 = 1;
 
 /// The default thread count: the compute team, else every logical CPU.
 fn default_threads() -> usize {
@@ -421,6 +463,7 @@ impl Drop for Watcher {
 
 /// A model ready to generate.
 pub struct Engine {
+    verification: Verification,
     memory: Memory,
     /// `None` without a plan (a fixed cache was requested).
     pressure: Option<Arc<Pressure>>,
@@ -482,7 +525,70 @@ impl Engine {
     /// I/O, tokenizer and architecture errors; [`RuntimeError::Memory`] if the model
     /// does not fit the budget or available RAM cannot be measured.
     pub fn load(meta: ModelMetadata, opts: EngineOptions) -> Result<Self, RuntimeError> {
-        Self::load_with_source(meta, opts, |s| s)
+        Self::load_mirrored(meta, opts, &[])
+    }
+
+    /// As [`Engine::load`], reading experts from the model's files and, when a read
+    /// fails, from copies of them under each of `mirrors` in turn
+    /// ([`MirroredSource`], ADR-006 amendment 4). No mirrors: [`Engine::load`].
+    ///
+    /// # Errors
+    /// As [`Engine::load`], and [`ModelExpertSource::mirror_at`]'s errors.
+    pub fn load_mirrored(
+        meta: ModelMetadata,
+        opts: EngineOptions,
+        mirrors: &[PathBuf],
+    ) -> Result<Self, RuntimeError> {
+        let (sums, verification) = match opts.verify {
+            VerifyExperts::Off => (None, Verification::Off),
+            VerifyExperts::Auto | VerifyExperts::Require => match ExpertSums::load(&meta)? {
+                SumsState::Fresh(s) => {
+                    let n = s.len();
+                    (Some(s.sums().clone()), Verification::Verified(n))
+                }
+                SumsState::Missing => (None, Verification::Missing),
+                SumsState::Stale(why) => (None, Verification::Stale(why)),
+            },
+        };
+        if opts.verify == VerifyExperts::Require && sums.is_none() {
+            return Err(RuntimeError::Model(format!(
+                "expert checksums are required, but {}: run `qubivex models verify {}`",
+                match &verification {
+                    Verification::Stale(why) => why.clone(),
+                    _ => format!("{} has no {SUMS_FILE}", meta.dir.display()),
+                },
+                meta.manifest.model.id
+            )));
+        }
+        // Each copy is verified on its own, so a copy with corrupt bytes fails over to
+        // the next.
+        let verified = |s: Arc<dyn ExpertSource>| -> Arc<dyn ExpertSource> {
+            match &sums {
+                Some(sums) => Arc::new(VerifiedSource::new(s, sums.clone())),
+                None => s,
+            }
+        };
+        let copies = mirrors
+            .iter()
+            .map(|d| {
+                let s: Arc<dyn ExpertSource> =
+                    Arc::new(ModelExpertSource::mirror_at(&meta, opts.expert_io, d)?);
+                Ok((d.display().to_string(), verified(s)))
+            })
+            .collect::<Result<Vec<_>, RuntimeError>>()?;
+        let primary = meta.dir.display().to_string();
+        let mut engine = Self::load_with_source(meta, opts, move |s| {
+            let first = verified(s);
+            if copies.is_empty() {
+                return first;
+            }
+            Arc::new(MirroredSource::new(
+                std::iter::once((primary, first)).chain(copies),
+                MirrorPolicy::default(),
+            ))
+        })?;
+        engine.verification = verification;
+        Ok(engine)
     }
 
     /// As [`Engine::load`], with the expert store reading through `wrap(source)`
@@ -649,6 +755,10 @@ impl Engine {
             io_threads,
         )
         .map_err(|e| RuntimeError::Model(format!("cannot start {io_threads} I/O threads: {e}")))?;
+        store
+            .set_read_timeout(opts.read_timeout.unwrap_or(ReadTimeout::DEFAULT))
+            .map_err(|e| RuntimeError::Model(e.to_string()))?;
+        store.set_read_retries(opts.read_retries.unwrap_or(DEFAULT_READ_RETRIES));
         let ledger = MemoryLedger::new(0);
         let charges = Charges {
             _dense: ledger.charge(Tier::Ram, Owner::Dense, Bytes(dense_bytes)),
@@ -709,6 +819,7 @@ impl Engine {
             store,
             layers,
             cache_target: AtomicU64::new(capacity),
+            verification: Verification::Off,
             model,
             tokenizer,
             backend,
@@ -749,6 +860,14 @@ impl Engine {
     #[must_use]
     pub const fn tokenizer(&self) -> &Tokenizer {
         &self.tokenizer
+    }
+
+    /// Whether expert reads are verified against recorded checksums. An engine made
+    /// with [`Engine::load_with_source`] reports [`Verification::Off`]: its wrapper
+    /// decides.
+    #[must_use]
+    pub const fn verification(&self) -> &Verification {
+        &self.verification
     }
 
     /// Expert store counters.
@@ -843,12 +962,26 @@ impl Engine {
         }
     }
 
-    /// Refuses a new request under critical memory pressure (ADR-005). Active
-    /// requests are never stopped.
+    /// Refuses a new request under critical memory pressure (ADR-005), or when every
+    /// expert I/O thread is blocked in a read past its deadline. Active requests are
+    /// never stopped.
     ///
     /// # Errors
-    /// [`RuntimeError::Memory`] when the pressure monitor refuses admission.
+    /// [`RuntimeError::Memory`] when the pressure monitor refuses admission;
+    /// [`RuntimeError::Storage`] when every I/O thread is stuck.
     pub fn admit(&self) -> Result<(), RuntimeError> {
+        // Every I/O thread blocked in a read past its deadline: a new request would
+        // only queue behind them and time out.
+        let threads = self.store.io_threads();
+        if threads > 0 {
+            let stuck = self.store_occupancy()?.stuck;
+            if stuck >= threads {
+                return Err(RuntimeError::Storage(format!(
+                    "new request refused: all {threads} expert I/O threads are blocked in \
+                     reads past their deadline; the drive may have failed"
+                )));
+            }
+        }
         match self.pressure() {
             Some(d) if !d.admit => Err(RuntimeError::Memory(format!(
                 "new request refused: memory pressure is {:?}; the expert cache is at its floor",

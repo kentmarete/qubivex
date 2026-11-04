@@ -5,6 +5,12 @@ Last updated: 2026-11-04
 ## Current phase
 **Phase 8 (GPU acceleration, Metal first): slices 1–4 done (2026-11-03).** Metal slice 5 is paused while the improvement-plan backlog (MIGRATION_PLAN §3a and Addendum §4) is cleared first.
 
+**Read hardening done (2026-11-04): the three gaps fault injection left; ADR-006 amendment 4.**
+- Hung reads: a per-waiter deadline (`ReadTimeout`; engine default 5 s + size at 10 MB/s; `--read-timeout`), `StoreError::Timeout`, `Occupancy::stuck`, `Engine::admit` refuses when every I/O thread is stuck (`RuntimeError::Storage`), and the store's drop detaches stuck threads. Retries: once by default (`--read-retries`).
+- Mirrors: `mirror::MirroredSource` (failover, skip after 3 failures for 30 s), `ModelExpertSource::mirror_at`, `Engine::load_mirrored`, `--mirror DIR`.
+- Checksums on by default: `experts.qvxsum` recorded by `qubivex models verify` (which also scrubs) and `models import --write`; the engine verifies every read when the file matches the weights (`--verify-experts auto|off|require`); stale files are reported, not used. The checksum went from 4 to 8 lanes (21 → 39 GiB/s). The cost is about 2–3% of decode at 1 GiB streaming, and nothing measurable when resident.
+- Tests: 265 pass on 1.99.1 and 1.85. Still open: hedged reads and per-device queues (need a second drive).
+
 **Fault injection done (2026-11-04), Addendum §4 Phase 3 item; ADR-006 amendment 3.**
 - Code: `qubivex_expert_stream::fault` (`FaultySource` with `Rule`/`Target`/`Fault`: EIO, short read, corrupt bytes, panic, delay; `VerifiedSource` and `checksum`); `ExpertStore::occupancy`; `Engine::load_with_source` and `Engine::store_occupancy`; `ModelExpertSource::keys`; `PageAligned::try_zeroed`/`try_resized`.
 - Fixes found by the suite: a panicking source killed an I/O thread and left its waiters hanging (now a load error); slab allocation aborted on failure (now a load error); a failed forward pass left partial keys and values in the KV cache (now rolled back); the ledger was not updated after a failed pass.

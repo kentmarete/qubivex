@@ -38,6 +38,7 @@
 //! `loom` (`RUSTFLAGS="--cfg loom"`), without I/O threads.
 
 pub mod fault;
+pub mod mirror;
 pub mod policy;
 pub mod predict;
 pub mod replay;
@@ -106,6 +107,16 @@ pub enum StoreError {
         /// The layer's slots.
         slots: u32,
     },
+    /// A caller waited longer than the read deadline ([`ReadTimeout`]) for the expert.
+    /// The read may still finish (a blocked read cannot be interrupted); if it does,
+    /// its bytes are published for the next caller.
+    #[error("expert (layer {}, expert {}) not read after {} ms: the read is stuck or the disk is too slow", key.0.0, key.1.0, waited.as_millis())]
+    Timeout {
+        /// The expert.
+        key: ExpertKey,
+        /// How long the caller waited.
+        waited: std::time::Duration,
+    },
     /// The store has no pool for the expert's layer.
     #[error("no expert pool for layer {}", .0.0)]
     NoPool(LayerIdx),
@@ -166,6 +177,52 @@ pub enum Priority {
     Demand,
 }
 
+/// How long a caller waits for one expert's read before giving up
+/// ([`StoreError::Timeout`]): `floor` plus the expert's size at `min_rate` bytes per
+/// second, counted from when the caller starts waiting for it. It is there to catch
+/// reads that hang (a failing drive, a lost network mount), not slow ones, so it is
+/// generous.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ReadTimeout {
+    /// The fixed part.
+    pub floor: std::time::Duration,
+    /// The slowest read rate still accepted, in bytes per second (0: no allowance for
+    /// size).
+    pub min_rate: u64,
+}
+
+impl ReadTimeout {
+    /// The engine's default: 5 s plus the expert's size at 10 MB/s.
+    pub const DEFAULT: Self = Self {
+        floor: std::time::Duration::from_secs(5),
+        min_rate: 10_000_000,
+    };
+
+    /// Waits forever (the store's default).
+    pub const NEVER: Self = Self {
+        floor: std::time::Duration::MAX,
+        min_rate: 0,
+    };
+
+    /// Whether this never times out.
+    #[must_use]
+    pub fn is_never(self) -> bool {
+        self.floor == std::time::Duration::MAX
+    }
+
+    /// The deadline for reading `bytes`.
+    #[must_use]
+    pub fn deadline(self, bytes: u64) -> std::time::Duration {
+        if self.min_rate == 0 {
+            return self.floor;
+        }
+        let secs = bytes as f64 / self.min_rate as f64;
+        self.floor.saturating_add(
+            std::time::Duration::try_from_secs_f64(secs).unwrap_or(std::time::Duration::MAX),
+        )
+    }
+}
+
 /// One layer's pool: how many experts it may hold, and the slot size (its largest
 /// expert).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -186,6 +243,8 @@ enum Entry {
         bytes: u64,
         waiters: u32,
         spec: Option<Instant>,
+        /// When a thread started reading it (`None` while queued).
+        started: Option<Instant>,
     },
     Ready {
         data: Arc<Slab>,
@@ -321,9 +380,23 @@ struct Inner {
     seq: u64,
     shutdown: bool,
     prefetch: PrefetchStats,
+    timeout: ReadTimeout,
 }
 
 impl Inner {
+    /// The next request to read, marked as started.
+    fn next_request(&mut self) -> Option<Request> {
+        let r = self.queue.pop()?;
+        if let Some(Entry::Loading { started, .. }) = self
+            .pools
+            .get_mut(&r.key.0)
+            .and_then(|p| p.entries.get_mut(&r.key.1.0))
+        {
+            *started = Some(Instant::now());
+        }
+        Some(r)
+    }
+
     /// Drops queued prefetches of `layer` that nobody waits for and that `keep` does
     /// not name; promotes those it names to [`Priority::Demand`]. Returns how many
     /// were dropped. A read already started is left to finish.
@@ -414,6 +487,10 @@ pub struct StoreStats {
     pub cancelled: u64,
     /// Nanoseconds callers spent blocked waiting for loads.
     pub wait_ns: u64,
+    /// Failed reads attempted again ([`ExpertStore::set_read_retries`]).
+    pub retried: u64,
+    /// Waits that ended in [`StoreError::Timeout`].
+    pub timeouts: u64,
     /// Prefetch counters.
     pub prefetch: PrefetchStats,
 }
@@ -426,6 +503,10 @@ struct Shared {
     /// Signalled when a request is queued, or at shutdown.
     work: Condvar,
     io_threads: usize,
+    /// Extra attempts after a failed read.
+    retries: AtomicU64,
+    retried: AtomicU64,
+    timeouts: AtomicU64,
     hits: AtomicU64,
     loads: AtomicU64,
     dedup_waits: AtomicU64,
@@ -525,6 +606,8 @@ pub struct Batch<'a> {
     store: &'a ExpertStore,
     ready: VecDeque<Lease<'a>>,
     pending: Vec<ExpertKey>,
+    /// When this batch started waiting for each pending expert (for the deadline).
+    since: HashMap<ExpertKey, Instant>,
     deferred: Vec<ExpertKey>,
 }
 
@@ -583,7 +666,7 @@ impl<'a> Iterator for Batch<'a> {
                     }
                     Ok(Claim::Pending) => {
                         budget -= 1;
-                        self.pending.push(k);
+                        self.pend(k);
                     }
                     Ok(Claim::Deferred) => self.deferred.push(k),
                     Err(e) => err = Some(e),
@@ -598,6 +681,10 @@ impl<'a> Iterator for Batch<'a> {
             // A finished load of ours?
             if let Some(r) = self.take_finished(&mut g) {
                 break Some(r);
+            }
+            // One we have waited too long for?
+            if let Some(e) = self.expire(&mut g) {
+                break Some(Err(e));
             }
             // A deferred expert whose layer is full of prefetches still loading gets a
             // slot when they land: wait for them instead of failing.
@@ -615,7 +702,7 @@ impl<'a> Iterator for Batch<'a> {
             waited.get_or_insert_with(std::time::Instant::now);
             // Nothing ready: read something ourselves without I/O threads, else wait.
             if shared.io_threads == 0 {
-                if let Some(req) = g.queue.pop() {
+                if let Some(req) = g.next_request() {
                     drop(g);
                     self.store.execute(req);
                     g = match shared.inner.lock() {
@@ -625,9 +712,13 @@ impl<'a> Iterator for Batch<'a> {
                     continue;
                 }
             }
-            g = match shared.loaded.wait(g) {
-                Ok(g) => g,
-                Err(_) => break Some(Err(StoreError::Poisoned)),
+            let woke = match self.next_deadline(&g) {
+                Some(d) => shared.loaded.wait_timeout(g, d).map(|(g, _)| g).ok(),
+                None => shared.loaded.wait(g).ok(),
+            };
+            g = match woke {
+                Some(g) => g,
+                None => break Some(Err(StoreError::Poisoned)),
             };
         };
         if let Some(t) = waited {
@@ -639,20 +730,97 @@ impl<'a> Iterator for Batch<'a> {
 }
 
 impl<'a> Batch<'a> {
+    /// Starts waiting for `key`.
+    fn pend(&mut self, key: ExpertKey) {
+        self.pending.push(key);
+        self.since.entry(key).or_insert_with(Instant::now);
+    }
+
+    /// Stops waiting for the pending expert at `i`.
+    fn unpend(&mut self, i: usize) -> ExpertKey {
+        let key = self.pending.swap_remove(i);
+        self.since.remove(&key);
+        key
+    }
+
+    /// The deadline and wait so far of a pending expert still loading.
+    fn overdue(
+        &self,
+        g: &Inner,
+        key: ExpertKey,
+    ) -> Option<(std::time::Duration, std::time::Duration)> {
+        let Some(Entry::Loading { bytes, .. }) =
+            g.pools.get(&key.0).and_then(|p| p.entries.get(&key.1.0))
+        else {
+            return None;
+        };
+        let waited = self.since.get(&key)?.elapsed();
+        Some((g.timeout.deadline(*bytes), waited))
+    }
+
+    /// How long to wait before some pending expert's deadline passes (`None`: no
+    /// deadline).
+    fn next_deadline(&self, g: &Inner) -> Option<std::time::Duration> {
+        if g.timeout.is_never() {
+            return None;
+        }
+        self.pending
+            .iter()
+            .filter_map(|&k| self.overdue(g, k))
+            .map(|(deadline, waited)| deadline.saturating_sub(waited))
+            .min()
+            .map(|d| d.max(std::time::Duration::from_millis(1)))
+    }
+
+    /// Gives up on a pending expert whose deadline has passed: this batch stops
+    /// waiting for it, a read nobody else waits for is cancelled if it has not
+    /// started, and a started one is left to finish.
+    fn expire(&mut self, g: &mut Inner) -> Option<StoreError> {
+        if g.timeout.is_never() {
+            return None;
+        }
+        let i = self.pending.iter().position(|&k| {
+            self.overdue(g, k)
+                .is_some_and(|(deadline, waited)| waited >= deadline)
+        })?;
+        let key = self.pending[i];
+        let waited = self
+            .since
+            .get(&key)
+            .map(Instant::elapsed)
+            .unwrap_or_default();
+        self.unpend(i);
+        let queued = g.queue.iter().any(|r| r.key == key);
+        if let Some(pool) = g.pools.get_mut(&key.0) {
+            if let Some(Entry::Loading { bytes, waiters, .. }) = pool.entries.get_mut(&key.1.0) {
+                *waiters -= 1;
+                if *waiters == 0 && queued {
+                    let bytes = *bytes;
+                    pool.entries.remove(&key.1.0);
+                    g.used -= bytes;
+                    g.queue.retain(|r| r.key != key);
+                    self.store.shared.cancelled.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+        }
+        self.store.shared.timeouts.fetch_add(1, Ordering::Relaxed);
+        Some(StoreError::Timeout { key, waited })
+    }
+
     /// Takes a pending expert whose load has finished: a lease (already counted for
     /// this waiter) or its error.
     fn take_finished(&mut self, g: &mut Inner) -> Option<Result<Lease<'a>, StoreError>> {
         for i in 0..self.pending.len() {
             let key = self.pending[i];
             let Some(pool) = g.pools.get_mut(&key.0) else {
-                self.pending.swap_remove(i);
+                self.unpend(i);
                 return Some(Err(StoreError::NoPool(key.0)));
             };
             match pool.entries.get_mut(&key.1.0) {
                 Some(Entry::Loading { .. }) => {}
                 Some(Entry::Ready { data, .. }) => {
                     let data = Arc::clone(data);
-                    self.pending.swap_remove(i);
+                    self.unpend(i);
                     return Some(Ok(self.store.lease(key, data)));
                 }
                 Some(Entry::Failed { detail, waiters }) => {
@@ -661,12 +829,12 @@ impl<'a> Batch<'a> {
                     if *waiters == 0 {
                         pool.entries.remove(&key.1.0);
                     }
-                    self.pending.swap_remove(i);
+                    self.unpend(i);
                     return Some(Err(StoreError::Load { key, detail }));
                 }
                 None => {
                     // Cannot happen while we are a waiter; recover by asking again.
-                    self.pending.swap_remove(i);
+                    self.unpend(i);
                     self.deferred.push(key);
                     return None;
                 }
@@ -771,10 +939,14 @@ impl ExpertStore {
                     seq: 0,
                     shutdown: false,
                     prefetch: PrefetchStats::default(),
+                    timeout: ReadTimeout::NEVER,
                 }),
                 loaded: Condvar::new(),
                 work: Condvar::new(),
                 io_threads,
+                retries: AtomicU64::new(0),
+                retried: AtomicU64::new(0),
+                timeouts: AtomicU64::new(0),
                 hits: AtomicU64::new(0),
                 loads: AtomicU64::new(0),
                 dedup_waits: AtomicU64::new(0),
@@ -877,6 +1049,8 @@ impl ExpertStore {
             slab_allocs: s.slab_allocs.load(Ordering::Relaxed),
             cancelled: s.cancelled.load(Ordering::Relaxed),
             wait_ns: s.wait_ns.load(Ordering::Relaxed),
+            retried: s.retried.load(Ordering::Relaxed),
+            timeouts: s.timeouts.load(Ordering::Relaxed),
             prefetch: self.lock().map(|g| g.prefetch).unwrap_or_default(),
         }
     }
@@ -965,6 +1139,7 @@ impl ExpertStore {
             store: self,
             ready: VecDeque::new(),
             pending: Vec::new(),
+            since: HashMap::new(),
             deferred: Vec::new(),
         };
         // Hits first, so that misses never evict an expert of this batch.
@@ -990,7 +1165,7 @@ impl ExpertStore {
             }
             match self.claim(&mut g, k, Priority::Demand) {
                 Ok(Claim::Leased(d)) => batch.ready.push_back(self.lease(k, d)),
-                Ok(Claim::Pending) => batch.pending.push(k),
+                Ok(Claim::Pending) => batch.pend(k),
                 Ok(Claim::Deferred) => batch.deferred.push(k),
                 Err(e) => err = Some(e),
             }
@@ -1082,6 +1257,7 @@ impl ExpertStore {
                 bytes: size,
                 waiters: 1,
                 spec: None,
+                started: None,
             },
         );
         g.used += size;
@@ -1185,6 +1361,7 @@ impl ExpertStore {
                     bytes: size,
                     waiters: 0,
                     spec: Some(Instant::now()),
+                    started: None,
                 },
             );
             g.used += size;
@@ -1264,18 +1441,35 @@ fn execute(s: &Shared, req: Request) {
                 key,
                 detail: format!("cannot allocate a {len}-byte slab: {e}"),
             })?;
-            // A panicking source must not take the I/O thread (or the caller) down
-            // with the load unresolved: its waiters would wait forever. The buffer is
-            // discarded, so a half-written one is never published.
-            let read = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                s.source.read_expert(key, buf.as_mut_slice())
-            }));
-            match read {
-                Ok(r) => r.map(|()| buf),
-                Err(p) => Err(StoreError::Load {
-                    key,
-                    detail: format!("the expert source panicked: {}", panic_message(&*p)),
-                }),
+            let retries = s.retries.load(Ordering::Relaxed);
+            let mut attempt = 0;
+            loop {
+                // A panicking source must not take the I/O thread (or the caller) down
+                // with the load unresolved: its waiters would wait forever. The buffer
+                // is discarded, so a half-written one is never published.
+                let read = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    s.source.read_expert(key, buf.as_mut_slice())
+                }));
+                let err = match read {
+                    Ok(Ok(())) => break Ok(buf),
+                    Ok(Err(e)) => e,
+                    Err(p) => StoreError::Load {
+                        key,
+                        detail: format!("the expert source panicked: {}", panic_message(&*p)),
+                    },
+                };
+                if attempt >= retries {
+                    let err = match err {
+                        StoreError::Load { key, detail } if attempt > 0 => StoreError::Load {
+                            key,
+                            detail: format!("{detail} (after {} attempts)", attempt + 1),
+                        },
+                        e => e,
+                    };
+                    break Err(err);
+                }
+                attempt += 1;
+                s.retried.fetch_add(1, Ordering::Relaxed);
             }
         });
     let Ok(mut g) = s.inner.lock() else {
@@ -1288,6 +1482,7 @@ fn execute(s: &Shared, req: Request) {
             bytes,
             waiters,
             spec,
+            ..
         }) = pool.entries.get(&key.1.0)
         {
             match read {
@@ -1334,7 +1529,7 @@ fn worker(s: &Shared) {
                 if g.shutdown {
                     return;
                 }
-                if let Some(r) = g.queue.pop() {
+                if let Some(r) = g.next_request() {
                     break r;
                 }
                 g = match s.work.wait(g) {
@@ -1349,15 +1544,23 @@ fn worker(s: &Shared) {
 
 impl Drop for ExpertStore {
     fn drop(&mut self) {
+        let stuck = self.occupancy().map_or(0, |o| o.stuck);
         if let Ok(mut g) = self.shared.inner.lock() {
             g.shutdown = true;
         }
         self.shared.work.notify_all();
+        // A thread blocked in a read that may never return would block the drop with
+        // it: then the threads are detached instead. Each holds its own reference to
+        // the shared state and exits when its read returns.
         #[cfg(not(loom))]
         for h in self.workers.drain(..) {
-            // A panicked I/O thread has nothing left to clean up.
-            let _ = h.join();
+            if stuck == 0 {
+                // A panicked I/O thread has nothing left to clean up.
+                let _ = h.join();
+            }
         }
+        #[cfg(loom)]
+        let _ = stuck;
     }
 }
 
@@ -1380,6 +1583,26 @@ impl ExpertStore {
             .collect())
     }
 
+    /// Sets how long a caller waits for an expert's read ([`ReadTimeout::NEVER`] by
+    /// default). Without I/O threads a caller reads its own misses and cannot time out
+    /// on those; it still can on reads it shares with another caller.
+    ///
+    /// # Errors
+    /// [`StoreError::Poisoned`].
+    pub fn set_read_timeout(&self, timeout: ReadTimeout) -> Result<(), StoreError> {
+        self.lock()?.timeout = timeout;
+        Ok(())
+    }
+
+    /// Sets how many times a failed read is attempted again before its waiters get
+    /// the error (0 by default). Every source error is retried, including a panic and
+    /// a checksum mismatch; an allocation failure is not.
+    pub fn set_read_retries(&self, retries: u32) {
+        self.shared
+            .retries
+            .store(u64::from(retries), Ordering::Relaxed);
+    }
+
     /// What the pools hold now, by state. After every caller has dropped its leases
     /// and batches, and every queued or in-flight read has finished, `leased`,
     /// `loading`, `failed` and `queued` are all 0, whatever the reads did.
@@ -1400,7 +1623,13 @@ impl ExpertStore {
                     o.resident += 1;
                     o.leased += 1;
                 }
-                Entry::Loading { .. } => o.loading += 1,
+                Entry::Loading { bytes, started, .. } => {
+                    o.loading += 1;
+                    let late = started.is_some_and(|t| t.elapsed() > g.timeout.deadline(*bytes));
+                    if !g.timeout.is_never() && late {
+                        o.stuck += 1;
+                    }
+                }
                 Entry::Failed { .. } => o.failed += 1,
             }
         }
@@ -1421,6 +1650,9 @@ pub struct Occupancy {
     pub failed: usize,
     /// Requests in the I/O queue.
     pub queued: usize,
+    /// Reads started longer ago than their deadline: a thread blocked on a read that
+    /// may never return.
+    pub stuck: usize,
     /// Bytes resident or loading ([`ExpertStore::used`]).
     pub used: u64,
 }

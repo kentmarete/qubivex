@@ -13,6 +13,13 @@ qubivex-compute = { workspace = true }
 qubivex-core = { workspace = true }
 thiserror = { workspace = true }
 
+[dev-dependencies]
+criterion = { workspace = true }
+
+[[bench]]
+name = "checksum"
+harness = false
+
 [target.'cfg(loom)'.dependencies]
 loom = { workspace = true }
 

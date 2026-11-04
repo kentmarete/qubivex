@@ -39,6 +39,8 @@ pub(crate) struct BenchArgs<'a> {
     pub(crate) runs: usize,
     pub(crate) threads: Option<usize>,
     pub(crate) memory: MemoryOptions,
+    /// Copies of the weight files to fail over to (`--mirror`).
+    pub(crate) mirrors: &'a [PathBuf],
     pub(crate) context: Option<usize>,
     pub(crate) label: Option<&'a str>,
     pub(crate) reference: Option<&'a Path>,
@@ -132,6 +134,10 @@ struct Config {
     /// Phase 6 slice 3).
     #[serde(default)]
     expert_io: Option<String>,
+    /// Whether expert reads were verified against recorded checksums: `verified`,
+    /// `off`, `missing` or `stale` (absent before ADR-006 amendment 4).
+    #[serde(default)]
+    verification: Option<String>,
     /// Router-lookahead prefetch settings; absent when prefetch is off (and before
     /// Phase 7).
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -252,6 +258,12 @@ struct Experts {
     /// (absent before Phase 6 slice 2).
     #[serde(default)]
     wait_ms_per_token: f64,
+    /// Failed reads attempted again, and waits that timed out, during the measured
+    /// runs (absent before ADR-006 amendment 4). Non-zero means the drive misbehaved.
+    #[serde(default)]
+    read_retries: u64,
+    #[serde(default)]
+    read_timeouts: u64,
     /// What prefetch did during the measured runs; absent when it is off.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     prefetch: Option<PrefetchRecord>,
@@ -546,8 +558,8 @@ pub(crate) fn bench(a: &BenchArgs<'_>) -> Result<String, String> {
         architecture: meta.manifest.architecture.id.clone(),
         dir: home_relative(&meta.dir),
     };
-    let engine =
-        Engine::load(meta, a.memory.engine(a.context, a.threads)).map_err(|e| chain(&e))?;
+    let engine = Engine::load_mirrored(meta, a.memory.engine(a.context, a.threads), a.mirrors)
+        .map_err(|e| chain(&e))?;
     let mut peak = PeakRss::new(host);
     let rss_after_load = peak.sample();
 
@@ -660,6 +672,15 @@ pub(crate) fn bench(a: &BenchArgs<'_>) -> Result<String, String> {
             cache_policy: Some(format!("{:?}", a.memory.cache_policy())),
             io_threads: Some(engine.io_threads()),
             expert_io: Some(engine.expert_io().name().to_owned()),
+            verification: Some(
+                match engine.verification() {
+                    qubivex_runtime::Verification::Verified(_) => "verified",
+                    qubivex_runtime::Verification::Off => "off",
+                    qubivex_runtime::Verification::Missing => "missing",
+                    qubivex_runtime::Verification::Stale(_) => "stale",
+                }
+                .to_owned(),
+            ),
             prefetch: a.memory.prefetch().map(|p| PrefetchConfig {
                 guard: p.guard,
                 smooth: p.lookahead.smooth,
@@ -724,6 +745,8 @@ pub(crate) fn bench(a: &BenchArgs<'_>) -> Result<String, String> {
             wait_ms_per_token: (after.wait_ns - before.wait_ns) as f64
                 / 1e6
                 / (a.runs * a.decode_tokens).max(1) as f64,
+            read_retries: after.retried - before.retried,
+            read_timeouts: after.timeouts - before.timeouts,
             prefetch: prefetch_before
                 .zip(prefetch_after)
                 .map(|(b, a)| prefetch_record(b, a)),

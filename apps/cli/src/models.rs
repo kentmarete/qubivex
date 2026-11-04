@@ -10,6 +10,8 @@ use qubivex_model::{
 };
 use serde_json::{Value, json};
 
+use qubivex_runtime::checksums::{ExpertSums, SumsState};
+
 use crate::chain;
 
 /// Model directories: `--dir` values, else `QUBIVEX_MODELS_DIRS` (`:`-separated), else
@@ -265,6 +267,7 @@ pub(crate) struct ImportArgs<'a> {
     pub(crate) set: &'a [String],
     pub(crate) write: bool,
     pub(crate) force: bool,
+    pub(crate) checksums: bool,
 }
 
 pub(crate) fn import_cmd(a: &ImportArgs<'_>) -> Result<String, String> {
@@ -295,11 +298,74 @@ pub(crate) fn import_cmd(a: &ImportArgs<'_>) -> Result<String, String> {
         ));
     }
     std::fs::write(&dest, &text).map_err(|e| format!("cannot write {}: {e}", dest.display()))?;
-    Ok(format!(
+    let mut out = format!(
         "wrote {} (model id {})\n",
         dest.display(),
         imp.manifest.model.id
+    );
+    if a.checksums {
+        let m = ModelMetadata::load(&imp.dir, &reg).map_err(|e| chain(&e))?;
+        out.push_str(&record_sums(&m, 0)?);
+    }
+    Ok(out)
+}
+
+/// Records and saves the model's per-expert checksums; returns a report line.
+fn record_sums(m: &ModelMetadata, threads: usize) -> Result<String, String> {
+    let t = std::time::Instant::now();
+    let sums = ExpertSums::record(m, threads).map_err(|e| chain(&e))?;
+    let path = sums.save(&m.dir).map_err(|e| chain(&e))?;
+    Ok(format!(
+        "recorded checksums of {} experts ({}) in {:.1} s: {}\n",
+        sums.len(),
+        Bytes(m.bytes().routed_experts),
+        t.elapsed().as_secs_f64(),
+        path.display()
     ))
+}
+
+/// `qubivex models verify`: checks every expert against the recorded checksums, or
+/// records them when there are none (or with `record`).
+pub(crate) fn verify(
+    what: &str,
+    dirs: &[PathBuf],
+    record: bool,
+    threads: usize,
+) -> Result<String, String> {
+    let reg = ArchitectureRegistry::with_builtins();
+    let m = find(what, &roots(dirs), &reg).map_err(|e| chain(&e))?;
+    if record {
+        return record_sums(&m, threads);
+    }
+    match ExpertSums::load(&m).map_err(|e| chain(&e))? {
+        SumsState::Missing => record_sums(&m, threads),
+        SumsState::Stale(why) => Err(format!(
+            "the recorded checksums are stale: {why}. If the weights were replaced on \
+             purpose, run `qubivex models verify {what} --record`"
+        )),
+        SumsState::Fresh(sums) => {
+            let t = std::time::Instant::now();
+            let bad = sums.check(&m, threads).map_err(|e| chain(&e))?;
+            if bad.is_empty() {
+                return Ok(format!(
+                    "ok: {} experts match their checksums ({:.1} s)\n",
+                    sums.len(),
+                    t.elapsed().as_secs_f64()
+                ));
+            }
+            let mut msg = format!("{} of {} experts do not match:", bad.len(), sums.len());
+            for b in bad.iter().take(20) {
+                msg.push_str(&format!(
+                    "\n  layer {} expert {}: {}",
+                    b.key.0.0, b.key.1.0, b.detail
+                ));
+            }
+            if bad.len() > 20 {
+                msg.push_str(&format!("\n  ... and {} more", bad.len() - 20));
+            }
+            Err(msg)
+        }
+    }
 }
 
 /// At import time there is no manifest yet: point "set overrides.config.KEY" at `--set`.

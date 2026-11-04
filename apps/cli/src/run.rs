@@ -20,6 +20,8 @@ pub(crate) struct RunArgs<'a> {
     pub(crate) max_tokens: usize,
     pub(crate) sampling: Sampling,
     pub(crate) memory: MemoryOptions,
+    /// Copies of the weight files to fail over to (`--mirror`).
+    pub(crate) mirrors: &'a [PathBuf],
     pub(crate) context: Option<usize>,
     pub(crate) threads: Option<usize>,
     pub(crate) quiet: bool,
@@ -33,8 +35,14 @@ pub(crate) fn run(a: &RunArgs<'_>) -> Result<(), String> {
         &ArchitectureRegistry::with_builtins(),
     )
     .map_err(|e| chain(&e))?;
-    let engine =
-        Engine::load(meta, a.memory.engine(a.context, a.threads)).map_err(|e| chain(&e))?;
+    let engine = Engine::load_mirrored(meta, a.memory.engine(a.context, a.threads), a.mirrors)
+        .map_err(|e| chain(&e))?;
+    if let qubivex_runtime::Verification::Stale(why) = engine.verification() {
+        eprintln!(
+            "qubivex: warning: expert reads are not verified: {why}; run `qubivex models verify {}`",
+            a.model
+        );
+    }
     let load = t0.elapsed();
     let tok = engine.tokenizer();
     let text = if a.chat {

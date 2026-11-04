@@ -13,7 +13,7 @@ use std::time::{Duration, Instant};
 use qubivex_core::{ExpertIdx, LayerIdx};
 use qubivex_expert_stream::fault::{Fault, FaultySource, Rule, Target, VerifiedSource};
 use qubivex_expert_stream::{
-    ExpertKey, ExpertSource, ExpertStore, Occupancy, Policy, PoolSpec, StoreError,
+    ExpertKey, ExpertSource, ExpertStore, Occupancy, Policy, PoolSpec, ReadTimeout, StoreError,
 };
 
 const SIZE: u64 = 4096;
@@ -369,4 +369,140 @@ fn a_failed_prefetch_does_not_fail_the_demand() {
     check(s.acquire(k).unwrap().bytes(), k);
     assert_eq!(src.reads(), 2);
     settled(&s);
+}
+
+/// A short deadline for the timeout tests.
+const QUICK: ReadTimeout = ReadTimeout {
+    floor: Duration::from_millis(100),
+    min_rate: 0,
+};
+
+/// The occupancy once some read counts as stuck (bounded wait).
+fn stuck(s: &ExpertStore) -> Occupancy {
+    let t = Instant::now();
+    loop {
+        let o = s.occupancy().unwrap();
+        if o.stuck > 0 {
+            return o;
+        }
+        assert!(t.elapsed() < Duration::from_secs(5), "never stuck: {o:?}");
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
+/// A read that hangs fails its waiters with [`StoreError::Timeout`] at the deadline
+/// while the layer's other experts keep loading on the other threads. A later caller
+/// joins the same stuck read and times out too. When the read finally returns, its
+/// bytes are published, and nothing is left behind.
+#[test]
+fn a_hung_read_times_out_and_the_rest_keep_loading() {
+    let bad = key(0, 5);
+    let keys: Vec<ExpertKey> = (0..8).map(|e| key(0, e)).collect();
+    let src = faulty(
+        Duration::ZERO,
+        [Rule::always(Target::Expert(bad), Fault::Hang)],
+    );
+    let s = store(src.clone(), 8, 4);
+    s.set_read_timeout(QUICK).unwrap();
+    let t = Instant::now();
+    let mut timeouts = 0;
+    for r in s.acquire_many(&keys).unwrap() {
+        match r {
+            Ok(l) => check(l.bytes(), l.key()),
+            Err(StoreError::Timeout { key, waited }) => {
+                assert_eq!(key, bad);
+                assert!(waited >= QUICK.floor, "{waited:?}");
+                timeouts += 1;
+            }
+            Err(e) => panic!("{e}"),
+        }
+    }
+    assert_eq!(timeouts, 1);
+    assert!(t.elapsed() < Duration::from_secs(3), "{:?}", t.elapsed());
+    // The read started a moment after the wait did; it counts as stuck once its own
+    // deadline passes.
+    let o = stuck(&s);
+    assert_eq!((o.loading, o.stuck, o.leased), (1, 1, 0), "{o:?}");
+    assert!(matches!(s.acquire(bad), Err(StoreError::Timeout { .. })));
+    assert_eq!(s.stats().timeouts, 2);
+    assert_eq!(
+        src.hanging(),
+        1,
+        "the second caller must join the stuck read"
+    );
+
+    src.release_hangs();
+    settled(&s);
+    check(s.acquire(bad).unwrap().bytes(), bad);
+    assert_eq!(src.reads(), 8, "the late read is published, not read again");
+    settled(&s);
+}
+
+/// With every I/O thread stuck, queued reads time out too and are cancelled (they
+/// never started), the store reports the stuck thread, and dropping the store does
+/// not wait for it.
+#[test]
+fn a_store_with_every_thread_stuck_reports_it_and_drops() {
+    let src = faulty(
+        Duration::ZERO,
+        [Rule::once_after(Target::Any, 0, Fault::Hang)],
+    );
+    let s = store(src.clone(), 4, 1);
+    s.set_read_timeout(QUICK).unwrap();
+    assert!(matches!(
+        s.acquire(key(0, 0)),
+        Err(StoreError::Timeout { .. })
+    ));
+    assert!(matches!(
+        s.acquire(key(0, 1)),
+        Err(StoreError::Timeout { .. })
+    ));
+    let o = stuck(&s);
+    assert_eq!((o.loading, o.queued, o.stuck), (1, 0, 1), "{o:?}");
+    assert_eq!(s.stats().cancelled, 1);
+    assert_eq!(o.used, SIZE, "only the stuck read's slot stays charged");
+    let t = Instant::now();
+    drop(s);
+    assert!(
+        t.elapsed() < Duration::from_secs(1),
+        "drop waited for the stuck read"
+    );
+    src.release_hangs();
+}
+
+/// A failed read is attempted again before its waiters see the error, as configured;
+/// when every attempt fails, the error says how many there were.
+#[test]
+fn failed_reads_are_retried() {
+    for threads in THREADS {
+        let k = key(1, 2);
+        let src = faulty(
+            Duration::ZERO,
+            [Rule::once_after(
+                Target::Expert(k),
+                0,
+                Fault::ShortRead { keep: 9 },
+            )],
+        );
+        let s = store(src.clone(), 4, threads);
+        s.set_read_retries(1);
+        check(s.acquire(k).unwrap().bytes(), k);
+        assert_eq!((src.reads(), s.stats().retried), (2, 1));
+        settled(&s);
+
+        let src = faulty(
+            Duration::ZERO,
+            [Rule::always(Target::Expert(k), Fault::Eio)],
+        );
+        let s = store(src.clone(), 4, threads);
+        s.set_read_retries(2);
+        match s.acquire(k) {
+            Err(StoreError::Load { detail, .. }) => {
+                assert!(detail.contains("after 3 attempts"), "{detail}");
+            }
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(src.reads(), 3);
+        settled(&s);
+    }
 }

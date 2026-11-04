@@ -106,6 +106,8 @@ enum Command {
         #[command(flatten)]
         prefetch: PrefetchArgs,
         #[command(flatten)]
+        storage: StorageArgs,
+        #[command(flatten)]
         device: DeviceArgs,
         /// Context limit in tokens (default: the model's).
         #[arg(long)]
@@ -172,6 +174,8 @@ enum Command {
         direct_io: bool,
         #[command(flatten)]
         prefetch: PrefetchArgs,
+        #[command(flatten)]
+        storage: StorageArgs,
         #[command(flatten)]
         device: DeviceArgs,
         /// Context limit in tokens (default: the model's).
@@ -272,6 +276,26 @@ enum ModelsCommand {
         /// Replace an existing manifest.json.
         #[arg(long)]
         force: bool,
+        /// With --write, do not record per-expert checksums (experts.qvxsum). Recording
+        /// reads every expert once.
+        #[arg(long)]
+        no_checksums: bool,
+    },
+    /// Check every expert against the model's recorded checksums (experts.qvxsum), or
+    /// record them if there are none. The engine verifies expert reads against them.
+    Verify {
+        /// A model id, or a model directory.
+        model: String,
+        /// A model directory to search for the id (repeatable).
+        #[arg(long = "dir")]
+        dirs: Vec<PathBuf>,
+        /// Record the checksums again from the files as they are now (after replacing
+        /// the weights on purpose).
+        #[arg(long)]
+        record: bool,
+        /// Threads reading experts (default: every CPU).
+        #[arg(long)]
+        threads: Option<usize>,
     },
     /// List the architectures this build supports.
     Architectures,
@@ -299,6 +323,9 @@ pub(crate) struct MemoryOptions {
     io_threads: Option<usize>,
     expert_io: qubivex_runtime::ExpertIo,
     prefetch: Option<qubivex_runtime::PrefetchOptions>,
+    read_timeout: Option<qubivex_expert_stream::ReadTimeout>,
+    read_retries: Option<u32>,
+    verify: qubivex_runtime::VerifyExperts,
     backend: qubivex_runtime::BackendKind,
     metal_ops: qubivex_runtime::MetalOps,
 }
@@ -350,6 +377,68 @@ impl DeviceArgs {
             }
         }
         Ok((backend, ops))
+    }
+}
+
+/// Expert-read failure handling (ADR-006 amendment 4), shared by `run` and `bench`.
+#[derive(clap::Args, Clone, Debug)]
+pub(crate) struct StorageArgs {
+    /// Seconds to wait for one expert's read before failing the request (plus the
+    /// expert's size at 10 MB/s), or off. Default: 5.
+    #[arg(long)]
+    read_timeout: Option<String>,
+    /// Extra attempts after a failed expert read. Default: 1.
+    #[arg(long)]
+    read_retries: Option<u32>,
+    /// Check expert reads against the model's recorded checksums (experts.qvxsum, from
+    /// `qubivex models verify`): auto (when they match the weights), off, or require.
+    #[arg(long, default_value = "auto")]
+    verify_experts: String,
+    /// A directory holding a copy of the model's weight files (same names), read when
+    /// a read from the model's own files fails. Repeatable; tried in order.
+    #[arg(long = "mirror")]
+    mirrors: Vec<PathBuf>,
+}
+
+impl StorageArgs {
+    fn options(
+        &self,
+    ) -> Result<
+        (
+            Option<qubivex_expert_stream::ReadTimeout>,
+            Option<u32>,
+            qubivex_runtime::VerifyExperts,
+        ),
+        String,
+    > {
+        let verify = match self.verify_experts.as_str() {
+            "auto" => qubivex_runtime::VerifyExperts::Auto,
+            "off" => qubivex_runtime::VerifyExperts::Off,
+            "require" => qubivex_runtime::VerifyExperts::Require,
+            other => {
+                return Err(format!(
+                    "unknown --verify-experts {other:?}; use auto, off or require"
+                ));
+            }
+        };
+        let timeout = match self.read_timeout.as_deref() {
+            None => None,
+            Some("off") => Some(qubivex_expert_stream::ReadTimeout::NEVER),
+            Some(v) => {
+                let secs: f64 = v.parse().map_err(|_| {
+                    format!("--read-timeout {v:?} is not a number of seconds or off")
+                })?;
+                let floor = std::time::Duration::try_from_secs_f64(secs)
+                    .ok()
+                    .filter(|d| !d.is_zero())
+                    .ok_or_else(|| format!("--read-timeout {v} must be positive"))?;
+                Some(qubivex_expert_stream::ReadTimeout {
+                    floor,
+                    ..qubivex_expert_stream::ReadTimeout::DEFAULT
+                })
+            }
+        };
+        Ok((timeout, self.read_retries, verify))
     }
 }
 
@@ -423,6 +512,21 @@ impl MemoryOptions {
         self
     }
 
+    /// The same options with these expert-read settings.
+    const fn with_storage(
+        mut self,
+        (timeout, retries, verify): (
+            Option<qubivex_expert_stream::ReadTimeout>,
+            Option<u32>,
+            qubivex_runtime::VerifyExperts,
+        ),
+    ) -> Self {
+        self.read_timeout = timeout;
+        self.read_retries = retries;
+        self.verify = verify;
+        self
+    }
+
     /// The same options with this backend and placement.
     const fn with_device(
         mut self,
@@ -454,6 +558,9 @@ impl MemoryOptions {
             io_threads: self.io_threads,
             expert_io: self.expert_io,
             prefetch: self.prefetch,
+            read_timeout: self.read_timeout,
+            read_retries: self.read_retries,
+            verify: self.verify,
             backend: self.backend,
             metal_ops: self.metal_ops,
             ..qubivex_runtime::EngineOptions::default()
@@ -472,6 +579,9 @@ fn memory_options(
 ) -> Result<MemoryOptions, String> {
     Ok(MemoryOptions {
         prefetch: None,
+        read_timeout: None,
+        read_retries: None,
+        verify: qubivex_runtime::VerifyExperts::Auto,
         backend: qubivex_runtime::BackendKind::Cpu,
         metal_ops: qubivex_runtime::MetalOps::default(),
         io_threads,
@@ -575,6 +685,7 @@ fn execute(cmd: &Command) -> Result<(), String> {
             io_threads,
             direct_io,
             prefetch,
+            storage,
             device,
             context,
             threads,
@@ -600,7 +711,9 @@ fn execute(cmd: &Command) -> Result<(), String> {
                 *direct_io,
             )?
             .with_prefetch(prefetch.options()?)
+            .with_storage(storage.options()?)
             .with_device(device.options()?),
+            mirrors: &storage.mirrors,
             context: *context,
             threads: *threads,
             quiet: *quiet,
@@ -622,6 +735,7 @@ fn execute(cmd: &Command) -> Result<(), String> {
             io_threads,
             direct_io,
             prefetch,
+            storage,
             device,
             context,
             label,
@@ -648,7 +762,9 @@ fn execute(cmd: &Command) -> Result<(), String> {
                 *direct_io,
             )?
             .with_prefetch(prefetch.options()?)
+            .with_storage(storage.options()?)
             .with_device(device.options()?),
+            mirrors: &storage.mirrors,
             context: *context,
             label: label.as_deref(),
             reference: reference.as_deref(),
@@ -690,6 +806,7 @@ fn execute(cmd: &Command) -> Result<(), String> {
                 set,
                 write,
                 force,
+                no_checksums,
             } => models::import_cmd(&models::ImportArgs {
                 path,
                 id: id.clone(),
@@ -697,7 +814,14 @@ fn execute(cmd: &Command) -> Result<(), String> {
                 set,
                 write: *write,
                 force: *force,
+                checksums: !*no_checksums,
             })?,
+            ModelsCommand::Verify {
+                model,
+                dirs,
+                record,
+                threads,
+            } => models::verify(model, dirs, *record, threads.unwrap_or(0))?,
             ModelsCommand::Architectures => models::architectures(),
         }),
     }

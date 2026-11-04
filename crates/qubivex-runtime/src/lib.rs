@@ -5,14 +5,15 @@
 //! GGUF file; and the routed experts as byte extents ([`ModelExpertSource`]) for the
 //! expert store.
 
+pub mod checksums;
 mod engine;
 mod experts;
 mod metal_forward;
 mod placement;
 
 pub use engine::{
-    DEFAULT_IO_THREADS, Engine, EngineOptions, PredictionStats, PrefetchOptions, PrefetchReport,
-    Sampling,
+    DEFAULT_IO_THREADS, DEFAULT_READ_RETRIES, Engine, EngineOptions, PredictionStats,
+    PrefetchOptions, PrefetchReport, Sampling, Verification, VerifyExperts,
 };
 pub use experts::{ExpertIo, ExpertLayout, IoPath, ModelExpertSource, PartLayout};
 pub use placement::{BackendKind, MetalOps, PlacementReport};
@@ -38,6 +39,9 @@ pub enum RuntimeError {
     /// The memory plan refuses the model or a context length (ADR-005).
     #[error("memory: {0}")]
     Memory(String),
+    /// Expert storage cannot serve reads (every I/O thread is stuck).
+    #[error("storage: {0}")]
+    Storage(String),
 }
 
 /// The tokenizer named by the model's manifest.
