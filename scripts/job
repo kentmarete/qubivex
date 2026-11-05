@@ -1,0 +1,490 @@
+#!/bin/zsh
+# Job lifecycle for QUBIVEX on macOS. See docs/development/JOB_WORKFLOW.md.
+#
+#   job status                          dashboard and verdict; changes nothing
+#   job start <slug> "<goal>" "<done when>" [--from <ref>]
+#   job save "<where things stand>"     add a checkpoint to the job card
+#   job commit "<message>" [paths...]   commit all changes, or only the given paths
+#   job verify                          run the CI gates locally
+#   job pr ["<title>"] [--base <branch>] [--draft] [--body-file <path>] [--skip-verify]
+#                                       push the branch, open or update its PR
+#   job merge [--yes]                   merge the PR once CI passes; asks you to confirm
+#   job finish "<outcome>"              close the card, log the job
+#   job clean [--deep] [--scratch] [--dry-run]
+#
+# It never deletes models, the oracle venv, git data, memory or session transcripts,
+# never kills a process, never force-pushes, and refuses to clean or verify while a
+# build or benchmark runs.
+
+set -u
+setopt pipe_fail null_glob
+
+ROOT=$(git -C "${0:A:h}" rev-parse --show-toplevel) || exit 1
+ENCODED=${ROOT//[^a-zA-Z0-9]/-}
+MEM=$HOME/.claude/projects/$ENCODED/memory
+INDEX=$MEM/MEMORY.md
+CARD=$MEM/current-job.md
+LOG=$MEM/job-log.md
+SCRATCH=/private/tmp/claude-$(id -u)/$ENCODED
+
+KEEP_FILE_KB=4     # a memory file larger than this should be split or trimmed
+KEEP_INDEX_LINES=30
+MIN_FREE_PCT=20
+MAX_SWAP_MB=2048
+SCRATCH_MAX_DAYS=7
+
+ATTRIBUTION='co-authored-by|generated with'  # commits and PRs here carry neither
+UNSAFE_FILES='(^|/)\.env($|\.)|\.(key|pem|p12|gguf|safetensors)$'
+
+die()  { print -r -- "job: $*" >&2; exit 1 }
+warn() { print -r -- "  ! $*"; WARNINGS+=("$*") }
+WARNINGS=()
+
+size_of() { [[ -e $1 ]] && du -sh "$1" 2>/dev/null | awk '{print $1}' || print -- - }
+card_field() { sed -n "s/^$1: //p" "$CARD" | head -1 }
+
+# Builds and QUBIVEX or Colibri binaries, wherever they run from.
+running_jobs() {
+  ps -axo pid=,rss=,etime=,comm= | while read -r pid rss etime comm; do
+    case ${comm:t} in
+      qubivex*|colibri*|cargo|rustc|cargo-*)
+        printf '%s  %5d MB  %11s  %s\n' "$pid" $((rss / 1024)) "$etime" "${comm:t}" ;;
+    esac
+  done
+}
+
+refuse_if_busy() {
+  local busy=$(running_jobs)
+  [[ -z $busy ]] && return
+  print -r -- "$busy" >&2
+  die "$1 refused: the processes above are running. Let them finish; another session may own them."
+}
+
+drop_index_line() {  # <file name>
+  [[ -f $INDEX ]] || return 0
+  grep -vF "]($1)" "$INDEX" > "$INDEX.tmp"
+  mv "$INDEX.tmp" "$INDEX"
+}
+
+set_card_field() {  # <field> <value>
+  grep -v "^$1: " "$CARD" | awk -v line="$1: $2" '{print} /^Started: /{print line}' > "$CARD.tmp"
+  mv "$CARD.tmp" "$CARD"
+}
+
+checkpoint() { print -r -- "- $(date '+%Y-%m-%d %H:%M') $1" >> "$CARD" }
+
+short_head() { git -C "$ROOT" rev-parse --short HEAD }
+
+tree_is_clean() { [[ -z $(git -C "$ROOT" status --porcelain) ]] }
+
+# Refuses unless a job is open and its branch is checked out. Sets BRANCH.
+require_job_branch() {
+  [[ -f $CARD ]] || die "no open job"
+  BRANCH=$(git -C "$ROOT" branch --show-current)
+  [[ $BRANCH != main ]] || die "refusing to work on main"
+  [[ $BRANCH == $(card_field Branch) ]] || die "the open job is on $(card_field Branch), but $BRANCH is checked out"
+}
+
+# SSH to origin fails here, so push over HTTPS with gh's credentials.
+remote_url() {
+  local url=$(git -C "$ROOT" remote get-url origin)
+  [[ $url == git@github.com:* ]] && url=https://github.com/${url#git@github.com:}
+  print -r -- "$url"
+}
+
+git_https() {
+  git -C "$ROOT" -c credential.helper= -c 'credential.helper=!gh auth git-credential' "$@"
+}
+
+add_index_line() {  # <file name> <line>
+  drop_index_line "$1"
+  print -r -- "$2" >> "$INDEX"
+}
+
+cmd_status() {
+  local branch=$(git -C "$ROOT" branch --show-current)
+  local head=$(git -C "$ROOT" rev-parse --short HEAD)
+  local dirty=$(git -C "$ROOT" status --porcelain | wc -l | tr -d ' ')
+
+  print "JOB"
+  if [[ -f $CARD ]]; then
+    print -r -- "  $(card_field Job): $(card_field Goal)"
+    print -r -- "  done when: $(card_field 'Done when')"
+    print -r -- "  last: $(grep '^- ' "$CARD" | tail -1 | cut -c3-)"
+  else
+    print "  none open"
+  fi
+
+  if [[ -f $CARD ]]; then
+    local verified=$(card_field Verified) pr=$(card_field PR)
+    [[ -n $verified ]] && print -r -- "  verified at: $verified"
+    [[ -n $pr ]] && print -r -- "  PR: $pr ($(card_field Merged | grep -q . && print merged || print not merged))"
+  fi
+
+  print "\nGIT"
+  print -r -- "  $branch @ $head, $dirty uncommitted"
+  [[ $dirty != 0 ]] && warn "uncommitted changes"
+  local local_only=()
+  local b
+  for b in ${(f)"$(git -C "$ROOT" branch --no-merged main --format='%(refname:short)')"}; do
+    git -C "$ROOT" rev-parse -q --verify "refs/remotes/origin/$b" >/dev/null || local_only+=($b)
+  done
+  (( $#local_only )) && print -r -- "  not on GitHub: ${(j:, :)local_only}"
+
+  print "\nRUNNING"
+  local busy=$(running_jobs)
+  if [[ -n $busy ]]; then
+    print -r -- "$busy" | sed 's/^/  /'
+    warn "builds or benchmarks are running"
+  else
+    print "  no builds or benchmarks"
+  fi
+
+  print "\nRAM"
+  local free_pct=$(memory_pressure -Q | sed -n 's/.*percentage: \([0-9]*\)%.*/\1/p')
+  local swap_mb=$(sysctl -n vm.swapusage | sed -n 's/.*used = \([0-9]*\).*/\1/p')
+  print -r -- "  ${free_pct}% free, swap ${swap_mb} MB used"
+  ps -axo rss=,comm= | sort -rn | head -4 | while read -r rss comm; do
+    printf '  %6d MB  %s\n' $((rss / 1024)) "${comm:t}"
+  done
+  (( free_pct < MIN_FREE_PCT )) && warn "memory free below ${MIN_FREE_PCT}%"
+  (( swap_mb > MAX_SWAP_MB )) && warn "swap above ${MAX_SWAP_MB} MB: quit apps, or reboot once scratchpad files are safe"
+
+  print "\nDISK"
+  print -r -- "  $(df -h / | awk 'NR==2 {print $4}') free; target $(size_of "$ROOT/target"), scratchpads $(size_of "$SCRATCH"), models+oracle $(size_of "$HOME/.qubivex")"
+
+  print "\nNOTES"
+  if [[ -f $INDEX ]]; then
+    local lines=$(wc -l < "$INDEX" | tr -d ' ')
+    print -r -- "  MEMORY.md $lines lines; all notes $(size_of "$MEM")"
+    (( lines > KEEP_INDEX_LINES )) && warn "MEMORY.md above $KEEP_INDEX_LINES lines"
+    local f
+    for f in "$MEM"/*.md; do
+      (( $(wc -c < "$f") > KEEP_FILE_KB * 1024 )) && warn "${f:t} above $KEEP_FILE_KB KB: split or trim it"
+    done
+  else
+    print "  no memory index yet"
+  fi
+
+  print "\nBENCHMARK"
+  if pmset -g batt | grep -q "AC Power"; then
+    print "  on power"
+  else
+    print "  on battery"
+    warn "on battery: benchmarks must run on power"
+  fi
+
+  print
+  if (( $#WARNINGS )); then
+    print "VERDICT: not clean ($#WARNINGS items marked !)"
+  else
+    print "VERDICT: clean, ready for the next job"
+  fi
+}
+
+cmd_start() {
+  local slug=${1:-} goal=${2:-} done_when=${3:-} from=
+  [[ -n $slug && -n $goal && -n $done_when ]] || die 'usage: job start <slug> "<goal>" "<done when>" [--from <ref>]'
+  [[ $slug =~ '^[a-z0-9][a-z0-9-]*$' ]] || die "slug must be lowercase letters, digits and hyphens"
+  if [[ ${4:-} == --from ]]; then
+    from=${5:-}
+    [[ -n $from ]] || die "--from needs a ref"
+  fi
+  [[ -d $MEM ]] || mkdir -p "$MEM"
+  [[ ! -f $CARD ]] || die "job $(card_field Job) is still open. Run job finish first."
+  local current=$(git -C "$ROOT" branch --show-current)
+  # Adopting the branch you are already on keeps work in progress.
+  if [[ $slug != $current ]]; then
+    tree_is_clean || die "the working tree has uncommitted changes. Commit or stash them first."
+  fi
+
+  if [[ $slug == $current ]]; then
+    [[ -z $from ]] || die "already on $slug, so --from does not apply"
+  elif git -C "$ROOT" rev-parse -q --verify "refs/heads/$slug" >/dev/null; then
+    [[ -z $from ]] || die "branch $slug already exists, so --from does not apply"
+    git -C "$ROOT" switch -q "$slug" || exit 1
+  else
+    git -C "$ROOT" switch -q -c "$slug" ${from:+"$from"} || exit 1
+  fi
+
+  local base=$(git -C "$ROOT" rev-parse --short HEAD)
+  cat > "$CARD" <<EOF
+---
+name: current-job
+description: Open job $slug on its branch; read this first when resuming work
+metadata:
+  type: project
+---
+
+Job: $slug
+Goal: $goal
+Done when: $done_when
+Branch: $slug
+Base: $base
+Started: $(date '+%Y-%m-%d %H:%M')
+
+## Checkpoints
+- $(date '+%Y-%m-%d %H:%M') started at $base
+EOF
+  add_index_line current-job.md "- [Current job](current-job.md) — $slug: $goal"
+  print -r -- "Started $slug at $base."
+}
+
+cmd_save() {
+  [[ -f $CARD ]] || die "no open job"
+  [[ -n ${1:-} ]] || die 'usage: job save "<where things stand>"'
+  local dirty=$(git -C "$ROOT" status --porcelain | wc -l | tr -d ' ')
+  checkpoint "@ $(short_head), $dirty uncommitted: $1"
+  print "Saved."
+}
+
+cmd_commit() {
+  local msg=${1:-}
+  [[ -n $msg ]] || die 'usage: job commit "<message>" [paths...]'
+  shift
+  require_job_branch
+  print -r -- "$msg" | grep -qiE "$ATTRIBUTION" && die "commits here carry no attribution lines"
+  # Another session may share this tree; all-changes would sweep up its work.
+  (( $# )) || refuse_if_busy "commit of all changes"
+  cd "$ROOT" || exit 1
+  if (( $# )); then
+    git add -- "$@" || exit 1
+  else
+    git add -A || exit 1
+  fi
+  local staged=$(git diff --cached --name-only)
+  [[ -n $staged ]] || die "nothing to commit"
+  local unsafe=$(print -r -- "$staged" | grep -E "$UNSAFE_FILES")
+  if [[ -n $unsafe ]]; then
+    git reset -q
+    print -r -- "$unsafe" >&2
+    die "refusing to commit the files above; nothing was committed, and everything is unstaged"
+  fi
+  # With paths, leave anything else that is staged out of this commit.
+  git commit -q -m "$msg" ${@:+--} "$@" || exit 1
+  local subject=$(git log -1 --format=%s)
+  checkpoint "committed $(short_head): $subject"
+  git show --stat --format='%h %s' HEAD
+}
+
+cmd_pr() {
+  local title= base=main draft= body_file= skip=
+  while (( $# )); do
+    case $1 in
+      --base) base=${2:-}; [[ -n $base ]] || die "--base needs a branch"; shift 2 ;;
+      --body-file) body_file=${2:-}; [[ -f $body_file ]] || die "--body-file needs a file"; shift 2 ;;
+      --draft) draft=1; shift ;;
+      --skip-verify) skip=1; shift ;;
+      -*) die "usage: job pr [title] [--base <branch>] [--draft] [--body-file <path>] [--skip-verify]" ;;
+      *) title=$1; shift ;;
+    esac
+  done
+  require_job_branch
+  tree_is_clean || die "the working tree has uncommitted changes. Run job commit first."
+  [[ -n $skip || $(card_field Verified) == $(short_head) ]] || die "this commit has not passed job verify (or use --skip-verify)"
+  git -C "$ROOT" rev-parse -q --verify "refs/remotes/origin/$base" >/dev/null || die "base $base is not on GitHub. Open its PR first."
+  [[ $(git -C "$ROOT" rev-list --count "origin/$base..HEAD") != 0 ]] || die "no commits ahead of $base"
+
+  cd "$ROOT" || exit 1
+  git_https push -q "$(remote_url)" "HEAD:refs/heads/$BRANCH" || die "push failed; this script never force-pushes"
+  git update-ref "refs/remotes/origin/$BRANCH" HEAD
+
+  local url=$(gh pr view "$BRANCH" --json url,state -q 'select(.state == "OPEN") | .url' 2>/dev/null)
+  if [[ -n $url ]]; then
+    set_card_field PR "$url"
+    checkpoint "pushed $(short_head) to $url"
+    print -r -- "Updated $url"
+    return
+  fi
+
+  local tmp=$(mktemp)
+  if [[ -n $body_file ]]; then
+    cp "$body_file" "$tmp"
+  else
+    {
+      print -r -- "## Goal"; print -r -- "$(card_field Goal)"; print
+      print -r -- "## Done when"; print -r -- "$(card_field 'Done when')"; print
+      print -r -- "## Commits"; git log --reverse --format='- %s' "origin/$base..HEAD"
+    } > "$tmp"
+  fi
+  if grep -qiE "$ATTRIBUTION" "$tmp"; then
+    rm -f "$tmp"
+    die "PR descriptions here carry no attribution lines"
+  fi
+  [[ -n $title ]] || title=$(git log -1 --format=%s)
+  url=$(gh pr create --base "$base" --head "$BRANCH" --title "$title" --body-file "$tmp" ${draft:+--draft})
+  local rc=$?
+  rm -f "$tmp"
+  (( rc == 0 )) || die "gh pr create failed; the branch is pushed"
+  url=${${(f)url}[-1]}
+  set_card_field PR "$url"
+  checkpoint "opened $url"
+  print -r -- "Opened $url"
+}
+
+cmd_merge() {
+  local yes=
+  case ${1:-} in
+    '') ;;
+    --yes) yes=1 ;;
+    *) die "usage: job merge [--yes]" ;;
+  esac
+  require_job_branch
+  local pr=$(card_field PR)
+  [[ -n $pr ]] || die "this job has no PR. Run job pr first."
+  cd "$ROOT" || exit 1
+
+  local state draft mergeable oid
+  read -r state draft mergeable oid <<< "$(gh pr view "$pr" --json state,isDraft,mergeable,headRefOid \
+    -q '"\(.state) \(.isDraft) \(.mergeable) \(.headRefOid)"')"
+  [[ $state == OPEN ]] || die "the PR is $state"
+  [[ $draft == false ]] || die "the PR is still a draft"
+  [[ $mergeable == MERGEABLE ]] || die "GitHub reports the PR as $mergeable; resolve that or retry shortly"
+  [[ $oid == $(git rev-parse HEAD) ]] || die "the PR head differs from local HEAD. Run job pr first."
+  gh pr checks "$pr" || die "CI has not passed yet"
+
+  if [[ -z $yes ]]; then
+    [[ -t 0 ]] || die "merging needs a confirmation: run it in a terminal, or pass --yes"
+    local answer
+    print -n -- "Merge $pr? Type merge to confirm: "
+    read -r answer
+    [[ $answer == merge ]] || die "not merged"
+  fi
+  gh pr merge "$pr" --merge --match-head-commit "$oid" || die "merge failed"
+  set_card_field Merged "$(date '+%Y-%m-%d %H:%M')"
+  checkpoint "merged $pr"
+  git_https fetch -q "$(remote_url)" '+refs/heads/main:refs/remotes/origin/main' \
+    && git_https fetch -q "$(remote_url)" 'main:main' \
+    || print -r -- "Note: local main was not updated."
+  print -r -- "Merged $pr. Main is now $(git rev-parse --short origin/main)."
+}
+
+cmd_verify() {
+  refuse_if_busy verify
+  cd "$ROOT" || exit 1
+  local step
+  local steps=(
+    'cargo fmt --all --check'
+    'cargo clippy --workspace --all-targets --locked -- -D warnings'
+    'cargo test --workspace --locked'
+    'RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --locked'
+    'cargo xtask check'
+    'cargo deny check'
+    'cargo +1.85 test --workspace --locked'
+    'CARGO_TARGET_DIR=target/loom RUSTFLAGS="--cfg loom -D warnings" cargo test --release --locked -p qubivex-expert-stream --test loom'
+  )
+  for step in $steps; do
+    print -r -- "==> $step"
+    eval "$step" || die "failed: $step"
+  done
+  print "All gates passed."
+  if [[ -f $CARD ]] && tree_is_clean; then
+    set_card_field Verified "$(short_head)"
+    checkpoint "verified at $(short_head)"
+  fi
+}
+
+cmd_finish() {
+  [[ -f $CARD ]] || die "no open job"
+  [[ -n ${1:-} ]] || die 'usage: job finish "<outcome>"'
+  tree_is_clean || die "the working tree has uncommitted changes. Commit or stash them first."
+
+  local slug=$(card_field Job) base=$(card_field Base) started=$(card_field Started)
+  local pr=$(card_field PR) merged=$(card_field Merged)
+  local head=$(short_head)
+  if [[ $head != $base ]] && git -C "$ROOT" diff --quiet "$base" HEAD -- IMPLEMENTATION_STATUS.md; then
+    print -r -- "Note: IMPLEMENTATION_STATUS.md did not change in this job."
+  fi
+  if ! git -C "$ROOT" rev-parse -q --verify "refs/remotes/origin/$slug" >/dev/null; then
+    print -r -- "Note: branch $slug is not on GitHub."
+  fi
+
+  if [[ ! -f $LOG ]]; then
+    cat > "$LOG" <<EOF
+---
+name: job-log
+description: One line per finished job, newest last; the outcome of past work at a glance
+metadata:
+  type: project
+---
+
+EOF
+  fi
+  if [[ -z $pr ]]; then
+    print -r -- "Note: this job has no PR."
+  elif [[ -z $merged ]]; then
+    print -r -- "Note: $pr is not merged yet."
+  fi
+  print -r -- "- ${started%% *} to $(date '+%Y-%m-%d') | $slug | $base..$head | ${pr:-no PR}${merged:+ (merged)} | $1" >> "$LOG"
+  add_index_line job-log.md "- [Job log](job-log.md) — finished jobs, one line each"
+  rm "$CARD"
+  drop_index_line current-job.md
+  print -r -- "Closed $slug."
+  print "Next: job clean, then /clear in Claude Code, then job status."
+}
+
+# Echoes the scratchpads that are safe to delete, one per line.
+stale_scratchpads() {
+  local dir
+  for dir in "$SCRATCH"/*(N/); do
+    [[ -n $(find "$dir" -type f -mtime -$SCRATCH_MAX_DAYS -print -quit 2>/dev/null) ]] && continue
+    [[ -n $(find "$dir" \( -name 'tokenizer*.json' -o -name 'colibri*' \) -print -quit 2>/dev/null) ]] && continue
+    print -r -- "$dir"
+  done
+}
+
+cmd_clean() {
+  local deep= scratch= dry=
+  local arg
+  for arg in "$@"; do
+    case $arg in
+      --deep) deep=1 ;;
+      --scratch) scratch=1 ;;
+      --dry-run) dry=1 ;;
+      *) die "usage: job clean [--deep] [--scratch] [--dry-run]" ;;
+    esac
+  done
+  [[ -n $dry ]] || refuse_if_busy clean
+
+  local targets=()
+  if [[ -n $deep ]]; then
+    [[ -d $ROOT/target ]] && targets+=("$ROOT/target")
+  else
+    local p
+    for p in "$ROOT"/target/{debug/incremental,wt,wt-main,loom}; do
+      [[ -e $p ]] && targets+=("$p")
+    done
+  fi
+  [[ -n $scratch ]] && targets+=(${(f)"$(stale_scratchpads)"})
+
+  if (( ! $#targets )); then
+    print "Nothing to clean."
+    return
+  fi
+  local t
+  for t in $targets; do
+    printf '%8s  %s\n' "$(size_of "$t")" "$t"
+  done
+  if [[ -n $dry ]]; then
+    print "Dry run: nothing deleted."
+    return
+  fi
+  for t in $targets; do
+    [[ $t == $ROOT/target || $t == $ROOT/target/* || $t == $SCRATCH/* ]] || die "refusing to delete $t"
+    rm -rf -- "$t"
+  done
+  print -r -- "Cleaned. $(df -h / | awk 'NR==2 {print $4}') free."
+}
+
+case ${1:-status} in
+  status) cmd_status ;;
+  start)  shift; cmd_start "$@" ;;
+  save)   shift; cmd_save "$@" ;;
+  commit) shift; cmd_commit "$@" ;;
+  verify) cmd_verify ;;
+  pr)     shift; cmd_pr "$@" ;;
+  merge)  shift; cmd_merge "$@" ;;
+  finish) shift; cmd_finish "$@" ;;
+  clean)  shift; cmd_clean "$@" ;;
+  *)      sed -n '2,17p' "${0:A}" | cut -c3- ;;
+esac
