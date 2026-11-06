@@ -3,6 +3,9 @@
 Last updated: 2026-11-06
 
 ## Current phase
+**Platform spec audit done (2026-11-06).** The owner's implementation spec is audited in [`docs/engineering/PLATFORM_AUDIT.md`](docs/engineering/PLATFORM_AUDIT.md): status per requirement, a mapping of its phases (S0–S10) to the phases here, and an 11-job plan. Largest gaps: no model downloads or install registry (S2), no batching (S8), and no structured logs or config files (S10). Baseline: 293 tests passed, 0 failed, 1 ignored.
+- **Next:** the audit's §5 owner decisions, then job 1 of its plan (generation contract). This replaces the "Phase 10" pointer below.
+
 **Phase 9 (serving) done (2026-11-04).** Phase 8 (GPU acceleration, Metal first): slices 1–6 done (2026-11-05). The improvement-plan backlog (MIGRATION_PLAN §3a) is cleared.
 
 **Metal at partial expert caches done (2026-11-06); ADR-011 amendment 6.** Measured on power with reference tokens at every size: Metal decode leads with most experts resident (3072 MiB: 49.2 against 42.9 tok/s), ties near 2048 MiB (40.1 against 40.8) and loses below it (1024 MiB: 29.5 against 34.9), because it waits on loads the CPU pass overlaps. Metal prefill leads at every size (128 tokens at 1024 MiB: 194 against 117).

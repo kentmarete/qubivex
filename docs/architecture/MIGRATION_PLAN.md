@@ -224,6 +224,9 @@ and a cancellation test passes. (Done 2026-11-04: ADR-013.)
 As in the specification: batched expert execution across requests, KV prefix reuse,
 paged KV, NUMA, multi-device; then a CLI UX catalogue and recommendations UI.
 
+The remaining order is in `docs/engineering/PLATFORM_AUDIT.md` §4, which maps the 2026-11-06
+platform spec's phases (S0–S10) onto these.
+
 ### 3a. Folded in from the Engineering Improvement Plan (2026-11-03)
 - **Phase 4.5: tensor descriptors (done, ADR-009).** `TensorDesc` (byte strides, offset,
   zero-copy views) in `qubivex-core`; typed `TensorView`, `TensorViewMut` and `Tensor<T>`
