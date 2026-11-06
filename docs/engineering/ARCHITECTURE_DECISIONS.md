@@ -4,7 +4,7 @@
 - Status: **Owner decisions taken 2026-11-03** on §2.1 (named opt-ins only, ADR-010),
   §2.6 (Metal first, ADR-007 amendment), §3 (keep `MIGRATION_PLAN.md`, fold the EIP in)
   and the tensor scope (ADR-009, implemented). The ADR status changes proposed in §1
-  for ADR-001, 003, 004 and 006 still await review.
+  for ADR-003, 004 and 006 still await review; ADR-001 was accepted on 2026-11-06.
 - Inputs: ADR-001 to ADR-008 (`docs/decisions/`), `QUBIVEX_DESIGN.md`,
   `MIGRATION_PLAN.md`, `IMPROVEMENTS_EVALUATION.md`, and the Engineering Improvement Plan
   (EIP).
