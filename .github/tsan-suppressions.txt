@@ -1,0 +1,8 @@
+# ThreadSanitizer suppressions for the CI job. Keep this list short: each line hides
+# real reports, so each one needs a reason.
+#
+# Tokio's I/O driver finds a ScheduledIo through the pointer it registered with
+# epoll_ctl and gets back from epoll_wait. That ordering runs through the kernel, so
+# TSan reports the driver's accesses as racing with the allocation. All 14 reports on
+# PR 38 had that shape, with no QUBIVEX memory involved. kqueue shows none on macOS.
+race:tokio::runtime::io::scheduled_io

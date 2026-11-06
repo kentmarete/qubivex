@@ -62,6 +62,7 @@ jobs:
     runs-on: ubuntu-latest
     env:
       RUSTFLAGS: -Zsanitizer=thread
+      TSAN_OPTIONS: suppressions=${{ github.workspace }}/.github/tsan-suppressions.txt
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@master
@@ -70,7 +71,7 @@ jobs:
           components: rust-src
       - uses: Swatinem/rust-cache@v2
       - run: >-
-          cargo test -Zbuild-std --target x86_64-unknown-linux-gnu --locked
+          cargo test -Zbuild-std --target x86_64-unknown-linux-gnu --locked --no-fail-fast
           -p qubivex-scheduler -p qubivex-api -p qubivex-expert-stream -p qubivex-runtime
           --test scheduler --test concurrency --test gateway --test store --test prefetch
           --test requests
