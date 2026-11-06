@@ -95,7 +95,7 @@ What QUBIVEX adds over a straight port:
 | Inference | CPU forward pass for `transformer_moe` (OLMoE, Qwen3-MoE) and `transformer_dense` (dense Qwen3, Llama-style): lossless kernels for f32, f16, bf16, Q8_0, Q4_K and Q6_K; an expert cache of any size with leases and LRU eviction; KV cache; greedy, temperature and top-p sampling; chat templates |
 | Tokenizers | Hugging Face `tokenizer.json`, or rebuilt from a GGUF file's vocabulary (verified identical to the official tokenizer) |
 | Serving | `qubivex serve`: OpenAI-compatible `/v1/chat/completions` and `/v1/completions` (streaming or not), `/v1/models`, `/health`, `/metrics`, `/v1/system`, admin load and unload; independent KV per conversation, admission against the memory plan, cancellation when a client disconnects |
-| CLI | `qubivex run`, `qubivex serve`, `qubivex bench`, `qubivex system`, `qubivex doctor --storage`, `qubivex models search / pull / list / inspect / import / verify / remove / architectures` |
+| CLI | `qubivex run`, `qubivex serve`, `qubivex bench`, `qubivex system`, `qubivex doctor --storage`, `qubivex models search / pull / list / inspect / analyse / import / migrate / verify / remove / architectures` |
 
 See the [Roadmap](#roadmap) for what is next.
 
@@ -340,9 +340,36 @@ dense (resident), and the largest single expert, which is the unit the expert ca
 moves. `--tensors` lists every tensor with its dtype, shape and role. `<ID>` is
 looked up in the model directories; a path to a model directory also works.
 
-### `qubivex models validate <ID|DIR>`
+### `qubivex models analyse <ID|DIR> [options]`
 
-An alias of `qubivex models verify`.
+Says whether a model can run on this machine, and what it would take:
+
+```bash
+qubivex models analyse olmoe-1b-7b-0125-instruct
+qubivex models analyse olmoe-1b-7b-0125-instruct --ram-budget 2GiB --ctx 8192 --json
+```
+
+The verdict is one of: everything in RAM, runs while reading some experts from disk, or
+does not fit. It lists the RAM to start, to reach the context, and to keep every expert
+cached, then this machine's RAM and what each backend would do. It reads only headers and
+changes nothing. "Does not fit" is an answer, so the command still exits 0; scripts should
+read `assessment.verdict` from `--json`. It takes the options of `qubivex plan`, which shows
+the placement behind the verdict. `analyze` also works.
+
+### `qubivex models verify <ID|DIR> [--record] [--threads N]`
+
+Checks every file against the checksums in its manifest, then every expert against
+`experts.qvxsum`, which it records if there are none. `--record` records both again from
+the files as they are, after replacing them on purpose; nothing else accepts a changed
+file. `qubivex models validate` is an alias.
+
+### `qubivex models migrate <ID|DIR> [--write] [--no-checksums]`
+
+Brings a manifest up to the current schema (1.1), adding the source from the registry and
+the size and checksum of every file. Prints the result unless given `--write`, which
+replaces `manifest.json` and reads every file once. A checksum already recorded stays, so
+migrating cannot hide a file that changed. Models keep working without this: 1.0 manifests
+load as they are.
 
 ### `qubivex models import <DIR|FILE.gguf> [options]`
 
@@ -362,7 +389,8 @@ The importer finds the weight files: a `model.safetensors.index.json`, all
 keeps the first combination under which every tensor validates. If none does, it
 reports the problems of the closest candidate. A tied output head reads the embedding;
 a copy of it stored under the head's name is listed in `overrides.ignore_tensors`. It records shard sizes,
-which are checked at every load, and the dominant dtype.
+which are checked at every load, and the dominant dtype. With `--write` it also records
+each file's checksum and the per-expert checksums, unless given `--no-checksums`.
 
 ### `qubivex models search <QUERY> [--limit N] [--json]`
 

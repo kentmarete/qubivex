@@ -10,7 +10,7 @@ use qubivex_core::{Bytes, LayerIdx};
 use qubivex_hardware::Probed;
 use qubivex_memory::{
     ACTIVATION_RESERVE, DenseGroup, HostMemory, LayerExperts, ModelFootprint, PlanRequest,
-    PlanningError, Profile, RoleGroup, Source, distribute, plan,
+    PlanningError, Profile, RoleGroup, Source, Verdict, assess, distribute, plan,
 };
 use qubivex_model::{ArchitectureRegistry, ModelMetadata};
 
@@ -385,4 +385,63 @@ proptest! {
             }
         }
     }
+}
+
+/// Each verdict, with the budget just either side of the figures that decide it.
+#[test]
+fn assessment_verdicts_turn_on_the_stated_requirements() {
+    let fp = ModelFootprint::from_metadata(&load("qwen3-moe-tiny")).unwrap();
+    let at = |budget: u64| {
+        let req = PlanRequest {
+            ram_budget: Some(Bytes(budget)),
+            context: Some(64),
+            ..PlanRequest::default()
+        };
+        assess(&fp, &host(GIB, GIB), &req).unwrap()
+    };
+    let need = at(GIB).requirements;
+    assert!(need.minimum <= need.at_context && need.at_context < need.in_memory);
+    assert_eq!(need.kv_context, 64);
+
+    let fits = at(need.in_memory.0);
+    assert_eq!(fits.verdict, Verdict::Fits);
+    assert!(fits.refusal.is_none());
+
+    assert_eq!(at(need.in_memory.0 - 1).verdict, Verdict::Streams);
+    assert_eq!(at(need.at_context.0).verdict, Verdict::Streams);
+
+    let refused = at(need.at_context.0 - 1);
+    assert_eq!(refused.verdict, Verdict::DoesNotFit);
+    assert!(refused.plan.is_none());
+    assert!(refused.refusal.unwrap().contains("at most"));
+
+    let too_small = at(need.minimum.0 - 1);
+    assert_eq!(too_small.verdict, Verdict::DoesNotFit);
+    assert!(too_small.refusal.unwrap().contains("does not fit"));
+}
+
+#[test]
+fn a_dense_model_has_no_streaming_verdict() {
+    let fp = ModelFootprint::from_metadata(&load("dense-tiny")).unwrap();
+    let req = PlanRequest {
+        context: Some(16),
+        ..PlanRequest::default()
+    };
+    let a = assess(&fp, &host(GIB, GIB), &req).unwrap();
+    assert_eq!(a.verdict, Verdict::Fits);
+    assert_eq!(a.requirements.at_context, a.requirements.in_memory);
+}
+
+#[test]
+fn an_unmeasurable_machine_is_an_error_not_a_verdict() {
+    let fp = ModelFootprint::from_metadata(&load("dense-tiny")).unwrap();
+    let unknown = HostMemory {
+        total: Probed::Unknown("no probe".into()),
+        available: Probed::Unknown("no probe".into()),
+        dense_resident: false,
+    };
+    assert!(matches!(
+        assess(&fp, &unknown, &PlanRequest::default()),
+        Err(PlanningError::UnknownAvailable(_))
+    ));
 }

@@ -1554,7 +1554,8 @@ fn pools_for(layers: &[LayerExperts], bytes: u64) -> Vec<PoolSpec> {
 /// every layer's GPU round trip costs more than the GPU saves (ADR-011 amendment 3).
 /// With fewer than half a layer's experts, decode waits on loads that the CPU pass
 /// overlaps with compute (ADR-011 amendment 6).
-fn cpu_pass_reason(layers: &[LayerExperts], bytes: u64, top_k: usize) -> Option<String> {
+#[must_use]
+pub fn cpu_pass_reason(layers: &[LayerExperts], bytes: u64, top_k: usize) -> Option<String> {
     let slots = qubivex_memory::distribute(layers, Bytes(bytes), None);
     let in_layers = || layers.iter().zip(&slots);
     if let Some((_, s)) = in_layers().find(|(_, s)| (**s as usize) < top_k) {

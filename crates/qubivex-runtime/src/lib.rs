@@ -15,7 +15,7 @@ mod request;
 pub use engine::{
     DEFAULT_IO_THREADS, DEFAULT_READ_RETRIES, Engine, EngineOptions, Finish, GenerateOptions,
     Generation, KvReservation, PredictionStats, PrefetchOptions, PrefetchReport, Sampling,
-    Verification, VerifyExperts,
+    Verification, VerifyExperts, cpu_pass_reason,
 };
 pub use experts::{ExpertIo, ExpertLayout, IoPath, ModelExpertSource, PartLayout};
 pub use placement::{BackendKind, MetalOps, PlacementReport};

@@ -1,4 +1,8 @@
-//! `manifest.json`, schema v1 (ADR-004). JSON Schema: `docs/model-support/manifest.schema.json`.
+//! `manifest.json`, schema 1.1 (ADR-004). JSON Schema: `docs/model-support/manifest.schema.json`.
+//!
+//! A minor version adds optional fields, so 1.0 still reads as it is; [`Manifest::upgraded`]
+//! moves one forward. A manifest from a newer minor is refused by name rather than as an
+//! unknown field.
 
 use std::fmt;
 use std::path::Path;
@@ -10,6 +14,14 @@ use crate::ModelError;
 
 /// The manifest schema major version this build reads.
 pub const SCHEMA_MAJOR: u64 = 1;
+/// The newest minor of [`SCHEMA_MAJOR`] this build reads, and the one it writes.
+pub const SCHEMA_MINOR: u64 = 1;
+/// The schema version this build writes.
+pub const SCHEMA_VERSION: SemVer = SemVer {
+    major: SCHEMA_MAJOR,
+    minor: SCHEMA_MINOR,
+    patch: 0,
+};
 
 /// A `major.minor.patch` version.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -83,6 +95,19 @@ pub struct ModelSection {
     pub version: Option<String>,
 }
 
+/// Where a model came from. Provider-neutral: repository metadata is normalised to this,
+/// and nothing that runs a model reads it.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ModelSource {
+    /// The provider, such as `huggingface`.
+    pub provider: String,
+    /// The repository at that provider.
+    pub repository: String,
+    /// The exact revision.
+    pub revision: String,
+}
+
 /// The `architecture` section.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -107,7 +132,7 @@ pub enum ManifestFormat {
     Gguf,
 }
 
-/// One weight file.
+/// One file of a model: a weight shard, or an entry of [`Manifest::files`].
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Shard {
@@ -116,7 +141,7 @@ pub struct Shard {
     /// Expected size in bytes; checked at load when given.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub size: Option<u64>,
-    /// Expected sha256, lowercase hex; checked by `qubivex models verify`.
+    /// Expected sha256, lowercase hex; checked by [`crate::verify_files`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sha256: Option<String>,
 }
@@ -168,12 +193,19 @@ pub struct Manifest {
     pub schema_version: SemVer,
     /// Identity.
     pub model: ModelSection,
+    /// Where it came from; `None` for a local import. Schema 1.1.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<ModelSource>,
     /// Architecture.
     pub architecture: ArchRef,
     /// Weights.
     pub weights: WeightsSection,
     /// Tokenizer.
     pub tokenizer: TokenizerSection,
+    /// The model's other files (config, tokenizer and its companions), for their
+    /// checksums. Schema 1.1.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub files: Vec<Shard>,
     /// Context length limit, if lower than the architecture's.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub context_length: Option<u64>,
@@ -202,12 +234,23 @@ impl Manifest {
             path: path.to_owned(),
             detail,
         };
+        // The version first: a newer manifest's fields would read as unknown ones.
+        if let Ok(v) = serde_json::from_str::<Version>(text) {
+            check_version(v.schema_version).map_err(bad)?;
+        }
         let m: Self = serde_json::from_str(text).map_err(|e| bad(e.to_string()))?;
-        if m.schema_version.major != SCHEMA_MAJOR {
+        if m.schema_version.minor == 0 && (m.source.is_some() || !m.files.is_empty()) {
             return Err(bad(format!(
-                "schema_version {} is not supported (this build reads {SCHEMA_MAJOR}.x)",
+                "schema_version {} has no source or files; they need 1.1",
                 m.schema_version
             )));
+        }
+        if let Some(s) = &m.source {
+            if s.provider.is_empty() || s.repository.is_empty() || s.revision.is_empty() {
+                return Err(bad(
+                    "source needs a provider, a repository and a revision".into()
+                ));
+            }
         }
         let id_ok = !m.model.id.is_empty()
             && m.model.id.len() <= 128
@@ -226,13 +269,14 @@ impl Manifest {
         }
         let mut paths: Vec<&str> = m.weights.shards.iter().map(|s| s.path.as_str()).collect();
         paths.extend(m.weights.config.as_deref());
+        paths.extend(m.files.iter().map(|f| f.path.as_str()));
         if let TokenizerSection::Huggingface { path: p } = &m.tokenizer {
             paths.push(p);
         }
         for p in &paths {
             check_relative(p).map_err(bad)?;
         }
-        for s in &m.weights.shards {
+        for s in m.weights.shards.iter().chain(&m.files) {
             if let Some(h) = &s.sha256 {
                 if h.len() != 64
                     || !h
@@ -240,7 +284,7 @@ impl Manifest {
                         .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
                 {
                     return Err(bad(format!(
-                        "shard {:?}: sha256 must be 64 lowercase hex digits",
+                        "file {:?}: sha256 must be 64 lowercase hex digits",
                         s.path
                     )));
                 }
@@ -269,6 +313,65 @@ impl Manifest {
         let text = read_small(path, MAX_MANIFEST_BYTES)?;
         Self::parse(&text, path)
     }
+
+    /// This manifest at [`SCHEMA_VERSION`]. Every step from an older minor adds optional
+    /// fields, so only the version changes; a later minor that changes more does it here.
+    /// What the fields hold comes from [`crate::fill_checksums`] and the registry.
+    #[must_use]
+    pub fn upgraded(mut self) -> Self {
+        self.schema_version = SCHEMA_VERSION;
+        self
+    }
+
+    /// Writes `manifest.json` in `dir` so that a crash leaves the old file or the new
+    /// one, never part of either.
+    ///
+    /// # Errors
+    /// [`ModelError::Io`], or [`ModelError::Manifest`] if it cannot be serialised.
+    pub fn save(&self, dir: &Path) -> Result<(), ModelError> {
+        use std::io::Write;
+        let path = dir.join(crate::MANIFEST_FILE);
+        let mut text = serde_json::to_string_pretty(self).map_err(|e| ModelError::Manifest {
+            path: path.clone(),
+            detail: e.to_string(),
+        })?;
+        text.push('\n');
+        let tmp = dir.join(format!(".manifest.{}.tmp", std::process::id()));
+        let io = |path: &Path| {
+            let path = path.to_owned();
+            move |source| ModelError::Io { path, source }
+        };
+        let written = std::fs::File::create(&tmp).and_then(|mut f| {
+            f.write_all(text.as_bytes())?;
+            f.sync_all()
+        });
+        if let Err(e) = written.and_then(|()| std::fs::rename(&tmp, &path)) {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(io(&path)(e));
+        }
+        Ok(())
+    }
+}
+
+/// Only the version, read before the rest.
+#[derive(Deserialize)]
+struct Version {
+    schema_version: SemVer,
+}
+
+fn check_version(v: SemVer) -> Result<(), String> {
+    if v.major != SCHEMA_MAJOR {
+        return Err(format!(
+            "schema_version {v} is not supported (this build reads {SCHEMA_MAJOR}.x)"
+        ));
+    }
+    if v.minor > SCHEMA_MINOR {
+        return Err(format!(
+            "schema_version {v} is newer than this build, which reads up to \
+             {SCHEMA_MAJOR}.{SCHEMA_MINOR}; update qubivex"
+        ));
+    }
+    Ok(())
 }
 
 /// Paths inside a model directory: relative, no `..`, no absolute or drive paths.

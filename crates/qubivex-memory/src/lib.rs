@@ -4,6 +4,8 @@
 //! - [`plan`]: one RAM budget per profile, the room the KV and expert caches share,
 //!   per-layer expert slots, placements and the reasons for every number. `qubivex
 //!   plan` and model loading use the same function.
+//! - [`assess`]: whether a model can run at all, and how much RAM each way of running
+//!   it takes, on top of [`plan`]. `qubivex models analyse` prints it.
 //! - [`MemoryPlan::expert_cache_for`]: the expert-cache capacity for a KV length,
 //!   and admission control (a KV that would push the cache below one slot per layer
 //!   is refused).
@@ -16,11 +18,13 @@
 //! RAM and VRAM budgets are separate and never summed. There is no VRAM budget until
 //! a GPU backend exists (Phase 8).
 
+mod assess;
 mod footprint;
 mod ledger;
 mod plan;
 mod pressure;
 
+pub use assess::{Assessment, Requirements, Verdict, assess};
 pub use footprint::{DenseGroup, KV_ELEMENT_BYTES, LayerExperts, ModelFootprint, RoleGroup};
 pub use ledger::{Charge, LedgerSnapshot, MemoryLedger, Owner, Tier};
 pub use plan::{

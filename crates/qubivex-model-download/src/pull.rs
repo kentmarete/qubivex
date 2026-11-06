@@ -1,19 +1,20 @@
 //! From a repository name to an installed model.
 
+use std::collections::BTreeMap;
 use std::fs;
 use std::io::Read;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
-use qubivex_model::{ArchitectureRegistry, ImportOptions, MANIFEST_FILE, import};
-use qubivex_model_registry::{Install, ModelRecord, ModelSource, Registry};
+use qubivex_model::{ArchitectureRegistry, ImportOptions, ModelSource, fill_checksums, import};
+use qubivex_model_registry::{Install, ModelRecord, Registry};
 use serde_json::{Map, Value};
 
 use crate::error::io_err;
 use crate::select::{self, INDEX, default_id, needs_index};
 use crate::transfer::{Transfer, retry};
-use crate::{DownloadError, ModelProvider, RepoListing, SearchHit, Selection};
+use crate::{Checksum, DownloadError, ModelProvider, RepoListing, SearchHit, Selection};
 
 /// Largest shard index read into memory, which is the importer's limit too.
 const MAX_INDEX: u64 = 64 << 20;
@@ -158,6 +159,7 @@ fn fill(
     install: &Install<'_>,
     req: &PullRequest,
     id: &str,
+    source: &ModelSource,
     arch: &ArchitectureRegistry,
     transfer: &Transfer<'_>,
     files: &[Selection],
@@ -180,13 +182,19 @@ fn fill(
         id: Some(id.to_owned()),
         name: req.name.clone(),
         set: req.set.clone(),
+        source: Some(source.clone()),
     };
-    let imported = import(dir, &opts, arch).map_err(DownloadError::Import)?;
-    let mut text = serde_json::to_string_pretty(&imported.manifest)
-        .map_err(|e| DownloadError::Protocol(e.to_string()))?;
-    text.push('\n');
-    let manifest = dir.join(MANIFEST_FILE);
-    fs::write(&manifest, text).map_err(io_err(&manifest))?;
+    let mut imported = import(dir, &opts, arch).map_err(DownloadError::Import)?;
+    // The transfer checked these against the provider, so large files are not read again.
+    let verified: BTreeMap<String, String> = files
+        .iter()
+        .filter_map(|f| match &f.remote.checksum {
+            Some(Checksum::Sha256(h)) => Some((f.name.clone(), h.clone())),
+            _ => None,
+        })
+        .collect();
+    fill_checksums(&mut imported.manifest, dir, &verified).map_err(DownloadError::Import)?;
+    imported.manifest.save(dir).map_err(DownloadError::Import)?;
     Ok(imported.warnings)
 }
 
@@ -238,14 +246,12 @@ pub fn pull(
         .clone()
         .unwrap_or_else(|| default_id(&req.repository, &files));
     registry.reconcile(arch)?;
-    let install = registry.begin_install(
-        &id,
-        Some(ModelSource {
-            provider: provider.name().to_owned(),
-            repository: listing.repository.clone(),
-            revision: listing.revision.clone(),
-        }),
-    )?;
+    let source = ModelSource {
+        provider: provider.name().to_owned(),
+        repository: listing.repository.clone(),
+        revision: listing.revision.clone(),
+    };
+    let install = registry.begin_install(&id, Some(source.clone()))?;
     progress(Progress::Planned {
         revision: listing.revision.clone(),
         files: files
@@ -262,7 +268,7 @@ pub fn pull(
         progress,
         failed: AtomicBool::new(false),
     };
-    match fill(&install, req, &id, arch, &transfer, &files) {
+    match fill(&install, req, &id, &source, arch, &transfer, &files) {
         Ok(warnings) => Ok(Pulled {
             record: install.commit(arch)?,
             warnings,

@@ -7,6 +7,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use qubivex_model::ArchitectureRegistry;
+use qubivex_model::Manifest;
 use qubivex_model_registry::{InstallState, ModelSource, REGISTRY_FILE, Registry, RegistryError};
 
 const FIXTURE: &str = "qwen3-moe-tiny";
@@ -197,6 +198,22 @@ fn reconcile_adopts_drops_and_skips() {
     fs::remove_dir_all(t.0.join("by-hand")).unwrap();
     assert_eq!(r.reconcile(&arch()).unwrap().dropped, [FIXTURE]);
     assert!(r.list().unwrap().is_empty());
+}
+
+#[test]
+fn an_adopted_model_keeps_the_source_in_its_manifest() {
+    let t = Tmp::new();
+    let dir = t.0.join(FIXTURE);
+    copy_fixture(&dir);
+    let mut m = Manifest::load(&dir.join("manifest.json"))
+        .unwrap()
+        .upgraded();
+    m.source = source("abc");
+    m.save(&dir).unwrap();
+
+    let r = Registry::open(&t.0).unwrap();
+    assert_eq!(r.reconcile(&arch()).unwrap().adopted, [FIXTURE]);
+    assert_eq!(r.get(FIXTURE).unwrap().unwrap().source, source("abc"));
 }
 
 #[test]

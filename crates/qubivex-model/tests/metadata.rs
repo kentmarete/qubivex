@@ -577,13 +577,16 @@ fn json_schema_matches_the_manifest_type() {
     m["model"]["version"] = json!("1");
     m["weights"]["shards"][0]["size"] = json!(1);
     m["weights"]["shards"][0]["sha256"] = json!("0".repeat(64));
+    m["schema_version"] = json!("1.1.0");
+    m["source"] = json!({ "provider": "p", "repository": "r", "revision": "v" });
+    m["files"] = json!([{ "path": "tokenizer.json" }]);
     // Round-trip through the type, so only fields it knows survive.
     let parsed = Manifest::parse(&m.to_string(), Path::new("m")).unwrap();
     let back = serde_json::to_value(&parsed).unwrap();
     let mut top: Vec<String> = back.as_object().unwrap().keys().cloned().collect();
     top.sort();
     assert_eq!(keys(&s), top);
-    for sec in ["model", "architecture", "weights", "overrides"] {
+    for sec in ["model", "source", "architecture", "weights", "overrides"] {
         let mut k: Vec<String> = back[sec].as_object().unwrap().keys().cloned().collect();
         k.sort();
         assert_eq!(keys(&s["properties"][sec]), k, "{sec}");
@@ -595,8 +598,11 @@ fn json_schema_matches_the_manifest_type() {
         .cloned()
         .collect();
     k.sort();
-    assert_eq!(
-        keys(&s["properties"]["weights"]["properties"]["shards"]["items"]),
-        k
-    );
+    assert_eq!(keys(&s["$defs"]["file"]), k);
+    for items in [
+        &s["properties"]["weights"]["properties"]["shards"]["items"],
+        &s["properties"]["files"]["items"],
+    ] {
+        assert_eq!(items["$ref"], "#/$defs/file");
+    }
 }

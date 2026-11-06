@@ -66,7 +66,8 @@ fn import_reproduces_the_committed_manifests() {
             ..Default::default()
         };
         let imported = import(&dir, &opts, &reg).unwrap().manifest;
-        assert_eq!(imported, committed, "{id}");
+        // Fixtures stay at schema 1.0, as input to the migration tests.
+        assert_eq!(imported, committed.upgraded(), "{id}");
     }
     // GGUF does not record top-K renormalisation: without --set, import says so.
     let e = import(

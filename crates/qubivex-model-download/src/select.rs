@@ -10,23 +10,8 @@ use serde_json::Value;
 
 use crate::{DownloadError, RemoteFile, RepoListing};
 
-/// The SafeTensors shard index.
-pub(crate) const INDEX: &str = "model.safetensors.index.json";
-
-/// Files that travel with SafeTensors weights, when the repository has them.
-const COMPANIONS: &[&str] = &[
-    "config.json",
-    "generation_config.json",
-    "tokenizer.json",
-    "tokenizer_config.json",
-    "special_tokens_map.json",
-    "chat_template.jinja",
-    "chat_template.json",
-    "LICENSE",
-    "LICENSE.md",
-    "LICENSE.txt",
-    "NOTICE",
-];
+use qubivex_model::COMPANION_FILES as COMPANIONS;
+pub(crate) use qubivex_model::SHARD_INDEX_FILE as INDEX;
 
 /// One file to fetch.
 #[derive(Clone, Debug, PartialEq, Eq)]
