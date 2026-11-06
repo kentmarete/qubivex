@@ -68,7 +68,7 @@ applies only to what remains.
 | `models remove` | Production | Needs `--yes`; deletes only inside the models directory |
 | `models analyse` | **Missing** as named | `qubivex plan` does the work; needs wiring |
 | Registry | Partial | `qubivex-model-registry`: atomic records of source, revision and install state, crash recovery, safe removal. Downloads do not use it until job 3 |
-| Lifecycle states | Partial | Install states are recorded (ADR-003 amendment 1). Loading, loaded and failed-load states are job 5, in the serving process |
+| Lifecycle states | Partial | Install states are recorded (ADR-003 amendment 2). Loading, loaded and failed-load states are job 5, in the serving process |
 | Manifest fields | Partial | No source repository, revision pin, per-file checksums or expert fields; checksums are `experts.qvxsum`. The schema is versioned, with no migration path yet |
 
 ### Server (Product C)

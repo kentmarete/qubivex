@@ -3,7 +3,7 @@
 Last updated: 2026-11-06
 
 ## Current phase
-**Model registry done (2026-11-06); ADR-003 amendment 1.** Job 2 of the platform plan. New crate `qubivex-model-registry`: `registry.json` records each installed model's source, revision and install state, with atomic updates. Installs build in staging and rename into place; `reconcile` recovers interrupted installs and adopts directories found on disk.
+**Model registry done (2026-11-06); ADR-003 amendment 2.** Job 2 of the platform plan. New crate `qubivex-model-registry`: `registry.json` records each installed model's source, revision and install state, with atomic updates. Installs build in staging and rename into place; `reconcile` recovers interrupted installs and adopts directories found on disk.
 - CLI: `qubivex models remove <id> [--yes]` (without `--yes` it deletes nothing), and `models validate` as an alias of `verify`.
 - Tests: 15 registry tests (a crash at each install and removal step, path traversal, tampered and newer registry files, symbolic links, 16 concurrent writers) and one test through the binary.
 - Limits: no CLI command starts an install until job 3, and removal does not check for a process serving the model.
@@ -49,7 +49,7 @@ Last updated: 2026-11-06
 - Tests: 284 on 1.85 and stable; `cargo deny` passes with the new dependencies. OLMoE single-request decode unchanged (43.2 tok/s, tokens match).
 - Next was Metal slice 5 (done, above).
 
-**Dense architecture and a real SafeTensors run done (2026-11-04), §3a item; ADR-003 amendment 1.**
+**Dense architecture and a real SafeTensors run done (2026-11-04), §3a item; ADR-003 amendment 2.**
 - `transformer_dense` registered beside `transformer_moe` (own config, presets `hf`/`gguf`, schema; refuses routed experts); shared config parsing in `qubivex-model/src/arch/common.rs`; new `TensorRole::Ffn` (planner group `dense FFN`). The forward pass (`qubivex_arch::Transformer`, renamed from `TransformerMoeModel`) shares embedding, attention, KV and head; the FFN is configuration. Whole-layer Metal and prefetch stay MoE-only; a dense model on Metal places its matmuls one by one (same bits).
 - Importer tries both architectures; a tied head stored anyway goes to `overrides.ignore_tensors`; no expert checksums for a dense model. Also refused now by every architecture: `mlp_bias`, `use_sliding_window`.
 - Real run: `Qwen/Qwen3-0.6B` bf16 SafeTensors (1.4 GiB) imports with no edits and generates coherent text (plain and chat template). Against transformers f32: 32 greedy tokens identical, the top-32 logits of every prompt position within 1.2e-5 relative; prefill equals token by token and 1 vs 4 threads bit for bit (`tests/real_dense.rs`, env-gated `QUBIVEX_DENSE_SAFETENSORS_DIR`).

@@ -1,7 +1,8 @@
 # ADR-003: Architecture registry keyed by manifest architecture id
 
 - Status: Proposed (Phase 0); accepted in practice (ARCHITECTURE_DECISIONS). Amendment 1
-  (2026-11-04): a second architecture, `transformer_dense`.
+  (2026-11-04): a second architecture, `transformer_dense`. Amendment 2 (2026-11-06): a
+  registry of installed models.
 - Date: 2026-11-01
 
 ## Context
@@ -68,7 +69,7 @@ registered beside the first, and runs a real checkpoint through it.
   transformers' 32 greedy tokens, logits within 1.2e-5 relative, and the invariants hold
   on it (`tests/real_dense.rs`, env-gated, `fixtures/oracle/dense_real.json`).
 
-## Amendment 1 (2026-11-06): installed models get a registry
+## Amendment 2 (2026-11-06): installed models get a registry
 "Registry" above means the architecture registry. Plan job 2 (`docs/engineering/PLATFORM_AUDIT.md`)
 adds a separate one for installed models, in a new crate, `qubivex-model-registry`:
 `registry.json` in the models directory, with no effect on models that do not use it.
