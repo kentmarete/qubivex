@@ -3,6 +3,9 @@
 //! the output (`n > 1`, tools, logprobs); fields that would not (`user`, penalties of
 //! zero) are accepted and ignored.
 
+use std::time::Duration;
+
+use qubivex_runtime::scheduler::Priority;
 use serde::Deserialize;
 use serde_json::Value;
 
@@ -71,6 +74,12 @@ pub(crate) struct Common {
     pub(crate) presence_penalty: Option<f32>,
     pub(crate) frequency_penalty: Option<f32>,
     pub(crate) logit_bias: Option<Value>,
+    /// A QUBIVEX field: `low`, `normal` or `high`.
+    pub(crate) priority: Option<String>,
+    /// A QUBIVEX field: seconds this request may take, queue included.
+    pub(crate) timeout: Option<f64>,
+    /// Who the request is for: the client, for fairness.
+    pub(crate) user: Option<String>,
 }
 
 /// `POST /v1/chat/completions`.
@@ -110,6 +119,9 @@ pub(crate) struct Params {
     pub(crate) stops: Vec<String>,
     pub(crate) stream: bool,
     pub(crate) include_usage: bool,
+    pub(crate) priority: Priority,
+    pub(crate) timeout: Option<Duration>,
+    pub(crate) client: Option<String>,
 }
 
 fn zero_or_absent(v: Option<f32>) -> bool {
@@ -164,6 +176,28 @@ impl Common {
                 })
             })
             .transpose()?;
+        let priority = match self.priority.as_deref() {
+            None | Some("normal") => Priority::Normal,
+            Some("low") => Priority::Low,
+            Some("high") => Priority::High,
+            Some(_) => {
+                return Err(ApiError::invalid_param(
+                    "priority",
+                    "priority must be low, normal or high",
+                ));
+            }
+        };
+        let timeout = self
+            .timeout
+            .map(|t| {
+                Duration::try_from_secs_f64(t)
+                    .ok()
+                    .filter(|d| !d.is_zero())
+                    .ok_or_else(|| {
+                        ApiError::invalid_param("timeout", "timeout must be positive seconds")
+                    })
+            })
+            .transpose()?;
         let stops = self.stop.map(OneOrMany::into_vec).unwrap_or_default();
         if stops.len() > 4 || stops.iter().any(String::is_empty) {
             return Err(ApiError::invalid_param(
@@ -180,6 +214,9 @@ impl Common {
             stops,
             stream: self.stream,
             include_usage: self.stream_options.is_some_and(|o| o.include_usage),
+            priority,
+            timeout,
+            client: self.user,
         })
     }
 }

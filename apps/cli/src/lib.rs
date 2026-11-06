@@ -151,12 +151,24 @@ enum Command {
         /// max_tokens when a request does not set it.
         #[arg(long, default_value_t = 512)]
         default_max_tokens: usize,
-        /// Seconds a request waits for a generation slot before a 429.
+        /// Requests per model that may wait beyond those running; more get a 429 at once.
+        #[arg(long, default_value_t = 32)]
+        max_queue: usize,
+        /// Seconds a request waits to start before a 429.
         #[arg(long, default_value_t = 30)]
         queue_timeout: u64,
+        /// When a request's memory is not free yet: queue (wait for it) or refuse (503).
+        #[arg(long, default_value = "queue")]
+        memory_policy: String,
         /// Seconds a generation may run.
         #[arg(long, default_value_t = 600)]
         request_timeout: u64,
+        /// Seconds a stream may go without the client reading before it ends.
+        #[arg(long, default_value_t = 30)]
+        stall_timeout: u64,
+        /// Seconds running requests get to finish at shutdown before they are stopped.
+        #[arg(long, default_value_t = 30)]
+        shutdown_grace: u64,
         /// A fixed expert cache in MiB per model, bypassing the memory planner.
         #[arg(long)]
         expert_cache_mb: Option<u64>,
@@ -930,8 +942,12 @@ fn execute(cmd: &Command) -> Result<(), String> {
             admin_token,
             max_concurrent,
             default_max_tokens,
+            max_queue,
             queue_timeout,
+            memory_policy,
             request_timeout,
+            stall_timeout,
+            shutdown_grace,
             expert_cache_mb,
             profile,
             ram_fraction,
@@ -948,8 +964,12 @@ fn execute(cmd: &Command) -> Result<(), String> {
             admin_token: admin_token.clone(),
             max_concurrent: *max_concurrent,
             default_max_tokens: *default_max_tokens,
+            max_queue: *max_queue,
             queue_timeout: std::time::Duration::from_secs(*queue_timeout),
+            memory_policy: serve::memory_policy(memory_policy)?,
             request_timeout: std::time::Duration::from_secs(*request_timeout),
+            stall_timeout: std::time::Duration::from_secs(*stall_timeout),
+            shutdown_grace: std::time::Duration::from_secs(*shutdown_grace),
             engine: memory_options(
                 *expert_cache_mb,
                 profile,

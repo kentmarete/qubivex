@@ -7,12 +7,13 @@
 use std::panic::AssertUnwindSafe;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Instant;
 
+use qubivex_runtime::scheduler::Grant;
 use qubivex_runtime::{
-    ChatMessage, Engine, Finish, GenerationEvent, GenerationRequest, Prompt, RequestError, Sampling,
+    ChatMessage, Engine, Finish, GenerationEvent, GenerationRequest, KvAdmission, PreparedRequest,
+    Prompt, RequestError, Sampling,
 };
-use tokio::sync::{OwnedSemaphorePermit, mpsc};
+use tokio::sync::mpsc;
 
 use crate::error::ApiError;
 use crate::metrics::Metrics;
@@ -69,28 +70,61 @@ impl Drop for CancelOnDrop {
     }
 }
 
+/// The runtime's request for what an HTTP request asked. The deadline is set when it is
+/// granted.
+pub(crate) fn request(
+    input: Input,
+    params: &Params,
+    default_max_tokens: usize,
+    prefill_chunk: usize,
+) -> GenerationRequest {
+    let prompt = match input {
+        Input::Text(t) => Prompt::Text(t),
+        Input::Chat(msgs) => Prompt::Chat(
+            msgs.iter()
+                .map(|(r, c)| ChatMessage::new(r.as_str(), c.as_str()))
+                .collect(),
+        ),
+    };
+    GenerationRequest {
+        prompt,
+        max_tokens: params.max_tokens,
+        default_max_tokens,
+        sampling: Sampling {
+            temperature: params.temperature,
+            top_k: params.top_k,
+            top_p: params.top_p,
+            seed: params.seed,
+        },
+        stops: params.stops.clone(),
+        prefill_chunk,
+        deadline: None,
+    }
+}
+
 /// A generation request handed to the worker.
 pub(crate) struct Job {
     pub(crate) engine: Arc<Engine>,
-    pub(crate) input: Input,
-    pub(crate) params: Params,
-    pub(crate) default_max_tokens: usize,
-    pub(crate) prefill_chunk: usize,
-    pub(crate) deadline: Instant,
+    pub(crate) request: GenerationRequest,
+    pub(crate) prepared: PreparedRequest,
+    /// The generation's slot and KV reservation.
+    pub(crate) grant: Grant<KvAdmission>,
     pub(crate) cancel: Arc<AtomicBool>,
     pub(crate) request_id: String,
     pub(crate) metrics: Arc<Metrics>,
 }
 
-/// Starts `job` on its own thread. The permit (one of the model's generation slots) is
-/// held until the thread ends.
-pub(crate) fn spawn(job: Job, tx: mpsc::Sender<Event>, permit: OwnedSemaphorePermit) {
+/// Starts `job` on its own thread.
+pub(crate) fn spawn(job: Job, tx: mpsc::Sender<Event>) {
     let name = format!("qubivex-req-{}", job.request_id);
+    let metrics = Arc::clone(&job.metrics);
+    // Counted here, not on the thread: shutdown must not see a gap between the grant
+    // and the thread's start.
+    metrics.active.fetch_add(1, Ordering::Relaxed);
+    let on_thread = Arc::clone(&metrics);
     let spawned = std::thread::Builder::new().name(name).spawn(move || {
-        let _permit = permit;
-        let metrics = Arc::clone(&job.metrics);
+        let metrics = on_thread;
         let rid = job.request_id.clone();
-        metrics.active.fetch_add(1, Ordering::Relaxed);
         let fail_tx = tx.clone();
         let r = std::panic::catch_unwind(AssertUnwindSafe(|| run(job, &tx)));
         if r.is_err() {
@@ -102,6 +136,7 @@ pub(crate) fn spawn(job: Job, tx: mpsc::Sender<Event>, permit: OwnedSemaphorePer
     });
     if let Err(e) = spawned {
         eprintln!("qubivex-api: cannot start a generation thread: {e}");
+        metrics.active.fetch_sub(1, Ordering::Relaxed);
     }
 }
 
@@ -110,32 +145,13 @@ fn run(job: Job, tx: &mpsc::Sender<Event>) {
     let fail = |e: ApiError| {
         let _ = tx.blocking_send(Event::Failed(e));
     };
-    let prompt = match &job.input {
-        Input::Text(t) => Prompt::Text(t.clone()),
-        Input::Chat(msgs) => Prompt::Chat(
-            msgs.iter()
-                .map(|(r, c)| ChatMessage::new(r.as_str(), c.as_str()))
-                .collect(),
-        ),
-    };
-    let request = GenerationRequest {
-        prompt,
-        max_tokens: job.params.max_tokens,
-        default_max_tokens: job.default_max_tokens,
-        sampling: Sampling {
-            temperature: job.params.temperature,
-            top_k: job.params.top_k,
-            top_p: job.params.top_p,
-            seed: job.params.seed,
-        },
-        stops: job.params.stops.clone(),
-        prefill_chunk: job.prefill_chunk,
-        deadline: Some(job.deadline),
-    };
     let m = &job.metrics;
-    let result = job
-        .engine
-        .run_request(&request, &job.cancel, |event| match event {
+    let result = job.engine.run_prepared(
+        &job.request,
+        &job.prepared,
+        job.grant.hold(),
+        &job.cancel,
+        |event| match event {
             GenerationEvent::Started { prompt_tokens } => {
                 let open = send(Event::Started { prompt_tokens });
                 if open {
@@ -149,7 +165,18 @@ fn run(job: Job, tx: &mpsc::Sender<Event>) {
                 true
             }
             GenerationEvent::Text(text) => send(Event::Text(text)),
-        });
+        },
+    );
+    // The slot and the memory go back before the client hears the end, so a client that
+    // sends its next request straight away finds them free.
+    let Job {
+        grant,
+        request_id,
+        metrics: m,
+        ..
+    } = job;
+    drop(grant);
+    let m = &m;
     match result {
         Ok(o) => {
             let finish = match o.finish {
@@ -169,19 +196,11 @@ fn run(job: Job, tx: &mpsc::Sender<Event>) {
                 completion_tokens: o.completion_tokens,
             });
         }
-        Err(RequestError::Invalid {
-            param: Some(param),
-            message,
-        }) => fail(ApiError::invalid_param(param, message)),
-        Err(RequestError::Invalid {
-            param: None,
-            message,
-        }) => fail(ApiError::invalid(message)),
-        Err(RequestError::Admission(err)) => fail(ApiError::from_runtime(&err, &job.request_id)),
-        Err(RequestError::Generation(err)) => {
-            m.errors.fetch_add(1, Ordering::Relaxed);
-            fail(ApiError::from_runtime(&err, &job.request_id));
+        Err(e) => {
+            if matches!(e, RequestError::Generation(_)) {
+                m.errors.fetch_add(1, Ordering::Relaxed);
+            }
+            fail(ApiError::from_request(&e, &request_id));
         }
-        Err(_) => fail(ApiError::internal(&job.request_id)),
     }
 }

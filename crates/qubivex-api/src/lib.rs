@@ -3,28 +3,31 @@
 //! - `GET /health`, `GET /metrics` (Prometheus text), `GET /v1/system`
 //! - `GET /v1/models`, `GET /v1/models/{id}`
 //! - `POST /v1/chat/completions` and `POST /v1/completions`, streaming (SSE) or not
-//! - `POST /v1/admin/models` (load) and `DELETE /v1/admin/models/{id}` (unload), behind
-//!   the admin token
+//! - `POST /v1/models/load` and `POST /v1/models/unload`, behind the admin token, with
+//!   `POST /v1/admin/models` and `DELETE /v1/admin/models/{id}` as aliases
 //!
 //! Tokio and Axum stay at the edge: every generation runs on its own dedicated thread
 //! (`worker`) and reaches the request over a bounded channel (QUBIVEX_DESIGN §4.7,
-//! RUST_GUIDELINES §4). Each conversation gets its own KV cache, and is admitted against
-//! the memory plan together with every other live one ([`Engine::reserve_kv`]). A
-//! request whose client goes away is cancelled: generation stops within one prefill
-//! chunk or one token. Every response carries an `x-request-id`; errors are
-//! OpenAI-shaped and never contain file paths.
+//! RUST_GUIDELINES §4). Each model has a [`Scheduler`](qubivex_runtime::scheduler) that
+//! decides when a request runs: its queue is bounded, and memory admission holds each
+//! conversation's KV against the plan with every other live one. A request whose client
+//! goes away is cancelled: generation stops within one prefill chunk or one token, and
+//! a stream that stops being read ends after [`ServerConfig::stall_timeout`]. Every
+//! response carries an `x-request-id`; errors are OpenAI-shaped and never contain file
+//! paths.
 
 mod error;
 mod metrics;
+mod models;
 mod openai;
 mod worker;
 
 use std::collections::BTreeMap;
 use std::convert::Infallible;
-use std::future::Future;
+use std::future::{Future, IntoFuture};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex, RwLock, Weak};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use axum::extract::rejection::JsonRejection;
@@ -36,14 +39,20 @@ use axum::routing::{delete, get, post};
 use axum::{Json, Router};
 pub use error::ApiError;
 pub use metrics::Metrics;
-use qubivex_model::{ArchitectureRegistry, find};
+use qubivex_runtime::scheduler::{EnterError, Outcome, RequestInfo};
+pub use qubivex_runtime::scheduler::{MemoryPolicy, Stats};
 use qubivex_runtime::{Engine, EngineOptions};
 use serde_json::{Value, json};
-use tokio::sync::{Semaphore, mpsc};
+use tokio::sync::{mpsc, oneshot, watch};
 use tokio_stream::wrappers::ReceiverStream;
 
+use crate::models::Entry;
 use crate::openai::{ChatRequest, CompletionRequest, Params};
-use crate::worker::{CancelOnDrop, Event, Input, Job};
+use crate::worker::{CancelOnDrop, Event, FinishReason, Input, Job};
+
+/// How long the server gives a stopped generation's thread and connection to end, after
+/// it has told them to.
+const STOP_MARGIN: Duration = Duration::from_secs(5);
 
 /// Server settings.
 #[derive(Clone, Debug)]
@@ -54,10 +63,22 @@ pub struct ServerConfig {
     pub admin_token: Option<String>,
     /// Generations that run at once per model; more wait for a slot.
     pub max_concurrent: usize,
-    /// How long a request waits for a generation slot before a 429.
+    /// Requests per model that may wait beyond those running. More get a 429 at once.
+    pub max_queue: usize,
+    /// How long a request waits to start before a 429.
     pub queue_timeout: Duration,
+    /// What a request does when its memory is not available yet.
+    pub memory_policy: MemoryPolicy,
+    /// How long a waiting request takes to gain one priority level. `None`: never.
+    pub priority_aging: Option<Duration>,
     /// Longest a generation runs; it then ends as if it reached `max_tokens`.
     pub request_timeout: Duration,
+    /// How long a stream may go without the client reading before it ends. A client
+    /// that keeps its connection open but stops reading would otherwise hold a slot and
+    /// its memory for as long as it liked.
+    pub stall_timeout: Duration,
+    /// How long running requests get to finish at shutdown before they are stopped.
+    pub shutdown_grace: Duration,
     /// `max_tokens` when a request does not say (capped by the context).
     pub default_max_tokens: usize,
     /// Prompt tokens per forward pass (how soon a cancelled prefill stops).
@@ -74,8 +95,13 @@ impl Default for ServerConfig {
             api_key: None,
             admin_token: None,
             max_concurrent: 4,
+            max_queue: 32,
             queue_timeout: Duration::from_secs(30),
+            memory_policy: MemoryPolicy::Queue,
+            priority_aging: Some(Duration::from_secs(10)),
             request_timeout: Duration::from_secs(600),
+            stall_timeout: Duration::from_secs(30),
+            shutdown_grace: Duration::from_secs(30),
             default_max_tokens: 512,
             prefill_chunk: 256,
             model_dirs: Vec::new(),
@@ -84,19 +110,16 @@ impl Default for ServerConfig {
     }
 }
 
-/// A loaded model.
-struct Loaded {
-    engine: Arc<Engine>,
-    slots: Arc<Semaphore>,
-    created: u64,
-}
-
 struct AppState {
     cfg: ServerConfig,
     /// Never held across an `.await`.
-    models: RwLock<BTreeMap<String, Arc<Loaded>>>,
+    models: RwLock<BTreeMap<String, Entry>>,
+    /// Unloaded engines, to see when running requests have let go of them.
+    unloaded: Mutex<Vec<Weak<Engine>>>,
     metrics: Arc<Metrics>,
     next_id: AtomicU64,
+    /// Set when the shutdown grace ends: running requests stop.
+    stop_now: watch::Sender<bool>,
 }
 
 /// The gateway: models plus settings. Clones share state.
@@ -141,8 +164,10 @@ impl Gateway {
             state: Arc::new(AppState {
                 cfg,
                 models: RwLock::new(BTreeMap::new()),
+                unloaded: Mutex::new(Vec::new()),
                 metrics: Arc::new(Metrics::default()),
                 next_id: AtomicU64::new(1),
+                stop_now: watch::Sender::new(false),
             }),
         }
     }
@@ -152,35 +177,31 @@ impl Gateway {
     /// # Errors
     /// [`ApiError`] (409) if `id` is already served.
     pub fn add_model(&self, id: &str, engine: Engine) -> Result<(), ApiError> {
-        let mut m = self
-            .state
-            .models
-            .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if m.contains_key(id) {
-            return Err(ApiError::conflict(format!(
-                "the model {id:?} is already loaded"
-            )));
-        }
-        m.insert(
-            id.to_owned(),
-            Arc::new(Loaded {
-                engine: Arc::new(engine),
-                slots: Arc::new(Semaphore::new(self.state.cfg.max_concurrent.max(1))),
-                created: now_secs(),
-            }),
-        );
-        Ok(())
+        self.state.insert(id, engine)
     }
 
     /// The ids served.
     #[must_use]
     pub fn model_ids(&self) -> Vec<String> {
-        self.state
-            .models
-            .read()
-            .map(|m| m.keys().cloned().collect())
-            .unwrap_or_default()
+        self.state.ready().into_iter().map(|(id, _)| id).collect()
+    }
+
+    /// Unloaded models whose weights are still held by running requests.
+    #[must_use]
+    pub fn draining_models(&self) -> usize {
+        self.state.draining()
+    }
+
+    /// The queue of model `id`, if it is loaded.
+    #[must_use]
+    pub fn queue_stats(&self, id: &str) -> Option<Stats> {
+        self.state.model(id).ok().map(|l| l.scheduler.stats())
+    }
+
+    /// KV positions reserved on model `id`, if it is loaded.
+    #[must_use]
+    pub fn kv_reserved(&self, id: &str) -> Option<usize> {
+        self.state.model(id).ok().map(|l| l.engine.kv_reserved())
     }
 
     /// The gateway's counters.
@@ -196,6 +217,8 @@ impl Gateway {
             .route("/metrics", get(metrics_text))
             .route("/v1/system", get(system))
             .route("/v1/models", get(list_models))
+            .route("/v1/models/load", post(admin_load))
+            .route("/v1/models/unload", post(models_unload))
             .route("/v1/models/{id}", get(get_model))
             .route("/v1/chat/completions", post(chat))
             .route("/v1/completions", post(completions))
@@ -205,7 +228,10 @@ impl Gateway {
             .with_state(Arc::clone(&self.state))
     }
 
-    /// Serves on `listener` until `shutdown` completes, then lets open requests finish.
+    /// Serves on `listener` until `shutdown` completes. New requests are then refused
+    /// and waiting ones end with a 503. Running requests get
+    /// [`ServerConfig::shutdown_grace`] to finish, and are stopped after that. Returns
+    /// when they have ended; a connection that will not close cannot hold it up.
     ///
     /// # Errors
     /// I/O errors from the listener.
@@ -214,9 +240,37 @@ impl Gateway {
         listener: tokio::net::TcpListener,
         shutdown: impl Future<Output = ()> + Send + 'static,
     ) -> std::io::Result<()> {
-        axum::serve(listener, self.router())
-            .with_graceful_shutdown(shutdown)
-            .await
+        let st = Arc::clone(&self.state);
+        let grace = st.cfg.shutdown_grace;
+        let (began_tx, began_rx) = oneshot::channel::<()>();
+        let begin = Arc::clone(&st);
+        let signal = async move {
+            shutdown.await;
+            begin.begin_shutdown();
+            let _ = began_tx.send(());
+        };
+        let server = axum::serve(listener, self.router())
+            .with_graceful_shutdown(signal)
+            .into_future();
+        let stopper = async {
+            if began_rx.await.is_err() {
+                std::future::pending::<()>().await;
+            }
+            tokio::time::sleep(grace).await;
+            st.stop_now.send_replace(true);
+            tokio::time::sleep(STOP_MARGIN).await;
+        };
+        let served = tokio::select! {
+            r = server => r,
+            () = stopper => Ok(()),
+        };
+        // A server that drained early never reached the grace's end.
+        st.stop_now.send_replace(true);
+        let waited = Instant::now();
+        while st.metrics.active() > 0 && waited.elapsed() < STOP_MARGIN {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        served
     }
 }
 
@@ -258,13 +312,11 @@ impl AppState {
         }
     }
 
-    fn model(&self, id: &str) -> Result<Arc<Loaded>, ApiError> {
-        self.models
-            .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .get(id)
-            .cloned()
-            .ok_or_else(|| ApiError::model_not_found(id))
+    /// Refuses new requests and ends the waiting ones.
+    fn begin_shutdown(&self) {
+        for (_, l) in self.ready() {
+            l.scheduler.close();
+        }
     }
 
     /// Adds the request id header and counts the request.
@@ -279,29 +331,31 @@ impl AppState {
 }
 
 async fn health(State(st): State<Arc<AppState>>) -> Json<Value> {
-    let n = st.models.read().map_or(0, |m| m.len());
-    Json(json!({ "status": "ok", "models": n }))
+    Json(json!({ "status": "ok", "models": st.ready().len() }))
 }
 
 async fn metrics_text(State(st): State<Arc<AppState>>) -> Response {
     let mut out = String::new();
     st.metrics.render(&mut out);
-    let models: Vec<(String, Arc<Loaded>)> = st
-        .models
-        .read()
-        .map(|m| m.iter().map(|(k, v)| (k.clone(), Arc::clone(v))).collect())
-        .unwrap_or_default();
-    for (name, help) in [
+    let models = st.ready();
+    for (name, kind) in [
         ("qubivex_kv_reserved_positions", "gauge"),
         ("qubivex_expert_cache_bytes", "gauge"),
         ("qubivex_generation_slots_free", "gauge"),
+        ("qubivex_queue_depth", "gauge"),
+        ("qubivex_queue_rejected_total", "counter"),
     ] {
-        out.push_str(&format!("# TYPE {name} {help}\n"));
+        out.push_str(&format!("# TYPE {name} {kind}\n"));
         for (id, l) in &models {
+            let q = l.scheduler.stats();
             let v = match name {
                 "qubivex_kv_reserved_positions" => l.engine.kv_reserved() as u64,
                 "qubivex_expert_cache_bytes" => l.engine.expert_cache_bytes(),
-                _ => l.slots.available_permits() as u64,
+                "qubivex_generation_slots_free" => {
+                    st.cfg.max_concurrent.saturating_sub(q.running) as u64
+                }
+                "qubivex_queue_depth" => q.queued as u64,
+                _ => q.rejected,
             };
             out.push_str(&format!("{name}{{model=\"{id}\"}} {v}\n"));
         }
@@ -323,22 +377,21 @@ async fn system(State(st): State<Arc<AppState>>, headers: HeaderMap) -> Response
         })
         .await
         .unwrap_or(Value::Null);
-        let models: Vec<(String, Arc<Loaded>)> = st
-            .models
-            .read()
-            .map(|m| m.iter().map(|(k, v)| (k.clone(), Arc::clone(v))).collect())
-            .unwrap_or_default();
-        let models: Vec<Value> = models
+        let models: Vec<Value> = st
+            .ready()
             .iter()
             .map(|(id, l)| {
                 let e = &l.engine;
+                let queue = l.scheduler.stats();
                 let ledger = e.ledger().snapshot(qubivex_memory::Tier::Ram);
                 json!({
                     "id": id,
                     "architecture": e.metadata().manifest.architecture.id,
                     "max_context": e.max_context(),
                     "generation_slots": st.cfg.max_concurrent,
-                    "generation_slots_free": l.slots.available_permits(),
+                    "generation_slots_free": st.cfg.max_concurrent.saturating_sub(queue.running),
+                    "queue_depth": queue.queued,
+                    "queue_limit": st.cfg.max_queue,
                     "kv_reserved_positions": e.kv_reserved(),
                     "expert_cache_bytes": e.expert_cache_bytes(),
                     "plan_budget_bytes": e.memory_plan().map(|p| p.ram.budget.bytes.0),
@@ -355,6 +408,8 @@ async fn system(State(st): State<Arc<AppState>>, headers: HeaderMap) -> Response
             "object": "system",
             "hardware": hardware,
             "models": models,
+            "model_states": st.states(),
+            "models_draining": st.draining(),
             "generations_active": st.metrics.active(),
         }))
         .into_response())
@@ -371,10 +426,10 @@ async fn list_models(State(st): State<Arc<AppState>>, headers: HeaderMap) -> Res
     let rid = st.request_id(&headers);
     let r = st.check_key(&headers).map(|()| {
         let data: Vec<Value> = st
-            .models
-            .read()
-            .map(|m| m.iter().map(|(id, l)| model_card(id, l.created)).collect())
-            .unwrap_or_default();
+            .ready()
+            .iter()
+            .map(|(id, l)| model_card(id, l.created))
+            .collect();
         Json(json!({ "object": "list", "data": data })).into_response()
     });
     st.finish("models", &rid, r)
@@ -459,7 +514,14 @@ async fn completions(
     st.finish("completions", &rid, r)
 }
 
-/// Starts a generation and answers with its result or its stream.
+/// Completes when the server has told running requests to stop.
+async fn stopped(stop: &mut watch::Receiver<bool>) {
+    if stop.wait_for(|s| *s).await.is_err() {
+        std::future::pending::<()>().await;
+    }
+}
+
+/// Queues a generation, starts it, and answers with its result or its stream.
 async fn generate(
     st: &Arc<AppState>,
     rid: &str,
@@ -468,35 +530,72 @@ async fn generate(
     params: Params,
     kind: Kind,
 ) -> Result<Response, ApiError> {
-    let loaded = st.model(model)?;
-    let permit = tokio::time::timeout(
-        st.cfg.queue_timeout,
-        Arc::clone(&loaded.slots).acquire_owned(),
-    )
+    let arrived = Instant::now();
+    let limit = params.timeout.map(|t| arrived + t);
+    let queue_until = arrived + st.cfg.queue_timeout;
+    let wait_until = limit.map_or(queue_until, |l| l.min(queue_until));
+    let loaded = st.model_ready(model, wait_until).await?;
+    // The place is taken before any work, so a burst past the limit costs nothing.
+    let ticket = loaded
+        .scheduler
+        .enter(RequestInfo {
+            priority: params.priority,
+            client: params.client.clone(),
+        })
+        .map_err(|e| match e {
+            EnterError::Full => ApiError::queue_full(st.cfg.max_concurrent, st.cfg.max_queue),
+            EnterError::Closed => ApiError::model_closing(),
+        })?;
+    let mut request = worker::request(
+        input,
+        &params,
+        st.cfg.default_max_tokens,
+        st.cfg.prefill_chunk,
+    );
+    let engine = Arc::clone(&loaded.engine);
+    // Tokenizing a long prompt is CPU work: off the Tokio workers.
+    let (returned, prepared) = tokio::task::spawn_blocking(move || {
+        let prepared = engine.prepare(&request);
+        (request, prepared)
+    })
     .await
-    .map_err(|_| ApiError::busy(st.cfg.max_concurrent))?
-    .map_err(|_| ApiError::overloaded("the model is being unloaded"))?;
+    .map_err(|_| ApiError::internal(rid))?;
+    request = returned;
+    let prepared = prepared.map_err(|e| ApiError::from_request(&e, rid))?;
+    let (grant_tx, grant_rx) = oneshot::channel();
+    ticket.ready(prepared.positions() as u64, move |o| {
+        let _ = grant_tx.send(o);
+    });
+    let grant = match tokio::time::timeout_at(wait_until.into(), grant_rx).await {
+        Ok(Ok(Outcome::Granted(g))) => g,
+        Ok(Ok(Outcome::Refused(e))) => return Err(ApiError::from_runtime(&e, rid)),
+        Ok(Ok(Outcome::Closed) | Err(_)) => return Err(ApiError::model_closing()),
+        // Dropping the ticket on the way out leaves the queue.
+        Err(_) if limit.is_some_and(|l| l <= queue_until) => {
+            return Err(ApiError::deadline_exceeded());
+        }
+        Err(_) => return Err(ApiError::busy(st.cfg.max_concurrent)),
+    };
+    let now = Instant::now();
+    let run_limit = now + st.cfg.request_timeout;
+    request.deadline = Some(limit.map_or(run_limit, |l| l.min(run_limit)));
     let cancel = Arc::new(AtomicBool::new(false));
     // Dropped (cancelling the generation) when the request is abandoned: the handler
     // future for a non-streaming request, the forwarding task for a stream.
     let guard = CancelOnDrop(Arc::clone(&cancel));
     let (tx, mut rx) = mpsc::channel(64);
-    let stream = params.stream;
-    let include_usage = params.include_usage;
+    let mut stop = st.stop_now.subscribe();
     worker::spawn(
         Job {
             engine: Arc::clone(&loaded.engine),
-            input,
-            params,
-            default_max_tokens: st.cfg.default_max_tokens,
-            prefill_chunk: st.cfg.prefill_chunk,
-            deadline: Instant::now() + st.cfg.request_timeout,
+            request,
+            prepared,
+            grant,
             cancel,
             request_id: rid.to_owned(),
             metrics: Arc::clone(&st.metrics),
         },
         tx,
-        permit,
     );
     // The first event decides the status: admission and prompt errors are HTTP errors
     // even for a stream.
@@ -505,50 +604,32 @@ async fn generate(
         Some(Event::Failed(e)) => return Err(e),
         _ => return Err(ApiError::internal(rid)),
     };
-    let id = match kind {
-        Kind::Chat => format!("chatcmpl-{rid}"),
-        Kind::Text => format!("cmpl-{rid}"),
+    let reply = Reply {
+        id: match kind {
+            Kind::Chat => format!("chatcmpl-{rid}"),
+            Kind::Text => format!("cmpl-{rid}"),
+        },
+        kind,
+        created: now_secs(),
+        model: model.to_owned(),
+        prompt_tokens,
+        include_usage: params.include_usage,
     };
-    let created = now_secs();
-    let model = model.to_owned();
-    if !stream {
+    if !params.stream {
         let mut text = String::new();
         loop {
-            match rx.recv().await {
+            let event = tokio::select! {
+                e = rx.recv() => e,
+                () = stopped(&mut stop) => return Err(ApiError::shutting_down()),
+            };
+            match event {
                 Some(Event::Text(t)) => text.push_str(&t),
                 Some(Event::Done {
                     finish,
                     completion_tokens,
                 }) => {
                     drop(guard);
-                    let usage = usage(prompt_tokens, completion_tokens);
-                    let choice = match kind {
-                        Kind::Chat => json!({
-                            "index": 0,
-                            "message": { "role": "assistant", "content": text },
-                            "logprobs": null,
-                            "finish_reason": finish.as_str(),
-                        }),
-                        Kind::Text => json!({
-                            "index": 0,
-                            "text": text,
-                            "logprobs": null,
-                            "finish_reason": finish.as_str(),
-                        }),
-                    };
-                    let object = match kind {
-                        Kind::Chat => "chat.completion",
-                        Kind::Text => "text_completion",
-                    };
-                    return Ok(Json(json!({
-                        "id": id,
-                        "object": object,
-                        "created": created,
-                        "model": model,
-                        "choices": [choice],
-                        "usage": usage,
-                    }))
-                    .into_response());
+                    return Ok(reply.whole(&text, finish, completion_tokens));
                 }
                 Some(Event::Failed(e)) => return Err(e),
                 Some(Event::Started { .. }) | None => return Err(ApiError::internal(rid)),
@@ -559,75 +640,145 @@ async fn generate(
     // away the response body (and with it `out_rx`) is dropped, the next send fails,
     // the task ends and drops `guard`, which cancels the generation.
     let (out_tx, out_rx) = mpsc::channel::<Result<SseEvent, Infallible>>(64);
+    let stall = st.cfg.stall_timeout;
     tokio::spawn(async move {
         let _guard = guard;
-        let object = match kind {
-            Kind::Chat => "chat.completion.chunk",
+        reply.forward(rx, out_tx, stall, stop).await;
+    });
+    Ok(Sse::new(ReceiverStream::new(out_rx)).into_response())
+}
+
+/// What every part of one response repeats.
+struct Reply {
+    id: String,
+    kind: Kind,
+    created: u64,
+    model: String,
+    prompt_tokens: usize,
+    include_usage: bool,
+}
+
+impl Reply {
+    /// The whole answer of a non-streaming request.
+    fn whole(&self, text: &str, finish: FinishReason, completion_tokens: usize) -> Response {
+        let choice = match self.kind {
+            Kind::Chat => json!({
+                "index": 0,
+                "message": { "role": "assistant", "content": text },
+                "logprobs": null,
+                "finish_reason": finish.as_str(),
+            }),
+            Kind::Text => json!({
+                "index": 0,
+                "text": text,
+                "logprobs": null,
+                "finish_reason": finish.as_str(),
+            }),
+        };
+        let object = match self.kind {
+            Kind::Chat => "chat.completion",
             Kind::Text => "text_completion",
         };
-        let chunk = |delta: Value, finish: Option<&str>| {
-            let choice = match kind {
-                Kind::Chat => json!({
-                    "index": 0, "delta": delta, "logprobs": null, "finish_reason": finish,
-                }),
-                Kind::Text => json!({
-                    "index": 0,
-                    "text": delta.get("content").and_then(Value::as_str).unwrap_or(""),
-                    "logprobs": null,
-                    "finish_reason": finish,
-                }),
-            };
-            json!({
-                "id": id, "object": object, "created": created, "model": model,
-                "choices": [choice],
-            })
+        Json(json!({
+            "id": self.id,
+            "object": object,
+            "created": self.created,
+            "model": self.model,
+            "choices": [choice],
+            "usage": usage(self.prompt_tokens, completion_tokens),
+        }))
+        .into_response()
+    }
+
+    fn object(&self) -> &'static str {
+        match self.kind {
+            Kind::Chat => "chat.completion.chunk",
+            Kind::Text => "text_completion",
+        }
+    }
+
+    fn chunk(&self, delta: &Value, finish: Option<&str>) -> Value {
+        let choice = match self.kind {
+            Kind::Chat => json!({
+                "index": 0, "delta": delta, "logprobs": null, "finish_reason": finish,
+            }),
+            Kind::Text => json!({
+                "index": 0,
+                "text": delta.get("content").and_then(Value::as_str).unwrap_or(""),
+                "logprobs": null,
+                "finish_reason": finish,
+            }),
         };
-        let send = |v: Value| {
-            let out_tx = out_tx.clone();
+        json!({
+            "id": self.id, "object": self.object(), "created": self.created,
+            "model": self.model, "choices": [choice],
+        })
+    }
+
+    /// Forwards worker events to the client until the generation ends, the client goes
+    /// away or stops reading for `stall`, or the server stops. Returning drops `rx`, so
+    /// a worker stuck sending to a client that stopped reading is released.
+    async fn forward(
+        &self,
+        mut rx: mpsc::Receiver<Event>,
+        out: mpsc::Sender<Result<SseEvent, Infallible>>,
+        stall: Duration,
+        mut stop: watch::Receiver<bool>,
+    ) {
+        let send = |text: String| {
+            let out = out.clone();
             async move {
-                out_tx
-                    .send(Ok(SseEvent::default().data(v.to_string())))
-                    .await
-                    .is_ok()
+                let sent = out.send(Ok(SseEvent::default().data(text)));
+                matches!(tokio::time::timeout(stall, sent).await, Ok(Ok(())))
             }
         };
-        if kind == Kind::Chat
-            && !send(chunk(json!({ "role": "assistant", "content": "" }), None)).await
-        {
-            return;
+        if self.kind == Kind::Chat {
+            let first = self.chunk(&json!({ "role": "assistant", "content": "" }), None);
+            if !send(first.to_string()).await {
+                return;
+            }
         }
-        while let Some(ev) = rx.recv().await {
-            match ev {
-                Event::Text(t) => {
-                    if !send(chunk(json!({ "content": t }), None)).await {
+        loop {
+            let event = tokio::select! {
+                e = rx.recv() => e,
+                () = stopped(&mut stop) => {
+                    let _ = send(ApiError::shutting_down().body().to_string()).await;
+                    break;
+                }
+            };
+            match event {
+                Some(Event::Text(t)) => {
+                    if !send(self.chunk(&json!({ "content": t }), None).to_string()).await {
                         return;
                     }
                 }
-                Event::Done {
+                Some(Event::Done {
                     finish,
                     completion_tokens,
-                } => {
-                    let _ = send(chunk(json!({}), Some(finish.as_str()))).await;
-                    if include_usage {
-                        let _ = send(json!({
-                            "id": id, "object": object, "created": created, "model": model,
-                            "choices": [], "usage": usage(prompt_tokens, completion_tokens),
-                        }))
-                        .await;
+                }) => {
+                    let last = self.chunk(&json!({}), Some(finish.as_str()));
+                    let _ = send(last.to_string()).await;
+                    if self.include_usage {
+                        let totals = json!({
+                            "id": self.id, "object": self.object(), "created": self.created,
+                            "model": self.model, "choices": [],
+                            "usage": usage(self.prompt_tokens, completion_tokens),
+                        });
+                        let _ = send(totals.to_string()).await;
                     }
                     break;
                 }
-                Event::Failed(e) => {
+                Some(Event::Failed(e)) => {
                     // Mid-stream: the status is already sent, so the error is an event.
-                    let _ = send(e.body()).await;
+                    let _ = send(e.body().to_string()).await;
                     break;
                 }
-                Event::Started { .. } => {}
+                Some(Event::Started { .. }) => {}
+                None => break,
             }
         }
-        let _ = out_tx.send(Ok(SseEvent::default().data("[DONE]"))).await;
-    });
-    Ok(Sse::new(ReceiverStream::new(out_rx)).into_response())
+        let _ = send("[DONE]".to_owned()).await;
+    }
 }
 
 fn usage(prompt: usize, completion: usize) -> Value {
@@ -656,29 +807,13 @@ async fn admin_load(
             .get("id")
             .and_then(Value::as_str)
             .map_or_else(|| what.clone(), str::to_owned);
-        if st.model(&id).is_ok() {
-            return Err(ApiError::conflict(format!(
-                "the model {id:?} is already loaded"
-            )));
-        }
-        let (dirs, opts, rid2) = (st.cfg.model_dirs.clone(), st.cfg.engine, rid.clone());
-        let what2 = what.clone();
-        // Loading reads weights for seconds: off the Tokio workers.
-        let engine = tokio::task::spawn_blocking(move || {
-            let meta =
-                find(&what2, &dirs, &ArchitectureRegistry::with_builtins()).map_err(|e| {
-                    eprintln!("qubivex-api: request {rid2}: cannot find {what2:?}: {e}");
-                    ApiError::model_not_found(&what2)
-                })?;
-            Engine::load(meta, opts).map_err(|e| ApiError::from_runtime(&e, &rid2))
-        })
-        .await
-        .map_err(|_| ApiError::internal(&rid))??;
-        let gw = Gateway {
-            state: Arc::clone(&st),
+        let (l, started) = st.load(&rid, &what, &id).await?;
+        let status = if started {
+            StatusCode::CREATED
+        } else {
+            StatusCode::OK
         };
-        gw.add_model(&id, engine)?;
-        Ok((StatusCode::CREATED, Json(model_card(&id, now_secs()))).into_response())
+        Ok((status, Json(model_card(&id, l.created))).into_response())
     }
     .await;
     st.finish("admin", &rid, r)
@@ -690,25 +825,128 @@ async fn admin_unload(
     headers: HeaderMap,
 ) -> Response {
     let rid = st.request_id(&headers);
-    let r = (|| {
-        st.check_admin(&headers)?;
-        let removed = st
-            .models
-            .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .remove(&id)
-            .ok_or_else(|| ApiError::model_not_found(&id))?;
-        // Requests already running hold the model and finish; new ones get 404. The
-        // weights are freed when the last of them ends.
-        removed.slots.close();
-        let draining = st
-            .cfg
-            .max_concurrent
-            .saturating_sub(removed.slots.available_permits());
-        Ok(
-            Json(json!({ "id": id, "object": "model", "deleted": true, "draining": draining }))
-                .into_response(),
-        )
-    })();
+    let r = st.check_admin(&headers).and_then(|()| unload(&st, &id));
     st.finish("admin", &rid, r)
+}
+
+async fn models_unload(
+    State(st): State<Arc<AppState>>,
+    headers: HeaderMap,
+    body: Result<Json<Value>, JsonRejection>,
+) -> Response {
+    let rid = st.request_id(&headers);
+    let r = st.check_admin(&headers).and_then(|()| {
+        let body = json_body(body)?;
+        let id = body
+            .get("model")
+            .and_then(Value::as_str)
+            .ok_or_else(|| ApiError::invalid_param("model", "give the model id to unload"))?;
+        unload(&st, id)
+    });
+    st.finish("admin", &rid, r)
+}
+
+/// Requests already running hold the model and finish; new ones get 404. The weights are
+/// freed when the last of them ends.
+fn unload(st: &AppState, id: &str) -> Result<Response, ApiError> {
+    let draining = st.unload(id)?;
+    Ok(
+        Json(json!({ "id": id, "object": "model", "deleted": true, "draining": draining }))
+            .into_response(),
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::{Duration, Instant};
+
+    use tokio::sync::{mpsc, watch};
+
+    use super::{Kind, Reply};
+    use crate::worker::{Event, FinishReason};
+
+    fn reply() -> Reply {
+        Reply {
+            id: "cmpl-x".into(),
+            kind: Kind::Text,
+            created: 0,
+            model: "m".into(),
+            prompt_tokens: 1,
+            include_usage: false,
+        }
+    }
+
+    /// A client that keeps its connection open and stops reading: the forwarder gives up
+    /// after the stall limit and drops the worker's channel, even with events to send.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn a_stream_nobody_reads_ends_at_the_stall_limit() {
+        let (tx, rx) = mpsc::channel(64);
+        // Nobody reads the far end of this, and it holds one event.
+        let (out, unread) = mpsc::channel(1);
+        let (_stop_tx, stop) = watch::channel(false);
+        for _ in 0..8 {
+            tx.send(Event::Text("x".into())).await.unwrap();
+        }
+        let start = tokio::time::Instant::now();
+        reply()
+            .forward(rx, out, Duration::from_secs(30), stop)
+            .await;
+        assert_eq!(start.elapsed(), Duration::from_secs(30));
+        assert!(tx.is_closed(), "the worker's sends now fail");
+        drop(unread);
+    }
+
+    /// A slow reader is not a stalled one.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn a_slow_reader_gets_everything() {
+        let (tx, rx) = mpsc::channel(64);
+        let (out, mut read) = mpsc::channel(1);
+        let (_stop_tx, stop) = watch::channel(false);
+        tokio::spawn(async move {
+            for _ in 0..4 {
+                tx.send(Event::Text("x".into())).await.unwrap();
+            }
+            tx.send(Event::Done {
+                finish: FinishReason::Stop,
+                completion_tokens: 4,
+            })
+            .await
+            .unwrap();
+        });
+        let forward = tokio::spawn(async move {
+            reply()
+                .forward(rx, out, Duration::from_secs(30), stop)
+                .await;
+        });
+        let mut events = 0;
+        while read.recv().await.is_some() {
+            events += 1;
+            tokio::time::sleep(Duration::from_secs(20)).await;
+        }
+        forward.await.unwrap();
+        // Four pieces, the finish and `[DONE]`.
+        assert_eq!(events, 6);
+    }
+
+    /// Stopping the server ends a stream with an error, not a silent cut.
+    #[tokio::test]
+    async fn stopping_the_server_ends_a_stream_with_an_error() {
+        let (_tx, rx) = mpsc::channel::<Event>(64);
+        let (out, mut read) = mpsc::channel(4);
+        let (stop_tx, stop) = watch::channel(false);
+        let started = Instant::now();
+        let forward = tokio::spawn(async move {
+            reply()
+                .forward(rx, out, Duration::from_secs(30), stop)
+                .await;
+        });
+        stop_tx.send_replace(true);
+        forward.await.unwrap();
+        let mut seen = 0;
+        while read.recv().await.is_some() {
+            seen += 1;
+        }
+        assert_eq!(seen, 2, "the error, then [DONE]");
+        assert!(started.elapsed() < Duration::from_secs(5));
+    }
 }

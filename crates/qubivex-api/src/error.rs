@@ -5,7 +5,7 @@
 use axum::Json;
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
-use qubivex_runtime::RuntimeError;
+use qubivex_runtime::{RequestError, RuntimeError};
 use serde_json::json;
 
 /// An error returned to the client.
@@ -115,6 +115,38 @@ impl ApiError {
         )
     }
 
+    /// 429: the queue is full, so the request was not queued.
+    pub fn queue_full(slots: usize, queue: usize) -> Self {
+        Self::new(
+            StatusCode::TOO_MANY_REQUESTS,
+            "rate_limit_error",
+            "too_many_requests",
+            format!(
+                "all {slots} generation slots are busy and {queue} requests are waiting; retry later"
+            ),
+        )
+    }
+
+    /// 504: the request's own time limit passed before it could start.
+    pub fn deadline_exceeded() -> Self {
+        Self::new(
+            StatusCode::GATEWAY_TIMEOUT,
+            "server_error",
+            "deadline_exceeded",
+            "the request's timeout passed before it could start".into(),
+        )
+    }
+
+    /// 503: the server is stopping.
+    pub fn shutting_down() -> Self {
+        Self::overloaded("the server is shutting down")
+    }
+
+    /// 503: the model closed while the request waited.
+    pub fn model_closing() -> Self {
+        Self::overloaded("the model is being unloaded or the server is shutting down")
+    }
+
     /// 503: memory or storage cannot take another request now.
     pub fn overloaded(message: impl Into<String>) -> Self {
         Self::new(
@@ -149,6 +181,24 @@ impl ApiError {
                 eprintln!("qubivex-api: request {request_id}: {other}");
                 Self::internal(request_id)
             }
+        }
+    }
+
+    /// A request's failure as the client should see it.
+    pub fn from_request(e: &RequestError, request_id: &str) -> Self {
+        match e {
+            RequestError::Invalid {
+                param: Some(param),
+                message,
+            } => Self::invalid_param(param, message.clone()),
+            RequestError::Invalid {
+                param: None,
+                message,
+            } => Self::invalid(message.clone()),
+            RequestError::Admission(err) | RequestError::Generation(err) => {
+                Self::from_runtime(err, request_id)
+            }
+            _ => Self::internal(request_id),
         }
     }
 

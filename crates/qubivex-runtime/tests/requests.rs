@@ -106,9 +106,10 @@ fn a_stop_sequence_ends_the_text_before_it() {
 fn deadlines_callers_and_cancellation_each_end_a_request_their_own_way() {
     let e = engine();
     let mut r = request(12);
+    // A deadline that has passed stops the request before its prefill.
     r.deadline = Some(Instant::now());
     let (o, ..) = run(&e, &r);
-    assert_eq!((o.finish, o.completion_tokens), (Finish::TimedOut, 1));
+    assert_eq!((o.finish, o.completion_tokens), (Finish::TimedOut, 0));
 
     let o = e
         .run_request(&request(12), &AtomicBool::new(false), |_| false)

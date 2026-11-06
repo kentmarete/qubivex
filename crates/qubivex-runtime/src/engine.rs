@@ -541,6 +541,8 @@ pub struct GenerateOptions {
     /// Prompt tokens per forward pass. Smaller chunks let a cancellation land sooner;
     /// the bits are the same for every size.
     pub prefill_chunk: usize,
+    /// When to stop, checked before every prefill chunk and every token.
+    pub deadline: Option<Instant>,
 }
 
 impl Default for GenerateOptions {
@@ -549,6 +551,7 @@ impl Default for GenerateOptions {
             max_new: 128,
             sampling: Sampling::default(),
             prefill_chunk: 256,
+            deadline: None,
         }
     }
 }
@@ -568,7 +571,7 @@ pub enum Finish {
     Cancelled,
     /// A stop sequence ended the text ([`Engine::run_request`] only).
     StopSequence,
-    /// The request's deadline passed ([`Engine::run_request`] only).
+    /// The deadline passed.
     TimedOut,
 }
 
@@ -584,13 +587,16 @@ pub struct Generation {
 }
 
 /// KV room held for one conversation (see [`Engine::reserve_kv`]).
+///
+/// It owns its claim on the engine's counter, so it can outlive a borrow of the engine:
+/// a scheduler holds it for as long as a request runs.
 #[derive(Debug)]
-pub struct KvReservation<'e> {
-    engine: &'e Engine,
+pub struct KvReservation {
+    reserved: Arc<AtomicUsize>,
     positions: usize,
 }
 
-impl KvReservation<'_> {
+impl KvReservation {
     /// Positions held (whole KV chunks).
     #[must_use]
     pub const fn positions(&self) -> usize {
@@ -598,12 +604,10 @@ impl KvReservation<'_> {
     }
 }
 
-impl Drop for KvReservation<'_> {
+impl Drop for KvReservation {
     fn drop(&mut self) {
         // Relaxed: see `Engine::reserve_kv`.
-        self.engine
-            .kv_reserved
-            .fetch_sub(self.positions, Ordering::Relaxed);
+        self.reserved.fetch_sub(self.positions, Ordering::Relaxed);
     }
 }
 
@@ -702,7 +706,7 @@ pub struct Engine {
     /// The byte budget the pools were last sized for.
     cache_target: AtomicU64,
     /// KV positions reserved by live [`KvReservation`]s, across conversations.
-    kv_reserved: AtomicUsize,
+    kv_reserved: Arc<AtomicUsize>,
     /// Forward passes run one at a time, first come first served (see
     /// [`Engine::forward`]).
     steps: StepQueue,
@@ -1054,7 +1058,7 @@ impl Engine {
             store,
             layers,
             cache_target: AtomicU64::new(capacity),
-            kv_reserved: AtomicUsize::new(0),
+            kv_reserved: Arc::new(AtomicUsize::new(0)),
             steps: StepQueue::default(),
             kv_position_bytes,
             verification: Verification::Off,
@@ -1410,10 +1414,14 @@ impl Engine {
         }
         let mut rng = Rng(opts.sampling.seed ^ 0x9e37_79b9_7f4a_7c15);
         let mut logits = Vec::new();
+        let late = || opts.deadline.is_some_and(|d| Instant::now() >= d);
         for chunk in prompt.chunks(opts.prefill_chunk.max(1)) {
             // Acquire: pairs with the canceller's Release store.
             if cancel.load(Ordering::Acquire) {
                 return done(Vec::new(), Finish::Cancelled);
+            }
+            if late() {
+                return done(Vec::new(), Finish::TimedOut);
             }
             logits = self.forward(chunk, &mut cache, Logits::Last, None)?;
         }
@@ -1439,6 +1447,9 @@ impl Engine {
             if cache.len() == cache.capacity() {
                 return done(out, Finish::ContextFull);
             }
+            if late() {
+                return done(out, Finish::TimedOut);
+            }
             logits = self.forward(&[next], &mut cache, Logits::Last, None)?;
         }
     }
@@ -1452,7 +1463,7 @@ impl Engine {
     ///
     /// # Errors
     /// [`RuntimeError::Memory`] if the reservations together would not fit.
-    pub fn reserve_kv(&self, positions: usize) -> Result<KvReservation<'_>, RuntimeError> {
+    pub fn reserve_kv(&self, positions: usize) -> Result<KvReservation, RuntimeError> {
         let want = KvCache::reserved_for(positions.min(self.max_context), self.max_context);
         let mut cur = self.kv_reserved.load(Ordering::Relaxed);
         loop {
@@ -1474,7 +1485,7 @@ impl Engine {
             ) {
                 Ok(_) => {
                     return Ok(KvReservation {
-                        engine: self,
+                        reserved: Arc::clone(&self.kv_reserved),
                         positions: want,
                     });
                 }

@@ -23,6 +23,8 @@ pub struct Metrics {
     pub(crate) timeouts: AtomicU64,
     /// Generations that failed after admission.
     pub(crate) errors: AtomicU64,
+    /// Model loads started.
+    model_loads: AtomicU64,
 }
 
 impl Metrics {
@@ -44,6 +46,17 @@ impl Metrics {
     #[must_use]
     pub fn cancelled(&self) -> u64 {
         self.cancelled.load(Ordering::Relaxed)
+    }
+
+    /// Counts a model load starting.
+    pub(crate) fn count_load(&self) {
+        self.model_loads.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Model loads started so far.
+    #[must_use]
+    pub fn model_loads(&self) -> u64 {
+        self.model_loads.load(Ordering::Relaxed)
     }
 
     /// Requests counted for `endpoint` with `status`.

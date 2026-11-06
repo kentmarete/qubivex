@@ -4,7 +4,7 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::time::Duration;
 
-use qubivex_api::{Gateway, ServerConfig};
+use qubivex_api::{Gateway, MemoryPolicy, ServerConfig};
 use qubivex_model::{ArchitectureRegistry, find};
 use qubivex_runtime::{Engine, EngineOptions};
 
@@ -19,9 +19,21 @@ pub(crate) struct ServeArgs<'a> {
     pub(crate) admin_token: Option<String>,
     pub(crate) max_concurrent: usize,
     pub(crate) default_max_tokens: usize,
+    pub(crate) max_queue: usize,
     pub(crate) queue_timeout: Duration,
+    pub(crate) memory_policy: MemoryPolicy,
     pub(crate) request_timeout: Duration,
+    pub(crate) stall_timeout: Duration,
+    pub(crate) shutdown_grace: Duration,
     pub(crate) engine: EngineOptions,
+}
+
+pub(crate) fn memory_policy(s: &str) -> Result<MemoryPolicy, String> {
+    match s {
+        "queue" => Ok(MemoryPolicy::Queue),
+        "refuse" => Ok(MemoryPolicy::Refuse),
+        _ => Err(format!("--memory-policy takes queue or refuse, not {s:?}")),
+    }
 }
 
 pub(crate) fn serve(a: &ServeArgs<'_>) -> Result<(), String> {
@@ -30,8 +42,12 @@ pub(crate) fn serve(a: &ServeArgs<'_>) -> Result<(), String> {
         api_key: a.api_key.clone(),
         admin_token: a.admin_token.clone(),
         max_concurrent: a.max_concurrent,
+        max_queue: a.max_queue,
         queue_timeout: a.queue_timeout,
+        memory_policy: a.memory_policy,
         request_timeout: a.request_timeout,
+        stall_timeout: a.stall_timeout,
+        shutdown_grace: a.shutdown_grace,
         default_max_tokens: a.default_max_tokens,
         model_dirs: dirs.clone(),
         engine: a.engine,
