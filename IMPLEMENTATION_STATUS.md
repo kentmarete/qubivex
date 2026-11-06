@@ -3,11 +3,20 @@
 Last updated: 2026-11-06
 
 ## Current phase
+**Model downloads done (2026-11-06); ADR-014.** Job 3 of the platform plan. New crate `qubivex-model-download`, the workspace's first network and TLS code (`ureq` + `rustls`, blocking, on plain threads): `qubivex models pull` and `models search`, Hugging Face first, behind a `ModelProvider` trait. A pull pins the commit, fetches only what a model needs, verifies each file, and installs through the registry, so a model is complete in place or absent.
+- Failure: stalls, drops and slow links share one path (a request budget, then resume at the offset). Retries back off exponentially, honour `Retry-After`, and reset on progress. Ctrl-C keeps the files and the same command continues them. Files that do not import stay, so a missing `--set` costs no second download.
+- Threat review in ADR-014: the token goes only to the configured origin, on every hop, so it never reaches the CDN; no downgrade to plain HTTP; file names cannot leave staging; bodies stop at the listed size; errors carry no signed URL or token.
+- Tests: 30 fault tests against a raw-socket hub, 14 unit tests, 4 through the binary. Each safety rule was removed in turn to check a test fails: 13 of 13 caught, one only after adding the case it exposed (a scheme with an explicit port).
+- Real pull: `Qwen/Qwen3-0.6B` from the live hub, cancelled by SIGINT at 210 MB and resumed. `model.safetensors` and `tokenizer.json` match the published SHA-256 and the existing install; 32 generated tokens are byte-identical to it. Live search and refusals (a missing repository, a repository of many GGUF files) work. No benchmarks: the machine was on battery.
+- Limits (ADR-014): split GGUF files are refused; a model's architecture is checked only after it arrives; published checksums protect against corruption, not a compromised hub; TLS uses bundled roots, so an inspecting proxy needs work. Source and revision are in the registry, not yet the manifest (job 4).
+- `deny.toml` gained a licence exception scoped to `webpki-roots` (the CA list, as data).
+- **Next:** job 4 (`models analyse`, manifest v1.1).
+
 **Model registry done (2026-11-06); ADR-003 amendment 2.** Job 2 of the platform plan. New crate `qubivex-model-registry`: `registry.json` records each installed model's source, revision and install state, with atomic updates. Installs build in staging and rename into place; `reconcile` recovers interrupted installs and adopts directories found on disk.
 - CLI: `qubivex models remove <id> [--yes]` (without `--yes` it deletes nothing), and `models validate` as an alias of `verify`.
 - Tests: 15 registry tests (a crash at each install and removal step, path traversal, tampered and newer registry files, symbolic links, 16 concurrent writers) and one test through the binary.
-- Limits: no CLI command starts an install until job 3, and removal does not check for a process serving the model.
-- **Next:** job 3 (downloader): `models pull` and `search`, with `ureq` and `rustls`.
+- Limits: removal does not check for a process serving the model.
+- Next was job 3 (downloads, above).
 
 **Generation contract done (2026-11-06); ADR-013 amendment 1.** Job 1 of the platform plan. `Engine::run_request` now holds the chat template, tokenization, context checks, KV reservation, stop sequences and detokenization. `qubivex run` and the gateway both use it, and so can an application embedding the runtime with no server, CLI or Tokio. No tensor or kernel code changed.
 - Added: `top_k` (runtime, `--top-k`, request field); `examples/embed.rs`; `tests/requests.rs` (6 tests, including concurrent requests on a shared engine equalling sequential ones); `cargo xtask check` fails if the runtime gains a server dependency.

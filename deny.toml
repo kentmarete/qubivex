@@ -29,6 +29,12 @@ allow = [
     "Zlib",
 ]
 
+# The Mozilla CA list as data, needed by rustls (PLATFORM_AUDIT section 5, decision 2).
+# Scoped to this crate, so the licence is not allowed for code.
+[[licenses.exceptions]]
+crate = "webpki-roots"
+allow = ["CDLA-Permissive-2.0"]
+
 [bans]
 multiple-versions = "warn"
 wildcards = "deny"

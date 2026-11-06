@@ -8,6 +8,7 @@ mod bench;
 mod doctor;
 mod models;
 mod plan;
+mod pull;
 mod run;
 mod serve;
 mod system;
@@ -364,6 +365,47 @@ enum ModelsCommand {
         /// Threads reading experts (default: every CPU).
         #[arg(long)]
         threads: Option<usize>,
+    },
+    /// Find models on Hugging Face.
+    Search {
+        /// What to look for.
+        query: String,
+        /// How many results to show.
+        #[arg(long, default_value_t = 20)]
+        limit: usize,
+        /// Print JSON instead of text.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Download a model from Hugging Face and install it. An interrupted pull continues
+    /// when the same command runs again. Private and gated models read HF_TOKEN, or the
+    /// token `hf auth login` saved. HF_ENDPOINT selects a mirror.
+    Pull {
+        /// The repository, as owner/name.
+        repository: String,
+        /// A file to fetch, by its path in the repository (repeatable). Needed when a
+        /// repository has several weight files, as GGUF repositories usually do.
+        #[arg(long = "file")]
+        files: Vec<String>,
+        /// A branch, tag or commit (default: the default branch).
+        #[arg(long)]
+        revision: Option<String>,
+        /// Model id (default: from the repository, or the GGUF file's name).
+        #[arg(long)]
+        id: Option<String>,
+        /// Display name.
+        #[arg(long)]
+        name: Option<String>,
+        /// A config value the checkpoint does not record, as KEY=VALUE (repeatable).
+        #[arg(long = "set")]
+        set: Vec<String>,
+        /// The models directory to install into. Default: the first of $QUBIVEX_MODELS_DIRS,
+        /// else ~/.qubivex/models.
+        #[arg(long)]
+        dir: Option<PathBuf>,
+        /// Files to fetch at once.
+        #[arg(long, default_value_t = 4)]
+        concurrency: usize,
     },
     /// Delete an installed model from a models directory. Without --yes, only says what
     /// would be deleted.
@@ -985,6 +1027,26 @@ fn execute(cmd: &Command) -> Result<(), String> {
                 record,
                 threads,
             } => models::verify(model, dirs, *record, threads.unwrap_or(0))?,
+            ModelsCommand::Search { query, limit, json } => pull::search_cmd(query, *limit, *json)?,
+            ModelsCommand::Pull {
+                repository,
+                files,
+                revision,
+                id,
+                name,
+                set,
+                dir,
+                concurrency,
+            } => pull::pull_cmd(&pull::PullArgs {
+                repository,
+                files,
+                revision: revision.as_deref(),
+                id: id.as_deref(),
+                name: name.as_deref(),
+                set,
+                dir: dir.as_deref(),
+                concurrency: *concurrency,
+            })?,
             ModelsCommand::Remove { model, dirs, yes } => models::remove(model, dirs, *yes)?,
             ModelsCommand::Architectures => models::architectures(),
         }),

@@ -20,12 +20,17 @@ qubivex-expert-stream = { workspace = true }
 qubivex-hardware = { workspace = true }
 qubivex-memory = { workspace = true }
 qubivex-model = { workspace = true }
+qubivex-model-download = { workspace = true }
 qubivex-model-registry = { workspace = true }
 qubivex-runtime = { workspace = true }
 qubivex-tokenizer = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 tokio = { workspace = true }
+
+[dev-dependencies]
+sha1 = { workspace = true }
+sha2 = { workspace = true }
 
 [lints]
 workspace = true

@@ -38,7 +38,9 @@ pub struct Imported {
     pub warnings: Vec<String>,
 }
 
-fn sanitise(s: &str) -> String {
+/// A model id from a free-form name: lower case, with unsafe characters replaced.
+#[must_use]
+pub fn sanitise_id(s: &str) -> String {
     let mut id: String = s
         .to_lowercase()
         .chars()
@@ -185,7 +187,7 @@ pub fn import(
             patch: 0,
         },
         model: ModelSection {
-            id: opts.id.clone().unwrap_or_else(|| sanitise(&stem)),
+            id: opts.id.clone().unwrap_or_else(|| sanitise_id(&stem)),
             name: opts.name.clone().unwrap_or_else(|| stem.clone()),
             version: None,
         },
@@ -324,8 +326,8 @@ mod tests {
 
     #[test]
     fn ids_are_sanitised() {
-        assert_eq!(sanitise("My Model 7B"), "my-model-7b");
-        assert_eq!(sanitise(""), "model");
-        assert_eq!(sanitise("a/b\\c"), "a-b-c");
+        assert_eq!(sanitise_id("My Model 7B"), "my-model-7b");
+        assert_eq!(sanitise_id(""), "model");
+        assert_eq!(sanitise_id("a/b\\c"), "a-b-c");
     }
 }

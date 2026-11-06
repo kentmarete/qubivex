@@ -1,7 +1,7 @@
 [workspace]
 resolver = "3"
-members = ["crates/qubivex-core", "crates/qubivex-hardware", "crates/qubivex-model", "crates/qubivex-model-registry", "crates/qubivex-compute", "crates/qubivex-backend-cpu", "crates/qubivex-tokenizer", "crates/qubivex-runtime", "crates/qubivex-expert-stream", "crates/qubivex-arch", "crates/qubivex-memory", "crates/qubivex-backend-metal", "crates/qubivex-api", "apps/cli", "xtask"]
-default-members = ["crates/qubivex-core", "crates/qubivex-hardware", "crates/qubivex-model", "crates/qubivex-model-registry", "crates/qubivex-compute", "crates/qubivex-backend-cpu", "crates/qubivex-tokenizer", "crates/qubivex-runtime", "crates/qubivex-expert-stream", "crates/qubivex-arch", "crates/qubivex-memory", "crates/qubivex-backend-metal", "crates/qubivex-api", "apps/cli", "xtask"]
+members = ["crates/qubivex-core", "crates/qubivex-hardware", "crates/qubivex-model", "crates/qubivex-model-registry", "crates/qubivex-model-download", "crates/qubivex-compute", "crates/qubivex-backend-cpu", "crates/qubivex-tokenizer", "crates/qubivex-runtime", "crates/qubivex-expert-stream", "crates/qubivex-arch", "crates/qubivex-memory", "crates/qubivex-backend-metal", "crates/qubivex-api", "apps/cli", "xtask"]
+default-members = ["crates/qubivex-core", "crates/qubivex-hardware", "crates/qubivex-model", "crates/qubivex-model-registry", "crates/qubivex-model-download", "crates/qubivex-compute", "crates/qubivex-backend-cpu", "crates/qubivex-tokenizer", "crates/qubivex-runtime", "crates/qubivex-expert-stream", "crates/qubivex-arch", "crates/qubivex-memory", "crates/qubivex-backend-metal", "crates/qubivex-api", "apps/cli", "xtask"]
 # Spikes are standalone packages with their own lock files (their dependencies are not
 # product dependencies until an ADR accepts them).
 exclude = ["spikes"]
@@ -20,6 +20,7 @@ qubivex-core = { path = "crates/qubivex-core", version = "0.1.0" }
 qubivex-hardware = { path = "crates/qubivex-hardware", version = "0.1.0" }
 qubivex-model = { path = "crates/qubivex-model", version = "0.1.0" }
 qubivex-model-registry = { path = "crates/qubivex-model-registry", version = "0.1.0" }
+qubivex-model-download = { path = "crates/qubivex-model-download", version = "0.1.0" }
 qubivex-compute = { path = "crates/qubivex-compute", version = "0.1.0" }
 qubivex-backend-cpu = { path = "crates/qubivex-backend-cpu", version = "0.1.0" }
 qubivex-tokenizer = { path = "crates/qubivex-tokenizer", version = "0.1.0" }
@@ -47,9 +48,14 @@ rayon = "1.10"
 tokenizers = { version = "0.23.2", default-features = false, features = ["fancy-regex"] }
 # Safe syscall wrappers (statvfs, O_DIRECT, F_NOCACHE, fadvise), so qubivex-hardware needs no unsafe.
 rustix = { version = "1.1", default-features = false, features = ["fs", "std"] }
+# Model downloads only (qubivex-model-download): checksums Hugging Face publishes.
+sha1 = "0.10"
+sha2 = "0.10"
 serde = { version = "1.0.219", features = ["derive"] }
 serde_json = "1.0.140"
 thiserror = "2.0.12"
+# Model downloads only: blocking, on dedicated threads (PLATFORM_AUDIT section 5, decision 2).
+ureq = { version = "3.1", default-features = false, features = ["rustls"] }
 tokio = { version = "1.40", features = ["rt-multi-thread", "net", "macros", "sync", "time", "signal"] }
 tokio-stream = { version = "0.1.16", default-features = false }
 

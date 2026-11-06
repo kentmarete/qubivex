@@ -43,6 +43,8 @@ fn allowed_deps(krate: &str) -> Option<Vec<&'static str>> {
         "qubivex-model" => vec!["qubivex-core"],
         // Installs and removes models; never executes them.
         "qubivex-model-registry" => vec!["qubivex-model"],
+        // Fetches models and installs them through the registry; never executes them.
+        "qubivex-model-download" => vec!["qubivex-model-registry", "qubivex-model"],
         "qubivex-compute" => vec!["qubivex-core"],
         b if BACKENDS.contains(&b) => vec!["qubivex-compute", "qubivex-core"],
         "qubivex-arch" => vec!["qubivex-model", "qubivex-compute", "qubivex-core"],

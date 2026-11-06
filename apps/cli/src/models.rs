@@ -254,7 +254,7 @@ pub(crate) fn inspect(
 }
 
 /// Parses `key=value`; the value is JSON when it parses as JSON, else a string.
-fn parse_set(s: &str) -> Result<(String, Value), String> {
+pub(crate) fn parse_set(s: &str) -> Result<(String, Value), String> {
     let (k, v) = s
         .split_once('=')
         .ok_or_else(|| format!("--set {s:?}: expected KEY=VALUE"))?;
@@ -316,7 +316,7 @@ pub(crate) fn import_cmd(a: &ImportArgs<'_>) -> Result<String, String> {
 }
 
 /// Records and saves the model's per-expert checksums; returns a report line.
-fn record_sums(m: &ModelMetadata, threads: usize) -> Result<String, String> {
+pub(crate) fn record_sums(m: &ModelMetadata, threads: usize) -> Result<String, String> {
     let t = std::time::Instant::now();
     let sums = ExpertSums::record(m, threads).map_err(|e| chain(&e))?;
     let path = sums.save(&m.dir).map_err(|e| chain(&e))?;
@@ -416,7 +416,7 @@ pub(crate) fn verify(
 }
 
 /// At import time there is no manifest yet: point "set overrides.config.KEY" at `--set`.
-fn with_set_hint(msg: &str) -> String {
+pub(crate) fn with_set_hint(msg: &str) -> String {
     let Some((_, rest)) = msg.split_once("overrides.config.") else {
         return msg.to_owned();
     };

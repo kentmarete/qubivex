@@ -63,11 +63,11 @@ applies only to what remains.
 |---|---|---|
 | Containers, manifest v1, validation | Production | `qubivex-model`: hardened GGUF and SafeTensors readers, proptests, JSON schema |
 | Import, discovery, verify | Production | `models import / list / inspect / verify` |
-| Downloads | **Missing** | No HTTP client in the workspace. `QUBIVEX_DESIGN.md:126` deferred it to Phase 11. The spec makes it S2 and acceptance criterion 1 |
-| `models pull / search` | **Missing** | |
+| Downloads | Production | `qubivex-model-download` (ADR-014): resumable, verified, atomic; 30 fault tests against a local server; a real interrupted pull resumed and matched the reference byte for byte |
+| `models pull / search` | Production | Hugging Face first, behind `ModelProvider`. Split GGUF files are refused (ADR-014) |
 | `models remove` | Production | Needs `--yes`; deletes only inside the models directory |
 | `models analyse` | **Missing** as named | `qubivex plan` does the work; needs wiring |
-| Registry | Partial | `qubivex-model-registry`: atomic records of source, revision and install state, crash recovery, safe removal. Downloads do not use it until job 3 |
+| Registry | Partial | `qubivex-model-registry`: atomic records of source, revision and install state, crash recovery, safe removal. `models pull` installs through it. Loaded state is job 5 |
 | Lifecycle states | Partial | Install states are recorded (ADR-003 amendment 2). Loading, loaded and failed-load states are job 5, in the serving process |
 | Manifest fields | Partial | No source repository, revision pin, per-file checksums or expert fields; checksums are `experts.qvxsum`. The schema is versioned, with no migration path yet |
 
@@ -106,7 +106,8 @@ applies only to what remains.
 | `chat --model --prompt` | Done as `run`. Interactive chat is missing |
 | `server status` | Missing |
 | `models remove` | Done |
-| `models search / pull / analyse` | Missing |
+| `models search / pull` | Done |
+| `models analyse` | Missing |
 
 `run` and the gateway both call `Engine::run_request`, so there is one inference pipeline,
 as the spec asks.
@@ -149,8 +150,8 @@ Dockerfile, and no `examples/`. CI covers Linux and macOS, MSRV 1.85, loom and `
 3. **Generated-token decoding is quadratic** in completion length (ADR-013). It should be
    fixed before longer outputs are served.
 4. **Downloads add the workspace's first outbound network and TLS code** (§5 decision 2).
-   That needs a threat review: redirects, path traversal from repository
-   file names, and token handling.
+   The threat review is in ADR-014: redirects, path traversal from repository file names,
+   and token handling.
 
 Rules the code already follows: the runtime does not depend on the server, the server has
 no tensor code, and the model crate executes nothing. `cargo tree -p qubivex-runtime` on this
@@ -180,7 +181,7 @@ Owner rules for this plan (2026-11-06):
 |---|---|---|---|---|
 | 1 | Generation contract (**done**) | S1 | | A `GenerationRequest`, stop handling and templates live in the runtime; `run` and the gateway both use them; top-k added; tokens unchanged; a compiled embedding example uses only the runtime; CI fails if the runtime gains `tokio`, `axum` or `qubivex-api` |
 | 2 | Registry (**done**) | S2 | | Atomic store of installed models, revisions and lifecycle states; survives a failed install; `models remove`, `validate` alias |
-| 3 | Downloader | S2 | 2 | Resumable, verified, atomic `models pull` and `search` from Hugging Face; fault tests against a local server; one real pull |
+| 3 | Downloader (**done**) | S2 | 2 | Resumable, verified, atomic `models pull` and `search` from Hugging Face; fault tests against a local server; one real pull |
 | 4 | Analyse and manifest v1.1 | S2, S3 | 2 | `models analyse`; source, revision and checksums in the manifest, with a migration test |
 | 5 | Concurrency correctness and scheduler (gate) | S4, S7 | 1 | Every §12.3 test passes, including 1, 2, 6, 9, 11, 12, 13, with a sanitizer run where supported; queue bounded by count, priorities, deadlines, load dedup |
 | 6 | KV subsystem | S4 | 1 | Prefix reuse with a bit-identity test; bounded and evictable |
