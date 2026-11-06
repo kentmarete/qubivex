@@ -36,7 +36,7 @@ pub mod write;
 pub use discover::{Discovered, discover, find};
 pub use error::ModelError;
 pub use gguf::{GgufHeader, GgufMetadata, GgufValue};
-pub use import::{ImportOptions, Imported, import};
+pub use import::{ImportOptions, Imported, import, sanitise_id};
 pub use index::{RawTensor, TensorEntry, TensorIndex, WeightFile, WeightFormat};
 pub use manifest::Manifest;
 pub use metadata::{ByteSummary, MANIFEST_FILE, ModelMetadata};

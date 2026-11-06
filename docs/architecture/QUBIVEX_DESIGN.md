@@ -123,7 +123,7 @@ qubivex/
 Things merged into other crates for now, to be split out when they grow:
 `kv-cache` and `sampling` go into `runtime`; `quantization` goes into
 `backend-cpu` and `model::formats`; `observability` uses `tracing` plus a `metrics`
-module in `runtime`; `downloader` waits until Phase 11.
+module in `runtime`. `downloader` is `qubivex-model-download` (ADR-014).
 
 ### 3.1 Dependency direction (enforced)
 

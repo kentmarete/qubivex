@@ -95,7 +95,7 @@ What QUBIVEX adds over a straight port:
 | Inference | CPU forward pass for `transformer_moe` (OLMoE, Qwen3-MoE) and `transformer_dense` (dense Qwen3, Llama-style): lossless kernels for f32, f16, bf16, Q8_0, Q4_K and Q6_K; an expert cache of any size with leases and LRU eviction; KV cache; greedy, temperature and top-p sampling; chat templates |
 | Tokenizers | Hugging Face `tokenizer.json`, or rebuilt from a GGUF file's vocabulary (verified identical to the official tokenizer) |
 | Serving | `qubivex serve`: OpenAI-compatible `/v1/chat/completions` and `/v1/completions` (streaming or not), `/v1/models`, `/health`, `/metrics`, `/v1/system`, admin load and unload; independent KV per conversation, admission against the memory plan, cancellation when a client disconnects |
-| CLI | `qubivex run`, `qubivex serve`, `qubivex bench`, `qubivex system`, `qubivex doctor --storage`, `qubivex models list / inspect / import / verify / architectures` |
+| CLI | `qubivex run`, `qubivex serve`, `qubivex bench`, `qubivex system`, `qubivex doctor --storage`, `qubivex models search / pull / list / inspect / import / verify / remove / architectures` |
 
 See the [Roadmap](#roadmap) for what is next.
 
@@ -363,6 +363,35 @@ keeps the first combination under which every tensor validates. If none does, it
 reports the problems of the closest candidate. A tied output head reads the embedding;
 a copy of it stored under the head's name is listed in `overrides.ignore_tensors`. It records shard sizes,
 which are checked at every load, and the dominant dtype.
+
+### `qubivex models search <QUERY> [--limit N] [--json]`
+
+Finds models on Hugging Face, most downloaded first.
+
+### `qubivex models pull <OWNER/NAME> [options]`
+
+Downloads a model and installs it, with no other tools needed:
+
+```bash
+qubivex models pull Qwen/Qwen3-0.6B
+qubivex models pull owner/Model-GGUF --file Model-Q4_K_M.gguf --set norm_topk_prob=false
+```
+
+Only the files a model needs are fetched, each is checked against its published checksum,
+and the model appears in the models directory only when complete. If a pull is interrupted,
+the same command continues it. A repository with several weight files needs `--file`.
+
+| Option | Meaning |
+|---|---|
+| `--file PATH` | A file to fetch, by its path in the repository (repeatable) |
+| `--revision REV` | A branch, tag or commit. The exact commit is recorded either way |
+| `--id ID`, `--name NAME` | The model id and display name |
+| `--set KEY=VALUE` | A config value the checkpoint lacks, as for `models import` |
+| `--dir DIR` | The models directory to install into |
+| `--concurrency N` | Files fetched at once (default 4) |
+
+Private and gated models read `HF_TOKEN`, or the token `hf auth login` saved; there is no
+token flag, because arguments show up in process listings. `HF_ENDPOINT` selects a mirror.
 
 ### `qubivex models remove <ID> [--dir DIR]... [--yes]`
 
