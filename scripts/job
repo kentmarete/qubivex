@@ -9,7 +9,7 @@
 #   job pr ["<title>"] [--base <branch>] [--draft] [--body-file <path>] [--skip-verify]
 #                                       push the branch, open or update its PR
 #   job merge [--yes]                   merge the PR once CI passes; asks you to confirm
-#   job finish "<outcome>"              close the card, log the job
+#   job finish "<outcome>" [--unmerged] close the card, log the job
 #   job clean [--deep] [--scratch] [--dry-run]
 #
 # It never deletes models, the oracle venv, git data, memory or session transcripts,
@@ -316,7 +316,7 @@ cmd_pr() {
   local rc=$?
   rm -f "$tmp"
   (( rc == 0 )) || die "gh pr create failed; the branch is pushed"
-  url=${${(f)url}[-1]}
+  url=${url##*$'\n'}  # gh may print notices first; the URL is the last line
   set_card_field PR "$url"
   checkpoint "opened $url"
   print -r -- "Opened $url"
@@ -334,9 +334,10 @@ cmd_merge() {
   [[ -n $pr ]] || die "this job has no PR. Run job pr first."
   cd "$ROOT" || exit 1
 
-  local state draft mergeable oid
-  read -r state draft mergeable oid <<< "$(gh pr view "$pr" --json state,isDraft,mergeable,headRefOid \
-    -q '"\(.state) \(.isDraft) \(.mergeable) \(.headRefOid)"')"
+  local state draft mergeable oid head
+  read -r state draft mergeable oid head <<< "$(gh pr view "$pr" --json state,isDraft,mergeable,headRefOid,headRefName \
+    -q '"\(.state) \(.isDraft) \(.mergeable) \(.headRefOid) \(.headRefName)"')"
+  [[ $head == $BRANCH ]] || die "$pr belongs to branch ${head:-unknown}, not $BRANCH. Check the PR field on the card."
   [[ $state == OPEN ]] || die "the PR is $state"
   [[ $draft == false ]] || die "the PR is still a draft"
   [[ $mergeable == MERGEABLE ]] || die "GitHub reports the PR as $mergeable; resolve that or retry shortly"
@@ -387,12 +388,34 @@ cmd_verify() {
 
 cmd_finish() {
   [[ -f $CARD ]] || die "no open job"
-  [[ -n ${1:-} ]] || die 'usage: job finish "<outcome>"'
+  local outcome= unmerged=
+  while (( $# )); do
+    case $1 in
+      --unmerged) unmerged=1 ;;
+      -*) die 'usage: job finish "<outcome>" [--unmerged]' ;;
+      *) outcome=$1 ;;
+    esac
+    shift
+  done
+  [[ -n $outcome ]] || die 'usage: job finish "<outcome>" [--unmerged]'
   tree_is_clean || die "the working tree has uncommitted changes. Commit or stash them first."
 
   local slug=$(card_field Job) base=$(card_field Base) started=$(card_field Started)
   local pr=$(card_field PR) merged=$(card_field Merged)
   local head=$(short_head)
+  if [[ -n $pr && -z $merged ]]; then
+    # Ask GitHub: the card only knows about merges made through job merge.
+    cd "$ROOT" || exit 1
+    local pr_state pr_head
+    read -r pr_state pr_head <<< "$(gh pr view "$pr" --json state,headRefName -q '"\(.state) \(.headRefName)"' 2>/dev/null)"
+    if [[ $pr_state == MERGED && $pr_head == $slug ]]; then
+      merged=$(date '+%Y-%m-%d %H:%M')
+    elif [[ -z $unmerged ]]; then
+      [[ -n $pr_state ]] || die "can't read $pr from GitHub. Retry, or pass --unmerged to close the job without a merge."
+      [[ $pr_head == $slug ]] || die "$pr belongs to branch $pr_head, not $slug. Fix the PR field on the card."
+      die "$pr is $pr_state. Merge it first, or pass --unmerged to leave it for review."
+    fi
+  fi
   if [[ $head != $base ]] && git -C "$ROOT" diff --quiet "$base" HEAD -- IMPLEMENTATION_STATUS.md; then
     print -r -- "Note: IMPLEMENTATION_STATUS.md did not change in this job."
   fi
@@ -416,7 +439,7 @@ EOF
   elif [[ -z $merged ]]; then
     print -r -- "Note: $pr is not merged yet."
   fi
-  print -r -- "- ${started%% *} to $(date '+%Y-%m-%d') | $slug | $base..$head | ${pr:-no PR}${merged:+ (merged)} | $1" >> "$LOG"
+  print -r -- "- ${started%% *} to $(date '+%Y-%m-%d') | $slug | $base..$head | ${pr:-no PR}${merged:+ (merged)} | $outcome" >> "$LOG"
   add_index_line job-log.md "- [Job log](job-log.md) — finished jobs, one line each"
   rm "$CARD"
   drop_index_line current-job.md

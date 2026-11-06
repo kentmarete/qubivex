@@ -24,7 +24,7 @@ needs two PRs, it is two jobs.
 | 6. Verify | `job verify` | Runs the CI gates locally and stops at the first failure. On a clean tree, records that this commit passed. |
 | 7. Raise a PR | `job pr` | Pushes the branch and opens its PR, or updates the open one. Needs a verified commit. |
 | 8. Merge, when wanted | `job merge` | Merges once CI passes and you confirm. Skip it to leave the PR for review. |
-| 9. Close | Paste the close prompt, then `job finish "<outcome>"` | Needs a clean tree. Logs the job and PR, then removes the card. |
+| 9. Close | Paste the close prompt, then `job finish "<outcome>"` | Needs a clean tree and a merged PR, unless you pass `--unmerged`. Logs the job and PR, then removes the card. |
 | 10. Clear | `job clean`, then `/clear` in Claude Code | Frees disk and empties the conversation. |
 | 11. Confirm | `job status` | Should say `clean, ready for the next job`. |
 
@@ -54,6 +54,10 @@ Run `job pr` again after new commits to update the open PR. It never force-pushe
 **`job merge`** uses a merge commit, as the repo's history does, and keeps the branch. It
 stops unless the PR is open, not a draft, mergeable, matches your local commit, and has
 passing checks. It then asks you to type `merge`, and updates local `main` afterwards.
+
+`job merge` and `job finish` check that the PR on the card belongs to the job's branch.
+`job finish` asks GitHub whether the PR merged, so a merge made outside `job merge` counts.
+To close a job and leave its PR for review, use `job finish "<outcome>" --unmerged`.
 
 Claude may pass `job merge --yes` only when you ask for that merge in the same request. In
 a stack, merge from the bottom up, then retarget the next PR to `main`.
