@@ -34,7 +34,7 @@ pub(crate) const KQ_ROWS: usize = 2;
 /// `kernels.metal`.
 pub(crate) const TILE: usize = 8;
 /// Activation rows from which a matmul uses the token-tiled kernel (ADR-011 amendment 5).
-/// Measured on OLMoE (M3 Pro): from 4 rows the tiles win (6 tokens: 68.5 → 62.3 ms),
+/// Measured on the reference model (M3 Pro): from 4 rows the tiles win (6 tokens: 68.5 → 62.3 ms),
 /// below they lose a little.
 pub(crate) const TILE_MIN: usize = 4;
 

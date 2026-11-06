@@ -267,7 +267,7 @@ pub enum Routing<'s, 'a> {
 }
 
 /// Mean entries per expert from which [`Routing::Grouped`] beats [`Routing::Ids`]
-/// (ADR-011 amendment 5; on OLMoE, 64 experts and top 8: from 16 tokens).
+/// (ADR-011 amendment 5; at 64 experts and top 8: from 16 tokens).
 pub const GROUPED_ENTRIES_PER_EXPERT: usize = 2;
 
 /// Experts one routed table may hold: the address table is passed inline (`setBytes`
