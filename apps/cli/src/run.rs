@@ -2,12 +2,12 @@
 
 use std::io::Write;
 use std::path::PathBuf;
+use std::sync::atomic::AtomicBool;
 use std::time::Instant;
 
 use qubivex_core::Bytes;
 use qubivex_model::{ArchitectureRegistry, find};
-use qubivex_runtime::{Engine, Sampling};
-use qubivex_tokenizer::ChatMessage;
+use qubivex_runtime::{ChatMessage, Engine, GenerationEvent, GenerationRequest, Prompt, Sampling};
 
 use crate::models::roots;
 use crate::{MemoryOptions, chain};
@@ -44,61 +44,55 @@ pub(crate) fn run(a: &RunArgs<'_>) -> Result<(), String> {
         );
     }
     let load = t0.elapsed();
-    let tok = engine.tokenizer();
-    let text = if a.chat {
-        tok.apply_chat_template(&[ChatMessage::new("user", a.prompt)], true)
-            .map_err(|e| chain(&e))?
+    let mut request = GenerationRequest::new(if a.chat {
+        Prompt::Chat(vec![ChatMessage::new("user", a.prompt)])
     } else {
-        a.prompt.to_owned()
-    };
-    let prompt = tok.encode(&text, !a.chat).map_err(|e| chain(&e))?;
-    if prompt.is_empty() {
-        return Err("the prompt encodes to no tokens".into());
-    }
-    let mut stream = tok.stream();
+        Prompt::Text(a.prompt.to_owned())
+    });
+    // As many as the context holds, up to --max-tokens.
+    request.default_max_tokens = a.max_tokens;
+    request.sampling = a.sampling;
     let mut out = std::io::stdout().lock();
-    if !a.chat {
-        let _ = write!(out, "{}", a.prompt);
-        let _ = out.flush();
-    }
     let t1 = Instant::now();
     let mut first: Option<f64> = None;
     let mut write_err = None;
-    let generated = engine
-        .generate(&prompt, a.max_tokens, a.sampling, |id| {
-            first.get_or_insert_with(|| t1.elapsed().as_secs_f64());
-            match stream.push(id) {
-                Ok(piece) => {
-                    if let Err(e) = write!(out, "{piece}").and_then(|()| out.flush()) {
-                        write_err = Some(e);
-                        return false;
-                    }
-                    true
+    let outcome = engine
+        .run_request(&request, &AtomicBool::new(false), |event| {
+            let written = match event {
+                GenerationEvent::Started { .. } if a.chat => Ok(()),
+                GenerationEvent::Started { .. } => {
+                    write!(out, "{}", a.prompt).and_then(|()| out.flush())
                 }
-                Err(_) => true,
-            }
+                GenerationEvent::Token(_) => {
+                    first.get_or_insert_with(|| t1.elapsed().as_secs_f64());
+                    Ok(())
+                }
+                GenerationEvent::Text(piece) => write!(out, "{piece}").and_then(|()| out.flush()),
+            };
+            written.map_err(|e| write_err = Some(e)).is_ok()
         })
         .map_err(|e| chain(&e))?;
     let _ = writeln!(out);
     if let Some(e) = write_err {
         return Err(format!("cannot write output: {e}"));
     }
+    let (prompt_tokens, generated) = (outcome.prompt_tokens, outcome.completion_tokens);
     let total = t1.elapsed().as_secs_f64();
     if !a.quiet {
         let st = engine.store_stats();
         let ttft = first.unwrap_or(total);
         #[allow(clippy::cast_precision_loss)]
-        let decode = if generated.len() > 1 {
-            (generated.len() - 1) as f64 / (total - ttft).max(1e-9)
+        let decode = if generated > 1 {
+            (generated - 1) as f64 / (total - ttft).max(1e-9)
         } else {
             0.0
         };
         #[allow(clippy::cast_precision_loss)]
-        let prefill = prompt.len() as f64 / ttft.max(1e-9);
+        let prefill = prompt_tokens as f64 / ttft.max(1e-9);
         eprintln!(
             "\n[{} prompt tokens, {} generated | {} threads | load {:.2}s | prefill {:.1} tok/s | decode {:.2} tok/s | experts: cache {}, {} hits, {} loads ({}), {} evictions | {}]",
-            prompt.len(),
-            generated.len(),
+            prompt_tokens,
+            generated,
             engine.threads(),
             load.as_secs_f64(),
             prefill,

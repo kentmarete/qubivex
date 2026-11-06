@@ -62,6 +62,7 @@ pub(crate) struct Common {
     pub(crate) stream_options: Option<StreamOptions>,
     pub(crate) max_tokens: Option<u64>,
     pub(crate) temperature: Option<f32>,
+    pub(crate) top_k: Option<u32>,
     pub(crate) top_p: Option<f32>,
     pub(crate) seed: Option<u64>,
     pub(crate) n: Option<u32>,
@@ -103,6 +104,7 @@ pub(crate) struct CompletionRequest {
 pub(crate) struct Params {
     pub(crate) max_tokens: Option<usize>,
     pub(crate) temperature: f32,
+    pub(crate) top_k: u32,
     pub(crate) top_p: f32,
     pub(crate) seed: u64,
     pub(crate) stops: Vec<String>,
@@ -172,6 +174,7 @@ impl Common {
         Ok(Params {
             max_tokens,
             temperature,
+            top_k: self.top_k.unwrap_or(0),
             top_p,
             seed: self.seed.unwrap_or(0),
             stops,

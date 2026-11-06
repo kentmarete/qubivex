@@ -73,6 +73,9 @@ enum Command {
         /// Sampling temperature; 0 is greedy.
         #[arg(long, default_value_t = 0.0)]
         temperature: f32,
+        /// Keep only the K likeliest tokens before top-p (0: off).
+        #[arg(long, default_value_t = 0)]
+        top_k: u32,
         /// Nucleus sampling mass.
         #[arg(long, default_value_t = 1.0)]
         top_p: f32,
@@ -774,6 +777,7 @@ fn execute(cmd: &Command) -> Result<(), String> {
             chat,
             max_tokens,
             temperature,
+            top_k,
             top_p,
             seed,
             expert_cache_mb,
@@ -797,6 +801,7 @@ fn execute(cmd: &Command) -> Result<(), String> {
             max_tokens: *max_tokens,
             sampling: qubivex_runtime::Sampling {
                 temperature: *temperature,
+                top_k: *top_k,
                 top_p: *top_p,
                 seed: *seed,
             },

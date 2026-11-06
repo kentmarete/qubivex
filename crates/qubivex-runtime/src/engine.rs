@@ -478,6 +478,8 @@ impl ExpertProvider for StoreProvider<'_> {
 pub struct Sampling {
     /// 0 for greedy (argmax, lowest id on ties).
     pub temperature: f32,
+    /// Keep only the `top_k` likeliest tokens, before `top_p` (0: off).
+    pub top_k: u32,
     /// Nucleus mass (1.0: off).
     pub top_p: f32,
     /// RNG seed: the same seed gives the same tokens.
@@ -488,6 +490,7 @@ impl Default for Sampling {
     fn default() -> Self {
         Self {
             temperature: 0.0,
+            top_k: 0,
             top_p: 1.0,
             seed: 0,
         }
@@ -563,6 +566,10 @@ pub enum Finish {
     Stopped,
     /// The cancellation flag was set.
     Cancelled,
+    /// A stop sequence ended the text ([`Engine::run_request`] only).
+    StopSequence,
+    /// The request's deadline passed ([`Engine::run_request`] only).
+    TimedOut,
 }
 
 /// A finished generation.
@@ -1605,7 +1612,8 @@ impl Rng {
     }
 }
 
-/// Greedy (argmax, lowest id on ties) or temperature + top-p sampling.
+/// Greedy (argmax, lowest id on ties), or temperature, then top-k, then top-p: top-p
+/// measures its mass within what top-k kept, as `transformers` does.
 fn sample(logits: &[f32], s: Sampling, rng: &mut Rng) -> u32 {
     let argmax = || {
         let mut best = 0usize;
@@ -1632,11 +1640,20 @@ fn sample(logits: &[f32], s: Sampling, rng: &mut Rng) -> u32 {
     }
     p.iter_mut().for_each(|x| x.1 /= sum);
     p.sort_by(|a, b| b.1.total_cmp(&a.1).then(a.0.cmp(&b.0)));
+    if s.top_k > 0 {
+        p.truncate(usize::try_from(s.top_k).unwrap_or(usize::MAX));
+    }
     let mut keep = p.len();
     if s.top_p < 1.0 {
+        let kept = usize::try_from(s.top_k).is_ok_and(|k| k > 0 && k < logits.len());
+        let mass = if kept {
+            p.iter().map(|x| x.1).sum()
+        } else {
+            1.0
+        };
         let mut acc = 0f32;
         for (i, x) in p.iter().enumerate() {
-            acc += x.1;
+            acc += x.1 / mass;
             if acc >= s.top_p {
                 keep = i + 1;
                 break;
@@ -1670,6 +1687,7 @@ mod tests {
         );
         let s = Sampling {
             temperature: 1.0,
+            top_k: 0,
             top_p: 0.5,
             seed: 0,
         };
@@ -1679,6 +1697,7 @@ mod tests {
         }
         let s = Sampling {
             temperature: 0.7,
+            top_k: 0,
             top_p: 1.0,
             seed: 0,
         };

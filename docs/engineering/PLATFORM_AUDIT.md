@@ -54,8 +54,8 @@ applies only to what remains.
 | Memory planner | Production | `qubivex-memory::plan`, cgroup-aware, explainable through `qubivex plan` |
 | KV cache | Partial | `KvCache` in `qubivex-arch` is per-conversation, bounded and reserved through the planner. No prefix reuse, eviction or paging, and no crate boundary |
 | Backends | Partial | CPU and Metal bit-identical. CUDA and Vulkan exist only as detection |
-| Stable interfaces | Partial | Traits exist for `ComputeBackend`, `ExpertSource`, `DenseWeights`, `ExpertProvider`, `ArchitectureFactory`, `ResourceProbe`. There is no engine contract, no generation request type shared across products, and no model handle |
-| Sampling | Partial | Greedy, temperature, top-p, seed. **No top-k** |
+| Stable interfaces | Partial | Traits exist for `ComputeBackend`, `ExpertSource`, `DenseWeights`, `ExpertProvider`, `ArchitectureFactory`, `ResourceProbe`. `Engine::run_request` is the generation contract (ADR-013 amendment 1). There is no model handle yet |
+| Sampling | Production | Greedy, temperature, top-k, top-p, seed |
 
 ### Model manager (Product B)
 
@@ -77,7 +77,7 @@ applies only to what remains.
 | OpenAI chat and completions, SSE | Production | `qubivex-api`; official SDK against OLMoE and Qwen3 |
 | Backpressure, disconnects | Production | 64-event bounded channel; drop guards; tests over HTTP |
 | Unsupported parameters | Production | Refused, not ignored (ADR-013) |
-| Top-k | Missing | Follows the runtime gap |
+| Top-k | Production | `top_k` request field |
 | Model endpoints | Partial | `POST /v1/admin/models`, `DELETE /v1/admin/models/{id}`. The spec names `POST /v1/models/load` and `/unload` |
 | Load dedup | **Missing** | `admin_load` checks, then loads outside any lock: two concurrent loads of one id both read the weights, and the second gets a 409 only afterwards |
 | Safe unload | Production | `Arc` holds the model for running requests; slots close at once |
@@ -106,9 +106,8 @@ applies only to what remains.
 | `server status` | Missing |
 | `models search / pull / analyse / remove` | Missing |
 
-`run` and the gateway both call `Engine::generate_with`, so there is one inference
-pipeline, as the spec asks. Template rendering and stop-sequence handling sit in
-`qubivex-api/src/worker.rs`, so embedders of the runtime do not get them.
+`run` and the gateway both call `Engine::run_request`, so there is one inference pipeline,
+as the spec asks.
 
 ### Tests the spec requires
 
@@ -153,9 +152,8 @@ Dockerfile, and no `examples/`. CI covers Linux and macOS, MSRV 1.85, loom and `
 
 Rules the code already follows: the runtime does not depend on the server, the server has
 no tensor code, and the model crate executes nothing. `cargo tree -p qubivex-runtime` on this
-commit shows no `tokio`, `axum` or `clap`, so the crate is embeddable in principle. Nothing
-yet proves it: there is no embedding example or test, and an embedder must rebuild templates
-and stop handling (see CLI above).
+commit shows no `tokio`, `axum` or `clap`. Job 1 added the proof: `examples/embed.rs`,
+`tests/requests.rs` and the `check-embeddable` gate.
 
 **Not adopted from the spec's target layout:** `qubivex-tensor`, `qubivex-moe`, `apps/server`
 and `apps/model-manager`. Splitting them now would move working code with no behaviour
@@ -178,7 +176,7 @@ Owner rules for this plan (2026-11-06):
 
 | # | Job | Spec | Depends on | Done when |
 |---|---|---|---|---|
-| 1 | Generation contract | S1 | | A `GenerationRequest`, stop handling and templates live in the runtime; `run` and the gateway both use them; top-k added; tokens unchanged; a compiled embedding example uses only the runtime; CI fails if the runtime gains `tokio`, `axum` or `qubivex-api` |
+| 1 | Generation contract (**done**) | S1 | | A `GenerationRequest`, stop handling and templates live in the runtime; `run` and the gateway both use them; top-k added; tokens unchanged; a compiled embedding example uses only the runtime; CI fails if the runtime gains `tokio`, `axum` or `qubivex-api` |
 | 2 | Registry | S2 | | Atomic store of installed models, revisions and lifecycle states; survives a failed install; `models remove`, `validate` alias |
 | 3 | Downloader | S2 | 2 | Resumable, verified, atomic `models pull` and `search` from Hugging Face; fault tests against a local server; one real pull |
 | 4 | Analyse and manifest v1.1 | S2, S3 | 2 | `models analyse`; source, revision and checksums in the manifest, with a migration test |

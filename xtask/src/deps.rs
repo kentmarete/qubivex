@@ -112,6 +112,30 @@ fn is_allowed(from: &str, to: &str, dev: bool, allowed: &[&str]) -> bool {
     allowed.contains(&to)
 }
 
+/// Crates that would tie the runtime to a server, an async runtime or the CLI.
+const NOT_IN_RUNTIME: &[&str] = &[
+    "axum",
+    "clap",
+    "hyper",
+    "qubivex-api",
+    "qubivex-cli",
+    "tokio",
+    "tower",
+];
+
+/// The [`NOT_IN_RUNTIME`] crates in `cargo tree --prefix none` output.
+pub(crate) fn server_deps(tree: &str) -> Vec<String> {
+    let mut found: Vec<String> = tree
+        .lines()
+        .filter_map(|l| l.split_whitespace().next())
+        .filter(|name| NOT_IN_RUNTIME.contains(name))
+        .map(str::to_owned)
+        .collect();
+    found.sort_unstable();
+    found.dedup();
+    found
+}
+
 /// Returns one message per forbidden edge or unknown crate.
 pub(crate) fn violations(meta: &Metadata) -> Vec<String> {
     let internal: Vec<&str> = meta.packages.iter().map(|p| p.name.as_str()).collect();
@@ -209,6 +233,14 @@ mod tests {
             ("qubivex-arch", &[("qubivex-test-utils", Some("dev"))]),
         ]);
         assert_eq!(v, Vec::<String>::new());
+    }
+
+    #[test]
+    fn the_runtime_may_not_gain_a_server_dependency() {
+        let clean = "qubivex-runtime v0.1.0 (/r)\nrayon v1.10.0\ntokio-util v0.7.0\n";
+        assert!(server_deps(clean).is_empty());
+        let dirty = "qubivex-runtime v0.1.0 (/r)\ntokio v1.40.0\naxum v0.8.0\ntokio v1.40.0 (*)\n";
+        assert_eq!(server_deps(dirty), ["axum", "tokio"]);
     }
 
     #[test]
