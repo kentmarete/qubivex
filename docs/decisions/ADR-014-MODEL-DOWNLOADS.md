@@ -75,4 +75,5 @@ Everything a server returns is treated as untrusted. "Test" names the check in
   path to compile C and assembly; it is the crypto provider ureq's `rustls` feature uses.
 - `deny.toml` gains an exception scoped to `webpki-roots`, whose CA list is data under
   CDLA-Permissive-2.0.
-- The source and revision are in the registry, not the manifest, until plan job 4.
+- The source and revision are in the registry and, since plan job 4, the manifest too
+  (ADR-004 amendment 1).

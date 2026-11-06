@@ -28,7 +28,7 @@ and paged KV. Below, **S0–S10** are spec phases. Phase numbers without the S s
 | S0 | Audit and plan | | This document | Yes |
 | S1 | Runtime foundations | 4 | Partial | Models run, but through the concrete `Engine`; there is no stable contract |
 | S2 | Model manager | 3 | Partial | No: nothing downloads or removes a model |
-| S3 | Memory planner | 5 | Mostly production | Yes through `qubivex plan`; `models analyse` is absent |
+| S3 | Memory planner | 5 | Mostly production | Yes, through `qubivex plan` and `models analyse` |
 | S4 | Runtime, expert streaming | 6, 7 | Mostly production | Yes |
 | S5 | HTTP server | 9 | Production | Yes |
 | S6 | Streaming | 9 | Production | Yes |
@@ -61,15 +61,15 @@ applies only to what remains.
 
 | Requirement | State | Evidence |
 |---|---|---|
-| Containers, manifest v1, validation | Production | `qubivex-model`: hardened GGUF and SafeTensors readers, proptests, JSON schema |
+| Containers, manifest 1.1, validation | Production | `qubivex-model`: hardened GGUF and SafeTensors readers, proptests, JSON schema |
 | Import, discovery, verify | Production | `models import / list / inspect / verify` |
 | Downloads | Production | `qubivex-model-download` (ADR-014): resumable, verified, atomic; 30 fault tests against a local server; a real interrupted pull resumed and matched the reference byte for byte |
 | `models pull / search` | Production | Hugging Face first, behind `ModelProvider`. Split GGUF files are refused (ADR-014) |
 | `models remove` | Production | Needs `--yes`; deletes only inside the models directory |
-| `models analyse` | **Missing** as named | `qubivex plan` does the work; needs wiring |
+| `models analyse` | Production | Says whether a model runs here, the RAM each way of running it needs, and what each backend would do. Built on the planner, through `qubivex_memory::assess` |
 | Registry | Partial | `qubivex-model-registry`: atomic records of source, revision and install state, crash recovery, safe removal. `models pull` installs through it. Loaded state is job 5 |
 | Lifecycle states | Partial | Install states are recorded (ADR-003 amendment 2). Loading, loaded and failed-load states are job 5, in the serving process |
-| Manifest fields | Partial | No source repository, revision pin, per-file checksums or expert fields; checksums are `experts.qvxsum`. The schema is versioned, with no migration path yet |
+| Manifest fields | Production | Schema 1.1: source, revision and every file's sha256, with `models migrate`. Dimensions and expert fields stay in the checkpoint on purpose (ADR-004 amendment 1) |
 
 ### Server (Product C)
 
@@ -107,7 +107,7 @@ applies only to what remains.
 | `server status` | Missing |
 | `models remove` | Done |
 | `models search / pull` | Done |
-| `models analyse` | Missing |
+| `models analyse` | Production |
 
 `run` and the gateway both call `Engine::run_request`, so there is one inference pipeline,
 as the spec asks.
@@ -182,7 +182,7 @@ Owner rules for this plan (2026-11-06):
 | 1 | Generation contract (**done**) | S1 | | A `GenerationRequest`, stop handling and templates live in the runtime; `run` and the gateway both use them; top-k added; tokens unchanged; a compiled embedding example uses only the runtime; CI fails if the runtime gains `tokio`, `axum` or `qubivex-api` |
 | 2 | Registry (**done**) | S2 | | Atomic store of installed models, revisions and lifecycle states; survives a failed install; `models remove`, `validate` alias |
 | 3 | Downloader (**done**) | S2 | 2 | Resumable, verified, atomic `models pull` and `search` from Hugging Face; fault tests against a local server; one real pull |
-| 4 | Analyse and manifest v1.1 | S2, S3 | 2 | `models analyse`; source, revision and checksums in the manifest, with a migration test |
+| 4 | Analyse and manifest v1.1 (**done**) | S2, S3 | 2 | `models analyse`; source, revision and checksums in the manifest, with a migration test |
 | 5 | Concurrency correctness and scheduler (gate) | S4, S7 | 1 | Every §12.3 test passes, including 1, 2, 6, 9, 11, 12, 13, with a sanitizer run where supported; queue bounded by count, priorities, deadlines, load dedup |
 | 6 | KV subsystem | S4 | 1 | Prefix reuse with a bit-identity test; bounded and evictable |
 | 7 | Batching design | S8 | 5 (gate), 6 | ADR with a measured prototype |

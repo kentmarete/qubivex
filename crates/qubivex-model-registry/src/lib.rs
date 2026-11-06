@@ -31,6 +31,7 @@ use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+pub use qubivex_model::ModelSource;
 use qubivex_model::{ArchitectureRegistry, ModelMetadata, discover};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -113,17 +114,6 @@ pub enum InstallState {
     },
 }
 
-/// Where a model came from. Provider-neutral: repository metadata is normalised to this.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ModelSource {
-    /// The provider, such as `huggingface`.
-    pub provider: String,
-    /// The repository at that provider.
-    pub repository: String,
-    /// The exact revision.
-    pub revision: String,
-}
-
 /// One model in the registry.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ModelRecord {
@@ -133,7 +123,8 @@ pub struct ModelRecord {
     pub dir: String,
     /// How far its install has got.
     pub state: InstallState,
-    /// Where it came from; `None` for a model adopted from disk.
+    /// Where it came from; `None` for a model adopted from disk with no source in its
+    /// manifest.
     pub source: Option<ModelSource>,
     /// When the state last changed, in seconds since the Unix epoch.
     pub updated_at: u64,
@@ -444,8 +435,9 @@ impl Registry {
                 (Some(id), Ok(_)) if found.contains_key(&id) => out
                     .skipped
                     .push((d.dir, format!("the id {id:?} is used by another directory"))),
-                (Some(id), Ok(_)) => {
-                    found.insert(id, d.dir);
+                (Some(id), Ok(m)) => {
+                    let source = m.manifest.source.clone();
+                    found.insert(id, (d.dir, source));
                 }
                 (_, Err(e)) => out.skipped.push((d.dir, e.to_string())),
                 (None, Ok(_)) => {}
@@ -477,7 +469,7 @@ impl Registry {
                 s.models.remove(&id);
                 out.dropped.push(id);
             }
-            for (id, dir) in &found {
+            for (id, (dir, source)) in &found {
                 let Some(name) = in_root(dir) else { continue };
                 match s.models.get_mut(id) {
                     Some(r) if r.state == InstallState::Installed || busy(id) => {}
@@ -494,7 +486,7 @@ impl Registry {
                                 id: id.clone(),
                                 dir: name,
                                 state: InstallState::Installed,
-                                source: None,
+                                source: source.clone(),
                                 updated_at: now_secs(),
                             },
                         );

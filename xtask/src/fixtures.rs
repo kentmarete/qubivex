@@ -10,6 +10,7 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use qubivex_core::{DType, GgmlType};
+use qubivex_model::manifest::SemVer;
 use qubivex_model::write::{self, TensorData};
 use qubivex_model::{ArchitectureRegistry, GgufValue, ImportOptions, import};
 use serde_json::{Value, json};
@@ -483,6 +484,13 @@ fn pretty(v: &Value) -> Vec<u8> {
     s
 }
 
+/// The schema version written to the fixtures' manifests.
+const OLDEST_SCHEMA: SemVer = SemVer {
+    major: 1,
+    minor: 0,
+    patch: 0,
+};
+
 /// Values the GGUF fixture's metadata does not record.
 fn import_options(dir: &str) -> ImportOptions {
     let mut o = ImportOptions {
@@ -510,6 +518,9 @@ fn generate(out: &Path) -> Result<Vec<PathBuf>, String> {
         let imp =
             import(&d, &import_options(dir), &reg).map_err(|e| format!("import {dir}: {e}"))?;
         let mut m = imp.manifest;
+        // Fixtures stay at the oldest schema a build reads: they are the migration
+        // tests' input, and the proof that such a manifest still loads.
+        m.schema_version = OLDEST_SCHEMA;
         m.model.name = match dir {
             "olmoe-tiny" => "Tiny OLMoE-style fixture",
             "olmoe-tiny-gguf" => "Tiny OLMoE-style fixture, GGUF Q8_0",

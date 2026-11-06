@@ -4,6 +4,7 @@
 //! `system` and `doctor` (Phase 2), `models` (Phase 3), `run` and `bench` (Phase 4),
 //! `plan` (Phase 5); `serve` later.
 
+mod analyse;
 mod bench;
 mod doctor;
 mod models;
@@ -344,13 +345,57 @@ enum ModelsCommand {
         /// Replace an existing manifest.json.
         #[arg(long)]
         force: bool,
-        /// With --write, do not record per-expert checksums (experts.qvxsum). Recording
-        /// reads every expert once.
+        /// With --write, do not record checksums (in the manifest and experts.qvxsum).
+        /// Recording reads every file once.
         #[arg(long)]
         no_checksums: bool,
     },
-    /// Check every expert against the model's recorded checksums (experts.qvxsum), or
-    /// record them if there are none. The engine verifies expert reads against them.
+    /// Estimate the memory a model needs and say whether it can run on this machine.
+    #[command(visible_alias = "analyze")]
+    Analyse {
+        /// A model id, or a model directory.
+        model: String,
+        /// A model directory to search for the id (repeatable).
+        #[arg(long = "dir")]
+        dirs: Vec<PathBuf>,
+        /// performance (0.88 of available RAM), balanced (0.75) or saver (0.50).
+        #[arg(long, default_value = "performance")]
+        profile: String,
+        /// A custom fraction of available RAM, in (0, 1] (the custom profile).
+        #[arg(long)]
+        ram_fraction: Option<f64>,
+        /// An explicit RAM budget, for example 8GiB; replaces the profile's.
+        #[arg(long)]
+        ram_budget: Option<String>,
+        /// Context per sequence in tokens (default: the model's).
+        #[arg(long = "ctx")]
+        context: Option<u64>,
+        /// Sequences whose KV must fit at once.
+        #[arg(long, default_value_t = 1)]
+        sequences: u32,
+        /// Print JSON instead of text.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Bring a model's manifest up to the current schema, adding its source from the
+    /// registry and the checksum of every file. Prints the result unless --write is given.
+    Migrate {
+        /// A model id, or a model directory.
+        model: String,
+        /// A model directory to search for the id (repeatable).
+        #[arg(long = "dir")]
+        dirs: Vec<PathBuf>,
+        /// Replace manifest.json instead of printing it. Without --no-checksums this reads
+        /// every file once.
+        #[arg(long)]
+        write: bool,
+        /// Do not add file checksums.
+        #[arg(long)]
+        no_checksums: bool,
+    },
+    /// Check every file against the checksums in the manifest and every expert against
+    /// experts.qvxsum, recording the latter if there are none. The engine verifies expert
+    /// reads against them.
     #[command(visible_alias = "validate")]
     Verify {
         /// A model id, or a model directory.
@@ -358,8 +403,8 @@ enum ModelsCommand {
         /// A model directory to search for the id (repeatable).
         #[arg(long = "dir")]
         dirs: Vec<PathBuf>,
-        /// Record the checksums again from the files as they are now (after replacing
-        /// the weights on purpose).
+        /// Record both sets of checksums again from the files as they are now (after
+        /// replacing the weights on purpose).
         #[arg(long)]
         record: bool,
         /// Threads reading experts (default: every CPU).
@@ -1027,6 +1072,31 @@ fn execute(cmd: &Command) -> Result<(), String> {
                 record,
                 threads,
             } => models::verify(model, dirs, *record, threads.unwrap_or(0))?,
+            ModelsCommand::Analyse {
+                model,
+                dirs,
+                profile,
+                ram_fraction,
+                ram_budget,
+                context,
+                sequences,
+                json,
+            } => analyse::run(&plan::PlanArgs {
+                model,
+                dirs,
+                profile,
+                ram_fraction: *ram_fraction,
+                ram_budget: ram_budget.as_deref(),
+                context: *context,
+                sequences: *sequences,
+                json: *json,
+            })?,
+            ModelsCommand::Migrate {
+                model,
+                dirs,
+                write,
+                no_checksums,
+            } => models::migrate(model, dirs, *write, !*no_checksums)?,
             ModelsCommand::Search { query, limit, json } => pull::search_cmd(query, *limit, *json)?,
             ModelsCommand::Pull {
                 repository,

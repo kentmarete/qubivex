@@ -12,7 +12,8 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use qubivex_model::{ArchitectureRegistry, ModelMetadata};
+use qubivex_model::manifest::SCHEMA_VERSION;
+use qubivex_model::{ArchitectureRegistry, Manifest, ModelMetadata, sha256_file, verify_files};
 use qubivex_model_download::{
     DownloadError, HuggingFace, ModelProvider, Opened, Progress, PullOptions, PullRequest, Pulled,
     RepoListing, SearchHit, Token, pull, search,
@@ -117,6 +118,25 @@ fn a_clean_pull_installs_exactly_what_a_model_needs() {
         assert!(hub.downloads(skipped).is_empty(), "{skipped} was fetched");
     }
     assert!(!tmp.0.join(ID).join("README.md").exists());
+
+    let dir = tmp.0.join(ID);
+    let manifest = Manifest::load(&dir.join("manifest.json")).unwrap();
+    assert_eq!(manifest.schema_version, SCHEMA_VERSION);
+    assert_eq!(
+        manifest.source.as_ref().map(|s| s.revision.as_str()),
+        Some(SHA),
+        "the manifest pins the commit the registry does"
+    );
+    let shard = &manifest.weights.shards[0];
+    assert_eq!(
+        shard.sha256.as_deref(),
+        Some(sha256_file(&dir.join(&shard.path)).unwrap().as_str()),
+        "the provider's checksum is the file's"
+    );
+    let check = verify_files(&manifest, &dir);
+    assert!(check.problems.is_empty(), "{:?}", check.problems);
+    assert_eq!(check.unrecorded, 0);
+    assert_eq!(check.matched, pulled.files.len());
 }
 
 #[test]

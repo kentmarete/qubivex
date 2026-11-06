@@ -26,6 +26,28 @@ pub(crate) struct PlanArgs<'a> {
     pub(crate) json: bool,
 }
 
+impl PlanArgs<'_> {
+    pub(crate) fn request(&self) -> Result<PlanRequest, String> {
+        Ok(PlanRequest {
+            profile: profile(self.profile, self.ram_fraction)?,
+            ram_budget: self.ram_budget.map(parse_bytes).transpose()?,
+            context: self.context,
+            sequences: self.sequences,
+            layer_weights: None,
+        })
+    }
+}
+
+/// This machine's memory as a plan sees it, before anything is loaded.
+pub(crate) fn host_memory() -> Result<(HostMemory, Host), String> {
+    let host = Host::live();
+    let memory = qubivex_hardware::probe_memory(&host);
+    let now = SystemProbe::new(host.clone())
+        .snapshot()
+        .map_err(|e| chain(&e))?;
+    Ok((HostMemory::before_load(&memory, &now), host))
+}
+
 #[derive(Serialize)]
 struct Report<'a> {
     model: &'a str,
@@ -86,17 +108,8 @@ pub(crate) fn run(a: &PlanArgs<'_>) -> Result<String, String> {
     )
     .map_err(|e| chain(&e))?;
     let fp = ModelFootprint::from_metadata(&meta).map_err(|e| chain(&e))?;
-    let host = Host::live();
-    let memory = qubivex_hardware::probe_memory(&host);
-    let now = SystemProbe::new(host).snapshot().map_err(|e| chain(&e))?;
-    let req = PlanRequest {
-        profile: profile(a.profile, a.ram_fraction)?,
-        ram_budget: a.ram_budget.map(parse_bytes).transpose()?,
-        context: a.context,
-        sequences: a.sequences,
-        layer_weights: None,
-    };
-    let p = plan(&fp, &HostMemory::before_load(&memory, &now), &req).map_err(|e| chain(&e))?;
+    let (host, _) = host_memory()?;
+    let p = plan(&fp, &host, &a.request()?).map_err(|e| chain(&e))?;
     let id = meta.manifest.model.id.as_str();
     if a.json {
         return crate::to_json(&Report {

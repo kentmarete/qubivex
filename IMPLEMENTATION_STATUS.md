@@ -1,16 +1,25 @@
 # QUBIVEX Implementation Status
 
-Last updated: 2026-11-06
+Last updated: 2026-11-07
 
 ## Current phase
+**`models analyse` and manifest 1.1 done (2026-11-07); ADR-004 amendment 1.** Job 4 of the platform plan.
+- `qubivex models analyse <id>` gives a verdict (fits, streams, or does not fit), the RAM to start, to reach the context and to cache every expert, and what each backend would do. It takes `plan`'s flags and `--json`. "Does not fit" is an answer, so it exits 0. `qubivex_memory::assess` holds the logic, so an embedding application can call it.
+- Manifest 1.1 adds `source` and `files` (config, tokenizer and the rest, with checksums). `models pull` and `models import --write` fill them; `models migrate` upgrades a 1.0 manifest. A newer minor is refused by name. Writes are atomic.
+- Fixed: `Shard.sha256` was documented as checked by `models verify`, and nothing checked it. Verify now checks every file first, then experts. `--record` rewrites both sets of checksums, and only `--record` accepts a changed file.
+- Tests: 392 passed, 0 failed, 1 ignored. Fixtures stay at 1.0 as migration input. Removing each of 22 rules in turn: all caught, one only after adding the case it exposed (a registry record of another directory). One more mutation showed a flag was redundant, so it was removed.
+- Real models: `analyse` on OLMoE-1B-7B Q4_K_M gives all three outcomes (default budget fits; 2 GiB streams; 700 MiB does not fit, needing 866.99 MiB). A copy of Qwen3-0.6B migrated with checksums equal to `shasum -a 256`, then verified in 3.1 s; `experts.qvxsum` needs no change, because it covers weight files only. The installed manifests were left at 1.0: run `qubivex models migrate <id> --write` to move them.
+- Limits: verify reads every file one at a time, with no mtime cache; a local import records no source; `import --force` drops a recorded source; pull's recording was tested against the fake hub, with no live pull. No benchmarks: no tensor or kernel code changed.
+- **Next:** job 5 (concurrency correctness and scheduler), the gate on batching; job 6 can run beside it.
+
 **Model downloads done (2026-11-06); ADR-014.** Job 3 of the platform plan. New crate `qubivex-model-download`, the workspace's first network and TLS code (`ureq` + `rustls`, blocking, on plain threads): `qubivex models pull` and `models search`, Hugging Face first, behind a `ModelProvider` trait. A pull pins the commit, fetches only what a model needs, verifies each file, and installs through the registry, so a model is complete in place or absent.
 - Failure: stalls, drops and slow links share one path (a request budget, then resume at the offset). Retries back off exponentially, honour `Retry-After`, and reset on progress. Ctrl-C keeps the files and the same command continues them. Files that do not import stay, so a missing `--set` costs no second download.
 - Threat review in ADR-014: the token goes only to the configured origin, on every hop, so it never reaches the CDN; no downgrade to plain HTTP; file names cannot leave staging; bodies stop at the listed size; errors carry no signed URL or token.
 - Tests: 30 fault tests against a raw-socket hub, 14 unit tests, 4 through the binary. Each safety rule was removed in turn to check a test fails: 13 of 13 caught, one only after adding the case it exposed (a scheme with an explicit port).
 - Real pull: `Qwen/Qwen3-0.6B` from the live hub, cancelled by SIGINT at 210 MB and resumed. `model.safetensors` and `tokenizer.json` match the published SHA-256 and the existing install; 32 generated tokens are byte-identical to it. Live search and refusals (a missing repository, a repository of many GGUF files) work. No benchmarks: the machine was on battery.
-- Limits (ADR-014): split GGUF files are refused; a model's architecture is checked only after it arrives; published checksums protect against corruption, not a compromised hub; TLS uses bundled roots, so an inspecting proxy needs work. Source and revision are in the registry, not yet the manifest (job 4).
+- Limits (ADR-014): split GGUF files are refused; a model's architecture is checked only after it arrives; published checksums protect against corruption, not a compromised hub; TLS uses bundled roots, so an inspecting proxy needs work. Source and revision were added to the manifest in job 4.
 - `deny.toml` gained a licence exception scoped to `webpki-roots` (the CA list, as data).
-- **Next:** job 4 (`models analyse`, manifest v1.1).
+- Next was job 4 (above).
 
 **Model registry done (2026-11-06); ADR-003 amendment 2.** Job 2 of the platform plan. New crate `qubivex-model-registry`: `registry.json` records each installed model's source, revision and install state, with atomic updates. Installs build in staging and rename into place; `reconcile` recovers interrupted installs and adopts directories found on disk.
 - CLI: `qubivex models remove <id> [--yes]` (without `--yes` it deletes nothing), and `models validate` as an alias of `verify`.

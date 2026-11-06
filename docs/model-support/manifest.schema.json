@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://github.com/kentmarete/qubivex/docs/model-support/manifest.schema.json",
   "title": "QUBIVEX model manifest",
-  "description": "manifest.json, schema v1 (ADR-004). Dimensions are read from config.json or GGUF metadata, not from here; the manifest only names files and supplies what the checkpoint does not declare.",
+  "description": "manifest.json, schema 1.1 (ADR-004). A minor version adds optional fields; `qubivex models migrate` moves a manifest forward, and a build refuses a newer minor. Dimensions are read from config.json or GGUF metadata, not from here; the manifest only names files and supplies what the checkpoint does not declare.",
   "type": "object",
   "additionalProperties": false,
   "required": ["schema_version", "model", "architecture", "weights", "tokenizer"],
@@ -13,10 +13,20 @@
       "minLength": 1,
       "description": "Relative to the model directory; no '..', no absolute or drive paths, no backslashes.",
       "not": { "anyOf": [{ "pattern": "^/" }, { "pattern": "(^|/)\\.\\.?(/|$)" }, { "pattern": "[\\\\:]" }] }
+    },
+    "file": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["path"],
+      "properties": {
+        "path": { "$ref": "#/$defs/relpath" },
+        "size": { "type": "integer", "minimum": 0, "description": "A shard's is checked against the file at load." },
+        "sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$", "description": "Checked by qubivex models verify." }
+      }
     }
   },
   "properties": {
-    "schema_version": { "$ref": "#/$defs/semver", "description": "This build reads 1.x." },
+    "schema_version": { "$ref": "#/$defs/semver", "description": "This build reads 1.0 and 1.1, and writes 1.1. `source` and `files` need 1.1." },
     "model": {
       "type": "object",
       "additionalProperties": false,
@@ -25,6 +35,17 @@
         "id": { "type": "string", "pattern": "^[a-z0-9._-]{1,128}$", "description": "Stable id used on the command line." },
         "name": { "type": "string" },
         "version": { "type": "string" }
+      }
+    },
+    "source": {
+      "type": "object",
+      "description": "Where the model came from (schema 1.1). Provider-neutral; nothing that runs a model reads it.",
+      "additionalProperties": false,
+      "required": ["provider", "repository", "revision"],
+      "properties": {
+        "provider": { "type": "string", "minLength": 1, "description": "For example huggingface." },
+        "repository": { "type": "string", "minLength": 1 },
+        "revision": { "type": "string", "minLength": 1, "description": "The exact revision, not a branch." }
       }
     },
     "architecture": {
@@ -49,16 +70,7 @@
         "shards": {
           "type": "array",
           "minItems": 1,
-          "items": {
-            "type": "object",
-            "additionalProperties": false,
-            "required": ["path"],
-            "properties": {
-              "path": { "$ref": "#/$defs/relpath" },
-              "size": { "type": "integer", "minimum": 0, "description": "Checked against the file at load." },
-              "sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$", "description": "Checked by qubivex models verify." }
-            }
-          }
+          "items": { "$ref": "#/$defs/file" }
         },
         "config": { "$ref": "#/$defs/relpath", "description": "config.json (SafeTensors only; GGUF carries its config)." }
       }
@@ -78,6 +90,11 @@
           "properties": { "kind": { "const": "gguf" } }
         }
       ]
+    },
+    "files": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/file" },
+      "description": "The model's other files, such as config and tokenizer, for their checksums (schema 1.1)."
     },
     "context_length": { "type": "integer", "minimum": 1, "description": "A lower limit than the architecture's." },
     "capabilities": { "type": "array", "items": { "type": "string" } },

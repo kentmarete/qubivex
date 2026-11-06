@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 use serde_json::{Map, Value, json};
 
 use crate::manifest::{
-    ArchRef, ManifestFormat, ModelSection, Overrides, SCHEMA_MAJOR, SemVer, Shard,
+    ArchRef, ManifestFormat, ModelSection, ModelSource, Overrides, SCHEMA_VERSION, SemVer, Shard,
     TokenizerSection, WeightsSection,
 };
 use crate::metadata::{check, index_files, read_config};
@@ -25,6 +25,8 @@ pub struct ImportOptions {
     pub name: Option<String>,
     /// `overrides.config` values (`config.json` names), for values the checkpoint lacks.
     pub set: Map<String, Value>,
+    /// Where the checkpoint came from, if a provider supplied it.
+    pub source: Option<ModelSource>,
 }
 
 /// An imported manifest.
@@ -105,7 +107,7 @@ fn locate(path: &Path) -> Result<(PathBuf, ManifestFormat, Vec<String>), ModelEr
         .filter(|n| n.ends_with(".safetensors"))
         .cloned()
         .collect();
-    let index = path.join("model.safetensors.index.json");
+    let index = path.join(crate::SHARD_INDEX_FILE);
     if index.is_file() {
         let text = crate::manifest::read_small(&index, 64 << 20)?;
         let v: Value =
@@ -181,16 +183,13 @@ pub fn import(
         })
         .collect();
     let base = Manifest {
-        schema_version: SemVer {
-            major: SCHEMA_MAJOR,
-            minor: 0,
-            patch: 0,
-        },
+        schema_version: SCHEMA_VERSION,
         model: ModelSection {
             id: opts.id.clone().unwrap_or_else(|| sanitise_id(&stem)),
             name: opts.name.clone().unwrap_or_else(|| stem.clone()),
             version: None,
         },
+        source: opts.source.clone(),
         architecture: ArchRef {
             id: "transformer_moe".to_owned(),
             version: SemVer {
@@ -206,6 +205,7 @@ pub fn import(
             config: (format == ManifestFormat::Safetensors).then(|| "config.json".to_owned()),
         },
         tokenizer,
+        files: Vec::new(),
         context_length: None,
         capabilities: Vec::new(),
         quantization: None,
