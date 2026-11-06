@@ -1094,7 +1094,7 @@ impl Batch<'_, '_> {
             ne: u32_of(experts.len(), OP)?,
             per_entry: u32::from(input == RoutedInput::Entry),
             entries: u32_of(entries, OP)?,
-            tiles: u32_of(tokens.div_ceil(crate::device::TILE), OP)?,
+            tiles: u32_of(tokens.div_ceil(crate::TILE), OP)?,
         };
         #[cfg(target_os = "macos")]
         {

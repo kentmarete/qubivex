@@ -41,6 +41,10 @@ use thiserror::Error;
 /// The kernel source, compiled at backend creation.
 pub const KERNEL_SOURCE: &str = include_str!("kernels.metal");
 
+/// Activation rows per threadgroup of the token-tiled kernels; must equal `TILE` in
+/// `kernels.metal`.
+pub(crate) const TILE: usize = 8;
+
 /// Errors from creating or driving the Metal backend.
 #[derive(Debug, Error)]
 #[non_exhaustive]

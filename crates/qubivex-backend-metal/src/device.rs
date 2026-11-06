@@ -22,7 +22,7 @@ use objc2_metal::{
 
 use qubivex_compute::host::PageAligned;
 
-use crate::{DeviceInfo, MetalError};
+use crate::{DeviceInfo, MetalError, TILE};
 
 /// Rows per threadgroup; must equal `ROWS` in `kernels.metal`.
 pub(crate) const ROWS: usize = 8;
@@ -30,9 +30,6 @@ pub(crate) const ROWS: usize = 8;
 /// `kernels.metal`.
 pub(crate) const KQ_ROWS: usize = 2;
 
-/// Activation rows per threadgroup of the token-tiled kernels; must equal `TILE` in
-/// `kernels.metal`.
-pub(crate) const TILE: usize = 8;
 /// Activation rows from which a matmul uses the token-tiled kernel (ADR-011 amendment 5).
 /// Measured on the reference model (M3 Pro): from 4 rows the tiles win (6 tokens: 68.5 → 62.3 ms),
 /// below they lose a little.

@@ -76,7 +76,7 @@ constant uint ROWS = 8;
 // per SIMD group, so each weight is loaded and dequantised once for all of them. Every
 // (row, token) output keeps its own two lane accumulators, the same fused multiply-adds
 // in the same order and the same tree: the bits are those of the one-token kernel.
-// Must equal `TILE` in `device.rs`.
+// Must equal `TILE` in `lib.rs`.
 constant uint TILE = 8;
 
 typedef device const float *xptr;
