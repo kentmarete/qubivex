@@ -6,14 +6,16 @@
 mod support;
 
 use std::fs;
+use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::time::Duration;
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use qubivex_model::{ArchitectureRegistry, ModelMetadata};
 use qubivex_model_download::{
-    DownloadError, HuggingFace, Progress, PullOptions, PullRequest, Pulled, Token, pull, search,
+    DownloadError, HuggingFace, ModelProvider, Opened, Progress, PullOptions, PullRequest, Pulled,
+    RepoListing, SearchHit, Token, pull, search,
 };
 use qubivex_model_registry::{InstallState, Registry, RegistryError};
 use support::{Fault, File, Hub, REPO, SHA, fixture};
@@ -393,26 +395,102 @@ fn a_concurrent_pull_of_one_model_is_refused() {
     );
 }
 
-#[test]
-fn concurrency_is_bounded_and_real() {
+/// Counts bodies open at once, on the client, which is what the limit is about. The
+/// server cannot see this: it may still be finishing a body the client has moved past.
+struct Counting {
+    inner: HuggingFace,
+    open: Arc<AtomicUsize>,
+    peak: Arc<AtomicUsize>,
+    /// Each open waits for this many, so overlap does not depend on timing.
+    expect: usize,
+}
+
+struct Counted {
+    body: Box<dyn Read + Send>,
+    open: Arc<AtomicUsize>,
+}
+
+impl Read for Counted {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        self.body.read(buf)
+    }
+}
+
+impl Drop for Counted {
+    fn drop(&mut self) {
+        self.open.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+impl ModelProvider for Counting {
+    fn name(&self) -> &str {
+        self.inner.name()
+    }
+
+    fn resolve(&self, repo: &str, revision: Option<&str>) -> Result<RepoListing, DownloadError> {
+        self.inner.resolve(repo, revision)
+    }
+
+    fn search(&self, query: &str, limit: usize) -> Result<Vec<SearchHit>, DownloadError> {
+        self.inner.search(query, limit)
+    }
+
+    fn open(&self, list: &RepoListing, path: &str, at: u64) -> Result<Opened, DownloadError> {
+        let opened = self.inner.open(list, path, at)?;
+        let now = self.open.fetch_add(1, Ordering::SeqCst) + 1;
+        self.peak.fetch_max(now, Ordering::SeqCst);
+        let waited = Instant::now();
+        while self.peak.load(Ordering::SeqCst) < self.expect
+            && waited.elapsed() < Duration::from_secs(5)
+        {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        Ok(Opened {
+            start: opened.start,
+            body: Box::new(Counted {
+                body: opened.body,
+                open: self.open.clone(),
+            }),
+        })
+    }
+}
+
+fn peak_transfers(concurrency: usize) -> usize {
     let tmp = Tmp::new();
     let names: Vec<String> = (0..6).map(|i| format!("data-{i}.bin")).collect();
     let files = names
         .iter()
         .map(|path| File {
             path: path.clone(),
-            bytes: vec![3; 256 << 10],
+            bytes: vec![3; 4096],
             lfs: true,
         })
         .collect();
     let hub = Hub::start(files);
-    *hub.state.pace.lock().unwrap() = Duration::from_millis(2);
+    let peak = Arc::new(AtomicUsize::new(0));
+    let counting = Counting {
+        inner: provider(&hub),
+        open: Arc::new(AtomicUsize::new(0)),
+        peak: peak.clone(),
+        expect: concurrency,
+    };
     let mut req = request();
     req.files = names;
+    let mut opts = fast();
+    opts.concurrency = concurrency;
+    let reg = Registry::open(&tmp.0).unwrap();
+    let arch = ArchitectureRegistry::with_builtins();
+    let cancel = AtomicBool::new(false);
     // These are not a model, so the import fails after every file has arrived.
-    let e = run(&tmp.0, &hub, &req).unwrap_err();
+    let e = pull(&reg, &counting, &req, &opts, &arch, &cancel, &|_| {}).unwrap_err();
     assert!(matches!(e, DownloadError::Import(_)), "{e:?}");
-    assert_eq!(hub.state.peak.load(Ordering::SeqCst), fast().concurrency);
+    peak.load(Ordering::SeqCst)
+}
+
+#[test]
+fn concurrency_is_bounded_and_real() {
+    assert_eq!(peak_transfers(1), 1);
+    assert_eq!(peak_transfers(3), 3);
 }
 
 #[test]

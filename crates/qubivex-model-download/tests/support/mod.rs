@@ -7,7 +7,6 @@ use std::collections::VecDeque;
 use std::io::{BufRead, BufReader, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::Path;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -97,9 +96,7 @@ pub struct State {
     pub api_faults: Mutex<VecDeque<u16>>,
     pub seen: Mutex<Vec<Seen>>,
     pub next_link: Mutex<Option<String>>,
-    pub active: AtomicUsize,
-    pub peak: AtomicUsize,
-    /// Pacing per 16 KiB of a body, so concurrency can overlap.
+    /// Pacing per 16 KiB of a body, so a test can act part way through.
     pub pace: Mutex<Duration>,
 }
 
@@ -121,8 +118,6 @@ impl Hub {
             api_faults: Mutex::new(VecDeque::new()),
             seen: Mutex::new(Vec::new()),
             next_link: Mutex::new(None),
-            active: AtomicUsize::new(0),
-            peak: AtomicUsize::new(0),
             pace: Mutex::new(Duration::ZERO),
         });
         let shared = state.clone();
@@ -292,11 +287,7 @@ fn download(
                 rest.len(),
                 headers(start)
             )?;
-            let n = state.active.fetch_add(1, Ordering::SeqCst) + 1;
-            state.peak.fetch_max(n, Ordering::SeqCst);
-            let out = body(s, state, rest);
-            state.active.fetch_sub(1, Ordering::SeqCst);
-            out
+            body(s, state, rest)
         }
     }
 }
