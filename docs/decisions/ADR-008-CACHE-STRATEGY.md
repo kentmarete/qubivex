@@ -204,4 +204,4 @@ simulator, like Colibri's `residency_sim.py`).
   differ by more than the gap to prefetch off, so that loss is not resolved: pooled,
   prefetch is about 2.5% behind. Amendment 2's small gain (19.87 → 20.3) has not
   survived the faster Q4_K kernel. No regime measured here shows a throughput gain.
-  Prefetch stays **off** by default, and whether it should remain is an owner decision.
+  Prefetch stays **off** by default. Owner decision (2026-11-06): it stays opt-in behind `--prefetch`, with no further work unless a real workload shows a gain.

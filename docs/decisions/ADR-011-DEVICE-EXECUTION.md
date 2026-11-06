@@ -1,6 +1,6 @@
 # ADR-011: Device execution, buffer lifetimes and GPU parity
 
-- Status: Proposed (Phase 8 slice 1, 2026-11-03; amendments 1–5, slices 2–6). Owner review pending.
+- Status: Proposed (Phase 8 slice 1, 2026-11-03; amendments 1–5, slices 2–6; amendment 6, 2026-11-06). Owner review pending.
 - Date: 2026-11-03
 - Related: ADR-007 (backends; amendment 2026-11-03), ADR-010 (lossless by default),
   `docs/engineering/ARCHITECTURE_DECISIONS.md` §2.4–2.5, TENSOR_ARCHITECTURE §6.
@@ -453,3 +453,53 @@ entries. Both are about twice the CPU.
 - Next for Metal: the small-cache regime (pools smaller than top-k), now that a token
   can be one submission; then CUDA.
 
+## Amendment 6 (2026-11-06): partial expert caches
+
+### The question
+Amendment 3 settled pools smaller than top-k. Between that and every expert resident,
+pools hold a token's experts but not all of a layer's. Most budgets from 2 to 4 GiB land
+here, and `--metal-ops token` needs every expert resident, so this regime gets the
+per-layer path. Nothing had measured it.
+
+### What was measured (M3 Pro, OLMoE Q4_K_M, on power)
+A 10-token prompt, 160 generated, 5 runs; every record gave the reference tokens. A CPU
+repeat at the end of the sweep gave 43.0 tok/s against 43.4 at the start. Records:
+`docs/performance/baselines/2026-11-06-m3pro-smallcache-*.json`.
+
+| expert cache | slots of 64 | CPU decode tok/s | Metal decode tok/s | Metal wait per token |
+|---|---|---|---|---|
+| all resident | 64 | 43.4 | **58.2** | 0 ms |
+| 3072 MiB | 52–53 | 42.9 | **49.2** | 1.5 ms |
+| 2048 MiB | 35–36 | 40.8 | 40.1 | 5.6 ms |
+| 1900 MiB | 32–33 | **39.5** | 37.5 | not extracted |
+| 1536 MiB | 26–27 | **38.6** | 34.5 | not extracted |
+| `--ram-budget 2GiB` | 20–21 | **35.5** | 30.8 | not extracted |
+| 1024 MiB | 17–18 | **34.9** | 29.5 | 12.0 ms |
+| 768 MiB | 13–14 | **32.5** | 26.3 | 14.2 ms |
+
+Metal waits on loads that the CPU pass overlaps with compute (the CPU waits 1.3 ms or
+less). `token` and `layers` give the same numbers below 64 slots, which fits the
+one-submission pass never running there; `Engine::gpu_routed_passes` was not recorded in
+these runs.
+
+Prefill goes the other way. Metal stays ahead at 128 tokens (1024 MiB: 194 against 117
+tok/s; 2048 MiB: 221 against 117) and at 10 tokens (1024 MiB: 46.9 against 41.4).
+
+### Decision
+- **The plan also chooses the CPU pass when any layer's pool holds fewer than half its
+  experts**, as amendment 3 does below top-k: at load, from the plan, with the reason in
+  `PlacementReport::fallback`. `--backend metal` now decodes at 37.7 tok/s at 1536 MiB
+  (was 34.5), 35.4 at `--ram-budget 2GiB` (was 30.8) and 34.1 at 1024 MiB (was 29.5). The
+  cost is prefill in that range, which runs at the CPU's speed: at 1024 MiB, 128 tokens
+  go from 194 to about 117 tok/s.
+- **The line is a judgement.** Half is not the decode crossover, which is near 35 slots.
+  Just above the line Metal gives up about 5% of decode (1900 MiB: 37.5 against 39.5) and
+  keeps its prefill (58.1 against 40.6 at 10 tokens), so the line favours keeping Metal
+  there.
+- **Not built: Metal for prefill and the CPU for decode.** It is the fastest combination
+  on paper (a 128-token prompt plus 160 tokens at 1024 MiB: about 5.2 s, against 5.7 s
+  with this decision and 6.1 s before, not counting the handoff). It would move the KV
+  between device buffers and host tensors at each switch and break §5's placement fixed
+  at load, for at most about 8% in a regime only `--backend metal` reaches.
+- Pools that pressure shrinks after load keep the pass chosen at load, as in amendment 3.
+- The CPU stays the default backend until the owner reviews amendments 2–6.

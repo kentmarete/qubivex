@@ -5,12 +5,19 @@ Last updated: 2026-11-06
 ## Current phase
 **Phase 9 (serving) done (2026-11-04).** Phase 8 (GPU acceleration, Metal first): slices 1–6 done (2026-11-05). The improvement-plan backlog (MIGRATION_PLAN §3a) is cleared.
 
+**Metal at partial expert caches done (2026-11-06); ADR-011 amendment 6.** Measured on power with reference tokens at every size: Metal decode leads with most experts resident (3072 MiB: 49.2 against 42.9 tok/s), ties near 2048 MiB (40.1 against 40.8) and loses below it (1024 MiB: 29.5 against 34.9), because it waits on loads the CPU pass overlaps. Metal prefill leads at every size (128 tokens at 1024 MiB: 194 against 117).
+- Code: `cpu_pass_reason` in `engine.rs`: `--backend metal` runs the CPU pass when a layer's pool holds fewer than top-k or fewer than half its experts, with the reason in `PlacementReport::fallback`. Decode goes 34.5 → 37.7 tok/s at 1536 MiB, 30.8 → 35.4 at `--ram-budget 2GiB`, 29.5 → 34.1 at 1024 MiB; prefill in that range drops to the CPU's speed.
+- Tests: a unit test of both limits. Existing Metal tests pass unchanged.
+- Not built: Metal for prefill with the CPU for decode (at most about 8% before the KV handoff, and it breaks placement fixed at load). Just above the line Metal gives up about 5% of decode to keep its prefill.
+- Records: `docs/performance/baselines/2026-11-06-m3pro-smallcache-*.json`.
+- **Next:** Phase 10.
+
 **Phase 7 saturation throttle done (2026-11-06); ADR-008 amendment 3.** On a saturated simulated disk at `--ram-budget 1GiB`, prefetch with the guard lost 3–4% (9.93 → 9.52 tok/s at 6 GB/s, 3.70 → 3.59 at 2 GB/s, 0.99 → 0.96 at 500 MB/s); the throttle removes that (9.99, 3.73, 1.00), and tokens stay identical.
 - Code: `fault::SlowDisk` and `bench --disk-mbps` / `--disk-latency-us`; `policy::SaturationGauge` (share of wall time blocked on reads, 100 ms windows, holds at 60%, resumes below 40%); checked in `Engine::forward`; `--prefetch-throttle on|off`, default on; `held_rate` in `bench` records.
 - Tests: gauge thresholds, windows and idle turns; shared bandwidth of `SlowDisk`; an engine test that a saturated disk holds speculation with identical tokens.
-- Open owner decision: no regime measured now shows prefetch gaining throughput. On the real warm disk it is about 2.5% behind, within the spread of its own repeat runs, and the throttle never holds there (about 37% blocked). Prefetch stays off by default.
+- Owner decision (2026-11-06): prefetch stays opt-in behind `--prefetch`, with no further work unless a real workload shows a gain. No regime measured shows it gaining throughput: on the real warm disk it is about 2.5% behind, within the spread of its own repeat runs, and the throttle never holds there (about 37% blocked).
 - Not on power, so not recorded as baselines: the 200 MB/s + 8 ms row and the `--expert-cache-mb 2048` rows.
-- **Next:** decide prefetch's future, Metal in the small-cache regime, then Phase 10.
+- Next was Metal at partial expert caches (done, above).
 
 **Phase 8 slice 6 done (2026-11-05): token tiles for Metal prefill; ADR-011 amendment 5.** Prefill with every expert resident: 128 tokens 97 → 239 tok/s, 1024 tokens 235 tok/s (CPU 115 for both), 10 tokens 91 → 102; decode unchanged (59.6); tokens bit-identical.
 - Code: token-tiled matmul kernels (`matmul_<dtype>_t`, up to 8 activation rows per weight load, per-(row, token) accumulators in the one-token order; row bodies are templates shared by every kernel), used from 4 rows; `moe_group` (GPU counting sort of routed entries by expert) and `Routing::Grouped` / `routed_<dtype>_g`, used by the one-submission pass from 2 entries per expert.

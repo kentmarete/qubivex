@@ -950,26 +950,13 @@ impl Engine {
                 (Some(plan), capacity, ctx)
             }
         };
-        // Whole layers beat the CPU only when each layer's pool holds a token's routed
-        // experts: with fewer slots, experts stream through the pool and every layer's
-        // GPU round trip costs more than the GPU saves (ADR-011 amendment 3). The plan
-        // then runs the CPU pass.
         let top_k = model.moe_config().map_or(0, |c| c.top_k as usize);
-        let short = pools_for(&footprint.layers, capacity)
-            .into_iter()
-            .find(|p| (p.slots as usize) < top_k);
+        let cpu_pass = cpu_pass_reason(&footprint.layers, capacity, top_k);
         let (backend, gpu) = match layers_on {
-            Some((be, _)) if short.is_some() => {
-                let p = short.map_or(0, |p| p.slots);
-                let reason = format!(
-                    "the expert cache holds {p} experts in some layer, fewer than the {top_k} \
-                     routed per token; the CPU pass is faster then"
-                );
-                (
-                    Placed::fallback(be.info().name, opts.metal_ops, reason),
-                    None,
-                )
-            }
+            Some((be, _)) if cpu_pass.is_some() => (
+                Placed::fallback(be.info().name, opts.metal_ops, cpu_pass.unwrap_or_default()),
+                None,
+            ),
             Some((be, host)) => {
                 let cfg = model.moe_config().ok_or_else(|| {
                     RuntimeError::Model("whole Metal layers need routed experts".into())
@@ -1555,6 +1542,31 @@ fn pools_for(layers: &[LayerExperts], bytes: u64) -> Vec<PoolSpec> {
         .collect()
 }
 
+/// Why a cache of `bytes` should run the CPU pass instead of whole Metal layers, if it
+/// should. With fewer slots than a token routes, experts stream through the pool and
+/// every layer's GPU round trip costs more than the GPU saves (ADR-011 amendment 3).
+/// With fewer than half a layer's experts, decode waits on loads that the CPU pass
+/// overlaps with compute (ADR-011 amendment 6).
+fn cpu_pass_reason(layers: &[LayerExperts], bytes: u64, top_k: usize) -> Option<String> {
+    let slots = qubivex_memory::distribute(layers, Bytes(bytes), None);
+    let in_layers = || layers.iter().zip(&slots);
+    if let Some((_, s)) = in_layers().find(|(_, s)| (**s as usize) < top_k) {
+        return Some(format!(
+            "the expert cache holds {s} experts in some layer, fewer than the {top_k} \
+             routed per token; the CPU pass is faster then"
+        ));
+    }
+    in_layers()
+        .find(|(l, s)| u64::from(**s) * 2 < u64::from(l.experts))
+        .map(|(l, s)| {
+            format!(
+                "the expert cache holds {s} of {} experts in some layer, fewer than half; \
+                 the CPU pass decodes faster then",
+                l.experts
+            )
+        })
+}
+
 fn plan_at_load(
     fp: &ModelFootprint,
     opts: &EngineOptions,
@@ -1673,5 +1685,23 @@ mod tests {
         let a: Vec<u32> = (0..10).map(|i| sample(&l, s, &mut Rng(i))).collect();
         let b: Vec<u32> = (0..10).map(|i| sample(&l, s, &mut Rng(i))).collect();
         assert_eq!(a, b, "same seed, same tokens");
+    }
+
+    #[test]
+    fn the_cpu_pass_takes_over_below_half_a_layers_experts() {
+        let layers: Vec<LayerExperts> = (0..2)
+            .map(|i| LayerExperts {
+                layer: qubivex_core::LayerIdx(i),
+                experts: 64,
+                expert_bytes: Bytes(10),
+                total: Bytes(640),
+            })
+            .collect();
+        let reason = |slots: u64| cpu_pass_reason(&layers, slots * 2 * 10, 8);
+        assert!(reason(4).is_some_and(|r| r.contains("fewer than the 8")));
+        assert!(reason(31).is_some_and(|r| r.contains("31 of 64")));
+        assert_eq!(reason(32), None, "half stays on Metal");
+        assert_eq!(reason(64), None);
+        assert_eq!(cpu_pass_reason(&[], 0, 0), None, "no routed experts");
     }
 }

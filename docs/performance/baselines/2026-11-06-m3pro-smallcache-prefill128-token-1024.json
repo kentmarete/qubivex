@@ -1,0 +1,251 @@
+{
+  "schema": 1,
+  "label": "prefill128-token-1024",
+  "started": "2026-11-06T09:29:15Z",
+  "build": {
+    "version": "0.1.0",
+    "git": "82d46bc67697",
+    "rustc": "rustc 1.99.1 (58cf8f9c3 2026-10-13)",
+    "profile": "release",
+    "opt_level": "3",
+    "debug_assertions": false,
+    "target": "aarch64-apple-darwin",
+    "target_features": "aes,crc,dit,dotprod,dpb,dpb2,fcma,fhm,flagm,fp16,frintts,jsconv,lor,lse,neon,paca,pacg,pan,pmuv3,ras,rcpc,rcpc2,rdm,sb,sha2,sha3,ssbs,vh",
+    "rustflags": ""
+  },
+  "hardware": {
+    "cpu": {
+      "arch": "aarch64",
+      "vendor": {
+        "known": "Apple"
+      },
+      "model": {
+        "known": "Apple M3 Pro"
+      },
+      "logical_cores": {
+        "known": 11
+      },
+      "physical_cores": {
+        "known": 11
+      },
+      "tiers": {
+        "known": [
+          {
+            "name": "Performance",
+            "physical": 5,
+            "logical": 5
+          },
+          {
+            "name": "Efficiency",
+            "physical": 6,
+            "logical": 6
+          }
+        ]
+      },
+      "simd": [
+        "neon",
+        "fp16",
+        "dotprod",
+        "i8mm",
+        "bf16"
+      ],
+      "numa_nodes": {
+        "known": 1
+      }
+    },
+    "memory": {
+      "total": {
+        "known": 19327352832
+      },
+      "cgroup_limit": {
+        "known": "none"
+      }
+    },
+    "os": {
+      "family": "macos",
+      "name": {
+        "known": "macOS 27.2 (26B123)"
+      },
+      "kernel": {
+        "known": "27.2.0"
+      }
+    }
+  },
+  "model": {
+    "id": "olmoe-1b-7b-0125-instruct",
+    "name": "OLMoE-1B-7B-0125-Instruct Q4_K_M",
+    "architecture": "transformer_moe",
+    "dir": "~/.qubivex/models/olmoe-1b-7b-0125-instruct"
+  },
+  "config": {
+    "threads": 5,
+    "expert_cache": 1073676288,
+    "expert_slots": [
+      18,
+      18,
+      18,
+      18,
+      18,
+      18,
+      18,
+      18,
+      18,
+      18,
+      17,
+      17,
+      17,
+      17,
+      17,
+      17
+    ],
+    "cache_policy": "Lfru { decay_window: 256 }",
+    "io_threads": 4,
+    "expert_io": "buffered",
+    "verification": "verified",
+    "device": {
+      "backend": "metal",
+      "device": "Apple M3 Pro",
+      "ops": "token",
+      "tensors": 81,
+      "bytes": 252545024
+    },
+    "context": 4096,
+    "prompt": "Write a long story about a lighthouse keeper.",
+    "prompt_tokens": 128,
+    "generated_tokens": 4,
+    "warmup_runs": 1,
+    "measured_runs": 5
+  },
+  "prefill": {
+    "ms": {
+      "n": 5,
+      "min": 658.828167,
+      "median": 659.3204999999999,
+      "p95": 660.690083,
+      "max": 660.690083,
+      "mean": 659.5335834
+    },
+    "tok_s_at_median": 194.13926914148735
+  },
+  "decode": {
+    "step_ms": {
+      "n": 15,
+      "min": 39.138625000000005,
+      "median": 48.117709000000005,
+      "p95": 50.433209,
+      "max": 50.433209,
+      "mean": 46.03864453333334
+    },
+    "tok_s_at_median": 20.782369335165146,
+    "run_tok_s": [
+      21.7070613975187,
+      21.91461953196275,
+      21.636390036693367,
+      21.694222294202046,
+      21.654408815619544
+    ]
+  },
+  "memory": {
+    "rss_after_load": {
+      "known": 356679680
+    },
+    "peak_rss": {
+      "known": 1443889152
+    },
+    "peak_source": "sampled",
+    "plan_budget": null,
+    "ledger": {
+      "dense": 311027712,
+      "expert_cache": 1073676288,
+      "kv": 67108864,
+      "total": 1451812864
+    }
+  },
+  "experts": {
+    "hits": 1907,
+    "loads": 3928,
+    "bytes_read": 15002861568,
+    "evictions": 3928,
+    "hit_rate": 0.3268209083119109,
+    "bytes_per_token": 750143078,
+    "slab_allocs": 0,
+    "wait_ms_per_token": 39.59604155,
+    "read_retries": 0,
+    "read_timeouts": 0
+  },
+  "check": {
+    "deterministic": true,
+    "first_divergence": null,
+    "reference": null,
+    "reference_match": null,
+    "reference_divergence": null
+  },
+  "runs": [
+    {
+      "prefill_ms": 660.690083,
+      "decode_step_ms": {
+        "n": 3,
+        "min": 40.000375,
+        "median": 47.901582999999995,
+        "p95": 50.301917,
+        "max": 50.301917,
+        "mean": 46.06795833333333
+      },
+      "decode_tok_s": 21.7070613975187
+    },
+    {
+      "prefill_ms": 659.3204999999999,
+      "decode_step_ms": {
+        "n": 3,
+        "min": 39.138625000000005,
+        "median": 47.981625,
+        "p95": 49.774666,
+        "max": 49.774666,
+        "mean": 45.63163866666667
+      },
+      "decode_tok_s": 21.91461953196275
+    },
+    {
+      "prefill_ms": 659.2298330000001,
+      "decode_step_ms": {
+        "n": 3,
+        "min": 40.104375,
+        "median": 48.117709000000005,
+        "p95": 50.433209,
+        "max": 50.433209,
+        "mean": 46.218431
+      },
+      "decode_tok_s": 21.636390036693367
+    },
+    {
+      "prefill_ms": 659.599334,
+      "decode_step_ms": {
+        "n": 3,
+        "min": 39.295249999999996,
+        "median": 48.755917000000004,
+        "p95": 50.234500000000004,
+        "max": 50.234500000000004,
+        "mean": 46.09522233333333
+      },
+      "decode_tok_s": 21.694222294202046
+    },
+    {
+      "prefill_ms": 658.828167,
+      "decode_step_ms": {
+        "n": 3,
+        "min": 39.987916999999996,
+        "median": 48.464792,
+        "p95": 50.087208000000004,
+        "max": 50.087208000000004,
+        "mean": 46.17997233333333
+      },
+      "decode_tok_s": 21.654408815619544
+    }
+  ],
+  "tokens": [
+    43775,
+    15,
+    10639,
+    247
+  ]
+}
