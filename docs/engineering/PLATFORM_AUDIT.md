@@ -152,7 +152,10 @@ Dockerfile, and no `examples/`. CI covers Linux and macOS, MSRV 1.85, loom and `
    file names, and token handling.
 
 Rules the code already follows: the runtime does not depend on the server, the server has
-no tensor code, and the model crate executes nothing.
+no tensor code, and the model crate executes nothing. `cargo tree -p qubivex-runtime` on this
+commit shows no `tokio`, `axum` or `clap`, so the crate is embeddable in principle. Nothing
+yet proves it: there is no embedding example or test, and an embedder must rebuild templates
+and stop handling (see CLI above).
 
 **Not adopted from the spec's target layout:** `qubivex-tensor`, `qubivex-moe`, `apps/server`
 and `apps/model-manager`. Splitting them now would move working code with no behaviour
@@ -163,15 +166,25 @@ new code only: `qubivex-model-download` and `qubivex-model-registry`.
 
 Each row is one job and one PR. Dependencies run downwards.
 
+Owner rules for this plan (2026-11-06):
+
+- **No tensor engine rewrite.** `qubivex-core`, `qubivex-compute` and the backends stay. This
+  audit establishes what works first, and any architectural change has to build on that.
+- **Concurrency correctness comes before batching.** Shared weights, independent KV caches,
+  expert leases and cancellation-safe resource management must be proven first. Job 5 is a
+  gate: jobs 7 and 8 do not start until it is merged.
+- **The runtime stays embeddable.** Qubivex must work inside another Rust application with
+  no HTTP server and no CLI. Job 1 proves it, and a check keeps it true.
+
 | # | Job | Spec | Depends on | Done when |
 |---|---|---|---|---|
-| 1 | Generation contract | S1 | | A `GenerationRequest`, stop handling and templates live in the runtime; `run` and the gateway both use them; top-k added; tokens unchanged |
+| 1 | Generation contract | S1 | | A `GenerationRequest`, stop handling and templates live in the runtime; `run` and the gateway both use them; top-k added; tokens unchanged; a compiled embedding example uses only the runtime; CI fails if the runtime gains `tokio`, `axum` or `qubivex-api` |
 | 2 | Registry | S2 | | Atomic store of installed models, revisions and lifecycle states; survives a failed install; `models remove`, `validate` alias |
 | 3 | Downloader | S2 | 2 | Resumable, verified, atomic `models pull` and `search` from Hugging Face; fault tests against a local server; one real pull |
 | 4 | Analyse and manifest v1.1 | S2, S3 | 2 | `models analyse`; source, revision and checksums in the manifest, with a migration test |
-| 5 | Scheduler | S7 | 1 | Queue bounded by count, priorities, deadlines, load dedup; §12.3 tests 1, 2, 6, 9, 11, 12, 13 |
+| 5 | Concurrency correctness and scheduler (gate) | S4, S7 | 1 | Every §12.3 test passes, including 1, 2, 6, 9, 11, 12, 13, with a sanitizer run where supported; queue bounded by count, priorities, deadlines, load dedup |
 | 6 | KV subsystem | S4 | 1 | Prefix reuse with a bit-identity test; bounded and evictable |
-| 7 | Batching design | S8 | 5, 6 | ADR with a measured prototype |
+| 7 | Batching design | S8 | 5 (gate), 6 | ADR with a measured prototype |
 | 8 | Batching, stages 2 and 3 | S8 | 7 | Sequences share a pass; tokens bit-identical; measured on power |
 | 9 | Hardening | S10 | 5 | Rate limits, request limits, CORS, non-localhost refusal, config files |
 | 10 | Observability | S10 | 5 | The §8 metrics; structured logs with no prompt text |
