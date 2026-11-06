@@ -55,6 +55,25 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - run: cargo test --release --locked -p qubivex-expert-stream --test loom
+      - run: cargo test --release --locked -p qubivex-scheduler --test loom
+
+  tsan:
+    name: ThreadSanitizer (scheduler, gateway, store)
+    runs-on: ubuntu-latest
+    env:
+      RUSTFLAGS: -Zsanitizer=thread
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: nightly-2026-11-06
+          components: rust-src
+      - uses: Swatinem/rust-cache@v2
+      - run: >-
+          cargo test -Zbuild-std --target x86_64-unknown-linux-gnu --locked
+          -p qubivex-scheduler -p qubivex-api -p qubivex-expert-stream -p qubivex-runtime
+          --test scheduler --test concurrency --test gateway --test store --test prefetch
+          --test requests
 
   deny:
     name: cargo deny

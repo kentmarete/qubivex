@@ -23,9 +23,13 @@ pub use qubivex_arch::{KvCache, Logits};
 pub use qubivex_expert_stream::fault::DiskLimit;
 use qubivex_model::manifest::TokenizerSection;
 use qubivex_model::{GgufMetadata, GgufValue, ModelMetadata};
+pub use qubivex_scheduler as scheduler;
 pub use qubivex_tokenizer::ChatMessage;
 use qubivex_tokenizer::{GgufVocab, Tokenizer, TokenizerError};
-pub use request::{GenerationEvent, GenerationOutcome, GenerationRequest, Prompt, RequestError};
+pub use request::{
+    GenerationEvent, GenerationOutcome, GenerationRequest, KvAdmission, PreparedRequest, Prompt,
+    RequestError,
+};
 use thiserror::Error;
 
 /// Runtime errors.

@@ -79,6 +79,12 @@ are unchanged. `cargo xtask check` now fails if the runtime gains `tokio`, `axum
   (it used to generate one token).
 - A KV reservation now ends just before the final event, not just after it.
 
+## Amendment 2 (2026-11-07): the scheduler replaces the semaphore
+ADR-015 replaces the per-model semaphore with `qubivex-scheduler`: a queue bounded by count,
+priorities, per-request deadlines and memory admission that can wait. Loads are deduplicated,
+a loaded model reloads as a 200 rather than a 409, shutdown drains, and a stream nobody reads
+ends. The threads, the turn lock and the cancellation flag described above are unchanged.
+
 ## Consequences
 - The exit criteria are met: `crates/qubivex-api/tests/gateway.rs` (over HTTP, tiny
   fixtures: shapes, streaming equals non-streaming, concurrent equals sequential,

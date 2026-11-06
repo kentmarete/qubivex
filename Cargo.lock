@@ -1229,11 +1229,19 @@ dependencies = [
  "qubivex-hardware",
  "qubivex-memory",
  "qubivex-model",
+ "qubivex-scheduler",
  "qubivex-tokenizer",
  "rayon",
  "rustix",
  "serde_json",
  "thiserror",
+]
+
+[[package]]
+name = "qubivex-scheduler"
+version = "0.1.0"
+dependencies = [
+ "loom",
 ]
 
 [[package]]

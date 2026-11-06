@@ -5,228 +5,18 @@
 
 #![allow(clippy::unwrap_used, clippy::too_many_lines)]
 
+mod common;
+
 use std::io::{Read, Write};
-use std::net::{SocketAddr, TcpStream};
-use std::path::PathBuf;
-use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::net::TcpStream;
+use std::time::Duration;
 
-use qubivex_api::{Gateway, ServerConfig};
-use qubivex_expert_stream::ExpertSource;
-use qubivex_expert_stream::fault::{Fault, FaultySource, Rule, Target};
-use qubivex_model::{ArchitectureRegistry, ModelMetadata};
-use qubivex_runtime::{Engine, EngineOptions, Sampling};
+use common::{
+    Resp, engine, http, meta, post, reference, request, root, slow_engine, start, text_of,
+    wait_until,
+};
+use qubivex_api::{Gateway, MemoryPolicy, ServerConfig};
 use serde_json::{Value, json};
-
-fn root() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/models")
-}
-
-fn meta(id: &str) -> ModelMetadata {
-    ModelMetadata::load(&root().join(id), &ArchitectureRegistry::with_builtins()).unwrap()
-}
-
-fn opts() -> EngineOptions {
-    EngineOptions {
-        max_context: Some(256),
-        pressure_interval_ms: Some(0),
-        ..EngineOptions::default()
-    }
-}
-
-fn engine(id: &str) -> Engine {
-    Engine::load(meta(id), opts()).unwrap()
-}
-
-/// An engine whose expert reads each take `delay` and whose cache holds one expert per
-/// layer, so every token reads from the (slow) source.
-fn slow_engine(id: &str, delay: Duration, ram_budget: Option<u64>) -> Engine {
-    let m = meta(id);
-    let largest = m.bytes().largest_expert;
-    let o = EngineOptions {
-        expert_cache_bytes: ram_budget.is_none().then_some(largest),
-        ram_budget,
-        ..opts()
-    };
-    Engine::load_with_source(m, o, move |src| {
-        let inner: Arc<dyn ExpertSource> = src;
-        Arc::new(FaultySource::new(
-            inner,
-            [Rule::always(Target::Any, Fault::Delay(delay))],
-        ))
-    })
-    .unwrap()
-}
-
-struct Server {
-    addr: SocketAddr,
-    stop: Option<tokio::sync::oneshot::Sender<()>>,
-    thread: Option<std::thread::JoinHandle<()>>,
-}
-
-impl Drop for Server {
-    fn drop(&mut self) {
-        if let Some(s) = self.stop.take() {
-            let _ = s.send(());
-        }
-        if let Some(t) = self.thread.take() {
-            let _ = t.join();
-        }
-    }
-}
-
-fn start(gw: &Gateway) -> Server {
-    let gw = gw.clone();
-    let (addr_tx, addr_rx) = std::sync::mpsc::sync_channel(1);
-    let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
-    let thread = std::thread::spawn(move || {
-        let rt = tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(2)
-            .enable_all()
-            .build()
-            .unwrap();
-        rt.block_on(async move {
-            let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-            addr_tx.send(l.local_addr().unwrap()).unwrap();
-            gw.serve(l, async {
-                let _ = stop_rx.await;
-            })
-            .await
-            .unwrap();
-        });
-    });
-    Server {
-        addr: addr_rx.recv().unwrap(),
-        stop: Some(stop_tx),
-        thread: Some(thread),
-    }
-}
-
-struct Resp {
-    status: u16,
-    headers: Vec<(String, String)>,
-    body: Vec<u8>,
-}
-
-impl Resp {
-    fn json(&self) -> Value {
-        serde_json::from_slice(&self.body)
-            .unwrap_or_else(|e| panic!("{e}: {}", String::from_utf8_lossy(&self.body)))
-    }
-    fn header(&self, k: &str) -> Option<&str> {
-        self.headers
-            .iter()
-            .find(|(n, _)| n.eq_ignore_ascii_case(k))
-            .map(|(_, v)| v.as_str())
-    }
-    /// The `data:` payloads of an SSE body.
-    fn events(&self) -> Vec<String> {
-        String::from_utf8_lossy(&self.body)
-            .lines()
-            .filter_map(|l| l.strip_prefix("data: ").map(str::to_owned))
-            .collect()
-    }
-}
-
-fn request(
-    addr: SocketAddr,
-    method: &str,
-    path: &str,
-    headers: &[(&str, &str)],
-    body: Option<&Value>,
-) -> String {
-    let body = body.map(Value::to_string).unwrap_or_default();
-    let mut req = format!(
-        "{method} {path} HTTP/1.1\r\nhost: {addr}\r\nconnection: close\r\ncontent-type: application/json\r\ncontent-length: {}\r\n",
-        body.len()
-    );
-    for (k, v) in headers {
-        req.push_str(&format!("{k}: {v}\r\n"));
-    }
-    req.push_str("\r\n");
-    req.push_str(&body);
-    req
-}
-
-fn dechunk(mut b: &[u8]) -> Vec<u8> {
-    let mut out = Vec::new();
-    loop {
-        let Some(nl) = b.windows(2).position(|w| w == b"\r\n") else {
-            return out;
-        };
-        let size =
-            usize::from_str_radix(std::str::from_utf8(&b[..nl]).unwrap().trim(), 16).unwrap();
-        if size == 0 {
-            return out;
-        }
-        out.extend_from_slice(&b[nl + 2..nl + 2 + size]);
-        b = &b[nl + 2 + size + 2..];
-    }
-}
-
-fn http(
-    addr: SocketAddr,
-    method: &str,
-    path: &str,
-    headers: &[(&str, &str)],
-    body: Option<&Value>,
-) -> Resp {
-    let mut s = TcpStream::connect(addr).unwrap();
-    s.set_read_timeout(Some(Duration::from_secs(60))).unwrap();
-    s.write_all(request(addr, method, path, headers, body).as_bytes())
-        .unwrap();
-    let mut raw = Vec::new();
-    s.read_to_end(&mut raw).unwrap();
-    let split = raw.windows(4).position(|w| w == b"\r\n\r\n").unwrap();
-    let head = String::from_utf8_lossy(&raw[..split]).into_owned();
-    let mut lines = head.lines();
-    let status = lines
-        .next()
-        .unwrap()
-        .split(' ')
-        .nth(1)
-        .unwrap()
-        .parse()
-        .unwrap();
-    let headers: Vec<(String, String)> = lines
-        .filter_map(|l| l.split_once(':'))
-        .map(|(k, v)| (k.trim().to_owned(), v.trim().to_owned()))
-        .collect();
-    let rest = &raw[split + 4..];
-    let chunked = headers
-        .iter()
-        .any(|(k, v)| k.eq_ignore_ascii_case("transfer-encoding") && v.contains("chunked"));
-    let body = if chunked {
-        dechunk(rest)
-    } else {
-        rest.to_vec()
-    };
-    Resp {
-        status,
-        headers,
-        body,
-    }
-}
-
-fn post(addr: SocketAddr, path: &str, body: &Value) -> Resp {
-    http(addr, "POST", path, &[], Some(body))
-}
-
-fn text_of(r: &Value) -> String {
-    let c = &r["choices"][0];
-    c["message"]["content"]
-        .as_str()
-        .or_else(|| c["text"].as_str())
-        .unwrap()
-        .to_owned()
-}
-
-/// The text the engine generates greedily for `prompt` (as `/v1/completions` encodes it).
-fn reference(e: &Engine, prompt: &str, n: usize) -> String {
-    let ids = e.tokenizer().encode(prompt, true).unwrap();
-    let toks = e.generate(&ids, n, Sampling::default(), |_| true).unwrap();
-    e.tokenizer().decode(&toks, true).unwrap()
-}
 
 #[test]
 fn openai_shapes_and_streaming_equal_non_streaming() {
@@ -384,17 +174,6 @@ fn concurrent_conversations_get_independent_kv() {
     assert_eq!(gw.metrics().active(), 0);
 }
 
-fn wait_until(what: &str, mut f: impl FnMut() -> bool) {
-    let t = Instant::now();
-    while !f() {
-        assert!(
-            t.elapsed() < Duration::from_secs(20),
-            "timed out waiting for {what}"
-        );
-        std::thread::sleep(Duration::from_millis(10));
-    }
-}
-
 #[test]
 fn a_client_that_goes_away_cancels_its_generation() {
     let gw = Gateway::new(ServerConfig {
@@ -461,6 +240,7 @@ fn kv_admission_refuses_what_the_plan_cannot_hold() {
         + 1024 * fp.kv_bytes_per_token.0;
     let gw = Gateway::new(ServerConfig {
         max_concurrent: 8,
+        memory_policy: MemoryPolicy::Refuse,
         ..ServerConfig::default()
     });
     gw.add_model(
@@ -616,8 +396,20 @@ fn auth_admin_and_errors_without_paths() {
     assert_eq!(r.status, 201, "{}", String::from_utf8_lossy(&r.body));
     assert_eq!(r.json()["id"], "dense-tiny");
     assert_eq!(gw.model_ids(), ["dense-tiny", "olmoe-tiny"]);
+    // Loading it again changes nothing.
     assert_eq!(
         http(s.addr, "POST", "/v1/admin/models", &admin, Some(&load)).status,
+        200
+    );
+    // One model cannot be served twice, and one id cannot mean two models.
+    let again = json!({ "model": "dense-tiny", "id": "other-name" });
+    assert_eq!(
+        http(s.addr, "POST", "/v1/admin/models", &admin, Some(&again)).status,
+        409
+    );
+    let clash = json!({ "model": "olmoe-tiny", "id": "dense-tiny" });
+    assert_eq!(
+        http(s.addr, "POST", "/v1/admin/models", &admin, Some(&clash)).status,
         409
     );
     let r = http(

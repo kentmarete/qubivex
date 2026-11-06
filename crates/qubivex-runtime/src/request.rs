@@ -7,15 +7,21 @@
 //! and a host can run as many as it likes on an `Arc<Engine>`, one thread each. Weights
 //! and the expert store are shared; each request owns its KV cache and reservation, and
 //! both are released on every way out, including a panic in the callback.
+//!
+//! A host with a queue splits that call in two: [`Engine::prepare`] says what a request
+//! will cost, [`KvAdmission`] lets a [`qubivex_scheduler::Scheduler`] decide when it
+//! runs, and [`Engine::run_prepared`] runs it under the reservation that decision took.
 
+use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use std::time::Instant;
 
+use qubivex_scheduler::Admission;
 use qubivex_tokenizer::ChatMessage;
 use thiserror::Error;
 
 use crate::RuntimeError;
-use crate::engine::{Engine, Finish, GenerateOptions, Sampling};
+use crate::engine::{Engine, Finish, GenerateOptions, KvReservation, Sampling};
 
 /// What to generate from.
 #[derive(Clone, Debug)]
@@ -41,7 +47,7 @@ pub struct GenerationRequest {
     pub stops: Vec<String>,
     /// Prompt tokens per forward pass (how soon a cancelled prefill stops).
     pub prefill_chunk: usize,
-    /// When to stop generating, checked after each token.
+    /// When to stop generating, checked before each prefill chunk and each token.
     pub deadline: Option<Instant>,
 }
 
@@ -88,6 +94,49 @@ pub struct GenerationOutcome {
     pub prompt_tokens: usize,
     /// Tokens generated.
     pub completion_tokens: usize,
+}
+
+/// A request tokenized and checked against the context, not yet admitted.
+#[derive(Clone, Debug)]
+pub struct PreparedRequest {
+    prompt: Vec<u32>,
+    max_new: usize,
+}
+
+impl PreparedRequest {
+    /// Prompt length in tokens.
+    #[must_use]
+    pub fn prompt_tokens(&self) -> usize {
+        self.prompt.len()
+    }
+
+    /// Most KV positions the conversation can use: the request's cost.
+    #[must_use]
+    pub fn positions(&self) -> usize {
+        self.prompt.len() + self.max_new
+    }
+}
+
+/// Admits requests against an engine's memory plan, in KV positions, for a
+/// [`qubivex_scheduler::Scheduler`].
+#[derive(Clone, Debug)]
+pub struct KvAdmission(pub Arc<Engine>);
+
+impl Admission for KvAdmission {
+    type Hold = KvReservation;
+    type Refusal = RuntimeError;
+
+    /// Loading refuses a context the plan cannot hold for one conversation, and
+    /// [`Engine::prepare`] refuses what the context cannot hold, so a prepared request
+    /// always fits alone.
+    fn check(&self, _cost: u64) -> Result<(), RuntimeError> {
+        Ok(())
+    }
+
+    fn try_hold(&self, cost: u64) -> Result<KvReservation, RuntimeError> {
+        self.0
+            .reserve_kv(usize::try_from(cost).unwrap_or(usize::MAX))
+    }
 }
 
 /// Why a request failed.
@@ -221,20 +270,12 @@ impl Engine {
         Ok(ids)
     }
 
-    /// Runs `req` on this thread, reporting through `on_event`. Reserves KV room with
-    /// every other live conversation, which is what lets several requests share an
-    /// engine, and returns it when the request ends. `cancel` is checked before every
-    /// prefill chunk and every token.
+    /// Tokenizes `req` and checks it against the context. Costs no memory and runs no
+    /// pass.
     ///
     /// # Errors
-    /// [`RequestError::Invalid`] before any pass runs, [`RequestError::Admission`] if
-    /// the plan has no room, [`RequestError::Generation`] if a pass fails.
-    pub fn run_request(
-        &self,
-        req: &GenerationRequest,
-        cancel: &AtomicBool,
-        mut on_event: impl FnMut(GenerationEvent) -> bool,
-    ) -> Result<GenerationOutcome, RequestError> {
+    /// [`RequestError::Invalid`] if the request cannot run on this model.
+    pub fn prepare(&self, req: &GenerationRequest) -> Result<PreparedRequest, RequestError> {
         let prompt = self.prompt_ids(&req.prompt)?;
         let prompt_tokens = prompt.len();
         let ctx = self.max_context();
@@ -256,9 +297,45 @@ impl Engine {
             Some(m) => m,
             None => req.default_max_tokens.min(room),
         };
-        let _kv = self
-            .reserve_kv(prompt_tokens + max_new)
+        Ok(PreparedRequest { prompt, max_new })
+    }
+
+    /// Runs `req` on this thread, reporting through `on_event`. Reserves KV room with
+    /// every other live conversation, which is what lets several requests share an
+    /// engine, and returns it when the request ends. `cancel` is checked before every
+    /// prefill chunk and every token.
+    ///
+    /// # Errors
+    /// [`RequestError::Invalid`] before any pass runs, [`RequestError::Admission`] if
+    /// the plan has no room, [`RequestError::Generation`] if a pass fails.
+    pub fn run_request(
+        &self,
+        req: &GenerationRequest,
+        cancel: &AtomicBool,
+        on_event: impl FnMut(GenerationEvent) -> bool,
+    ) -> Result<GenerationOutcome, RequestError> {
+        let prepared = self.prepare(req)?;
+        let kv = self
+            .reserve_kv(prepared.positions())
             .map_err(RequestError::Admission)?;
+        self.run_prepared(req, &prepared, &kv, cancel, on_event)
+    }
+
+    /// Runs a request [`Engine::prepare`] checked, under a reservation for its
+    /// [`PreparedRequest::positions`]. `req` must be the request that was prepared.
+    ///
+    /// # Errors
+    /// [`RequestError::Generation`] if a pass fails.
+    pub fn run_prepared(
+        &self,
+        req: &GenerationRequest,
+        prepared: &PreparedRequest,
+        _kv: &KvReservation,
+        cancel: &AtomicBool,
+        mut on_event: impl FnMut(GenerationEvent) -> bool,
+    ) -> Result<GenerationOutcome, RequestError> {
+        let (prompt, max_new) = (&prepared.prompt, prepared.max_new);
+        let prompt_tokens = prepared.prompt_tokens();
         let ended = |finish, completion_tokens| GenerationOutcome {
             finish,
             prompt_tokens,
@@ -272,12 +349,13 @@ impl Engine {
             max_new,
             sampling: req.sampling,
             prefill_chunk: req.prefill_chunk,
+            deadline: req.deadline,
         };
         let mut decoder = self.tokenizer().stream();
         let mut stops = Stops::new(&req.stops);
-        let (mut hit_stop, mut gone, mut timed_out) = (false, false, false);
+        let (mut hit_stop, mut gone) = (false, false);
         let g = self
-            .generate_with(&prompt, &opts, cancel, |id| {
+            .generate_with(prompt, &opts, cancel, |id| {
                 if !on_event(GenerationEvent::Token(id)) {
                     gone = true;
                     return false;
@@ -290,10 +368,6 @@ impl Engine {
                 }
                 if hit {
                     hit_stop = true;
-                    return false;
-                }
-                if req.deadline.is_some_and(|d| Instant::now() >= d) {
-                    timed_out = true;
                     return false;
                 }
                 true
@@ -324,8 +398,6 @@ impl Engine {
         }
         let finish = if hit_stop {
             Finish::StopSequence
-        } else if timed_out {
-            Finish::TimedOut
         } else {
             g.finish
         };

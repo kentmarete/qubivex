@@ -32,7 +32,7 @@ and paged KV. Below, **S0–S10** are spec phases. Phase numbers without the S s
 | S4 | Runtime, expert streaming | 6, 7 | Mostly production | Yes |
 | S5 | HTTP server | 9 | Production | Yes |
 | S6 | Streaming | 9 | Production | Yes |
-| S7 | Concurrent scheduler | 9 | Partial | Requests are correct and share weights; the queue is not bounded by size and there are no priorities |
+| S7 | Concurrent scheduler | 9 | Production | Yes: `qubivex-scheduler` (ADR-015) |
 | S8 | Continuous batching | 10 | Missing | No |
 | S9 | Hardware acceleration | 8 | Partial | CPU and Metal yes; CUDA blocked (B2), Vulkan not started |
 | S10 | Production readiness | 10–11 | Partial | No |
@@ -67,8 +67,8 @@ applies only to what remains.
 | `models pull / search` | Production | Hugging Face first, behind `ModelProvider`. Split GGUF files are refused (ADR-014) |
 | `models remove` | Production | Needs `--yes`; deletes only inside the models directory |
 | `models analyse` | Production | Says whether a model runs here, the RAM each way of running it needs, and what each backend would do. Built on the planner, through `qubivex_memory::assess` |
-| Registry | Partial | `qubivex-model-registry`: atomic records of source, revision and install state, crash recovery, safe removal. `models pull` installs through it. Loaded state is job 5 |
-| Lifecycle states | Partial | Install states are recorded (ADR-003 amendment 2). Loading, loaded and failed-load states are job 5, in the serving process |
+| Registry | Production | `qubivex-model-registry`: atomic records of source, revision and install state, crash recovery, safe removal. `models pull` installs through it |
+| Lifecycle states | Production | Install states are recorded (ADR-003 amendment 2). Loading, loaded and failed states are held by the serving process and shown in `/v1/system` (ADR-015) |
 | Manifest fields | Production | Schema 1.1: source, revision and every file's sha256, with `models migrate`. Dimensions and expert fields stay in the checkpoint on purpose (ADR-004 amendment 1) |
 
 ### Server (Product C)
@@ -79,19 +79,19 @@ applies only to what remains.
 | Backpressure, disconnects | Production | 64-event bounded channel; drop guards; tests over HTTP |
 | Unsupported parameters | Production | Refused, not ignored (ADR-013) |
 | Top-k | Production | `top_k` request field |
-| Model endpoints | Partial | `POST /v1/admin/models`, `DELETE /v1/admin/models/{id}`. The spec names `POST /v1/models/load` and `/unload` |
-| Load dedup | **Missing** | `admin_load` checks, then loads outside any lock: two concurrent loads of one id both read the weights, and the second gets a 409 only afterwards |
-| Safe unload | Production | `Arc` holds the model for running requests; slots close at once |
-| Queue | Partial | A semaphore with a timeout. Waiters are limited by time, not count, so a burst parks without bound for up to `--queue-timeout` |
-| Priorities, deadlines, per-client fairness | Missing | FIFO only. `--request-timeout` is a global setting |
-| Memory admission | Production | `reserve_kv` against the plan |
+| Model endpoints | Production | `POST /v1/models/load` and `/unload`; the admin routes stay as aliases |
+| Load dedup | Production | Concurrent loads join one load; one directory, one instance (ADR-015) |
+| Safe unload | Production | `Arc` holds the model for running requests; the queue closes at once; tested with a live stream |
+| Queue | Production | `qubivex-scheduler`: bounded by count, refused at once past the limit |
+| Priorities, deadlines, per-client fairness | Production | `priority` and `timeout` request fields, aging, fewest-running-first by `user`. `user` is not authenticated (job 9) |
+| Memory admission | Production | Against the plan through the scheduler; queues or refuses by `--memory-policy` |
 | Batching | **Missing** | See §3 |
 | Auth | Partial | Optional API key and admin token, constant-time. No key refuses a non-localhost bind |
 | Rate limiting | Missing | The 429 means queue timeout only |
 | Request limits | Partial | Axum's default body limit only; no configured prompt length, no explicit limit |
 | CORS | Missing | |
-| Graceful shutdown | Partial | `with_graceful_shutdown` exists; shutdown with active generations is untested |
-| Metrics | Partial | Requests, tokens, active, cancelled, failed, KV, cache bytes, slots. No TTFT, tokens/s, latency histograms, queue depth, hit rate, evictions or disk throughput |
+| Graceful shutdown | Production | Waiters end at once, running requests get `--shutdown-grace`, then stop with an error. Tested over HTTP |
+| Metrics | Partial | Requests, tokens, active, cancelled, failed, KV, cache bytes, slots, queue depth, rejections. No TTFT, tokens/s, latency histograms, hit rate, evictions or disk throughput |
 | Structured logs | **Missing** | `eprintln!` with a request id. No model or sequence ids, levels or format |
 | Config files | **Missing** | Flags and three environment variables. No TOML, no precedence rule |
 
@@ -116,17 +116,17 @@ as the spec asks.
 
 | Test (§12.3) | State |
 |---|---|
-| 1. Ten simultaneous requests | Missing at that count; 4-that-fit tested |
-| 2. Fifty, bounded | Missing |
+| 1. Ten simultaneous requests | Covered: `concurrency.rs` |
+| 2. Fifty, bounded | Covered: `concurrency.rs` |
 | 3, 4. Same expert, concurrent loads | Covered in the store's tests and loom |
 | 5. Eviction while executing | Covered by the store's leases |
-| 6. Model load dedup | Missing, and the code fails it |
+| 6. Model load dedup | Covered: `concurrency.rs` |
 | 7, 8. Cancellation, SSE disconnect | Covered |
-| 9. Unload while active | Not tested with a live request |
-| 10. Memory exhaustion | Covered for KV admission |
-| 11. Shutdown with active requests | Missing |
-| 12. Different context lengths | Missing |
-| 13. Multiple models | Covered only by the SDK script, which is not in CI |
+| 9. Unload while active | Covered: a live stream and a waiter |
+| 10. Memory exhaustion | Covered for KV admission, both policies |
+| 11. Shutdown with active requests | Covered: within the grace and past it |
+| 12. Different context lengths | Covered: `concurrency.rs` |
+| 13. Multiple models | Covered for correctness and separate queues in CI. Shared capacity is not arbitrated (ADR-015) |
 
 ### Docs and packaging
 
@@ -183,7 +183,7 @@ Owner rules for this plan (2026-11-06):
 | 2 | Registry (**done**) | S2 | | Atomic store of installed models, revisions and lifecycle states; survives a failed install; `models remove`, `validate` alias |
 | 3 | Downloader (**done**) | S2 | 2 | Resumable, verified, atomic `models pull` and `search` from Hugging Face; fault tests against a local server; one real pull |
 | 4 | Analyse and manifest v1.1 (**done**) | S2, S3 | 2 | `models analyse`; source, revision and checksums in the manifest, with a migration test |
-| 5 | Concurrency correctness and scheduler (gate) | S4, S7 | 1 | Every §12.3 test passes, including 1, 2, 6, 9, 11, 12, 13, with a sanitizer run where supported; queue bounded by count, priorities, deadlines, load dedup |
+| 5 | Concurrency correctness and scheduler (gate) (**done**) | S4, S7 | 1 | Every §12.3 test passes, including 1, 2, 6, 9, 11, 12, 13, with a sanitizer run where supported; queue bounded by count, priorities, deadlines, load dedup |
 | 6 | KV subsystem | S4 | 1 | Prefix reuse with a bit-identity test; bounded and evictable |
 | 7 | Batching design | S8 | 5 (gate), 6 | ADR with a measured prototype |
 | 8 | Batching, stages 2 and 3 | S8 | 7 | Sequences share a pass; tokens bit-identical; measured on power |
