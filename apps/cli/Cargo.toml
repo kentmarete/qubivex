@@ -20,6 +20,7 @@ qubivex-expert-stream = { workspace = true }
 qubivex-hardware = { workspace = true }
 qubivex-memory = { workspace = true }
 qubivex-model = { workspace = true }
+qubivex-model-registry = { workspace = true }
 qubivex-runtime = { workspace = true }
 qubivex-tokenizer = { workspace = true }
 serde = { workspace = true }

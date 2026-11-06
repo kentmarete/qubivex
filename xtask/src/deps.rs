@@ -41,6 +41,8 @@ fn allowed_deps(krate: &str) -> Option<Vec<&'static str>> {
         "qubivex-hardware" | "qubivex-tokenizer" => vec!["qubivex-core"],
         // The model crate never depends on compute.
         "qubivex-model" => vec!["qubivex-core"],
+        // Installs and removes models; never executes them.
+        "qubivex-model-registry" => vec!["qubivex-model"],
         "qubivex-compute" => vec!["qubivex-core"],
         b if BACKENDS.contains(&b) => vec!["qubivex-compute", "qubivex-core"],
         "qubivex-arch" => vec!["qubivex-model", "qubivex-compute", "qubivex-core"],

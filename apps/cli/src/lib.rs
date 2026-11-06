@@ -350,6 +350,7 @@ enum ModelsCommand {
     },
     /// Check every expert against the model's recorded checksums (experts.qvxsum), or
     /// record them if there are none. The engine verifies expert reads against them.
+    #[command(visible_alias = "validate")]
     Verify {
         /// A model id, or a model directory.
         model: String,
@@ -363,6 +364,18 @@ enum ModelsCommand {
         /// Threads reading experts (default: every CPU).
         #[arg(long)]
         threads: Option<usize>,
+    },
+    /// Delete an installed model from a models directory. Without --yes, only says what
+    /// would be deleted.
+    Remove {
+        /// A model id.
+        model: String,
+        /// A models directory to search for the id (repeatable).
+        #[arg(long = "dir")]
+        dirs: Vec<PathBuf>,
+        /// Delete it.
+        #[arg(long)]
+        yes: bool,
     },
     /// List the architectures this build supports.
     Architectures,
@@ -972,6 +985,7 @@ fn execute(cmd: &Command) -> Result<(), String> {
                 record,
                 threads,
             } => models::verify(model, dirs, *record, threads.unwrap_or(0))?,
+            ModelsCommand::Remove { model, dirs, yes } => models::remove(model, dirs, *yes)?,
             ModelsCommand::Architectures => models::architectures(),
         }),
     }

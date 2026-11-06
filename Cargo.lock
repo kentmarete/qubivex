@@ -1049,6 +1049,7 @@ dependencies = [
  "qubivex-hardware",
  "qubivex-memory",
  "qubivex-model",
+ "qubivex-model-registry",
  "qubivex-runtime",
  "qubivex-tokenizer",
  "serde",
@@ -1115,6 +1116,17 @@ version = "0.1.0"
 dependencies = [
  "proptest",
  "qubivex-core",
+ "serde",
+ "serde_json",
+ "thiserror",
+]
+
+[[package]]
+name = "qubivex-model-registry"
+version = "0.1.0"
+dependencies = [
+ "qubivex-model",
+ "rustix",
  "serde",
  "serde_json",
  "thiserror",
