@@ -2,7 +2,7 @@
   <img src="docs/assets/qubivex-logo.png" alt="QUBIVEX logo" width="480">
 </p>
 
-# Qubivex
+# QUBIVEX
 
 ### A Hardware-Aware AI Inference Platform Built in Rust
 
