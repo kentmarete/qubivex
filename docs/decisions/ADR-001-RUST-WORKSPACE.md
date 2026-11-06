@@ -1,6 +1,9 @@
 # ADR-001: Rust Cargo workspace with phase-gated crates
 
-- Status: Proposed (Phase 0)
+- Status: **Accepted (2026-11-06)** by owner decision, as implemented since Phase 1.
+  One point is not yet in force: no crate defines Cargo features yet (the Metal backend
+  is selected by `target_os`), so the feature-powerset CI job has nothing to build. It
+  is added with the first feature.
 - Date: 2026-11-01
 
 ## Context

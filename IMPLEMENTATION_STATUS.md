@@ -220,7 +220,7 @@ live on macOS. Remaining: seeing both commands' output on a real Linux host (CI 
 only the live tests there).
 
 Phase 1 exit criteria are met (clean workspace; ADR-002 Accepted: hybrid, without
-Candle). ADR-001 still awaits your review.
+Candle). ADR-001 was accepted on 2026-11-06.
 
 ## Completed
 | Phase | Deliverables |
@@ -427,7 +427,7 @@ The `miri` and `loom` jobs arrive with the first unsafe or concurrent code (Phas
 
 ## Remaining in Phase 1
 - ADR-002 follow-ups (not blocking): an AVX2 measurement on Linux x86-64 against Colibri, and optional lossless Q4_K speed-up (24% of STREAM today).
-- Move ADR-001 to Accepted after review.
+- ~~Move ADR-001 to Accepted after review~~: accepted 2026-11-06.
 
 ## Environment change (supersedes MIGRATION_PLAN §2)
 Development moved to an **Apple M3 Pro (arm64, 18 GB RAM, macOS)** with about 374 GB free.
@@ -437,7 +437,7 @@ Development moved to an **Apple M3 Pro (arm64, 18 GB RAM, macOS)** with about 37
 
 ## Pending review decisions
 1. Synchronous lease-based expert store instead of the specification's async trait (ADR-006).
-2. 11 initial crates instead of about 25 (ADR-001).
+2. ~~11 initial crates instead of about 25 (ADR-001)~~: accepted with ADR-001 (2026-11-06).
 3. Merged architecture factory with `tensor_schema` (ADR-003).
 4. Minimal expert store moved into Phase 4 (MIGRATION_PLAN §3).
 5. Reference model: OLMoE-1B-7B-0125-Instruct, plus a tiny Qwen3-MoE fixture.
@@ -463,6 +463,6 @@ ADR-002 spike, M3 Pro: [`docs/performance/ADR-002-SPIKE.md`](docs/performance/AD
 
 ## Architectural decisions
 Register and proposed status changes: `docs/engineering/ARCHITECTURE_DECISIONS.md` §1.
-- Accepted: ADR-002 (hybrid, no Candle; amendment 1: own register-blocked prefill instead of `gemm`, spinning pool deferred), ADR-009 (tensor descriptors), ADR-010 (numerical precision).
+- Accepted: ADR-001 (workspace, phase-gated crates; 2026-11-06), ADR-002 (hybrid, no Candle; amendment 1: own register-blocked prefill instead of `gemm`, spinning pool deferred), ADR-009 (tensor descriptors), ADR-010 (numerical precision).
 - Amended: ADR-007 (Metal first; device assignment fixed per execution plan).
-- Proposed: ADR-001, 003, 004 and 006 are implemented and proposed for Accepted, awaiting owner review. ADR-005 and ADR-008 are not built yet.
+- Proposed: ADR-003, 004 and 006 are implemented and proposed for Accepted, awaiting owner review. ADR-005 and ADR-008 are not built yet.
