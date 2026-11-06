@@ -225,7 +225,7 @@ As in the specification: batched expert execution across requests, KV prefix reu
 paged KV, NUMA, multi-device; then a CLI UX catalogue and recommendations UI.
 
 The remaining order is in `docs/engineering/PLATFORM_AUDIT.md` §4, which maps the 2026-11-06
-platform spec's phases (S0–S10) onto these.
+platform spec's phases (S0–S10, `PLATFORM_SPEC.md`) onto these.
 
 ### 3a. Folded in from the Engineering Improvement Plan (2026-11-03)
 - **Phase 4.5: tensor descriptors (done, ADR-009).** `TensorDesc` (byte strides, offset,

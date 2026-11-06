@@ -6,10 +6,10 @@ Last updated: 2026-11-06
 **Generation contract done (2026-11-06); ADR-013 amendment 1.** Job 1 of the platform plan. `Engine::run_request` now holds the chat template, tokenization, context checks, KV reservation, stop sequences and detokenization. `qubivex run` and the gateway both use it, and so can an application embedding the runtime with no server, CLI or Tokio. No tensor or kernel code changed.
 - Added: `top_k` (runtime, `--top-k`, request field); `examples/embed.rs`; `tests/requests.rs` (6 tests, including concurrent requests on a shared engine equalling sequential ones); `cargo xtask check` fails if the runtime gains a server dependency.
 - Tests: 300 passed, 0 failed, 1 ignored. `qubivex run` on real OLMoE-1B-7B Q4_K_M (32 tokens, raw and chat) is byte-identical to the build before the change. No benchmarks: the machine was on battery.
-- **Next:** job 2 of the plan (registry), after the audit's §5 decisions.
+- **Next:** job 2 of the plan (registry). The audit's §5 decisions are made.
 
 **Platform spec audit done (2026-11-06).** The owner's implementation spec is audited in [`docs/engineering/PLATFORM_AUDIT.md`](docs/engineering/PLATFORM_AUDIT.md): status per requirement, a mapping of its phases (S0–S10) to the phases here, and an 11-job plan. Largest gaps: no model downloads or install registry (S2), no batching (S8), and no structured logs or config files (S10). Baseline: 293 tests passed, 0 failed, 1 ignored.
-- **Next:** the audit's §5 owner decisions, then job 1 of its plan (generation contract). This replaces the "Phase 10" pointer below.
+- Spec: [`docs/architecture/PLATFORM_SPEC.md`](docs/architecture/PLATFORM_SPEC.md). This replaces the "Phase 10" pointer below.
 
 **Phase 9 (serving) done (2026-11-04).** Phase 8 (GPU acceleration, Metal first): slices 1–6 done (2026-11-05). The improvement-plan backlog (MIGRATION_PLAN §3a) is cleared.
 

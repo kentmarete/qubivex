@@ -7,8 +7,8 @@
   committed records in `docs/performance/baselines/`.
 
 This audits the repo against the owner's "Complete Implementation Specification" (the
-platform spec), received 2026-11-06. It is the spec's Phase 0 deliverable. The spec itself
-is not committed; the plan below carries its phases, and §5 asks whether to add it.
+platform spec, [`docs/architecture/PLATFORM_SPEC.md`](../architecture/PLATFORM_SPEC.md)),
+received 2026-11-06. It is the spec's Phase 0 deliverable.
 
 Ratings describe what the code does, not what a module is called:
 
@@ -146,8 +146,8 @@ Dockerfile, and no `examples/`. CI covers Linux and macOS, MSRV 1.85, loom and `
    it is unmeasured. It needs its own ADR, and ADR-012 stays reserved for the graph IR.
 3. **Generated-token decoding is quadratic** in completion length (ADR-013). It should be
    fixed before longer outputs are served.
-4. **Downloads add the workspace's first outbound network and TLS code.** That needs a
-   dependency decision (§5) and a threat review: redirects, path traversal from repository
+4. **Downloads add the workspace's first outbound network and TLS code** (§5 decision 2).
+   That needs a threat review: redirects, path traversal from repository
    file names, and token handling.
 
 Rules the code already follows: the runtime does not depend on the server, the server has
@@ -190,16 +190,16 @@ Owner rules for this plan (2026-11-06):
 | Blocked | CUDA | S9 | B2 | Needs NVIDIA hardware; abstraction only until then |
 | Later | Vulkan | S9 | | Spec says "where practical" |
 
-## 5. Owner decisions
+## 5. Owner decisions (2026-11-06)
 
-1. **Numbering.** Keep `MIGRATION_PLAN.md`'s phases and use S-numbers for the spec, as here?
-   Recommended: yes, because renumbering would break references in every ADR.
-2. **HTTP client.** Recommended: `ureq` with `rustls`, blocking, on dedicated threads. It
-   matches the runtime's thread model, and `qubivex-model` stays free of Tokio. `reqwest` is
-   the alternative, and it pulls in Tokio.
-3. **Turn lock.** Keep it until S8 (finding 1)? Recommended: yes.
-4. **Endpoint names.** Add `POST /v1/models/load` and `/unload` beside the admin routes, or
-   replace them? Recommended: add, and keep the admin routes as aliases.
-5. **Crate layout.** Accept the "not adopted" list in §3? It restates ADR-001.
-6. **Spec in the repo.** Commit the spec as `docs/architecture/PLATFORM_SPEC.md`? The earlier
-   specification the docs cite is not in the repo either. Recommended: yes.
+All six were taken as recommended.
+
+1. **Numbering.** `MIGRATION_PLAN.md` keeps its phases, and S-numbers mean spec phases.
+2. **HTTP client.** `ureq` with `rustls`, blocking, on dedicated threads. `qubivex-model`
+   stays free of Tokio.
+3. **Turn lock.** `Engine::forward` keeps it until S8 replaces it with real batches
+   (finding 1). This is a deliberate exception to spec §7.3 until then.
+4. **Endpoints.** `POST /v1/models/load` and `/unload` are added, and the admin routes stay
+   as aliases.
+5. **Crate layout.** The "not adopted" list in §3 stands. New crates only for new code.
+6. **Spec.** Committed as `docs/architecture/PLATFORM_SPEC.md`.
