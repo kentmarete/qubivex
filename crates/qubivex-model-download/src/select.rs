@@ -130,7 +130,7 @@ fn ambiguous(listing: &RepoListing, files: &[&RemoteFile]) -> DownloadError {
 }
 
 /// The files to fetch. `wanted` names files exactly; empty means work it out. `index`
-/// is the content of the shard index when [`needs_index`] says one applies.
+/// is the content of `model.safetensors.index.json`, when the repository has one.
 ///
 /// With no names: SafeTensors at the repository root win, as they come with a
 /// `config.json`; failing that, a single GGUF file. Several candidates are an error
