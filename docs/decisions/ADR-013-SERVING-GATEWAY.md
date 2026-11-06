@@ -64,6 +64,21 @@ the design allows either).
 - **Dependencies:** `axum` 0.8 (`http1`, `json`, `tokio`, `query`), `tokio`,
   `tokio-stream`; licences checked by `cargo deny`.
 
+## Amendment 1 (2026-11-06): the generation contract moves to the runtime
+The worker's chat template, tokenization, context checks, KV reservation, stop sequences and
+detokenization are now `Engine::run_request` (`qubivex-runtime/src/request.rs`), with
+`GenerationRequest`, `GenerationEvent`, `GenerationOutcome` and `RequestError`. `qubivex run`
+uses it too, so a host embedding the runtime gets the same behaviour with no server, CLI or
+Tokio. The worker keeps only channels and metrics, and threads, admission and cancellation
+are unchanged. `cargo xtask check` now fails if the runtime gains `tokio`, `axum`, `hyper`,
+`tower`, `clap`, `qubivex-api` or `qubivex-cli`, directly or through another crate.
+
+- `Finish` gains `StopSequence` and `TimedOut`. `Sampling` gains `top_k` (0: off), applied
+  before `top_p` as in `transformers`, and exposed as the `top_k` request field and `--top-k`.
+- `qubivex run` now reserves KV like the gateway, and refuses a prompt that fills the context
+  (it used to generate one token).
+- A KV reservation now ends just before the final event, not just after it.
+
 ## Consequences
 - The exit criteria are met: `crates/qubivex-api/tests/gateway.rs` (over HTTP, tiny
   fixtures: shapes, streaming equals non-streaming, concurrent equals sequential,

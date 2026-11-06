@@ -39,6 +39,7 @@ are validated before any byte is used, and results are bitwise reproducible.
 - [Quick start](#quick-start)
 - [Command reference](#command-reference)
 - [Model manifests](#model-manifests)
+- [Embedding the runtime](#embedding-the-runtime)
 - [Supported models and formats](#supported-models-and-formats)
 - [Design principles](#design-principles)
 - [Roadmap](#roadmap)
@@ -418,6 +419,26 @@ version this build does not implement are all errors. The full JSON Schema is in
 over the config, which takes precedence over the manifest. At load, QUBIVEX lists every
 missing tensor, wrong shape and unexpected tensor in one error. A wrong manifest fails
 loudly instead of producing wrong numbers.
+
+## Embedding the runtime
+
+`qubivex-runtime` works inside another Rust program, with no server, CLI or async runtime.
+Share one `Arc<Engine>` and give each request a thread:
+
+```rust
+let meta = ModelMetadata::load(&dir, &ArchitectureRegistry::with_builtins())?;
+let engine = Engine::load(meta, EngineOptions::default())?;
+let request = GenerationRequest::new(Prompt::Text("Hello".into()));
+engine.run_request(&request, &AtomicBool::new(false), |event| {
+    if let GenerationEvent::Text(piece) = event {
+        print!("{piece}");
+    }
+    true // false stops the generation
+})?;
+```
+
+A complete program is in
+[`crates/qubivex-runtime/examples/embed.rs`](crates/qubivex-runtime/examples/embed.rs).
 
 ## Supported models and formats
 

@@ -200,6 +200,7 @@ fn sampling_is_reproducible() {
     let e = engine("qwen3-moe-tiny", None);
     let s = Sampling {
         temperature: 0.8,
+        top_k: 0,
         top_p: 0.9,
         seed: 42,
     };

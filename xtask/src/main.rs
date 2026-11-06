@@ -17,11 +17,12 @@ fn main() -> ExitCode {
     let cmd = std::env::args().nth(1).unwrap_or_default();
     let root = workspace_root();
     let result = match cmd.as_str() {
-        "check-deps" => check_deps(&root),
+        "check-deps" => check_deps(&root).and_then(|()| check_embeddable(&root)),
         "check-model-names" => check_model_names(&root),
         "gen-fixtures" => fixtures::write_fixtures(&root),
         "check-fixtures" => fixtures::check_fixtures(&root),
         "check" => check_deps(&root)
+            .and_then(|()| check_embeddable(&root))
             .and_then(|()| check_model_names(&root))
             .and_then(|()| fixtures::check_fixtures(&root)),
         _ => Err(
@@ -75,6 +76,43 @@ fn check_deps(root: &Path) -> Result<(), String> {
             "check-deps: {} violation(s) of QUBIVEX_DESIGN §3.1:\n  {}",
             violations.len(),
             violations.join("\n  ")
+        ))
+    }
+}
+
+/// The runtime must stay usable with no server or CLI, on every target.
+fn check_embeddable(root: &Path) -> Result<(), String> {
+    let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".to_owned());
+    let out = Command::new(cargo)
+        .args([
+            "tree",
+            "--package",
+            "qubivex-runtime",
+            "--edges",
+            "normal",
+            "--target",
+            "all",
+            "--prefix",
+            "none",
+            "--offline",
+        ])
+        .current_dir(root)
+        .output()
+        .map_err(|e| format!("failed to run cargo tree: {e}"))?;
+    if !out.status.success() {
+        return Err(format!(
+            "cargo tree failed:\n{}",
+            String::from_utf8_lossy(&out.stderr)
+        ));
+    }
+    let found = deps::server_deps(&String::from_utf8_lossy(&out.stdout));
+    if found.is_empty() {
+        println!("check-embeddable: ok");
+        Ok(())
+    } else {
+        Err(format!(
+            "check-embeddable: the runtime must not depend on: {}",
+            found.join(", ")
         ))
     }
 }
