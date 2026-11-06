@@ -6,7 +6,7 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::thread::JoinHandle;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use qubivex_arch::{
     ArchError, DenseWeights, ExpertProvider, ExpertWeights, KvCache, Logits, Sources, Tracer,
@@ -16,8 +16,9 @@ use qubivex_compute::WeightView;
 use qubivex_compute::host::PageAligned;
 use qubivex_compute::tensor::TensorView;
 use qubivex_core::{Bytes, ExpertIdx, LayerIdx, Shape, TensorDesc};
-use qubivex_expert_stream::fault::VerifiedSource;
+use qubivex_expert_stream::fault::{DiskLimit, SlowDisk, VerifiedSource};
 use qubivex_expert_stream::mirror::{MirrorPolicy, MirroredSource};
+use qubivex_expert_stream::policy::SaturationGauge;
 use qubivex_expert_stream::predict::{Lookahead, LookaheadConfig};
 use qubivex_expert_stream::{
     Batch, ExpertKey, ExpertSource, ExpertStore, Lease, Next, Occupancy, Policy, PoolSpec,
@@ -80,6 +81,9 @@ pub struct EngineOptions {
     pub threads: Option<usize>,
     /// Router-lookahead prefetch during decode (Phase 7). `None`: off.
     pub prefetch: Option<PrefetchOptions>,
+    /// Reads go through a simulated disk with this limit, to measure saturation on a
+    /// machine whose warm reads never saturate ([`SlowDisk`]). `None`: the real source.
+    pub disk_limit: Option<DiskLimit>,
     /// The compute backend (Phase 8). Placement changes speed, never bits.
     pub backend: BackendKind,
     /// The dense matmuls placed on Metal with [`BackendKind::Metal`].
@@ -94,6 +98,8 @@ pub struct PrefetchOptions {
     /// The LFRU eviction guard: a prediction may evict a resident expert only if it is
     /// clearly hotter (ADR-008).
     pub guard: bool,
+    /// Stop speculating while reads hold compute back (ADR-008 amendment 3).
+    pub throttle: bool,
 }
 
 /// How well the lookahead predicted routing: every decode layer that had a prediction
@@ -136,6 +142,10 @@ pub struct PrefetchReport {
     pub prediction: PredictionStats,
     /// Reads issued, hidden, wasted and cancelled.
     pub store: PrefetchStats,
+    /// Forward passes since load.
+    pub passes: u64,
+    /// Of those, passes the saturation throttle kept from speculating.
+    pub held_passes: u64,
 }
 
 /// The predictor's state across forward passes.
@@ -147,6 +157,12 @@ struct Predictor {
     /// The last prediction issued, checked against the layer's routing.
     issued: Option<(LayerIdx, Vec<ExpertIdx>)>,
     stats: PredictionStats,
+    /// `None`: the throttle is off.
+    saturation: Option<SaturationGauge>,
+    /// The gauge's clock.
+    epoch: Instant,
+    passes: u64,
+    held_passes: u64,
 }
 
 /// I/O threads when none are requested.
@@ -786,15 +802,21 @@ impl Engine {
             })
             .collect::<Result<Vec<_>, RuntimeError>>()?;
         let primary = meta.dir.display().to_string();
+        let disk_limit = opts.disk_limit;
         let mut engine = Self::load_with_source(meta, opts, move |s| {
             let first = verified(s);
-            if copies.is_empty() {
-                return first;
+            let source: Arc<dyn ExpertSource> = if copies.is_empty() {
+                first
+            } else {
+                Arc::new(MirroredSource::new(
+                    std::iter::once((primary, first)).chain(copies),
+                    MirrorPolicy::default(),
+                ))
+            };
+            match disk_limit {
+                Some(limit) => Arc::new(SlowDisk::new(source, limit)),
+                None => source,
             }
-            Arc::new(MirroredSource::new(
-                std::iter::once((primary, first)).chain(copies),
-                MirrorPolicy::default(),
-            ))
         })?;
         engine.verification = verification;
         Ok(engine)
@@ -1014,6 +1036,10 @@ impl Engine {
                 pending: None,
                 issued: None,
                 stats: PredictionStats::default(),
+                saturation: o.throttle.then(SaturationGauge::default),
+                epoch: Instant::now(),
+                passes: 0,
+                held_passes: 0,
             })
         });
         Ok(Self {
@@ -1115,12 +1141,14 @@ impl Engine {
     /// Prefetch counters, if prefetch is on.
     #[must_use]
     pub fn prefetch_report(&self) -> Option<PrefetchReport> {
-        self.predictor.as_ref().map(|p| PrefetchReport {
-            prediction: p
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .stats,
-            store: self.store.stats().prefetch,
+        self.predictor.as_ref().map(|p| {
+            let p = p.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            PrefetchReport {
+                prediction: p.stats,
+                store: self.store.stats().prefetch,
+                passes: p.passes,
+                held_passes: p.held_passes,
+            }
         })
     }
 
@@ -1279,7 +1307,8 @@ impl Engine {
     ) -> Result<Vec<f32>, RuntimeError> {
         let _turn = self.steps.wait();
         // Memory pressure stops prefetch first (ADR-005): drop what is queued.
-        let allowed = self.pressure().is_none_or(|d| d.prefetch);
+        // So does a saturated disk: unused speculation costs throughput there.
+        let allowed = self.pressure().is_none_or(|d| d.prefetch) && !self.disk_saturated();
         if !allowed && self.predictor.is_some() {
             let _ = self.store.cancel_prefetch(None);
         }
@@ -1472,11 +1501,33 @@ impl Engine {
         self.max_context
     }
 
+    /// Whether the prefetch throttle holds speculation for this forward pass.
+    fn disk_saturated(&self) -> bool {
+        let Some(p) = &self.predictor else {
+            return false;
+        };
+        let mut p = p.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let wait_ns = self.store.stats().wait_ns;
+        let now_ns = u64::try_from(p.epoch.elapsed().as_nanos()).unwrap_or(u64::MAX);
+        let held = p
+            .saturation
+            .as_mut()
+            .is_some_and(|g| g.observe(now_ns, wait_ns));
+        p.passes += 1;
+        p.held_passes += u64::from(held);
+        held
+    }
+
     /// Ends a turn: queued prefetches are dropped, since the next request starts
     /// elsewhere. [`Engine::generate`] calls it; callers driving
     /// [`Engine::forward`] themselves call it between requests.
     pub fn end_turn(&self) {
-        if self.predictor.is_some() {
+        if let Some(p) = &self.predictor {
+            let mut p = p.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            if let Some(g) = &mut p.saturation {
+                g.pause();
+            }
+            drop(p);
             // Advisory: a poisoned store fails the next forward pass anyway.
             let _ = self.store.cancel_prefetch(None);
         }

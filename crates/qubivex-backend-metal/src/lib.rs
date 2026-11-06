@@ -27,7 +27,8 @@ mod device;
 mod program;
 
 pub use program::{
-    AttentionShape, Batch, DeviceVec, MAX_ROUTED_EXPERTS, Pending, RoutedInput, Span,
+    AttentionShape, Batch, DeviceVec, GROUPED_ENTRIES_PER_EXPERT, MAX_ROUTED_EXPERTS, Pending,
+    RoutedInput, Routing, Span,
 };
 
 use std::sync::Arc;
@@ -39,6 +40,10 @@ use thiserror::Error;
 
 /// The kernel source, compiled at backend creation.
 pub const KERNEL_SOURCE: &str = include_str!("kernels.metal");
+
+/// Activation rows per threadgroup of the token-tiled kernels; must equal `TILE` in
+/// `kernels.metal`.
+pub(crate) const TILE: usize = 8;
 
 /// Errors from creating or driving the Metal backend.
 #[derive(Debug, Error)]

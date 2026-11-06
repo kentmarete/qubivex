@@ -156,8 +156,52 @@ simulator, like Colibri's `residency_sim.py`).
 - **Defaults.** Prefetch stays **off** (`--prefetch` opts in): its gain is small and
   limited to tight budgets. When on, the guard is on: it never costs measurably and
   keeps most of the 1 GiB gain.
-- **Not built yet:** a throttle when the disk is saturated (warm reads never saturated
-  here; it needs cold or slower-disk measurements), lookahead beyond one layer
-  (Colibri PILOT=2/3), and predicting layer 0 of the next token. A cancelled prefetch
-  frees its slab buffer instead of keeping it: 197 allocations over 3 runs with 1 I/O
-  thread, none at 4.
+- **Not built yet:** lookahead beyond one layer (Colibri PILOT=2/3) and predicting
+  layer 0 of the next token. The saturation throttle is amendment 3. A cancelled
+  prefetch frees its slab buffer instead of keeping it: 197 allocations over 3 runs
+  with 1 I/O thread, none at 4.
+
+## Amendment 3 (2026-11-06): the saturation throttle, Phase 7
+
+- **Measured first.** Warm reads come from the page cache, so a simulated disk
+  (`fault::SlowDisk`, `bench --disk-mbps`, `--disk-latency-us`) gives every read a turn
+  on one device with one bandwidth. It is a FIFO model: no real device's queueing, and
+  no cold read has been measured.
+- **The loss is real.** At `--ram-budget 1GiB` (2–3 slots per layer) on a saturated
+  disk, prefetch with the guard costs 3–4%, because it reads 3.5% more bytes (441 vs
+  426 MiB per token) and speed there follows the bytes read. A used speculative read
+  gains nothing when no disk time is idle, and an unused one costs its transfer.
+  Nothing was late or cancelled: the loss is waste, not stale queues.
+  `--expert-cache-mb 1024` is not this regime: it gives 17–18 slots and hid the loss.
+- **The signal.** `policy::SaturationGauge`: the share of wall time compute spent
+  blocked on reads, from `StoreStats::wait_ns`, over windows of at least 100 ms. It
+  holds at 60% and resumes below 40%. Disk utilisation was rejected: in early
+  measurements 68% gained and 72% lost. The window closes at `Engine::end_turn`, and
+  the verdict is kept, because idle time says nothing about the disk.
+- **Where.** `Engine::forward`, beside the memory-pressure stop: while held, nothing is
+  predicted (saving the router lookahead) and queued prefetches are dropped.
+  `ExpertStore::prefetch` is not throttled, because the Metal pass uses it for experts
+  it needs, not for speculation. On by default with `--prefetch`;
+  `--prefetch-throttle off` disables it. `bench` records `held_rate`.
+- **Measured** (M3 Pro, 5 threads, OLMoE Q4_K_M, 10 + 160 tokens, 1 warm-up, AC power;
+  3 runs real disk, 2 at 6 and 2 GB/s, 1 at 500 MB/s; simulated disks add 80 µs per
+  read; tokens identical in every run):
+
+  | `--ram-budget 1GiB` | Prefetch off | Guard | Guard + throttle | Held | MiB per token |
+  |---|---|---|---|---|---|
+  | 6 GB/s | 9.93 | 9.52 | **9.99** | 100% | 426 / 441 / 426 |
+  | 2 GB/s | 3.70 | 3.59 | **3.73** | 100% | 426 / 441 / 426 |
+  | 500 MB/s | 0.99 | 0.96 | **1.00** | 100% | 426 / 441 / 426 |
+  | real disk, warm | 21.4–22.3 | 20.7–21.3 | 20.4–22.5 | 0% | 426 / 441 / 441 |
+
+  Records: `docs/performance/baselines/2026-11-06-m3pro-throttle-*.json`.
+  On battery, so not baselines: 200 MB/s + 8 ms seek at 1 GiB, 48 tokens, one run:
+  0.31 / 0.30 / 0.31, held 100%. `--expert-cache-mb 2048`, 86% hits: 6 GB/s
+  32.2 / 32.3 / 32.4, held 0%; 2 GB/s 16.6 / 16.7 / 16.7, held 22%. The throttle costs
+  nothing there, and prefetch gains nothing either.
+- **What is still open.** On the real warm disk the gauge never holds (blocked share
+  about 37%). The last two columns of that row are the same configuration, and they
+  differ by more than the gap to prefetch off, so that loss is not resolved: pooled,
+  prefetch is about 2.5% behind. Amendment 2's small gain (19.87 → 20.3) has not
+  survived the faster Q4_K kernel. No regime measured here shows a throughput gain.
+  Prefetch stays **off** by default, and whether it should remain is an owner decision.

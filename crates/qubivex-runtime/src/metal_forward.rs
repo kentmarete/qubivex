@@ -22,8 +22,8 @@ use qubivex_arch::ops::{Rope, route};
 use qubivex_arch::{ArchError, DenseWeights, KvCache, Logits, layer_name};
 use qubivex_backend_cpu::CpuBackend;
 use qubivex_backend_metal::{
-    AttentionShape, Batch, DeviceVec, MAX_ROUTED_EXPERTS, MetalBackend, MetalHost, MetalWeights,
-    RoutedInput,
+    AttentionShape, Batch, DeviceVec, GROUPED_ENTRIES_PER_EXPERT, MAX_ROUTED_EXPERTS, MetalBackend,
+    MetalHost, MetalWeights, RoutedInput, Routing,
 };
 use qubivex_compute::{ComputeBackend, ComputeError, WeightView};
 use qubivex_core::{ExpertIdx, LayerIdx};
@@ -99,6 +99,9 @@ struct Bufs {
     logits: DeviceVec,
     /// Per layer, the expert ids `moe_route` chose (u32 bits), `s × top_k` each.
     routes: DeviceVec,
+    /// The current layer's entries sorted by expert, and the group offsets.
+    order: DeviceVec,
+    offsets: DeviceVec,
 }
 
 /// Model dimensions.
@@ -380,6 +383,8 @@ impl MetalForward {
             xf: v(s * h)?,
             logits: v(s * vocab)?,
             routes: v(self.layers.len() * s * k_top)?,
+            order: v(s * k_top)?,
+            offsets: v(ne + 1)?,
         });
         work.tokens = s;
         work.span = span;
@@ -680,17 +685,30 @@ impl MetalForward {
                 let wts = w.weights.span(0, entries)?;
                 let o = w.o.span(0, s * h)?;
                 let router = w.router.span(0, s * dm.ne)?;
+                let order = w.order.span(0, entries)?;
+                let offsets = w.offsets.all();
                 for (l, ly) in self.layers.iter().enumerate() {
                     self.record_attention(b, w, kv, l, ly, attn)?;
                     let ids = w.routes.span(l * entries, entries)?;
                     b.moe_route(&router, s, dm.ne, k, self.cfg.norm_topk_prob, &ids, &wts)?;
                     let (gate, up, down) = &tables[l];
+                    // Enough entries per expert: sort them by expert, so each weight
+                    // load serves up to 8 of them (ADR-011 amendment 5).
+                    let routing = if entries >= GROUPED_ENTRIES_PER_EXPERT * dm.ne {
+                        b.moe_group(&ids, entries, dm.ne, &order, &offsets)?;
+                        Routing::Grouped {
+                            order: &order,
+                            offsets: &offsets,
+                        }
+                    } else {
+                        Routing::Ids(&ids)
+                    };
                     b.concurrent(|b| {
-                        b.routed_matmul(gate, &ids, &x, RoutedInput::Token, s, k, &g)?;
-                        b.routed_matmul(up, &ids, &x, RoutedInput::Token, s, k, &u)
+                        b.routed_matmul(gate, routing, &x, RoutedInput::Token, s, k, &g)?;
+                        b.routed_matmul(up, routing, &x, RoutedInput::Token, s, k, &u)
                     })?;
                     b.swiglu(&g, &u, entries * ffn)?;
-                    b.routed_matmul(down, &ids, &g, RoutedInput::Entry, s, k, &contrib)?;
+                    b.routed_matmul(down, routing, &g, RoutedInput::Entry, s, k, &contrib)?;
                     b.moe_combine(&contrib, &wts, &o, s, k, h)?;
                     b.add(&w.hs.all(), &o, s * h)?;
                 }

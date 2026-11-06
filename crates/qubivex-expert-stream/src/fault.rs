@@ -14,11 +14,80 @@
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use qubivex_core::LayerIdx;
 
 use crate::{ExpertKey, ExpertSource, StoreError};
+
+/// What a simulated disk can do ([`SlowDisk`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DiskLimit {
+    /// Sustained reads, in bytes per second (at least 1).
+    pub bytes_per_sec: u64,
+    /// Added to every read: seek or queueing time inside the device.
+    pub latency: Duration,
+}
+
+/// An [`ExpertSource`] behind a simulated disk: every read takes its turn on one device
+/// with one bandwidth, however many threads read at once.
+///
+/// Warm reads come from the page cache, so a real disk cannot be saturated on demand.
+/// This can, which is how the prefetch throttle is measured (ADR-008 amendment 3). The
+/// bytes are the inner source's; only the time changes.
+pub struct SlowDisk {
+    inner: Arc<dyn ExpertSource>,
+    limit: DiskLimit,
+    /// When the device finishes the reads already given to it.
+    free_at: Mutex<Instant>,
+}
+
+impl std::fmt::Debug for SlowDisk {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SlowDisk")
+            .field("limit", &self.limit)
+            .finish_non_exhaustive()
+    }
+}
+
+impl SlowDisk {
+    /// `inner` behind a device limited to `limit`.
+    #[must_use]
+    pub fn new(inner: Arc<dyn ExpertSource>, limit: DiskLimit) -> Self {
+        Self {
+            inner,
+            limit,
+            free_at: Mutex::new(Instant::now()),
+        }
+    }
+
+    /// When a read of `bytes` arriving now finishes, booking the device for it.
+    fn book(&self, bytes: u64) -> Instant {
+        let per_sec = u128::from(self.limit.bytes_per_sec.max(1));
+        let nanos = u128::from(bytes).saturating_mul(1_000_000_000) / per_sec;
+        let transfer = Duration::from_nanos(u64::try_from(nanos).unwrap_or(u64::MAX));
+        let mut free_at = self
+            .free_at
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let done = (*free_at).max(Instant::now()) + self.limit.latency + transfer;
+        *free_at = done;
+        done
+    }
+}
+
+impl ExpertSource for SlowDisk {
+    fn expert_size(&self, key: ExpertKey) -> Result<u64, StoreError> {
+        self.inner.expert_size(key)
+    }
+
+    fn read_expert(&self, key: ExpertKey, dst: &mut [u8]) -> Result<(), StoreError> {
+        let done = self.book(dst.len() as u64);
+        let read = self.inner.read_expert(key, dst);
+        std::thread::sleep(done.saturating_duration_since(Instant::now()));
+        read
+    }
+}
 
 /// How one read fails.
 #[derive(Clone, Debug, PartialEq, Eq)]

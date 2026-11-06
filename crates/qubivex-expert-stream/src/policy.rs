@@ -30,6 +30,57 @@ pub fn speculation_beats(heat: u32, victim: u64) -> bool {
     lfru_score(heat, 0) > victim.saturating_add(victim / 4).saturating_add(4 << 8)
 }
 
+/// Whether reads hold compute back: the share of wall time callers spent blocked on
+/// loads, over windows of at least [`SaturationGauge::WINDOW_NS`] (ADR-008 amendment 3).
+///
+/// On a saturated disk, speed follows the bytes read, so a speculative read that goes
+/// unused costs throughput and one that is used gains nothing. Disk utilisation does not
+/// tell that case from a useful one: the measured regimes overlap. This does, and
+/// [`crate::StoreStats::wait_ns`] already counts it.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct SaturationGauge {
+    /// When the open window started, and the blocked time then.
+    start: Option<(u64, u64)>,
+    saturated: bool,
+}
+
+impl SaturationGauge {
+    /// The shortest window judged: about two tokens at the speed of a fast disk.
+    pub const WINDOW_NS: u64 = 100_000_000;
+    /// Saturated from this blocked share, in percent.
+    pub const HOLD_PERCENT: u64 = 60;
+    /// No longer saturated below this blocked share, in percent. The gap keeps the
+    /// gauge from flipping when prefetch itself moves the share.
+    pub const RESUME_PERCENT: u64 = 40;
+
+    /// Takes a reading (`now_ns` on any monotonic clock, `wait_ns` the blocked time so
+    /// far) and says whether reads are saturated.
+    pub fn observe(&mut self, now_ns: u64, wait_ns: u64) -> bool {
+        let Some((t0, w0)) = self.start else {
+            self.start = Some((now_ns, wait_ns));
+            return self.saturated;
+        };
+        let elapsed = now_ns.saturating_sub(t0);
+        if elapsed >= Self::WINDOW_NS {
+            let blocked = u128::from(wait_ns.saturating_sub(w0)) * 100;
+            let share = blocked / u128::from(elapsed);
+            if share >= u128::from(Self::HOLD_PERCENT) {
+                self.saturated = true;
+            } else if share < u128::from(Self::RESUME_PERCENT) {
+                self.saturated = false;
+            }
+            self.start = Some((now_ns, wait_ns));
+        }
+        self.saturated
+    }
+
+    /// Closes the open window, keeping the verdict: idle time between requests says
+    /// nothing about the disk.
+    pub const fn pause(&mut self) {
+        self.start = None;
+    }
+}
+
 /// Accesses per expert, halved every `window` accesses so that old popularity fades.
 #[derive(Clone, Debug, Default)]
 pub struct Heat {
@@ -62,6 +113,43 @@ impl Heat {
 
 #[cfg(test)]
 mod tests {
+    use super::SaturationGauge;
+
+    const W: u64 = SaturationGauge::WINDOW_NS;
+
+    #[test]
+    fn gauge_holds_at_60_percent_and_resumes_below_40() {
+        let mut g = SaturationGauge::default();
+        assert!(!g.observe(0, 0));
+        // 59%: not yet.
+        assert!(!g.observe(W, W * 59 / 100));
+        // 60% of the next window.
+        assert!(g.observe(2 * W, W * 119 / 100));
+        // 50%: inside the gap, the verdict stands.
+        assert!(g.observe(3 * W, W * 169 / 100));
+        // 39%: resumed.
+        assert!(!g.observe(4 * W, W * 208 / 100));
+    }
+
+    #[test]
+    fn gauge_judges_only_full_windows() {
+        let mut g = SaturationGauge::default();
+        g.observe(0, 0);
+        assert!(!g.observe(W - 1, W - 1), "a short window is not judged");
+        assert!(g.observe(W, W), "the window kept running");
+    }
+
+    #[test]
+    fn idle_between_requests_does_not_clear_the_verdict() {
+        let mut g = SaturationGauge::default();
+        g.observe(0, 0);
+        assert!(g.observe(W, W));
+        g.pause();
+        // A minute idle, then the first reading of the next request.
+        assert!(g.observe(60_000_000_000, W));
+        assert!(g.observe(60_000_000_000 + W, 2 * W));
+    }
+
     use super::*;
 
     #[test]

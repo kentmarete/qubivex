@@ -192,6 +192,17 @@ fn engine_on_metal_gives_the_cpu_tokens() {
             // The experts load in the background; once they are all resident, every
             // pass is one routed submission.
             assert!(gpu.gpu_routed_passes() > 0, "nothing was routed on the GPU");
+            // The prompt again, now as one routed submission with the entries grouped
+            // by expert (token tiles, ADR-011 amendment 5).
+            let before = gpu.gpu_routed_passes();
+            let mut c = gpu.new_cache();
+            let lc = gpu.forward(&prompt, &mut c, Logits::All, None).unwrap();
+            assert_eq!(
+                gpu.gpu_routed_passes(),
+                before + 1,
+                "the prompt was not routed"
+            );
+            assert!(bits(&la) == bits(&lc), "routed prompt logits differ");
         }
     }
 }
