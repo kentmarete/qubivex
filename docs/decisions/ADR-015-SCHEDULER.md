@@ -111,6 +111,13 @@ at a full queue or queue timeout, 400 for what can never run, 503 for memory or 
 
   64 tests, no reports. A deliberately racy program built the same way was reported, so the
   sanitizer was active. It sees Rust memory only, so it does not cover Metal.
+
+  CI runs the same tests on Linux, also with no reports, under one suppression in
+  `.github/tsan-suppressions.txt`. Without it, the gateway's tests gave 14 reports, all
+  against the allocation of tokio's `ScheduledIo`, none touching QUBIVEX memory. Tokio's
+  driver reaches that object through a pointer kept by epoll, an ordering TSan does not
+  see. That explanation comes from reading the reports. It is not proven, and the
+  suppression would also hide a real race inside that tokio module.
 - Miri is clean on the scheduler's tests. It cannot run the engine's SIMD or file I/O.
 
 ## Consequences
