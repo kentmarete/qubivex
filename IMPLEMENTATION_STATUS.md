@@ -8,9 +8,9 @@ Last updated: 2026-11-06
 **Phase 7 saturation throttle done (2026-11-06); ADR-008 amendment 3.** On a saturated simulated disk at `--ram-budget 1GiB`, prefetch with the guard lost 3–4% (9.93 → 9.52 tok/s at 6 GB/s, 3.70 → 3.59 at 2 GB/s, 0.99 → 0.96 at 500 MB/s); the throttle removes that (9.99, 3.73, 1.00), and tokens stay identical.
 - Code: `fault::SlowDisk` and `bench --disk-mbps` / `--disk-latency-us`; `policy::SaturationGauge` (share of wall time blocked on reads, 100 ms windows, holds at 60%, resumes below 40%); checked in `Engine::forward`; `--prefetch-throttle on|off`, default on; `held_rate` in `bench` records.
 - Tests: gauge thresholds, windows and idle turns; shared bandwidth of `SlowDisk`; an engine test that a saturated disk holds speculation with identical tokens.
-- Open owner decision: no regime measured now shows prefetch gaining throughput. On the real warm disk it is about 2.5% behind, within the spread of its own repeat runs, and the throttle never holds there (about 37% blocked). Prefetch stays off by default.
+- Owner decision (2026-11-06): prefetch stays opt-in behind `--prefetch`, with no further work unless a real workload shows a gain. No regime measured shows it gaining throughput: on the real warm disk it is about 2.5% behind, within the spread of its own repeat runs, and the throttle never holds there (about 37% blocked).
 - Not on power, so not recorded as baselines: the 200 MB/s + 8 ms row and the `--expert-cache-mb 2048` rows.
-- **Next:** decide prefetch's future, Metal in the small-cache regime, then Phase 10.
+- **Next:** Metal in the small-cache regime, then Phase 10.
 
 **Phase 8 slice 6 done (2026-11-05): token tiles for Metal prefill; ADR-011 amendment 5.** Prefill with every expert resident: 128 tokens 97 → 239 tok/s, 1024 tokens 235 tok/s (CPU 115 for both), 10 tokens 91 → 102; decode unchanged (59.6); tokens bit-identical.
 - Code: token-tiled matmul kernels (`matmul_<dtype>_t`, up to 8 activation rows per weight load, per-(row, token) accumulators in the one-token order; row bodies are templates shared by every kernel), used from 4 rows; `moe_group` (GPU counting sort of routed entries by expert) and `Routing::Grouped` / `routed_<dtype>_g`, used by the one-submission pass from 2 entries per expert.
