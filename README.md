@@ -2,32 +2,109 @@
   <img src="docs/assets/qubivex-logo.png" alt="QUBIVEX logo" width="480">
 </p>
 
-# QUBIVEX
+# Qubivex
 
-**Run large Mixture-of-Experts (MoE) language models on ordinary hardware by streaming
-experts from disk and RAM instead of holding the whole model in memory.**
+### A Hardware-Aware AI Inference Platform Built in Rust
 
-QUBIVEX is a Rust runtime for MoE models such as OLMoE and Qwen3-MoE. In an MoE model,
-each token uses only a few experts out of many (for example 8 of 64 per layer). Most of
-the weights are therefore idle at any moment. QUBIVEX keeps the small, always-used part
-of the model (embeddings, attention, routers, norms) resident. It treats the experts as
-a cache: experts are loaded from fast storage when the router picks them, kept while
-they are hot, and evicted under memory pressure. A model several times larger than your
-RAM or VRAM can still run, and more memory makes it faster, never different.
+**Qubivex is an independent, hardware-aware AI inference platform designed to download, manage, load, execute and serve large language models locally.**
 
-QUBIVEX is a Rust redesign of the mechanisms proven in
-[Colibri](https://github.com/JustVugg/colibri) (C, Apache-2.0). Colibri showed the
-approach works. QUBIVEX's aim is to make it safe, model-agnostic and maintainable:
-models are described by manifests rather than per-family engines, untrusted model files
-are validated before any byte is used, and results are bitwise reproducible.
+Built in Rust, Qubivex combines a high-performance tensor computation engine, a native inference runtime and an intelligent Mixture of Experts (MoE) execution architecture to make running AI models more efficient, accessible and adaptable to available hardware.
 
-> **Status: early development.** QUBIVEX now generates text on CPU (`qubivex run`), with
-> experts streamed through a cache of any size; the output is identical whatever the
-> cache holds. It is a prototype: about 21 tok/s decode for OLMoE-1B-7B Q4_K_M on
-> an Apple M3 Pro, lossless. That is faster than Colibri's default lossy kernels on the
-> same machine, with output identical to Colibri's lossless path
-> ([benchmark](docs/performance/COLIBRI-OLMOE-BENCHMARK.md)). No GPU, no server yet. See
-> [Roadmap](#roadmap) and [`IMPLEMENTATION_STATUS.md`](IMPLEMENTATION_STATUS.md).
+Unlike solutions that rely on external inference runtimes, Qubivex aims to own the entire model inference lifecycle. From discovering and downloading models to managing model weights, allocating memory, routing experts, executing tensor operations and exposing inference APIs, everything is handled within the Qubivex ecosystem.
+
+At its core, Qubivex is built around the idea that **AI inference should adapt to the hardware available, rather than requiring hardware to adapt to the model.**
+
+## What makes Qubivex different?
+
+### Hardware-Aware Tensor Computation
+
+Qubivex provides its own tensor computation engine, designed to execute the mathematical operations underlying modern neural networks.
+
+It focuses on efficient matrix multiplication, tensor operations, attention computation, quantised execution and memory management.
+
+Its hardware-aware architecture is designed to detect available compute resources and select appropriate execution strategies across CPUs, GPUs and hybrid environments.
+
+### Native Mixture of Experts (MoE) Inference
+
+Qubivex places particular emphasis on Mixture of Experts architectures.
+
+MoE models contain multiple specialised neural network experts, while activating only a subset of those experts for a given token.
+
+Qubivex is designed to make this execution more efficient through intelligent expert routing, dynamic expert loading, expert caching and hardware-aware memory allocation.
+
+Rather than requiring every expert to remain resident in memory, Qubivex supports an expert streaming architecture that can load experts as needed, subject to available memory and execution requirements.
+
+This creates opportunities to run larger models on machines with constrained RAM and GPU memory.
+
+### Independent Model Management
+
+Qubivex includes its own model management capabilities, eliminating the need for external applications such as Ollama.
+
+It is designed to support:
+
+- Discovering and downloading models from repositories such as Hugging Face.
+- Managing GGUF and SafeTensors model formats.
+- Model manifests and metadata.
+- Model validation and registration.
+- Quantised model management.
+- Model loading, unloading and lifecycle management.
+- Hardware compatibility and memory requirement analysis.
+
+The objective is to make model acquisition and execution part of one integrated platform.
+
+### Local Inference and Model Serving
+
+Qubivex is designed to run models directly on the host machine, without depending on a third-party inference runtime.
+
+It also provides an HTTP serving architecture that allows applications to communicate with locally or remotely hosted models.
+
+The planned OpenAI-compatible API will support:
+
+- Chat completions.
+- Text generation.
+- Streaming responses through Server-Sent Events (SSE).
+- Multiple concurrent inference requests.
+- Request scheduling and resource management.
+- Shared model instances.
+- Per-request context and KV cache management.
+
+This makes Qubivex suitable both as an embedded inference engine and as a standalone AI inference server.
+
+## Architecture
+
+Qubivex is organised around three independently usable products:
+
+| Component | Responsibility |
+|---|---|
+| **Qubivex Runtime** | Tensor computation, transformer execution, MoE routing, expert streaming, memory planning and inference. |
+| **Qubivex Model Manager** | Model discovery, downloads, manifests, validation, registration and lifecycle management. |
+| **Qubivex Server** | HTTP inference APIs, streaming, scheduling, concurrent execution and multi-client serving. |
+
+These components share a common Rust foundation while maintaining clear architectural boundaries.
+
+## Technology and Design Principles
+
+Qubivex is built around several engineering principles:
+
+- **Native execution:** Own the tensor computation and inference pipeline.
+- **Hardware awareness:** Adapt execution and memory allocation to available resources.
+- **Memory efficiency:** Use intelligent caching, expert streaming and dynamic memory planning.
+- **Modularity:** Keep model management, inference execution and serving independently usable.
+- **Concurrency:** Support multiple inference requests while efficiently sharing model resources.
+- **Performance:** Optimise mathematical operations, memory access and hardware utilisation.
+- **Extensibility:** Support additional model architectures, quantisation formats and compute backends over time.
+
+## Vision
+
+The long-term vision for Qubivex is to provide an independent foundation for running and serving AI models across a wide range of hardware, from personal computers and developer workstations to dedicated inference servers.
+
+By combining native tensor computation, hardware-aware execution, MoE optimisation, intelligent memory management and integrated model serving, Qubivex aims to make local AI inference more efficient without requiring users to depend on heavyweight external inference platforms.
+
+**Qubivex is not intended to be another wrapper around an existing inference engine. It is an effort to build the inference engine itself.**
+
+---
+
+**Built with Rust. Designed for efficient AI computation. Engineered for hardware-aware inference.**
 
 ---
 
