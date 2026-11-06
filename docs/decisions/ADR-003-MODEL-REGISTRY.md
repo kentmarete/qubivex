@@ -67,3 +67,17 @@ registered beside the first, and runs a real checkpoint through it.
   checkpoint (per-head q/k norm, GQA, tied head) imports with no manifest edits, gives
   transformers' 32 greedy tokens, logits within 1.2e-5 relative, and the invariants hold
   on it (`tests/real_dense.rs`, env-gated, `fixtures/oracle/dense_real.json`).
+
+## Amendment 1 (2026-11-06): installed models get a registry
+"Registry" above means the architecture registry. Plan job 2 (`docs/engineering/PLATFORM_AUDIT.md`)
+adds a separate one for installed models, in a new crate, `qubivex-model-registry`:
+`registry.json` in the models directory, with no effect on models that do not use it.
+
+- A model directory stays the unit of installation, so discovery and the runtime are
+  unchanged and a directory copied in by hand is adopted.
+- Installs build in `.staging/<id>`, validate, then rename. Removal renames to `.trash`
+  first. `registry.json` changes by temporary file, fsync and rename.
+- Locks are `flock`s, because the kernel releases them when a process dies.
+- A record's `dir` must be one path component, and a file that breaks this fails to load.
+- Loaded state is not recorded: a file cannot say whether a process is alive.
+- `models remove` deletes nothing without `--yes`.

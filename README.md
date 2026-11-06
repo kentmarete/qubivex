@@ -340,6 +340,10 @@ dense (resident), and the largest single expert, which is the unit the expert ca
 moves. `--tensors` lists every tensor with its dtype, shape and role. `<ID>` is
 looked up in the model directories; a path to a model directory also works.
 
+### `qubivex models validate <ID|DIR>`
+
+An alias of `qubivex models verify`.
+
 ### `qubivex models import <DIR|FILE.gguf> [options]`
 
 Writes a `manifest.json` for a checkpoint:
@@ -359,6 +363,12 @@ keeps the first combination under which every tensor validates. If none does, it
 reports the problems of the closest candidate. A tied output head reads the embedding;
 a copy of it stored under the head's name is listed in `overrides.ignore_tensors`. It records shard sizes,
 which are checked at every load, and the dominant dtype.
+
+### `qubivex models remove <ID> [--dir DIR]... [--yes]`
+
+Deletes a model from its models directory. Without `--yes` it only says what would be
+deleted. It refuses symbolic links and models outside the directory's top level, and
+does not check whether a running server has the model loaded.
 
 ### `qubivex models architectures`
 

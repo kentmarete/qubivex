@@ -3,6 +3,12 @@
 Last updated: 2026-11-06
 
 ## Current phase
+**Model registry done (2026-11-06); ADR-003 amendment 1.** Job 2 of the platform plan. New crate `qubivex-model-registry`: `registry.json` records each installed model's source, revision and install state, with atomic updates. Installs build in staging and rename into place; `reconcile` recovers interrupted installs and adopts directories found on disk.
+- CLI: `qubivex models remove <id> [--yes]` (without `--yes` it deletes nothing), and `models validate` as an alias of `verify`.
+- Tests: 15 registry tests (a crash at each install and removal step, path traversal, tampered and newer registry files, symbolic links, 16 concurrent writers) and one test through the binary.
+- Limits: no CLI command starts an install until job 3, and removal does not check for a process serving the model.
+- **Next:** job 3 (downloader): `models pull` and `search`, with `ureq` and `rustls`.
+
 **Generation contract done (2026-11-06); ADR-013 amendment 1.** Job 1 of the platform plan. `Engine::run_request` now holds the chat template, tokenization, context checks, KV reservation, stop sequences and detokenization. `qubivex run` and the gateway both use it, and so can an application embedding the runtime with no server, CLI or Tokio. No tensor or kernel code changed.
 - Added: `top_k` (runtime, `--top-k`, request field); `examples/embed.rs`; `tests/requests.rs` (6 tests, including concurrent requests on a shared engine equalling sequential ones); `cargo xtask check` fails if the runtime gains a server dependency.
 - Tests: 300 passed, 0 failed, 1 ignored. `qubivex run` on real OLMoE-1B-7B Q4_K_M (32 tokens, raw and chat) is byte-identical to the build before the change. No benchmarks: the machine was on battery.

@@ -10,6 +10,7 @@ use qubivex_model::{
 };
 use serde_json::{Value, json};
 
+use qubivex_model_registry::Registry;
 use qubivex_runtime::checksums::{ExpertSums, SumsState};
 
 use crate::chain;
@@ -325,6 +326,48 @@ fn record_sums(m: &ModelMetadata, threads: usize) -> Result<String, String> {
         Bytes(m.bytes().routed_experts),
         t.elapsed().as_secs_f64(),
         path.display()
+    ))
+}
+
+fn dir_size(dir: &Path) -> u64 {
+    std::fs::read_dir(dir).map_or(0, |entries| {
+        entries
+            .flatten()
+            .filter_map(|e| Some((e.path(), e.file_type().ok()?, e.metadata().ok()?)))
+            .map(|(p, t, m)| if t.is_dir() { dir_size(&p) } else { m.len() })
+            .sum()
+    })
+}
+
+/// `qubivex models remove`: deletes a model the registry of one of the model directories
+/// knows, adopting what is on disk first. Without `yes`, only says what would go.
+pub(crate) fn remove(id: &str, dirs: &[PathBuf], yes: bool) -> Result<String, String> {
+    let arch = ArchitectureRegistry::with_builtins();
+    let searched = roots(dirs);
+    for root in &searched {
+        let reg = Registry::open(root).map_err(|e| chain(&e))?;
+        reg.reconcile(&arch).map_err(|e| chain(&e))?;
+        let Some(record) = reg.get(id).map_err(|e| chain(&e))? else {
+            continue;
+        };
+        let dir = reg.dir_of(&record);
+        let size = Bytes(dir_size(&dir));
+        if !yes {
+            return Err(format!(
+                "this would delete {} ({size}); pass --yes to delete it",
+                dir.display()
+            ));
+        }
+        reg.remove(id).map_err(|e| chain(&e))?;
+        return Ok(format!("Removed {id} ({size}) from {}\n", dir.display()));
+    }
+    Err(format!(
+        "no model {id:?} in {}",
+        searched
+            .iter()
+            .map(|r| r.display().to_string())
+            .collect::<Vec<_>>()
+            .join(", ")
     ))
 }
 

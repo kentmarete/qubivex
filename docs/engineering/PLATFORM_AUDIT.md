@@ -64,10 +64,11 @@ applies only to what remains.
 | Containers, manifest v1, validation | Production | `qubivex-model`: hardened GGUF and SafeTensors readers, proptests, JSON schema |
 | Import, discovery, verify | Production | `models import / list / inspect / verify` |
 | Downloads | **Missing** | No HTTP client in the workspace. `QUBIVEX_DESIGN.md:126` deferred it to Phase 11. The spec makes it S2 and acceptance criterion 1 |
-| `models pull / search / remove` | **Missing** | |
+| `models pull / search` | **Missing** | |
+| `models remove` | Production | Needs `--yes`; deletes only inside the models directory |
 | `models analyse` | **Missing** as named | `qubivex plan` does the work; needs wiring |
-| Registry | Partial | "Registry" today means the architecture registry. Models are found by scanning directories. No record of revisions, install state, duplicates or failures, and no atomic updates |
-| Lifecycle states | Missing | Only the gateway's loaded map |
+| Registry | Partial | `qubivex-model-registry`: atomic records of source, revision and install state, crash recovery, safe removal. Downloads do not use it until job 3 |
+| Lifecycle states | Partial | Install states are recorded (ADR-003 amendment 1). Loading, loaded and failed-load states are job 5, in the serving process |
 | Manifest fields | Partial | No source repository, revision pin, per-file checksums or expert fields; checksums are `experts.qvxsum`. The schema is versioned, with no migration path yet |
 
 ### Server (Product C)
@@ -100,11 +101,12 @@ applies only to what remains.
 |---|---|
 | `system` | Done |
 | `models list / inspect` | Done |
-| `models validate` | Done as `models verify`; needs an alias |
+| `models validate` | Done, alias of `models verify` |
 | `serve` | Done, with `--listen` instead of `--host` and `--port` |
 | `chat --model --prompt` | Done as `run`. Interactive chat is missing |
 | `server status` | Missing |
-| `models search / pull / analyse / remove` | Missing |
+| `models remove` | Done |
+| `models search / pull / analyse` | Missing |
 
 `run` and the gateway both call `Engine::run_request`, so there is one inference pipeline,
 as the spec asks.
@@ -177,7 +179,7 @@ Owner rules for this plan (2026-11-06):
 | # | Job | Spec | Depends on | Done when |
 |---|---|---|---|---|
 | 1 | Generation contract (**done**) | S1 | | A `GenerationRequest`, stop handling and templates live in the runtime; `run` and the gateway both use them; top-k added; tokens unchanged; a compiled embedding example uses only the runtime; CI fails if the runtime gains `tokio`, `axum` or `qubivex-api` |
-| 2 | Registry | S2 | | Atomic store of installed models, revisions and lifecycle states; survives a failed install; `models remove`, `validate` alias |
+| 2 | Registry (**done**) | S2 | | Atomic store of installed models, revisions and lifecycle states; survives a failed install; `models remove`, `validate` alias |
 | 3 | Downloader | S2 | 2 | Resumable, verified, atomic `models pull` and `search` from Hugging Face; fault tests against a local server; one real pull |
 | 4 | Analyse and manifest v1.1 | S2, S3 | 2 | `models analyse`; source, revision and checksums in the manifest, with a migration test |
 | 5 | Concurrency correctness and scheduler (gate) | S4, S7 | 1 | Every §12.3 test passes, including 1, 2, 6, 9, 11, 12, 13, with a sanitizer run where supported; queue bounded by count, priorities, deadlines, load dedup |
