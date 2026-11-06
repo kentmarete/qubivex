@@ -229,6 +229,13 @@ enum Command {
         /// Linux), so streaming does not fill the file cache.
         #[arg(long)]
         direct_io: bool,
+        /// Simulate a disk of this many MB/s (decimal), shared by all I/O threads:
+        /// warm reads otherwise come from the page cache and never saturate.
+        #[arg(long, value_parser = clap::value_parser!(u64).range(1..))]
+        disk_mbps: Option<u64>,
+        /// Time added to every read of the simulated disk, in microseconds.
+        #[arg(long, default_value_t = 0, requires = "disk_mbps")]
+        disk_latency_us: u64,
         #[command(flatten)]
         prefetch: PrefetchArgs,
         #[command(flatten)]
@@ -380,6 +387,7 @@ pub(crate) struct MemoryOptions {
     io_threads: Option<usize>,
     expert_io: qubivex_runtime::ExpertIo,
     prefetch: Option<qubivex_runtime::PrefetchOptions>,
+    disk_limit: Option<qubivex_runtime::DiskLimit>,
     read_timeout: Option<qubivex_expert_stream::ReadTimeout>,
     read_retries: Option<u32>,
     verify: qubivex_runtime::VerifyExperts,
@@ -517,6 +525,10 @@ pub(crate) struct PrefetchArgs {
     /// clearly hotter) or off.
     #[arg(long, default_value = "on")]
     prefetch_guard: String,
+    /// Stop speculating while reads hold compute back: on or off. On a saturated disk
+    /// speed follows the bytes read, so unused speculation costs throughput.
+    #[arg(long, default_value = "on")]
+    prefetch_throttle: String,
     /// Predict at most top-K × this many experts per layer (default 1).
     #[arg(long)]
     prefetch_width: Option<u32>,
@@ -534,6 +546,15 @@ impl PrefetchArgs {
             "on" => true,
             "off" => false,
             other => return Err(format!("unknown --prefetch-guard {other:?}; use on or off")),
+        };
+        let throttle = match self.prefetch_throttle.as_str() {
+            "on" => true,
+            "off" => false,
+            other => {
+                return Err(format!(
+                    "unknown --prefetch-throttle {other:?}; use on or off"
+                ));
+            }
         };
         if !self.prefetch {
             return Ok(None);
@@ -560,6 +581,7 @@ impl PrefetchArgs {
         Ok(Some(qubivex_runtime::PrefetchOptions {
             lookahead: l,
             guard,
+            throttle,
         }))
     }
 }
@@ -601,6 +623,17 @@ impl MemoryOptions {
         self
     }
 
+    /// The same options with reads going through a simulated disk.
+    const fn with_disk(mut self, disk_limit: Option<qubivex_runtime::DiskLimit>) -> Self {
+        self.disk_limit = disk_limit;
+        self
+    }
+
+    /// The simulated disk (`None`: the real one).
+    pub(crate) const fn disk_limit(self) -> Option<qubivex_runtime::DiskLimit> {
+        self.disk_limit
+    }
+
     /// Prefetch settings (`None`: off).
     pub(crate) const fn prefetch(self) -> Option<qubivex_runtime::PrefetchOptions> {
         self.prefetch
@@ -622,6 +655,7 @@ impl MemoryOptions {
             io_threads: self.io_threads,
             expert_io: self.expert_io,
             prefetch: self.prefetch,
+            disk_limit: self.disk_limit,
             read_timeout: self.read_timeout,
             read_retries: self.read_retries,
             verify: self.verify,
@@ -643,6 +677,7 @@ fn memory_options(
 ) -> Result<MemoryOptions, String> {
     Ok(MemoryOptions {
         prefetch: None,
+        disk_limit: None,
         read_timeout: None,
         read_retries: None,
         verify: qubivex_runtime::VerifyExperts::Auto,
@@ -838,6 +873,8 @@ fn execute(cmd: &Command) -> Result<(), String> {
             cache_policy,
             io_threads,
             direct_io,
+            disk_mbps,
+            disk_latency_us,
             prefetch,
             storage,
             device,
@@ -866,6 +903,10 @@ fn execute(cmd: &Command) -> Result<(), String> {
                 *direct_io,
             )?
             .with_prefetch(prefetch.options()?)
+            .with_disk(disk_mbps.map(|mbps| qubivex_runtime::DiskLimit {
+                bytes_per_sec: mbps.saturating_mul(1_000_000),
+                latency: std::time::Duration::from_micros(*disk_latency_us),
+            }))
             .with_storage(storage.options()?)
             .with_device(device.options()?),
             mirrors: &storage.mirrors,

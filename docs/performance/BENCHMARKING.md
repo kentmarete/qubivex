@@ -285,3 +285,10 @@ Each decode step reads every weight once (about 1.13 GiB including the head), so
 tok/s is about 77 GiB/s, close to the 80 GiB/s bf16 streams in the kernel benchmarks.
 On Metal a dense model's matmuls are placed one by one (about 196 synchronisations per
 token), which is why it is slower than the CPU; a dense whole-layer pass is future work.
+
+## Saturated disks
+
+Warm reads never saturate here, so `bench --disk-mbps N` (with `--disk-latency-us`) puts
+reads behind a simulated disk with one shared bandwidth. Use `--ram-budget 1GiB` for the
+tight regime (2–3 slots per layer). `--expert-cache-mb 1024` is a different regime: it
+gives the experts the whole GiB (17–18 slots). Results: ADR-008 amendment 3.

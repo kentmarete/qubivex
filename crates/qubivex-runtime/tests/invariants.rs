@@ -3,9 +3,13 @@
 #![allow(clippy::unwrap_used)]
 
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::time::Duration;
 
 use qubivex_arch::Logits;
 use qubivex_arch::{TraceEvent, TracePoint};
+use qubivex_expert_stream::ExpertSource;
+use qubivex_expert_stream::fault::{DiskLimit, SlowDisk};
 use qubivex_expert_stream::predict::LookaheadConfig;
 use qubivex_model::{ArchitectureRegistry, ModelMetadata};
 use qubivex_runtime::{Engine, EngineOptions, ExpertIo, IoPath, PrefetchOptions, Sampling};
@@ -460,6 +464,63 @@ fn pressure_thread_stops_with_the_engine() {
     );
 }
 
+/// The throttle (ADR-008 amendment 3): on a disk that holds compute back, speculation
+/// stops, and the tokens stay the same; off, or with reads that do not block, it never
+/// holds.
+#[test]
+fn a_saturated_disk_holds_speculation_and_keeps_the_tokens() {
+    let id = "olmoe-tiny";
+    let prompt = [72, 101, 108, 108, 111];
+    let want = engine(id, None)
+        .generate(&prompt, 30, Sampling::default(), |_| true)
+        .unwrap();
+    let largest = engine(id, None).metadata().bytes().largest_expert;
+    let run = |throttle: bool, disk: Option<u64>| {
+        let meta = ModelMetadata::load(&dir(id), &ArchitectureRegistry::with_builtins()).unwrap();
+        let e = Engine::load_with_source(
+            meta,
+            EngineOptions {
+                expert_cache_bytes: disk.map(|_| largest),
+                max_context: Some(256),
+                io_threads: Some(2),
+                prefetch: Some(PrefetchOptions {
+                    lookahead: LookaheadConfig::default(),
+                    guard: true,
+                    throttle,
+                }),
+                ..EngineOptions::default()
+            },
+            |s| -> Arc<dyn ExpertSource> {
+                match disk {
+                    Some(ms) => Arc::new(SlowDisk::new(
+                        s,
+                        DiskLimit {
+                            bytes_per_sec: u64::MAX,
+                            latency: Duration::from_millis(ms),
+                        },
+                    )),
+                    None => s,
+                }
+            },
+        )
+        .unwrap();
+        let got = e
+            .generate(&prompt, 30, Sampling::default(), |_| true)
+            .unwrap();
+        assert_eq!(got, want, "throttle {throttle}, disk {disk:?}");
+        e.prefetch_report().unwrap()
+    };
+    let held = run(true, Some(10));
+    assert!(held.passes > 0);
+    assert!(
+        held.held_passes > 0,
+        "never held on a saturated disk: {} passes",
+        held.passes
+    );
+    assert_eq!(run(false, Some(10)).held_passes, 0, "the throttle is off");
+    assert_eq!(run(true, None).held_passes, 0, "reads never blocked");
+}
+
 /// Phase 7 exit test: routing is identical with prediction on and off. The lookahead
 /// only chooses what to read ahead, so the router logits, the chosen experts with
 /// their weights, and the output logits keep every bit, whatever the cache size, the
@@ -493,8 +554,11 @@ fn prefetch_never_changes_routing_or_bits() {
                     expert_cache_bytes: cap.map(|n: u64| n * largest),
                     max_context: Some(256),
                     io_threads: Some(io),
-                    prefetch: prefetch
-                        .map(|(lookahead, guard)| PrefetchOptions { lookahead, guard }),
+                    prefetch: prefetch.map(|(lookahead, guard)| PrefetchOptions {
+                        lookahead,
+                        guard,
+                        throttle: !guard,
+                    }),
                     ..EngineOptions::default()
                 },
             )

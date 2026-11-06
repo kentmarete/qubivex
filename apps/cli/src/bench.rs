@@ -142,6 +142,10 @@ struct Config {
     /// Phase 7).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     prefetch: Option<PrefetchConfig>,
+    /// The simulated disk reads went through; absent on the real one (and before
+    /// ADR-008 amendment 3).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    disk: Option<DiskConfig>,
     /// The compute backend and device placement; absent on the CPU (and before
     /// Phase 8 slice 2).
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -282,9 +286,18 @@ struct DeviceConfig {
     fallback: Option<String>,
 }
 
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+struct DiskConfig {
+    bytes_per_sec: u64,
+    latency_us: u64,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct PrefetchConfig {
     guard: bool,
+    /// The saturation throttle (absent before ADR-008 amendment 3).
+    #[serde(default)]
+    throttle: bool,
     smooth: f32,
     confidence: f32,
     width: u32,
@@ -293,6 +306,10 @@ struct PrefetchConfig {
 /// Prefetch counters over the measured runs (Phase 7 metrics).
 #[derive(Debug, Serialize, Deserialize)]
 struct PrefetchRecord {
+    /// Forward passes the saturation throttle kept from speculating, as a share of
+    /// all of them (absent before ADR-008 amendment 3).
+    #[serde(default)]
+    held_rate: f64,
     /// Routed experts that were predicted, over decode layers with a prediction.
     recall: f64,
     /// Predicted experts that were routed.
@@ -336,6 +353,8 @@ fn prefetch_record(
     let d = |f: fn(&qubivex_expert_stream::PrefetchStats) -> u64| f(&s1) - f(&s0);
     let (issued, ready, late) = (d(|s| s.issued), d(|s| s.ready), d(|s| s.late));
     PrefetchRecord {
+        held_rate: (after.held_passes - before.held_passes) as f64
+            / ((after.passes - before.passes) as f64).max(1.0),
         recall: p.recall(),
         precision: p.precision(),
         predicted_per_layer: p.predicted as f64 / (p.layers as f64).max(1.0),
@@ -681,8 +700,13 @@ pub(crate) fn bench(a: &BenchArgs<'_>) -> Result<String, String> {
                 }
                 .to_owned(),
             ),
+            disk: a.memory.disk_limit().map(|d| DiskConfig {
+                bytes_per_sec: d.bytes_per_sec,
+                latency_us: u64::try_from(d.latency.as_micros()).unwrap_or(u64::MAX),
+            }),
             prefetch: a.memory.prefetch().map(|p| PrefetchConfig {
                 guard: p.guard,
+                throttle: p.throttle,
                 smooth: p.lookahead.smooth,
                 confidence: p.lookahead.confidence,
                 width: p.lookahead.width,

@@ -183,8 +183,9 @@ precision, ready/late, wasted bytes, lead time, blocked time). **Exit met:** at 
 blocked time falls from 8.29 to 4.87 ms per token (guard on) or 3.95 ms (guard off),
 and decode goes from 19.87 to 20.3–20.5 tok/s. At 2–3 GiB and all resident there is no
 gain (guard on) or a 1–2% loss (guard off), so prefetch stays opt-in (`--prefetch`).
-The routing-identity test passes on every fixture. Not built: a disk-saturation
-throttle, lookahead beyond one layer, and next-token layer-0 prediction.
+The routing-identity test passes on every fixture. The disk-saturation throttle is done
+(ADR-008 amendment 3). Not built: lookahead beyond one layer and next-token layer-0
+prediction.
 
 ### Phase 8: GPU acceleration
 **Order amended 2026-11-03 (ADR-007): Metal first** (`qubivex-backend-metal`, testable on

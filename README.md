@@ -475,7 +475,7 @@ These invariants are enforced by tests and CI
 | 4 | CPU inference prototype: kernels, tokenizer, a minimal expert store, generation | Done: matches `transformers` to under 1e-6 relative; identical output at every expert-cache size |
 | 5 | Memory planner: fits the model to RAM, VRAM and cgroup limits | Done |
 | 6 | Full expert streaming: tiered cache, I/O pool, packed expert files | Done |
-| 7 | Predictive expert prefetching | Slice 1 done (router lookahead); the disk-saturation throttle is parked |
+| 7 | Predictive expert prefetching | Router lookahead and the disk-saturation throttle done; off by default |
 | 8 | GPU backends: CUDA, Vulkan, Metal | Metal slices 1–6 done (bit-identical; 1.4× the CPU at decode, 2× at prefill); CUDA next |
 | 9 | OpenAI-compatible HTTP server and serving | Done: `qubivex serve` (ADR-013); the OpenAI SDK works against real models |
 | 10–11 | Hardening, packaging, documentation | Planned |

@@ -11,7 +11,9 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use qubivex_core::{ExpertIdx, LayerIdx};
-use qubivex_expert_stream::fault::{Fault, FaultySource, Rule, Target, VerifiedSource};
+use qubivex_expert_stream::fault::{
+    DiskLimit, Fault, FaultySource, Rule, SlowDisk, Target, VerifiedSource,
+};
 use qubivex_expert_stream::{
     ExpertKey, ExpertSource, ExpertStore, Occupancy, Policy, PoolSpec, ReadTimeout, StoreError,
 };
@@ -505,4 +507,33 @@ fn failed_reads_are_retried() {
         assert_eq!(src.reads(), 3);
         settled(&s);
     }
+}
+
+/// One bandwidth, shared: four threads reading at once take as long as one thread
+/// reading the same bytes, and the bytes are the inner source's.
+#[test]
+fn slow_disk_shares_one_bandwidth_between_threads() {
+    let disk = Arc::new(SlowDisk::new(
+        Arc::new(Pattern::default()),
+        DiskLimit {
+            bytes_per_sec: SIZE * 100, // 10 ms per read
+            latency: Duration::ZERO,
+        },
+    ));
+    let t = Instant::now();
+    std::thread::scope(|s| {
+        for e in 0..8u32 {
+            let disk = Arc::clone(&disk);
+            s.spawn(move || {
+                let mut buf = vec![0; SIZE as usize];
+                disk.read_expert(key(0, e), &mut buf).unwrap();
+                check(&buf, key(0, e));
+            });
+        }
+    });
+    assert!(
+        t.elapsed() >= Duration::from_millis(80),
+        "{:?}",
+        t.elapsed()
+    );
 }

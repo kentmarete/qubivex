@@ -19,6 +19,7 @@ pub use engine::{
 pub use experts::{ExpertIo, ExpertLayout, IoPath, ModelExpertSource, PartLayout};
 pub use placement::{BackendKind, MetalOps, PlacementReport};
 pub use qubivex_arch::{KvCache, Logits};
+pub use qubivex_expert_stream::fault::DiskLimit;
 use qubivex_model::manifest::TokenizerSection;
 use qubivex_model::{GgufMetadata, GgufValue, ModelMetadata};
 use qubivex_tokenizer::{GgufVocab, Tokenizer, TokenizerError};
