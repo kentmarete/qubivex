@@ -340,6 +340,36 @@ impl MetalForward {
         Ok((2 * self.layers.len() * per_layer(cap) * 4) as u64)
     }
 
+    /// Fills the empty `cache` with a copy of `src`'s first `positions` positions.
+    /// Caches are position-major, so a prefix of each buffer is a prefix of the positions,
+    /// whatever either cache's capacity.
+    pub(crate) fn restore(
+        &self,
+        src: &KvCache,
+        cache: &mut KvCache,
+        positions: usize,
+    ) -> Result<(), ArchError> {
+        let bytes = self.ensure_kv(cache, positions)?;
+        cache.set_device_bytes(bytes);
+        fn gpu(c: &KvCache) -> Result<&GpuKv, ArchError> {
+            c.device()
+                .and_then(|b| b.downcast_ref::<GpuKv>())
+                .ok_or_else(|| ArchError::Input("no device cache".into()))
+        }
+        let (from, to) = (gpu(src)?, gpu(cache)?);
+        let used = positions * self.dims.kv_out;
+        self.be
+            .submit(|b| {
+                for l in 0..self.layers.len() {
+                    b.copy(&to.k[l].all(), &from.k[l].all(), used)?;
+                    b.copy(&to.v[l].all(), &from.v[l].all(), used)?;
+                }
+                Ok(())
+            })
+            .map_err(dev)?;
+        cache.advance(positions)
+    }
+
     /// Makes the activation buffers hold `s` tokens attending over `span` positions.
     fn ensure_work(&self, work: &mut Work, s: usize, span: usize) -> Result<(), ArchError> {
         if work.bufs.is_some() && work.tokens >= s && work.span >= span {

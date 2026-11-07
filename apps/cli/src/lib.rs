@@ -169,6 +169,11 @@ enum Command {
         /// Seconds running requests get to finish at shutdown before they are stopped.
         #[arg(long, default_value_t = 30)]
         shutdown_grace: u64,
+        /// MiB per model of finished KV to keep, so a prompt that repeats a prefix skips
+        /// it. Counts against the memory plan. Requests with different `user` values
+        /// never share it. 0 keeps none.
+        #[arg(long, default_value_t = 0)]
+        prefix_cache_mb: u64,
         /// A fixed expert cache in MiB per model, bypassing the memory planner.
         #[arg(long)]
         expert_cache_mb: Option<u64>,
@@ -948,6 +953,7 @@ fn execute(cmd: &Command) -> Result<(), String> {
             request_timeout,
             stall_timeout,
             shutdown_grace,
+            prefix_cache_mb,
             expert_cache_mb,
             profile,
             ram_fraction,
@@ -970,17 +976,20 @@ fn execute(cmd: &Command) -> Result<(), String> {
             request_timeout: std::time::Duration::from_secs(*request_timeout),
             stall_timeout: std::time::Duration::from_secs(*stall_timeout),
             shutdown_grace: std::time::Duration::from_secs(*shutdown_grace),
-            engine: memory_options(
-                *expert_cache_mb,
-                profile,
-                *ram_fraction,
-                ram_budget.as_deref(),
-                "lfru",
-                *io_threads,
-                false,
-            )?
-            .with_device(device.options()?)
-            .engine(*context, *threads),
+            engine: qubivex_runtime::EngineOptions {
+                prefix_cache_bytes: prefix_cache_mb.saturating_mul(1 << 20),
+                ..memory_options(
+                    *expert_cache_mb,
+                    profile,
+                    *ram_fraction,
+                    ram_budget.as_deref(),
+                    "lfru",
+                    *io_threads,
+                    false,
+                )?
+                .with_device(device.options()?)
+                .engine(*context, *threads)
+            },
         }),
         Command::Bench {
             model,

@@ -18,6 +18,7 @@ qubivex-expert-stream = { workspace = true }
 qubivex-hardware = { workspace = true }
 qubivex-memory = { workspace = true }
 qubivex-model = { workspace = true }
+qubivex-kv-cache = { workspace = true }
 qubivex-scheduler = { workspace = true }
 qubivex-tokenizer = { workspace = true }
 rayon = { workspace = true }

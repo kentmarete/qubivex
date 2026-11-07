@@ -270,6 +270,12 @@ impl KvCache {
         &mut self.device
     }
 
+    /// A device forward pass's keys and values for this cache, to read.
+    #[must_use]
+    pub fn device(&self) -> Option<&DeviceKv> {
+        self.device.as_ref()
+    }
+
     /// Records the bytes a device forward pass has allocated for this cache.
     pub const fn set_device_bytes(&mut self, bytes: u64) {
         self.device_bytes = bytes;
@@ -307,6 +313,36 @@ impl KvCache {
     #[must_use]
     pub const fn capacity(&self) -> usize {
         self.max
+    }
+
+    /// Fills this empty cache with a copy of `src`'s first `positions` positions. The two
+    /// share no memory, so what either writes next the other never sees.
+    ///
+    /// # Errors
+    /// [`ArchError::Input`] if this cache is not empty or does not match `src`, or `src`
+    /// holds fewer positions.
+    pub fn restore_from(&mut self, src: &Self, positions: usize) -> Result<(), ArchError> {
+        let same = self.k.len() == src.k.len()
+            && self.kv_heads == src.kv_heads
+            && self.head_dim == src.head_dim;
+        if !self.is_empty() || !same || positions > src.len || positions > self.max {
+            return Err(ArchError::Input(format!(
+                "cannot restore {positions} positions of {src:?} into {self:?}"
+            )));
+        }
+        let n = positions as u64;
+        for l in 0..self.k.len() {
+            self.reserve(l, positions)?;
+            for (to, from) in [(&mut self.k[l], &src.k[l]), (&mut self.v[l], &src.v[l])] {
+                let mut all = to.view_mut()?;
+                for g in 0..self.kv_heads {
+                    let dst = contiguous_mut(all.reborrow().select(0, g)?.narrow(0, 0, n)?)?;
+                    dst.copy_from_slice(contiguous(from.view().select(0, g)?.narrow(0, 0, n)?)?);
+                }
+            }
+        }
+        self.len = positions;
+        Ok(())
     }
 
     /// Forgets the positions past `positions`. Reserved capacity is kept; rows past

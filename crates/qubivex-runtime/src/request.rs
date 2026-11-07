@@ -49,6 +49,8 @@ pub struct GenerationRequest {
     pub prefill_chunk: usize,
     /// When to stop generating, checked before each prefill chunk and each token.
     pub deadline: Option<Instant>,
+    /// See [`GenerateOptions::cache_scope`].
+    pub cache_scope: Option<String>,
 }
 
 impl GenerationRequest {
@@ -64,6 +66,7 @@ impl GenerationRequest {
             stops: Vec::new(),
             prefill_chunk: d.prefill_chunk,
             deadline: None,
+            cache_scope: None,
         }
     }
 }
@@ -94,6 +97,8 @@ pub struct GenerationOutcome {
     pub prompt_tokens: usize,
     /// Tokens generated.
     pub completion_tokens: usize,
+    /// Prompt tokens reused from retained KV, which no pass ran.
+    pub cached_tokens: usize,
 }
 
 /// A request tokenized and checked against the context, not yet admitted.
@@ -336,13 +341,13 @@ impl Engine {
     ) -> Result<GenerationOutcome, RequestError> {
         let (prompt, max_new) = (&prepared.prompt, prepared.max_new);
         let prompt_tokens = prepared.prompt_tokens();
-        let ended = |finish, completion_tokens| GenerationOutcome {
-            finish,
-            prompt_tokens,
-            completion_tokens,
-        };
         if !on_event(GenerationEvent::Started { prompt_tokens }) {
-            return Ok(ended(Finish::Stopped, 0));
+            return Ok(GenerationOutcome {
+                finish: Finish::Stopped,
+                prompt_tokens,
+                completion_tokens: 0,
+                cached_tokens: 0,
+            });
         }
 
         let opts = GenerateOptions {
@@ -350,6 +355,7 @@ impl Engine {
             sampling: req.sampling,
             prefill_chunk: req.prefill_chunk,
             deadline: req.deadline,
+            cache_scope: req.cache_scope.clone(),
         };
         let mut decoder = self.tokenizer().stream();
         let mut stops = Stops::new(&req.stops);
@@ -373,26 +379,31 @@ impl Engine {
                 true
             })
             .map_err(RequestError::Generation)?;
-        let completion_tokens = g.tokens.len();
+        let ended = |finish| GenerationOutcome {
+            finish,
+            prompt_tokens,
+            completion_tokens: g.tokens.len(),
+            cached_tokens: g.cached_tokens,
+        };
         if g.finish == Finish::Cancelled {
-            return Ok(ended(Finish::Cancelled, completion_tokens));
+            return Ok(ended(Finish::Cancelled));
         }
         if gone {
-            return Ok(ended(Finish::Stopped, completion_tokens));
+            return Ok(ended(Finish::Stopped));
         }
         if !hit_stop {
             // A trailing incomplete character, as `decode` of every id shows it.
             let tail = decoder.finish().unwrap_or_default();
             let (out, hit) = stops.push(&tail);
             if !out.is_empty() && !on_event(GenerationEvent::Text(out)) {
-                return Ok(ended(Finish::Stopped, completion_tokens));
+                return Ok(ended(Finish::Stopped));
             }
             if hit {
                 hit_stop = true;
             } else {
                 let rest = stops.flush();
                 if !rest.is_empty() && !on_event(GenerationEvent::Text(rest)) {
-                    return Ok(ended(Finish::Stopped, completion_tokens));
+                    return Ok(ended(Finish::Stopped));
                 }
             }
         }
@@ -401,7 +412,7 @@ impl Engine {
         } else {
             g.finish
         };
-        Ok(ended(finish, completion_tokens))
+        Ok(ended(finish))
     }
 }
 

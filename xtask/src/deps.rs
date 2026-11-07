@@ -47,6 +47,8 @@ fn allowed_deps(krate: &str) -> Option<Vec<&'static str>> {
         "qubivex-model-download" => vec!["qubivex-model-registry", "qubivex-model"],
         // Decides what runs; knows nothing of models, HTTP or Tokio.
         "qubivex-scheduler" => vec![],
+        // Decides which retained KV a prompt can reuse; knows nothing of tensors.
+        "qubivex-kv-cache" => vec![],
         "qubivex-compute" => vec!["qubivex-core"],
         b if BACKENDS.contains(&b) => vec!["qubivex-compute", "qubivex-core"],
         "qubivex-arch" => vec!["qubivex-model", "qubivex-compute", "qubivex-core"],
@@ -62,6 +64,7 @@ fn allowed_deps(krate: &str) -> Option<Vec<&'static str>> {
                 "qubivex-arch",
                 "qubivex-memory",
                 "qubivex-expert-stream",
+                "qubivex-kv-cache",
                 "qubivex-model",
                 "qubivex-scheduler",
                 "qubivex-tokenizer",

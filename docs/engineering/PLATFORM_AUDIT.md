@@ -52,7 +52,7 @@ applies only to what remains.
 | MoE routing | Production | Softmax and top-K renormalised routing; GPU routing has `ops::route`'s bits |
 | Expert lifecycle | Production | `qubivex-expert-stream`: leases, in-flight dedup, LRU, bounded prefetch, cancellation of unstarted loads, loom checks |
 | Memory planner | Production | `qubivex-memory::plan`, cgroup-aware, explainable through `qubivex plan` |
-| KV cache | Partial | `KvCache` in `qubivex-arch` is per-conversation, bounded and reserved through the planner. No prefix reuse, eviction or paging, and no crate boundary |
+| KV cache | Partial (job 6: prefix reuse done) | `KvCache` in `qubivex-arch` is per-conversation, bounded and reserved through the planner. Job 6 added retained KV with prefix reuse, a budget and eviction in `qubivex-kv-cache` (ADR-016). No paging |
 | Backends | Partial | CPU and Metal bit-identical. CUDA and Vulkan exist only as detection |
 | Stable interfaces | Partial | Traits exist for `ComputeBackend`, `ExpertSource`, `DenseWeights`, `ExpertProvider`, `ArchitectureFactory`, `ResourceProbe`. `Engine::run_request` is the generation contract (ADR-013 amendment 1). There is no model handle yet |
 | Sampling | Production | Greedy, temperature, top-k, top-p, seed |
@@ -184,7 +184,7 @@ Owner rules for this plan (2026-11-06):
 | 3 | Downloader (**done**) | S2 | 2 | Resumable, verified, atomic `models pull` and `search` from Hugging Face; fault tests against a local server; one real pull |
 | 4 | Analyse and manifest v1.1 (**done**) | S2, S3 | 2 | `models analyse`; source, revision and checksums in the manifest, with a migration test |
 | 5 | Concurrency correctness and scheduler (gate) (**done**) | S4, S7 | 1 | Every §12.3 test passes, including 1, 2, 6, 9, 11, 12, 13, with a sanitizer run where supported; queue bounded by count, priorities, deadlines, load dedup |
-| 6 | KV subsystem | S4 | 1 | Prefix reuse with a bit-identity test; bounded and evictable |
+| 6 | KV subsystem (**done**) | S4 | 1 | Prefix reuse with a bit-identity test; bounded and evictable |
 | 7 | Batching design | S8 | 5 (gate), 6 | ADR with a measured prototype |
 | 8 | Batching, stages 2 and 3 | S8 | 7 | Sequences share a pass; tokens bit-identical; measured on power |
 | 9 | Hardening | S10 | 5 | Rate limits, request limits, CORS, non-localhost refusal, config files |

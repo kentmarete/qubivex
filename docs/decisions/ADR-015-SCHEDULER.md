@@ -106,8 +106,11 @@ at a full queue or queue timeout, 400 for what can never run, 503 for memory or 
   CARGO_TARGET_DIR=target/tsan RUSTFLAGS="-Zsanitizer=thread" \
     cargo +nightly test -Zbuild-std --target aarch64-apple-darwin \
     -p qubivex-scheduler -p qubivex-api -p qubivex-expert-stream -p qubivex-runtime \
-    --test scheduler --test concurrency --test gateway --test store --test prefetch --test requests
+    --test scheduler --test concurrency --test gateway --test store --test prefetch --test requests \
+    --test prefix
   ```
+
+  `--test prefix` was added with ADR-016.
 
   64 tests, no reports. A deliberately racy program built the same way was reported, so the
   sanitizer was active. It sees Rust memory only, so it does not cover Metal.
