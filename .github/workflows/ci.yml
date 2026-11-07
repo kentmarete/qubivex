@@ -74,7 +74,7 @@ jobs:
           cargo test -Zbuild-std --target x86_64-unknown-linux-gnu --locked --no-fail-fast
           -p qubivex-scheduler -p qubivex-api -p qubivex-expert-stream -p qubivex-runtime
           --test scheduler --test concurrency --test gateway --test store --test prefetch
-          --test requests
+          --test requests --test prefix
 
   deny:
     name: cargo deny

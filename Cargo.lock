@@ -1166,6 +1166,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "qubivex-kv-cache"
+version = "0.1.0"
+
+[[package]]
 name = "qubivex-memory"
 version = "0.1.0"
 dependencies = [
@@ -1227,6 +1231,7 @@ dependencies = [
  "qubivex-core",
  "qubivex-expert-stream",
  "qubivex-hardware",
+ "qubivex-kv-cache",
  "qubivex-memory",
  "qubivex-model",
  "qubivex-scheduler",

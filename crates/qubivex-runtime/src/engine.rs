@@ -25,6 +25,7 @@ use qubivex_expert_stream::{
     PrefetchStats, ReadTimeout, StoreError, StoreStats,
 };
 use qubivex_hardware::{Host, Probed, ResourceProbe, SystemProbe};
+use qubivex_kv_cache::{PrefixCache, PrefixStats};
 use qubivex_memory::{
     Charge, HostMemory, LayerExperts, MemoryLedger, MemoryPlan, ModelFootprint, Owner, PlanRequest,
     PressureConfig, PressureDecision, PressureMonitor, Profile, Tier,
@@ -88,6 +89,10 @@ pub struct EngineOptions {
     pub backend: BackendKind,
     /// The dense matmuls placed on Metal with [`BackendKind::Metal`].
     pub metal_ops: MetalOps,
+    /// Most bytes of finished KV to keep for later prompts to reuse (ADR-016). 0: none,
+    /// and every prompt runs in full. It counts against the memory plan, and running
+    /// requests and memory pressure take it back first.
+    pub prefix_cache_bytes: u64,
 }
 
 /// Router-lookahead prefetch settings (Phase 7).
@@ -532,7 +537,7 @@ impl Drop for Turn<'_> {
 }
 
 /// How [`Engine::generate_with`] generates.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub struct GenerateOptions {
     /// Most tokens to generate.
     pub max_new: usize,
@@ -543,6 +548,10 @@ pub struct GenerateOptions {
     pub prefill_chunk: usize,
     /// When to stop, checked before every prefill chunk and every token.
     pub deadline: Option<Instant>,
+    /// Who may reuse this generation's KV, and whose it may reuse. A reused prefix is
+    /// faster, and so tells a caller that another request sent it: requests that must
+    /// not learn of each other need different scopes.
+    pub cache_scope: Option<String>,
 }
 
 impl Default for GenerateOptions {
@@ -552,6 +561,7 @@ impl Default for GenerateOptions {
             sampling: Sampling::default(),
             prefill_chunk: 256,
             deadline: None,
+            cache_scope: None,
         }
     }
 }
@@ -584,6 +594,8 @@ pub struct Generation {
     pub finish: Finish,
     /// Prompt length in tokens.
     pub prompt_tokens: usize,
+    /// Prompt tokens reused from retained KV, which no pass ran.
+    pub cached_tokens: usize,
 }
 
 /// KV room held for one conversation (see [`Engine::reserve_kv`]).
@@ -620,7 +632,8 @@ struct Memory {
 }
 
 /// Ledger charges the engine holds. The KV charge is the larger of the most recent
-/// sequence's cache and what live [`KvReservation`]s hold across conversations.
+/// sequence's cache and what live [`KvReservation`]s hold across conversations, plus
+/// retained KV.
 struct Charges {
     _dense: Charge,
     experts: Charge,
@@ -631,6 +644,16 @@ struct Charges {
 struct Pressure {
     monitor: Mutex<PressureMonitor>,
     ledger: Arc<MemoryLedger>,
+    retained: Option<Arc<Retained>>,
+}
+
+/// Finished KV kept for later prompts, priced in KV positions (ADR-016).
+type Retained = Mutex<PrefixCache<KvCache>>;
+
+fn lock_retained(r: &Retained) -> std::sync::MutexGuard<'_, PrefixCache<KvCache>> {
+    // A poisoned lock means a panic mid-update; the index stays usable, and every value
+    // in it is immutable.
+    r.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 impl Pressure {
@@ -644,7 +667,15 @@ impl Pressure {
 
     fn observe(&self, available: Bytes) -> PressureDecision {
         let used = self.ledger.snapshot(Tier::Ram).expert_cache;
-        self.lock().observe(available, used)
+        let decision = self.lock().observe(available, used);
+        // Speculation goes first (ADR-005), and retained KV is speculation. This runs on
+        // the sampling thread, so an idle server gives it back too.
+        if !decision.prefetch {
+            if let Some(r) = &self.retained {
+                lock_retained(r).clear();
+            }
+        }
+        decision
     }
 }
 
@@ -710,6 +741,8 @@ pub struct Engine {
     /// Forward passes run one at a time, first come first served (see
     /// [`Engine::forward`]).
     steps: StepQueue,
+    /// Finished KV kept for later prompts (`None`: off).
+    retained: Option<Arc<Retained>>,
     /// KV bytes per position (keys and values of every layer).
     kv_position_bytes: u64,
     model: Transformer,
@@ -1000,10 +1033,15 @@ impl Engine {
             experts: ledger.charge(Tier::Ram, Owner::ExpertCache, Bytes(0)),
             kv: ledger.charge(Tier::Ram, Owner::Kv, Bytes(0)),
         };
+        let retained = (opts.prefix_cache_bytes > 0).then(|| {
+            let positions = opts.prefix_cache_bytes / kv_position_bytes.max(1);
+            Arc::new(Mutex::new(PrefixCache::new(positions)))
+        });
         let pressure = plan.as_ref().map(|p| {
             Arc::new(Pressure {
                 monitor: Mutex::new(PressureMonitor::new(opts.pressure, p.ram.cache_floor.bytes)),
                 ledger: Arc::clone(&ledger),
+                retained: retained.clone(),
             })
         });
         let interval = opts.pressure_interval_ms.unwrap_or(500);
@@ -1059,6 +1097,7 @@ impl Engine {
             layers,
             cache_target: AtomicU64::new(capacity),
             kv_reserved: Arc::new(AtomicUsize::new(0)),
+            retained,
             steps: StepQueue::default(),
             kv_position_bytes,
             verification: Verification::Off,
@@ -1251,8 +1290,9 @@ impl Engine {
         // With concurrent conversations, the plan prices every reservation together.
         let projected = KvCache::reserved_for(cache.len() + tokens, cache.capacity())
             .max(self.kv_reserved.load(Ordering::Relaxed));
+        let retained = self.make_room(projected);
         let mut cap = plan
-            .expert_cache_for(projected as u64)
+            .expert_cache_for(projected as u64 + retained)
             .map_err(|r| RuntimeError::Memory(r.to_string()))?;
         if let Some(limit) = self.pressure().and_then(|d| d.cache_cap) {
             cap = cap.min(limit);
@@ -1265,17 +1305,98 @@ impl Engine {
         Ok(())
     }
 
-    /// Updates the ledger from the store and the KV cache.
-    fn account(&self, cache: &KvCache) {
+    /// Evicts retained KV until the plan holds it beside `live` positions, and returns
+    /// the positions still retained. Nothing goes if `live` alone cannot fit: evicting
+    /// would not help, and the caller is about to refuse.
+    fn make_room(&self, live: usize) -> u64 {
+        let Some(r) = &self.retained else {
+            return 0;
+        };
+        let mut r = lock_retained(r);
+        if let Some(plan) = &self.memory.plan {
+            let live = live as u64;
+            if plan.expert_cache_for(live).is_ok() {
+                while plan.expert_cache_for(live + r.cost()).is_err() && r.evict_oldest() {}
+            }
+        }
+        r.cost()
+    }
+
+    /// Fills the empty `cache` from retained KV sharing a prefix with `prompt`, and
+    /// returns how many positions it holds. Passes take turns, and so does this: the copy
+    /// is a device submission on Metal, and it allocates what a pass would.
+    fn restore(
+        &self,
+        scope: Option<&str>,
+        prompt: &[u32],
+        cache: &mut KvCache,
+    ) -> Result<usize, RuntimeError> {
+        let Some(r) = &self.retained else {
+            return Ok(0);
+        };
+        let Some(hit) = lock_retained(r).lookup(scope, prompt) else {
+            return Ok(0);
+        };
+        let _turn = self.steps.wait();
+        self.fit_room(cache, hit.reuse)?;
+        if let Some(g) = &self.gpu {
+            g.restore(&hit.value, cache, hit.reuse)?;
+        } else {
+            cache.restore_from(&hit.value, hit.reuse)?;
+        }
+        self.account(cache.allocated_bytes());
+        Ok(hit.reuse)
+    }
+
+    /// Keeps a finished `cache`, which ran `tokens`, for later prompts. It moves, with no
+    /// copy. The positions may still be reserved for the request that just ended, so
+    /// that reservation is not counted twice.
+    fn retain(&self, scope: Option<&str>, tokens: Vec<u32>, cache: KvCache) {
+        let Some(r) = &self.retained else {
+            return;
+        };
+        if self.pressure().is_some_and(|d| !d.prefetch) {
+            return;
+        }
+        let cost = KvCache::reserved_for(cache.len(), cache.capacity());
+        lock_retained(r).insert(scope, tokens, cost as u64, cache);
+        self.make_room(
+            self.kv_reserved
+                .load(Ordering::Relaxed)
+                .saturating_sub(cost),
+        );
+        self.account(0);
+    }
+
+    /// Prefix reuse so far, and what is retained now. Zeros when it is off.
+    #[must_use]
+    pub fn prefix_stats(&self) -> PrefixStats {
+        self.retained
+            .as_ref()
+            .map_or_else(PrefixStats::default, |r| lock_retained(r).stats())
+    }
+
+    /// Drops all retained KV.
+    pub fn clear_prefix_cache(&self) {
+        if let Some(r) = &self.retained {
+            lock_retained(r).clear();
+        }
+    }
+
+    /// Updates the ledger from the store, retained KV and `cache_bytes` of a sequence's
+    /// KV cache.
+    fn account(&self, cache_bytes: u64) {
         // A poisoned lock means another thread panicked mid-update; the counters are
         // diagnostics, so skip rather than propagate.
         if let Ok(mut c) = self.memory.charges.lock() {
             c.experts.resize(Bytes(self.store.used().unwrap_or(0)));
             let reserved = self.kv_reserved.load(Ordering::Relaxed) as u64;
-            let kv = cache
-                .allocated_bytes()
-                .max(reserved.saturating_mul(self.kv_position_bytes));
-            c.kv.resize(Bytes(kv));
+            let live = cache_bytes.max(reserved.saturating_mul(self.kv_position_bytes));
+            let retained = self
+                .prefix_stats()
+                .cost
+                .saturating_mul(self.kv_position_bytes);
+            c.kv.resize(Bytes(live.saturating_add(retained)));
         }
     }
 
@@ -1332,7 +1453,7 @@ impl Engine {
                 &self.source,
                 logits,
             );
-            self.account(cache);
+            self.account(cache.allocated_bytes());
             return Ok(out?);
         }
         let provider = StoreProvider {
@@ -1350,7 +1471,7 @@ impl Engine {
             .pool
             .install(|| self.model.forward(tokens, cache, src, logits, trace));
         // Failed passes too: the ledger follows what the store and cache hold.
-        self.account(cache);
+        self.account(cache.allocated_bytes());
         Ok(out?)
     }
 
@@ -1396,14 +1517,7 @@ impl Engine {
             return Err(RuntimeError::Model("the prompt is empty".into()));
         }
         self.admit()?;
-        let done = |tokens, finish| {
-            self.end_turn();
-            Ok(Generation {
-                tokens,
-                finish,
-                prompt_tokens: prompt.len(),
-            })
-        };
+        let scope = opts.cache_scope.as_deref();
         let mut cache = self.new_cache();
         if prompt.len() > cache.capacity() {
             return Err(RuntimeError::Model(format!(
@@ -1412,43 +1526,61 @@ impl Engine {
                 cache.capacity()
             )));
         }
+        let cached_tokens = self.restore(scope, prompt, &mut cache)?;
+        // However it ended, the cache holds the first `len` tokens of the prompt and the
+        // output: the last token generated may not have run.
+        let done = |tokens: Vec<u32>, finish, cache: KvCache| {
+            self.end_turn();
+            if self.retained.is_some() {
+                let mut fed = prompt.to_vec();
+                fed.extend_from_slice(&tokens);
+                fed.truncate(cache.len());
+                self.retain(scope, fed, cache);
+            }
+            Ok(Generation {
+                tokens,
+                finish,
+                prompt_tokens: prompt.len(),
+                cached_tokens,
+            })
+        };
         let mut rng = Rng(opts.sampling.seed ^ 0x9e37_79b9_7f4a_7c15);
         let mut logits = Vec::new();
         let late = || opts.deadline.is_some_and(|d| Instant::now() >= d);
-        for chunk in prompt.chunks(opts.prefill_chunk.max(1)) {
+        for chunk in prompt[cached_tokens..].chunks(opts.prefill_chunk.max(1)) {
             // Acquire: pairs with the canceller's Release store.
             if cancel.load(Ordering::Acquire) {
-                return done(Vec::new(), Finish::Cancelled);
+                return done(Vec::new(), Finish::Cancelled, cache);
             }
             if late() {
-                return done(Vec::new(), Finish::TimedOut);
+                return done(Vec::new(), Finish::TimedOut, cache);
             }
             logits = self.forward(chunk, &mut cache, Logits::Last, None)?;
         }
         let mut out = Vec::new();
         loop {
             if out.len() == opts.max_new {
-                return done(out, Finish::Length);
+                return done(out, Finish::Length, cache);
             }
             if cancel.load(Ordering::Acquire) {
-                return done(out, Finish::Cancelled);
+                return done(out, Finish::Cancelled, cache);
             }
             let next = sample(&logits, opts.sampling, &mut rng);
             if self.tokenizer.eos_ids().contains(&next) {
-                return done(out, Finish::Eos);
+                return done(out, Finish::Eos, cache);
             }
             out.push(next);
             if !on_token(next) {
-                return done(out, Finish::Stopped);
+                return done(out, Finish::Stopped, cache);
             }
             if out.len() == opts.max_new {
-                return done(out, Finish::Length);
+                return done(out, Finish::Length, cache);
             }
             if cache.len() == cache.capacity() {
-                return done(out, Finish::ContextFull);
+                return done(out, Finish::ContextFull, cache);
             }
             if late() {
-                return done(out, Finish::TimedOut);
+                return done(out, Finish::TimedOut, cache);
             }
             logits = self.forward(&[next], &mut cache, Logits::Last, None)?;
         }
@@ -1459,7 +1591,7 @@ impl Engine {
     /// for concurrent conversations: the memory plan must still keep one expert slot
     /// per layer with all reservations' KV in RAM (ADR-005). Without a plan (a fixed
     /// expert cache) every reservation is granted. Dropping the reservation returns the
-    /// room.
+    /// room. Retained KV never stands in the way: it is evicted to make room.
     ///
     /// # Errors
     /// [`RuntimeError::Memory`] if the reservations together would not fit.
@@ -1484,6 +1616,7 @@ impl Engine {
                 Ordering::Relaxed,
             ) {
                 Ok(_) => {
+                    self.make_room(total);
                     return Ok(KvReservation {
                         reserved: Arc::clone(&self.kv_reserved),
                         positions: want,

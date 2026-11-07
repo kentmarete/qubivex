@@ -344,10 +344,16 @@ async fn metrics_text(State(st): State<Arc<AppState>>) -> Response {
         ("qubivex_generation_slots_free", "gauge"),
         ("qubivex_queue_depth", "gauge"),
         ("qubivex_queue_rejected_total", "counter"),
+        ("qubivex_prefix_cache_lookups_total", "counter"),
+        ("qubivex_prefix_cache_hits_total", "counter"),
+        ("qubivex_prefix_cache_tokens_reused_total", "counter"),
+        ("qubivex_prefix_cache_evictions_total", "counter"),
+        ("qubivex_prefix_cache_positions", "gauge"),
     ] {
         out.push_str(&format!("# TYPE {name} {kind}\n"));
         for (id, l) in &models {
             let q = l.scheduler.stats();
+            let p = l.engine.prefix_stats();
             let v = match name {
                 "qubivex_kv_reserved_positions" => l.engine.kv_reserved() as u64,
                 "qubivex_expert_cache_bytes" => l.engine.expert_cache_bytes(),
@@ -355,7 +361,12 @@ async fn metrics_text(State(st): State<Arc<AppState>>) -> Response {
                     st.cfg.max_concurrent.saturating_sub(q.running) as u64
                 }
                 "qubivex_queue_depth" => q.queued as u64,
-                _ => q.rejected,
+                "qubivex_queue_rejected_total" => q.rejected,
+                "qubivex_prefix_cache_lookups_total" => p.lookups,
+                "qubivex_prefix_cache_hits_total" => p.hits,
+                "qubivex_prefix_cache_tokens_reused_total" => p.tokens_reused,
+                "qubivex_prefix_cache_evictions_total" => p.evicted,
+                _ => p.cost,
             };
             out.push_str(&format!("{name}{{model=\"{id}\"}} {v}\n"));
         }
@@ -383,6 +394,7 @@ async fn system(State(st): State<Arc<AppState>>, headers: HeaderMap) -> Response
             .map(|(id, l)| {
                 let e = &l.engine;
                 let queue = l.scheduler.stats();
+                let prefix = e.prefix_stats();
                 let ledger = e.ledger().snapshot(qubivex_memory::Tier::Ram);
                 json!({
                     "id": id,
@@ -393,6 +405,14 @@ async fn system(State(st): State<Arc<AppState>>, headers: HeaderMap) -> Response
                     "queue_depth": queue.queued,
                     "queue_limit": st.cfg.max_queue,
                     "kv_reserved_positions": e.kv_reserved(),
+                    "prefix_cache": {
+                        "entries": prefix.entries,
+                        "positions": prefix.cost,
+                        "lookups": prefix.lookups,
+                        "hits": prefix.hits,
+                        "tokens_reused": prefix.tokens_reused,
+                        "evicted": prefix.evicted,
+                    },
                     "expert_cache_bytes": e.expert_cache_bytes(),
                     "plan_budget_bytes": e.memory_plan().map(|p| p.ram.budget.bytes.0),
                     "ledger_bytes": {
@@ -627,9 +647,11 @@ async fn generate(
                 Some(Event::Done {
                     finish,
                     completion_tokens,
+                    cached_tokens,
                 }) => {
                     drop(guard);
-                    return Ok(reply.whole(&text, finish, completion_tokens));
+                    let tokens = usage(prompt_tokens, completion_tokens, cached_tokens);
+                    return Ok(reply.whole(&text, finish, tokens));
                 }
                 Some(Event::Failed(e)) => return Err(e),
                 Some(Event::Started { .. }) | None => return Err(ApiError::internal(rid)),
@@ -660,7 +682,7 @@ struct Reply {
 
 impl Reply {
     /// The whole answer of a non-streaming request.
-    fn whole(&self, text: &str, finish: FinishReason, completion_tokens: usize) -> Response {
+    fn whole(&self, text: &str, finish: FinishReason, usage: Value) -> Response {
         let choice = match self.kind {
             Kind::Chat => json!({
                 "index": 0,
@@ -685,7 +707,7 @@ impl Reply {
             "created": self.created,
             "model": self.model,
             "choices": [choice],
-            "usage": usage(self.prompt_tokens, completion_tokens),
+            "usage": usage,
         }))
         .into_response()
     }
@@ -755,6 +777,7 @@ impl Reply {
                 Some(Event::Done {
                     finish,
                     completion_tokens,
+                    cached_tokens,
                 }) => {
                     let last = self.chunk(&json!({}), Some(finish.as_str()));
                     let _ = send(last.to_string()).await;
@@ -762,7 +785,7 @@ impl Reply {
                         let totals = json!({
                             "id": self.id, "object": self.object(), "created": self.created,
                             "model": self.model, "choices": [],
-                            "usage": usage(self.prompt_tokens, completion_tokens),
+                            "usage": usage(self.prompt_tokens, completion_tokens, cached_tokens),
                         });
                         let _ = send(totals.to_string()).await;
                     }
@@ -781,11 +804,12 @@ impl Reply {
     }
 }
 
-fn usage(prompt: usize, completion: usize) -> Value {
+fn usage(prompt: usize, completion: usize, cached: usize) -> Value {
     json!({
         "prompt_tokens": prompt,
         "completion_tokens": completion,
         "total_tokens": prompt + completion,
+        "prompt_tokens_details": { "cached_tokens": cached },
     })
 }
 
@@ -909,6 +933,7 @@ mod tests {
             tx.send(Event::Done {
                 finish: FinishReason::Stop,
                 completion_tokens: 4,
+                cached_tokens: 0,
             })
             .await
             .unwrap();

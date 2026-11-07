@@ -12,10 +12,11 @@ use std::net::TcpStream;
 use std::time::Duration;
 
 use common::{
-    Resp, engine, http, meta, post, reference, request, root, slow_engine, start, text_of,
+    Resp, engine, http, meta, opts, post, reference, request, root, slow_engine, start, text_of,
     wait_until,
 };
 use qubivex_api::{Gateway, MemoryPolicy, ServerConfig};
+use qubivex_runtime::{Engine, EngineOptions};
 use serde_json::{Value, json};
 
 #[test]
@@ -285,6 +286,78 @@ fn kv_admission_refuses_what_the_plan_cannot_hold() {
     assert_eq!(r.status, 200, "{}", String::from_utf8_lossy(&r.body));
     drop(held);
     wait_until("every conversation to end", || metrics.active() == 0);
+}
+
+/// A reused prefix over HTTP: the same answer, reported in `usage`, per client. A client
+/// that claims another `user` does not reach what the first kept.
+#[test]
+fn a_repeated_prompt_reuses_kv_within_a_client() {
+    let gw = Gateway::new(ServerConfig::default());
+    let on = EngineOptions {
+        prefix_cache_bytes: 64 << 20,
+        ..opts()
+    };
+    gw.add_model("on", Engine::load(meta("olmoe-tiny"), on).unwrap())
+        .unwrap();
+    gw.add_model("off", engine("olmoe-tiny")).unwrap();
+    let s = start(&gw);
+    let ask = |model: &str, user: &str, stream: bool| {
+        let mut b = json!({
+            "model": model, "user": user, "temperature": 0, "max_tokens": 6, "stream": stream,
+            "prompt": "the quick brown fox jumps over the lazy dog ".repeat(4),
+        });
+        if stream {
+            b["stream_options"] = json!({ "include_usage": true });
+        }
+        let r = post(s.addr, "/v1/completions", &b);
+        assert_eq!(r.status, 200, "{}", String::from_utf8_lossy(&r.body));
+        r
+    };
+    let cached = |r: &Value| r["usage"]["prompt_tokens_details"]["cached_tokens"].as_u64();
+    let first = ask("on", "a", false).json();
+    let prompt = first["usage"]["prompt_tokens"].as_u64().unwrap();
+    assert!(prompt > 40, "{prompt}");
+    assert_eq!(cached(&first), Some(0));
+    let again = ask("on", "a", false).json();
+    assert_eq!(cached(&again), Some(prompt - 1));
+    assert_eq!(again["choices"], first["choices"]);
+    let off = ask("off", "a", false).json();
+    assert_eq!(
+        off["choices"], first["choices"],
+        "the same as with no reuse"
+    );
+    assert_eq!(cached(&off), Some(0));
+    assert_eq!(cached(&ask("on", "b", false).json()), Some(0));
+
+    let events = ask("on", "a", true).events();
+    let totals: Value = serde_json::from_str(&events[events.len() - 2]).unwrap();
+    assert_eq!(cached(&totals), Some(prompt - 1), "and when streaming");
+
+    let text = String::from_utf8(http(s.addr, "GET", "/metrics", &[], None).body).unwrap();
+    assert!(
+        text.contains("qubivex_prefix_cache_hits_total{model=\"on\"} 2"),
+        "{text}"
+    );
+    assert!(
+        text.contains("qubivex_prefix_cache_lookups_total{model=\"on\"} 4"),
+        "{text}"
+    );
+    assert!(
+        text.contains("qubivex_prefix_cache_lookups_total{model=\"off\"} 0"),
+        "{text}"
+    );
+    let system = http(s.addr, "GET", "/v1/system", &[], None).json();
+    let cache = system["models"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|m| m["id"] == "on")
+        .unwrap()["prefix_cache"]
+        .clone();
+    assert_eq!(
+        (cache["entries"].as_u64(), cache["hits"].as_u64()),
+        (Some(2), Some(2))
+    );
 }
 
 #[test]

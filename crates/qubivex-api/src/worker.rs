@@ -55,6 +55,7 @@ pub(crate) enum Event {
     Done {
         finish: FinishReason,
         completion_tokens: usize,
+        cached_tokens: usize,
     },
     Failed(ApiError),
 }
@@ -99,6 +100,9 @@ pub(crate) fn request(
         stops: params.stops.clone(),
         prefill_chunk,
         deadline: None,
+        // Retained KV is shared within a client and never across clients, because a
+        // reused prefix is faster and so shows that someone already sent it (ADR-016).
+        cache_scope: params.client.clone(),
     }
 }
 
@@ -194,6 +198,7 @@ fn run(job: Job, tx: &mpsc::Sender<Event>) {
             let _ = send(Event::Done {
                 finish,
                 completion_tokens: o.completion_tokens,
+                cached_tokens: o.cached_tokens,
             });
         }
         Err(e) => {
