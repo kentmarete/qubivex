@@ -114,8 +114,7 @@ impl<V> PrefixCache<V> {
         self.clock
     }
 
-    /// The entry of `scope` sharing the longest prefix with `prompt`, the latest used on
-    /// a tie, or `None` below [`MIN_REUSE`] tokens. The last token of the prompt is never
+    /// The entry of `scope` sharing the longest prefix with `prompt`, or `None` below [`MIN_REUSE`] tokens. The last token of the prompt is never
     /// reused: its logits are what the caller needs, and only a pass produces them.
     pub fn lookup(&mut self, scope: Option<&str>, prompt: &[u32]) -> Option<Hit<V>> {
         self.stats.lookups += 1;
@@ -126,10 +125,7 @@ impl<V> PrefixCache<V> {
                 continue;
             }
             let shared = common_prefix(&e.tokens, prompt).min(limit);
-            let better = best.is_none_or(|(n, at)| {
-                shared > n || (shared == n && e.used > self.entries[at].used)
-            });
-            if shared >= MIN_REUSE && better {
+            if shared >= MIN_REUSE && best.is_none_or(|(n, _)| shared > n) {
                 best = Some((shared, i));
             }
         }

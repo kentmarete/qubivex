@@ -255,6 +255,8 @@ fn retained_kv_stays_within_its_budget() {
     }
     let s = e.prefix_stats();
     assert_eq!((s.entries, s.cost, s.evicted), (2, 512, 1));
+    // The ledger follows the eviction, not the cache the last pass wrote.
+    assert_eq!(e.ledger().snapshot(Tier::Ram).kv.0, 512 * per);
     assert_eq!(generate(&e, &prompts[0], &gen_opts(2)).cached_tokens, 0);
     assert_eq!(generate(&e, &prompts[2], &gen_opts(2)).cached_tokens, 99);
 
@@ -315,6 +317,20 @@ fn running_requests_take_room_from_retained_kv() {
     let rest = [e.reserve_kv(256).unwrap(), e.reserve_kv(256).unwrap()];
     assert_eq!(e.prefix_stats().cost, 0);
     drop((one, rest));
+}
+
+/// A request's KV moves to the cache while its reservation is still held; it is one
+/// set of positions, not two.
+#[test]
+fn a_finishing_request_is_not_counted_twice() {
+    let e = tight("olmoe-tiny", 3);
+    for s in 1..=2 {
+        generate(&e, &toks(s, 100), &gen_opts(2));
+    }
+    let held = e.reserve_kv(256).unwrap();
+    generate(&e, &toks(3, 100), &gen_opts(2));
+    assert_eq!(e.prefix_stats().entries, 3, "{:?}", e.prefix_stats());
+    drop(held);
 }
 
 #[test]

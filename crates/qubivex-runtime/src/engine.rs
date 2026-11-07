@@ -1306,8 +1306,7 @@ impl Engine {
     }
 
     /// Evicts retained KV until the plan holds it beside `live` positions, and returns
-    /// the positions still retained. Nothing goes if `live` alone cannot fit: evicting
-    /// would not help, and the caller is about to refuse.
+    /// the positions still retained.
     fn make_room(&self, live: usize) -> u64 {
         let Some(r) = &self.retained else {
             return 0;
@@ -1315,16 +1314,18 @@ impl Engine {
         let mut r = lock_retained(r);
         if let Some(plan) = &self.memory.plan {
             let live = live as u64;
-            if plan.expert_cache_for(live).is_ok() {
-                while plan.expert_cache_for(live + r.cost()).is_err() && r.evict_oldest() {}
-            }
+            while plan.expert_cache_for(live + r.cost()).is_err() && r.evict_oldest() {}
         }
         r.cost()
     }
 
     /// Fills the empty `cache` from retained KV sharing a prefix with `prompt`, and
-    /// returns how many positions it holds. Passes take turns, and so does this: the copy
-    /// is a device submission on Metal, and it allocates what a pass would.
+    /// returns how many positions it holds. The request's reservation already prices
+    /// the copy, and its first pass sizes the expert cache.
+    ///
+    /// The copy takes a turn like a pass. No test shows that it must: the device lock
+    /// orders submissions. It is kept because device KV has only ever been allocated
+    /// under the turn, and the cost is at most one pass of waiting.
     fn restore(
         &self,
         scope: Option<&str>,
@@ -1338,7 +1339,6 @@ impl Engine {
             return Ok(0);
         };
         let _turn = self.steps.wait();
-        self.fit_room(cache, hit.reuse)?;
         if let Some(g) = &self.gpu {
             g.restore(&hit.value, cache, hit.reuse)?;
         } else {

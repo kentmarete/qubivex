@@ -171,7 +171,7 @@ What QUBIVEX adds over a straight port:
 | Models | Manifest v1, architecture registry, the `transformer_moe` and `transformer_dense` architectures, full cross-validation of manifest, config and tensors, discovery, automatic manifest import |
 | Inference | CPU forward pass for `transformer_moe` (OLMoE, Qwen3-MoE) and `transformer_dense` (dense Qwen3, Llama-style): lossless kernels for f32, f16, bf16, Q8_0, Q4_K and Q6_K; an expert cache of any size with leases and LRU eviction; KV cache; greedy, temperature and top-p sampling; chat templates |
 | Tokenizers | Hugging Face `tokenizer.json`, or rebuilt from a GGUF file's vocabulary (verified identical to the official tokenizer) |
-| Serving | `qubivex serve`: OpenAI-compatible `/v1/chat/completions` and `/v1/completions` (streaming or not), `/v1/models`, `/health`, `/metrics`, `/v1/system`, model load and unload; a bounded queue with priorities and deadlines, shared load of a model, independent KV per conversation, admission against the memory plan, cancellation when a client disconnects, a shutdown that drains (ADR-015) |
+| Serving | `qubivex serve`: OpenAI-compatible `/v1/chat/completions` and `/v1/completions` (streaming or not), `/v1/models`, `/health`, `/metrics`, `/v1/system`, model load and unload; a bounded queue with priorities and deadlines, shared load of a model, independent KV per conversation, prefix reuse of retained KV (ADR-016), admission against the memory plan, cancellation when a client disconnects, a shutdown that drains (ADR-015) |
 | CLI | `qubivex run`, `qubivex serve`, `qubivex bench`, `qubivex system`, `qubivex doctor --storage`, `qubivex models search / pull / list / inspect / analyse / import / migrate / verify / remove / architectures` |
 
 See the [Roadmap](#roadmap) for what is next.
@@ -343,8 +343,8 @@ r = client.chat.completions.create(model="qwen3-0.6b",
 |---|---|
 | `POST /v1/chat/completions`, `POST /v1/completions` | Streaming (SSE, `stream_options.include_usage`) or not; `max_tokens`, `temperature`, `top_k`, `top_p`, `seed`, `stop`. Scheduling: `priority` (`low`, `normal`, `high`), `timeout` (seconds, queue included), `user` (the client, for fairness). Refused, not ignored: `n > 1`, tools, logprobs, penalties |
 | `GET /v1/models`, `GET /v1/models/{id}` | The loaded models |
-| `GET /health`, `GET /metrics` | Liveness; Prometheus counters (requests, tokens, cancellations, reserved KV, queue depth) |
-| `GET /v1/system` | Hardware, each model's memory (plan, ledger, reserved KV, free slots, queue) and state |
+| `GET /health`, `GET /metrics` | Liveness; Prometheus counters (requests, tokens, cancellations, reserved KV, queue depth, prefix cache) |
+| `GET /v1/system` | Hardware, each model's memory (plan, ledger, reserved KV, prefix cache, free slots, queue) and state |
 | `POST /v1/models/load` `{"model": ID}`, `POST /v1/models/unload` `{"model": ID}` | With `--admin-token` only. Concurrent loads share one load. `POST /v1/admin/models` and `DELETE /v1/admin/models/{id}` are aliases |
 
 | Option | Default | |
@@ -357,6 +357,7 @@ r = client.chat.completions.create(model="qwen3-0.6b",
 | `--memory-policy queue\|refuse` | `queue` | When a request's memory is not free yet: wait for it, or answer 503 |
 | `--stall-timeout S` | 30 | End a stream the client has stopped reading |
 | `--shutdown-grace S` | 30 | How long running requests get to finish at shutdown, before they stop |
+| `--prefix-cache-mb N` | 0 | Finished KV to keep per model, so a prompt that repeats a prefix (a chat's earlier turns) skips it. Same tokens; reported as `usage.prompt_tokens_details.cached_tokens`. Not shared between `user` values (ADR-016) |
 | `--default-max-tokens N` | 512 | When a request does not set `max_tokens` |
 | `--request-timeout S` | 600 | A generation then ends with `finish_reason: "length"` |
 | memory, device, `--context`, `--threads` | as `qubivex run` | Per model |
@@ -368,6 +369,11 @@ passes of running conversations take turns, first come first served, and long pr
 in chunks, so one request cannot hold the others up for long. A client that disconnects
 cancels its generation within one chunk or one token. Errors follow OpenAI's shape, carry
 the `x-request-id`, and never contain file paths. ADR-015 has the concurrency model.
+
+With `--prefix-cache-mb`, a finished conversation's KV is kept, and the next request from
+the same `user` that starts with the same tokens copies it instead of running them again. On
+OLMoE-1B-7B a chat's second turn of 714 tokens took 0.57 s instead of 6.59 s, with the same
+text. A request that needs the memory takes it back first, and so does memory pressure.
 
 ### `qubivex system [--json]`
 
@@ -672,6 +678,7 @@ crates/qubivex-memory/    footprint, memory planner, ledger, pressure monitor
 crates/qubivex-runtime/   the engine: loading, generation, admission
 crates/qubivex-api/       the OpenAI-compatible HTTP gateway (`qubivex serve`)
 crates/qubivex-scheduler/ who runs and when: bounded queue, priorities, memory admission
+crates/qubivex-kv-cache/  which retained KV a prompt can reuse: prefix index, budget, LRU
 xtask/                    repository checks and fixture generator (`cargo xtask ...`)
 fixtures/models/          tiny generated models used by tests and the quick start
 spikes/                   standalone experiments (ADR-002 tensor-engine benchmark)
