@@ -1,6 +1,6 @@
 # ADR-015: The request scheduler and the concurrency model
 
-- Status: Proposed
+- Status: **Accepted (2026-11-08)** by owner decision, as merged in PR #38
 - Date: 2026-11-07
 
 ## Context

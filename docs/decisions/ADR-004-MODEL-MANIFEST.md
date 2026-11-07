@@ -1,6 +1,6 @@
 # ADR-004: Versioned JSON manifest, cross-validated, never trusted alone
 
-- Status: Proposed (Phase 0). Amendment 1 (2026-11-07): schema 1.1, with source, checksums
+- Status: **Accepted (2026-11-08)** by owner decision, with amendment 1. Amendment 1 (2026-11-07): schema 1.1, with source, checksums
   and a migration path.
 - Date: 2026-11-01
 
