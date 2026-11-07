@@ -1,6 +1,6 @@
 # ADR-016: The KV subsystem: retained KV and prefix reuse
 
-- Status: Proposed
+- Status: **Accepted (2026-11-07)** by owner decision, as merged in PR #39
 - Date: 2026-11-07
 
 ## Context
