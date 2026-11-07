@@ -1,6 +1,6 @@
 # QUBIVEX Implementation Status
 
-Last updated: 2026-11-07
+Last updated: 2026-11-08
 
 ## Current phase
 **KV subsystem done (2026-11-07); ADR-016, accepted 2026-11-07.** Job 6 of the platform plan.
@@ -10,9 +10,9 @@ Last updated: 2026-11-07
 - Tests: 459 passed, 0 failed, 1 ignored. 10 index tests, 19 in `tests/prefix.rs` (bit-identical logits from a restored cache; a session of prompts with reuse on and off giving identical sampled tokens on the CPU and both Metal placements; isolation; scopes; budget; ledger; eviction for reservations and the plan; pressure; cancellation; four racing threads), one over HTTP, one env-gated on OLMoE. Removing each of 33 rules: 29 caught, two only after adding the test each exposed; three rules were redundant and removed; one, the forward-pass turn around the restore copy, survives by design (ADR-016). ThreadSanitizer: no reports over the prefix and gateway tests on macOS; CI adds `--test prefix` on Linux.
 - Real model, OLMoE-1B-7B Q4_K_M on power: tokens identical with and without reuse on the CPU and Metal. Over HTTP with warm experts, a chat's second turn (714 tokens, 695 reused) took 0.57 s instead of 6.59 s and the third (738, 720) 0.45 s instead of 6.78 s, with identical text; another `user` got no hit. Single runs, not benchmarks; no kernel changed.
 - Limits (ADR-016): a running request's prefix exists twice (retained and its own copy) until paged KV; the scheduler does not prefer hits; `user` is unauthenticated, so scopes hold among honest clients (job 9); a fixed `--expert-cache-mb` has no plan, so only the budget bounds it.
-- **Next:** job 7 (batching design). ADR-016 was accepted on 2026-11-07; ADR-015 is Proposed for the owner to accept.
+- **Next:** job 7 (batching design). ADR-016 was accepted on 2026-11-07 and ADR-015 on 2026-11-08.
 
-**Concurrency correctness and the scheduler done (2026-11-07); ADR-015.** Job 5 of the platform plan, the gate on batching.
+**Concurrency correctness and the scheduler done (2026-11-07); ADR-015, accepted 2026-11-08.** Job 5 of the platform plan, the gate on batching.
 - New crate `qubivex-scheduler`, no dependencies: a queue bounded by count, priorities with aging, fewest-running-first per client, and memory admission that waits or refuses. The runtime gains `Engine::prepare` and `run_prepared`, so an embedding application can schedule the same way. Deadlines are now checked before each prefill chunk too.
 - Gateway: `--max-queue`, `--memory-policy`, `--stall-timeout`, `--shutdown-grace`; `priority`, `timeout` and `user` request fields; `POST /v1/models/load` and `/unload`; concurrent loads share one load and one directory has one instance; loading, loaded and failed states in `/v1/system`; unloading ends waiters and lets running requests finish; shutdown drains.
 - Fixed, not in the audit: a client that kept its connection open and stopped reading held its slot and KV indefinitely, because the worker blocked in a channel send where neither the cancel flag nor the deadline was checked. A stream now ends after `--stall-timeout`.
@@ -487,12 +487,12 @@ Development moved to an **Apple M3 Pro (arm64, 18 GB RAM, macOS)** with about 37
 - Apple GPU: Metal becomes the locally testable GPU backend. CUDA still needs other hardware.
 
 ## Pending review decisions
-1. Synchronous lease-based expert store instead of the specification's async trait (ADR-006).
+1. ~~Synchronous lease-based expert store instead of the specification's async trait (ADR-006)~~: accepted with ADR-006 (2026-11-08).
 2. ~~11 initial crates instead of about 25 (ADR-001)~~: accepted with ADR-001 (2026-11-06).
-3. Merged architecture factory with `tensor_schema` (ADR-003).
+3. ~~Merged architecture factory with `tensor_schema` (ADR-003)~~: accepted with ADR-003 (2026-11-08).
 4. Minimal expert store moved into Phase 4 (MIGRATION_PLAN §3).
 5. Reference model: OLMoE-1B-7B-0125-Instruct, plus a tiny Qwen3-MoE fixture.
-6. Optional expert-packed container layout (ADR-006).
+6. ~~Optional expert-packed container layout (ADR-006)~~: accepted with ADR-006 (2026-11-08).
 7. Keep prefetch (Phase 7) before GPU (Phase 8).
 8. Treat failure handling as P0.
 9. No lossy option in any execution profile.
@@ -514,6 +514,6 @@ ADR-002 spike, M3 Pro: [`docs/performance/ADR-002-SPIKE.md`](docs/performance/AD
 
 ## Architectural decisions
 Register and proposed status changes: `docs/engineering/ARCHITECTURE_DECISIONS.md` §1.
-- Accepted: ADR-001 (workspace, phase-gated crates; 2026-11-06), ADR-016 (KV subsystem: retained KV and prefix reuse; 2026-11-07), ADR-002 (hybrid, no Candle; amendment 1: own register-blocked prefill instead of `gemm`, spinning pool deferred), ADR-009 (tensor descriptors), ADR-010 (numerical precision).
+- Accepted: ADR-001 (workspace, phase-gated crates; 2026-11-06), ADR-003 (architecture registry; 2026-11-08), ADR-004 (versioned manifest; 2026-11-08), ADR-006 (synchronous lease-based expert store, io_uring deferred; 2026-11-08), ADR-015 (scheduler and concurrency model; 2026-11-08), ADR-016 (KV subsystem: retained KV and prefix reuse; 2026-11-07), ADR-002 (hybrid, no Candle; amendment 1: own register-blocked prefill instead of `gemm`, spinning pool deferred), ADR-009 (tensor descriptors), ADR-010 (numerical precision).
 - Amended: ADR-007 (Metal first; device assignment fixed per execution plan).
-- Proposed: ADR-003, 004 and 006 are implemented and proposed for Accepted, awaiting owner review. ADR-005 and ADR-008 are not built yet.
+- Proposed: ADR-005 and ADR-008 are not built yet. ADR-014 is Proposed.
