@@ -9,8 +9,8 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use qubivex_arch::{
-    ArchError, DenseWeights, ExpertProvider, ExpertWeights, KvCache, Logits, Sources, Tracer,
-    Transformer,
+    ArchError, DenseWeights, ExpertProvider, ExpertWeights, KvCache, Logits, Segment, Sources,
+    Tracer, Transformer,
 };
 use qubivex_compute::WeightView;
 use qubivex_compute::host::PageAligned;
@@ -1425,19 +1425,7 @@ impl Engine {
         trace: Option<Tracer<'_>>,
     ) -> Result<Vec<f32>, RuntimeError> {
         let _turn = self.steps.wait();
-        // Memory pressure stops prefetch first (ADR-005): drop what is queued.
-        // So does a saturated disk: unused speculation costs throughput there.
-        let allowed = self.pressure().is_none_or(|d| d.prefetch) && !self.disk_saturated();
-        if !allowed && self.predictor.is_some() {
-            let _ = self.store.cancel_prefetch(None);
-        }
-        let predictor = self.predictor.as_ref().filter(|_| allowed);
-        if let Some(p) = predictor {
-            let mut p = p.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-            // A prediction never crosses a forward pass: the next one starts at layer 0.
-            p.pending = None;
-            p.issued = None;
-        }
+        let predictor = self.start_pass();
         if let Some(g) = &self.gpu {
             if trace.is_some() {
                 return Err(RuntimeError::Model(
@@ -1472,6 +1460,65 @@ impl Engine {
             .install(|| self.model.forward(tokens, cache, src, logits, trace));
         // Failed passes too: the ledger follows what the store and cache hold.
         self.account(cache.allocated_bytes());
+        Ok(out?)
+    }
+
+    /// The predictor a pass may use, with its state reset; `None` while memory
+    /// pressure or a saturated disk holds speculation, which also drops what is queued
+    /// (ADR-005).
+    fn start_pass(&self) -> Option<&Mutex<Predictor>> {
+        let allowed = self.pressure().is_none_or(|d| d.prefetch) && !self.disk_saturated();
+        if !allowed && self.predictor.is_some() {
+            let _ = self.store.cancel_prefetch(None);
+        }
+        let predictor = self.predictor.as_ref().filter(|_| allowed);
+        if let Some(p) = predictor {
+            let mut p = p.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            // A prediction never crosses a forward pass: the next one starts at layer 0.
+            p.pending = None;
+            p.issued = None;
+        }
+        predictor
+    }
+
+    /// One forward pass shared by several sequences, each with its own cache (see
+    /// [`Transformer::forward_batch`]). Each segment's logits have the bits
+    /// [`Engine::forward`] gives that segment alone.
+    ///
+    /// A prototype for ADR-017: the CPU forward pass only, and nothing schedules it
+    /// yet.
+    ///
+    /// # Errors
+    /// Architecture errors; [`RuntimeError::Model`] when layers run on Metal.
+    pub fn forward_batch(
+        &self,
+        segments: &mut [Segment<'_>],
+    ) -> Result<Vec<Vec<f32>>, RuntimeError> {
+        if self.gpu.is_some() {
+            return Err(RuntimeError::Model(
+                "batched passes need the CPU forward pass (not --metal-ops layers)".into(),
+            ));
+        }
+        let _turn = self.steps.wait();
+        let predictor = self.start_pass();
+        let provider = StoreProvider {
+            store: &self.store,
+            source: &self.source,
+            predictor,
+        };
+        let src = Sources {
+            dense: &self.dense,
+            experts: &provider,
+            backend: &self.backend,
+        };
+        for g in segments.iter() {
+            self.fit_room(g.cache, g.tokens.len())?;
+        }
+        let out = self
+            .pool
+            .install(|| self.model.forward_batch(segments, src));
+        let bytes = segments.iter().map(|g| g.cache.allocated_bytes()).sum();
+        self.account(bytes);
         Ok(out?)
     }
 

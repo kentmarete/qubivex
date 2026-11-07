@@ -204,6 +204,17 @@ pub enum Logits {
     All,
 }
 
+/// One sequence's part of a batched forward pass (see [`Transformer::forward_batch`]).
+#[derive(Debug)]
+pub struct Segment<'a> {
+    /// The sequence's new tokens, at positions `cache.len()..`.
+    pub tokens: &'a [u32],
+    /// The sequence's own keys and values.
+    pub cache: &'a mut KvCache,
+    /// Which of its logits to return.
+    pub logits: Logits,
+}
+
 /// A device backend's keys and values for a cache (see [`KvCache::device_mut`]).
 pub type DeviceKv = Box<dyn std::any::Any + Send + Sync>;
 
@@ -343,14 +354,6 @@ impl KvCache {
         }
         self.len = positions;
         Ok(())
-    }
-
-    /// Forgets the positions past `positions`. Reserved capacity is kept; rows past
-    /// the count are never read, and the next step overwrites them.
-    const fn rollback(&mut self, positions: usize) {
-        if positions < self.len {
-            self.len = positions;
-        }
     }
 
     /// Forgets every position.
@@ -766,8 +769,8 @@ impl Transformer {
     /// keys and values to `cache`. Returns logits: the last token's, or every token's
     /// (`tokens.len() × vocab`, row-major).
     ///
-    /// On an error the cache is rolled back to the positions it held before the call,
-    /// so the same tokens can be run again on it (a failed expert read must not leave
+    /// On an error the cache keeps the positions it held before the call, so the same
+    /// tokens can be run again on it (a failed expert read must not leave
     /// half a step of keys and values behind).
     ///
     /// # Errors
@@ -781,42 +784,79 @@ impl Transformer {
         logits: Logits,
         trace: Option<Tracer<'_>>,
     ) -> Result<Vec<f32>, ArchError> {
-        let p0 = cache.len;
-        let out = self.forward_unchecked(tokens, cache, src, logits, trace);
-        if out.is_err() {
-            cache.rollback(p0);
-        }
-        out
+        let mut one = [Segment {
+            tokens,
+            cache,
+            logits,
+        }];
+        let mut out = self.forward_segments(&mut one, src, trace)?;
+        Ok(out.pop().unwrap_or_default())
     }
 
-    #[allow(clippy::too_many_lines)]
-    fn forward_unchecked(
+    /// Runs several sequences through the model in one pass (ADR-017): each segment's
+    /// tokens at positions `cache.len()..` of its own cache. Returns each segment's
+    /// logits, in segment order, as [`Transformer::forward`] would return them for
+    /// that segment alone, with the same bits.
+    ///
+    /// Every step but attention is per token, and matmuls are batch-invariant, so the
+    /// segments share each weight read (and each routed expert's load) while every
+    /// token's arithmetic stays what it would be alone. Attention reads only the
+    /// token's own cache, at its own position.
+    ///
+    /// On an error every cache keeps the positions it held before the call.
+    ///
+    /// # Errors
+    /// As [`Transformer::forward`], for any segment.
+    pub fn forward_batch(
         &self,
-        tokens: &[u32],
-        cache: &mut KvCache,
+        segments: &mut [Segment<'_>],
         src: Sources<'_>,
-        logits: Logits,
+    ) -> Result<Vec<Vec<f32>>, ArchError> {
+        self.forward_segments(segments, src, None)
+    }
+
+    /// Positions are counted in the caches only once the whole pass has succeeded, so
+    /// a failure anywhere leaves every cache as it was.
+    #[allow(clippy::too_many_lines)]
+    fn forward_segments(
+        &self,
+        segments: &mut [Segment<'_>],
+        src: Sources<'_>,
         mut trace: Option<Tracer<'_>>,
-    ) -> Result<Vec<f32>, ArchError> {
+    ) -> Result<Vec<Vec<f32>>, ArchError> {
         let (dense, experts, be) = (src.dense, src.experts, src.backend);
         let c = &self.cfg;
+        // Each segment's first token in the batch, token count and first position.
+        let mut layout = Vec::with_capacity(segments.len());
+        let mut tokens = Vec::new();
+        for g in segments.iter() {
+            let (p0, n) = (g.cache.len, g.tokens.len());
+            if g.cache.k.len() != self.norms.len() || g.cache.v.len() != self.norms.len() {
+                return Err(ArchError::Input(format!(
+                    "KV cache has {} layers, the model {}",
+                    g.cache.k.len(),
+                    self.norms.len()
+                )));
+            }
+            if p0 + n > g.cache.max {
+                return Err(ArchError::Input(format!(
+                    "context full: {} positions + {n} new > {}",
+                    p0, g.cache.max
+                )));
+            }
+            layout.push((tokens.len(), n, p0));
+            tokens.extend_from_slice(g.tokens);
+        }
         let s = tokens.len();
         if s == 0 {
-            return Ok(Vec::new());
+            return Ok(vec![Vec::new(); segments.len()]);
         }
-        let p0 = cache.len;
-        if cache.k.len() != self.norms.len() || cache.v.len() != self.norms.len() {
-            return Err(ArchError::Input(format!(
-                "KV cache has {} layers, the model {}",
-                cache.k.len(),
-                self.norms.len()
-            )));
-        }
-        if p0 + s > cache.max {
-            return Err(ArchError::Input(format!(
-                "context full: {} positions + {s} new > {}",
-                p0, cache.max
-            )));
+        // Per token: its segment and its position in that segment's sequence.
+        let mut seg_of = Vec::with_capacity(s);
+        let mut pos = Vec::with_capacity(s);
+        for (i, &(_, n, p0)) in layout.iter().enumerate() {
+            seg_of.extend(std::iter::repeat_n(i, n));
+            pos.extend(p0..p0 + n);
         }
         let h = usize_of(c.hidden)?;
         let d = usize_of(c.head_dim)?;
@@ -931,9 +971,8 @@ impl Transformer {
                 }
                 _ => {}
             }
-            cache.reserve(l, p0 + s)?;
             for t in 0..s {
-                self.rope.table(p0 + t, &mut rope_cs);
+                self.rope.table(pos[t], &mut rope_cs);
                 q[t * q_out..(t + 1) * q_out]
                     .chunks_exact_mut(d)
                     .for_each(|hd| Rope::rotate(hd, &rope_cs));
@@ -941,18 +980,31 @@ impl Transformer {
                     .chunks_exact_mut(d)
                     .for_each(|hd| Rope::rotate(hd, &rope_cs));
             }
-            cache.store(l, s, &k, &v)?;
-            // Every (token, head) pair is independent once the cache holds the whole
-            // batch, so they run in parallel; each is the same sequential `attend`.
-            let (kl, vl) = cache.heads(l, p0 + s)?;
+            for (g, &(first, n, p0)) in segments.iter_mut().zip(&layout) {
+                if n > 0 {
+                    let rows = first * kv_out..(first + n) * kv_out;
+                    g.cache.reserve(l, p0 + n)?;
+                    g.cache.store(l, n, &k[rows.clone()], &v[rows])?;
+                }
+            }
+            // Every (token, head) pair is independent once each cache holds its
+            // segment, so they run in parallel; each is the same sequential `attend`
+            // over its own sequence's keys and values.
+            let kv = segments
+                .iter()
+                .zip(&layout)
+                .map(|(g, &(_, n, p0))| g.cache.heads(l, p0 + n))
+                .collect::<Result<Vec<_>, _>>()?;
             att.par_chunks_mut(d)
                 .enumerate()
                 .for_each_init(Vec::new, |scores, (i, out)| {
                     let (t, hd) = (i / heads, i % heads);
                     let g = hd / group;
+                    let (kl, vl) = &kv[seg_of[t]];
                     let qs = &q[t * q_out + hd * d..t * q_out + (hd + 1) * d];
-                    attend(qs, kl[g], vl[g], p0 + t, out, scores);
+                    attend(qs, kl[g], vl[g], pos[t], out, scores);
                 });
+            drop(kv);
             be.matmul(&dense.view(&n(&c.names.o))?, &att, s, &mut o)?;
             for t in 0..s {
                 emit(
@@ -1112,17 +1164,23 @@ impl Transformer {
                 );
             }
         }
-        cache.len += s;
-
-        // Final norm and head, for the tokens whose logits are wanted.
-        let first = match logits {
-            Logits::Last => s - 1,
-            Logits::All => 0,
-        };
-        let m = s - first;
-        let mut xf = hs[first * h..].to_vec();
-        for xt in xf.chunks_exact_mut(h) {
-            rms_norm(xt, &self.final_norm, c.rms_eps);
+        // Final norm and head, for the tokens whose logits are wanted: one matmul over
+        // every segment's rows.
+        let wanted: Vec<std::ops::Range<usize>> = segments
+            .iter()
+            .zip(&layout)
+            .map(|(g, &(first, n, _))| match (g.logits, n) {
+                (_, 0) => first..first,
+                (Logits::Last, _) => first + n - 1..first + n,
+                (Logits::All, _) => first..first + n,
+            })
+            .collect();
+        let rows: Vec<usize> = wanted.iter().flat_map(Clone::clone).collect();
+        let m = rows.len();
+        let mut xf = vec![0f32; m * h];
+        for (dst, &t) in xf.chunks_exact_mut(h).zip(&rows) {
+            dst.copy_from_slice(&hs[t * h..(t + 1) * h]);
+            rms_norm(dst, &self.final_norm, c.rms_eps);
         }
         let head = if c.tie_embeddings {
             emb
@@ -1131,15 +1189,29 @@ impl Transformer {
         };
         let mut out = vec![0f32; m * vocab];
         be.matmul(&head, &xf, m, &mut out)?;
-        for t in 0..m {
+        for (j, &t) in rows.iter().enumerate() {
             emit(
                 TracePoint::Logits,
                 None,
-                first + t,
-                &out[t * vocab..(t + 1) * vocab],
+                t,
+                &out[j * vocab..(j + 1) * vocab],
                 &[],
             );
         }
-        Ok(out)
+        for (g, &(_, n, _)) in segments.iter_mut().zip(&layout) {
+            g.cache.len += n;
+        }
+        if let [_] = wanted.as_slice() {
+            return Ok(vec![out]);
+        }
+        let mut at = 0;
+        Ok(wanted
+            .iter()
+            .map(|r| {
+                let n = r.len() * vocab;
+                at += n;
+                out[at - n..at].to_vec()
+            })
+            .collect())
     }
 }
