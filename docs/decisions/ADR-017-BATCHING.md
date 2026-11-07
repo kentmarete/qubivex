@@ -115,8 +115,8 @@ predicting the union is worth adding when experts stream; it changes no bits eit
 
 ## The prototype (job 7)
 Built in this job: `Transformer::forward_batch`, `Segment`, `Engine::forward_batch` (CPU
-only, not yet called by the generation loop), `tests/batch.rs`, and the measurement
-`examples/batch.rs`. Section 2 to 5 are job 8.
+only, not yet called by the generation loop), `tests/batch.rs`, the measurement
+`examples/batch.rs` and the `batch_s<N>` kernel benchmark. Section 2 to 5 are job 8.
 
 ### Tests
 `tests/batch.rs`, on the four fixtures (three MoE, one dense):
@@ -139,10 +139,84 @@ counting positions after the head instead removed the need for it, and
 `KvCache::rollback` was deleted.
 
 ### Measurements
-<!-- MEASUREMENTS -->
+On power, M3 Pro, OLMoE-1B-7B-0125-Instruct Q4_K_M, 5 compute threads, 2026-11-08.
+`examples/batch.rs`: greedy decode of N different prompts, 32 tokens each, one pass per
+sequence per step against one `forward_batch` per step, median of 3 interleaved runs.
+Prefill is per sequence and not timed.
+
+All experts resident:
+
+| N | sequential tok/s | batched tok/s | speed-up | tokens identical |
+|---:|---:|---:|---:|---|
+| 1 | 33.34 | 37.48 | 1.12x | yes |
+| 2 | 41.01 | 28.22 | 0.69x | yes |
+| 4 | 36.69 | 32.78 | 0.89x | yes |
+| 8 | 35.68 | 35.28 | 0.99x | yes |
+
+1024 MiB expert cache (experts stream):
+
+| N | sequential tok/s | batched tok/s | speed-up | tokens identical |
+|---:|---:|---:|---:|---|
+| 1 | 32.69 | 34.93 | 1.07x | yes |
+| 2 | 31.05 | 25.89 | 0.83x | yes |
+| 4 | 27.78 | 16.33 | 0.59x | yes |
+| 8 | 28.15 | 28.12 | 1.00x | yes |
+
+At N = 1 both columns run the same code, so their 7 to 12% gap is this harness's noise.
+**The tokens are identical at every size, but sharing a pass gives no throughput on
+the CPU today, and costs up to 41% at N = 2 to 4.**
+
+The cause is the CPU kernel at 2 to 5 activation rows, not the pass. On Apple silicon,
+one row uses a fused dequantise-and-dot kernel; 2 to 5 rows fall back to the portable
+path (dequantise each weight row into a buffer, then one portable dot per activation
+row); the register-blocked kernel starts at 6 (`tile::MIN_ROWS`). The new `batch_s<N>`
+group in `benches/kernels.rs` measures it, on the compute team (5 threads):
+
+| rows | Q4_K expert 1024×2048 | per row | Q6_K head 50304×2048 | per row |
+|---:|---:|---:|---:|---:|
+| 1 | 42.0 µs | 42.0 µs | 2.91 ms | 2.91 ms |
+| 2 | 129.9 µs | 65.0 µs | 12.06 ms | 6.03 ms |
+| 3 | 155.2 µs | 51.7 µs | 13.45 ms | 4.48 ms |
+| 4 | 180.2 µs | 45.1 µs | 14.20 ms | 3.55 ms |
+| 6 | 226.2 µs | 37.7 µs | 15.64 ms | 2.61 ms |
+| 8 | 259.9 µs | 32.5 µs | 17.33 ms | 2.17 ms |
+
+So a two-row matmul costs 1.5× (expert) and 2.1× (head) two one-row matmuls, and only
+from 6 rows does sharing the weight read pay, by at most 1.3× at 8 rows. In a decode
+batch every dense matmul and the head see N rows, and an expert sees the few tokens
+routed to it, mostly 1 or 2.
+
+Expert sharing is small at these widths anyway. With 8 of 64 experts per token,
+uniform routing gives N tokens about 64·(1 − (56/64)^N) distinct experts per layer:
+15 for 16 expert runs at N = 2, 26.5 for 32 at N = 4, 42 for 64 at N = 8. The saving
+that matters is the dense weights (attention projections and head, about a third of a
+token's weight bytes), read once per pass instead of once per sequence, and that saving
+depends on a matmul whose cost grows slowly with its row count.
+
+**Consequence for job 8: a fused kernel for 2 to 5 rows comes first.** It dequantises
+each weight block once, in registers, and accumulates it into up to 5 activation rows,
+with each row's lane order unchanged so the bits stay those of the one-row kernel
+(the same argument as `tile`, ADR-002 amendment 1). The combining point (section 2) is
+built only after that kernel shows a speed-up on this table; without it, combining
+would make concurrent decode slower than taking turns.
+
+Single-sequence regression check (`qubivex bench`, OLMoE, all resident, 3 interleaved
+rounds of main 7fa510b against this branch, defaults of 1 warm-up and 5 runs):
+
+| | main | branch |
+|---|---:|---:|
+| decode tok/s at the median step, median of rounds | 42.41 | 42.09 |
+| prefill tok/s, median of rounds | 43.10 | 43.32 |
+| tokens match main | | yes, every round |
+
+The 0.8% decode difference is inside the rounds' spread (41.87 to 43.18 on main), so
+routing `forward` through `forward_batch` costs nothing measurable. The `batch` example
+reports less than `qubivex bench` at N = 1 because it times whole steps including
+argmax and the per-step vectors, where `bench` reports the median step.
 
 ## Not built
-- Sections 2 to 7, which are job 8.
+- Sections 2 to 7, which are job 8, after the 2-to-5-row CPU kernel the measurements
+  call for.
 - **Paged KV.** Each sequence keeps its contiguous cache. Attention runs per (token,
   head) over that sequence's rows, so a batch needs no shared layout.
 - **Speculative decoding, beam search, `n > 1`.** They need several sequences per

@@ -109,10 +109,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             "--steps" => steps = value.parse()?,
             "--runs" => runs = value.parse()?,
             "--sizes" => {
-                sizes = value
-                    .split(',')
-                    .map(str::parse)
-                    .collect::<Result<_, _>>()?;
+                sizes = value.split(',').map(str::parse).collect::<Result<_, _>>()?;
             }
             _ => return Err(usage.into()),
         }
