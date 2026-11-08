@@ -1,11 +1,12 @@
 # ADR-006: Synchronous lease-based expert store with dedicated I/O threads
 
-- Status: Proposed (Phase 0). **This deviates from the specification's async trait.**
+- Status: **Accepted (2026-11-08)** by owner decision, for the synchronous lease model
+  and amendments 1 to 5. io_uring stays deferred until it is measured on a Linux host.
+  **This deviates from the specification's async trait.**
   The queue, I/O threads and `acquire_many` were built in Phase 6 (amendment 1), and
   direct I/O in slice 3 (amendment 2); io_uring is deferred. Failure behaviour and the
   fault-injection suite: amendment 3; deadlines, retries, mirrors and recorded
-  checksums: amendment 4; holding several leases of a batch: amendment 5. Awaiting
-  acceptance.
+  checksums: amendment 4; holding several leases of a batch: amendment 5.
 - Date: 2026-11-01
 
 ## Context

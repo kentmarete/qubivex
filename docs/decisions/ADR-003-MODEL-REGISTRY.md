@@ -1,6 +1,6 @@
 # ADR-003: Architecture registry keyed by manifest architecture id
 
-- Status: Proposed (Phase 0); accepted in practice (ARCHITECTURE_DECISIONS). Amendment 1
+- Status: **Accepted (2026-11-08)** by owner decision, with amendments 1 and 2. Amendment 1
   (2026-11-04): a second architecture, `transformer_dense`. Amendment 2 (2026-11-06): a
   registry of installed models.
 - Date: 2026-11-01
