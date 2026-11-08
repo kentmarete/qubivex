@@ -293,7 +293,7 @@ fn prefill(c: &mut Criterion) {
 /// step of N sequences sharing a pass gives each shared matmul (ADR-017).
 fn batch_rows(c: &mut Criterion) {
     let t = team_threads();
-    for s in [1, 2, 3, 4, 6, 8] {
+    for s in [1, 2, 3, 4, 5, 6, 8] {
         let name = format!("batch_s{s}_t{t}");
         matmul_group(c, &name, &[Q4_K], &EXPERT, s, t, false);
         matmul_group(c, &name, &[Q6_K], &[HEAD], s, t, false);

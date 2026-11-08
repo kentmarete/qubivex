@@ -9,9 +9,11 @@
 //! Supported dtypes: f32, f16, bf16, Q8_0, Q4_K and Q6_K.
 //!
 //! Paths, all with the same bits: one activation row (decode) uses a fused NEON row dot
-//! where there is one; six or more rows (prefill) use the register-blocked kernel in
-//! `tile`, which computes the same 64 lanes in a different grouping; everything else
-//! dequantises a row and takes one portable dot per output.
+//! where there is one, and two to five rows (a decode step over a few sequences) its
+//! multi-row form, which dequantises each weight once into every row; six or more rows
+//! (prefill) use the register-blocked kernel in `tile`, which computes the same 64
+//! lanes in a different grouping; everything else dequantises a row and takes one
+//! portable dot per output.
 //!
 //! On x86-64 the same portable source is also compiled with `avx2,fma` and selected
 //! at run time; `f32::mul_add` is correctly rounded either way, so both give the
@@ -116,6 +118,20 @@ fn fused(dtype: DType) -> Option<RowDot> {
     }
 }
 
+/// A fused multi-row dot for `dtype` (2 to `neon::MAX_ROWS` activation rows), if this
+/// CPU has one.
+#[cfg(target_arch = "aarch64")]
+fn fused_rows(dtype: DType) -> Option<neon::RowsDot> {
+    use qubivex_core::GgmlType;
+    match dtype {
+        DType::Ggml(GgmlType::Q4_K) => Some(neon::q4_k_rows),
+        DType::Ggml(GgmlType::Q6_K) => Some(neon::q6_k_rows),
+        DType::Ggml(GgmlType::Q8_0) => Some(neon::q8_0_rows),
+        DType::BF16 => Some(neon::bf16_rows),
+        _ => None,
+    }
+}
+
 fn rows(w: &WeightView<'_>, xs: &[f32], s: usize, r0: usize, out: &mut [f32], buf: &mut [f32]) {
     // One activation row (decode): fuse dequantization into the dot, without the
     // scratch row. The bits equal the portable path's (see `neon`).
@@ -124,6 +140,17 @@ fn rows(w: &WeightView<'_>, xs: &[f32], s: usize, r0: usize, out: &mut [f32], bu
         if let Some(dot) = fused(w.dtype()) {
             for (j, y) in out.iter_mut().enumerate() {
                 *y = dot(w.row(r0 + j), xs);
+            }
+            return;
+        }
+    }
+    // Two to five rows (a decode step over a few sequences): dequantise each weight
+    // once, in registers, into every row, with each row's lanes unchanged (`neon`).
+    #[cfg(target_arch = "aarch64")]
+    if (2..=neon::MAX_ROWS).contains(&s) {
+        if let Some(dot) = fused_rows(w.dtype()) {
+            for (j, o) in out.chunks_exact_mut(s).enumerate() {
+                dot(w.row(r0 + j), xs, o);
             }
             return;
         }
