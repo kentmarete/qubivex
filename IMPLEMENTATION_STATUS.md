@@ -3,11 +3,11 @@
 Last updated: 2026-11-08
 
 ## Current phase
-**Batching design done (2026-11-08); ADR-017, Proposed.** Job 7 of the platform plan.
+**Batching design done (2026-11-08); ADR-017, accepted 2026-11-08.** Job 7 of the platform plan.
 - `Transformer::forward_batch` over `Segment`s (a sequence's new tokens, its own `KvCache`, the logits it wants): everything per token runs once over the batch; RoPE, the KV write and attention use each token's own sequence. `forward` is `forward_batch` with one segment. `Engine::forward_batch` is public, CPU only, and not yet used by generation. Caches advance only after the whole pass succeeds, so `KvCache::rollback` was deleted.
 - Tests: 464 passed, 0 failed, 1 ignored. `tests/batch.rs`, 5 tests on the four fixtures (mixed decode and prefill segments, lock-step decode with sequences leaving, failure isolation, a one-expert cache, empty batches), each bit-identical to the sequences run alone. Three wrong rules (attention on the first cache, unshifted positions, RoPE at the batch index) each fail them.
 - Real model, OLMoE-1B-7B Q4_K_M on power (`examples/batch.rs`, N = 1, 2, 4, 8): tokens identical at every size, all resident and with a 1024 MiB expert cache, but no speed-up: 0.59x to 1.00x at N ≥ 2. The cause is the CPU matmul at 2 to 5 activation rows, which drops from the fused one-row kernel to the portable path: two rows cost 1.5x (Q4_K expert) and 2.1x (Q6_K head) two one-row calls (`batch_s<N>` in `benches/kernels.rs`). Single-sequence decode is unchanged: 42.41 tok/s on main against 42.09 on the branch over three interleaved rounds, tokens matching.
-- **Next:** job 8, starting with a fused 2-to-5-row CPU kernel with the one-row bits, then the combining point at the engine turn (ADR-017 §2–7). ADR-017 is Proposed for the owner to accept.
+- **Next:** job 8, starting with a fused 2-to-5-row CPU kernel with the one-row bits, then the combining point at the engine turn (ADR-017 §2–7). ADR-017 was accepted on 2026-11-08, with that order.
 
 **KV subsystem done (2026-11-07); ADR-016, accepted 2026-11-07.** Job 6 of the platform plan.
 - New crate `qubivex-kv-cache`, no dependencies: `PrefixCache`, which finds the retained KV sharing the longest prefix with a prompt, keeps a budget with LRU eviction, and holds one entry per conversation. The runtime keeps finished caches in it and copies a hit's prefix into the request's own cache (`KvCache::restore_from` on the host, `MetalForward::restore` on the device), so no running sequence shares KV memory. What is kept is what ran, also for a cancelled or late request; a failed pass keeps nothing.

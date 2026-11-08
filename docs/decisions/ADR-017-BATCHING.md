@@ -1,6 +1,6 @@
 # ADR-017: Continuous batching: sequences share a forward pass
 
-- Status: **Proposed (2026-11-07)**, for the owner to accept
+- Status: **Accepted (2026-11-08)** by owner decision, including the order for job 8: the 2-to-5-row CPU kernel first, then sections 2 to 7
 - Date: 2026-11-07
 
 ## Context
