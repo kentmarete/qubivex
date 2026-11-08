@@ -24,6 +24,8 @@
 //!   a 128-token prompt; the register-blocked kernel).
 //! - `prefill_s16`: 16 activation rows, what one expert sees in a 128-token prompt
 //!   (128 tokens × 8 routed / 64 experts).
+//! - `batch_s<N>`: N activation rows (1 to 8), the expert and head shapes: what each
+//!   shared matmul of a decode step over N sequences sees (ADR-017).
 //! - `dequant_row` and `dot`: the building blocks, one 2048-wide row.
 //!
 //! The team size is `QUBIVEX_BENCH_THREADS`, else the performance cores on macOS
@@ -287,6 +289,17 @@ fn prefill(c: &mut Criterion) {
     );
 }
 
+/// 1 to 8 activation rows on the team, the expert and head shapes: what a decode
+/// step of N sequences sharing a pass gives each shared matmul (ADR-017).
+fn batch_rows(c: &mut Criterion) {
+    let t = team_threads();
+    for s in [1, 2, 3, 4, 6, 8] {
+        let name = format!("batch_s{s}_t{t}");
+        matmul_group(c, &name, &[Q4_K], &EXPERT, s, t, false);
+        matmul_group(c, &name, &[Q6_K], &[HEAD], s, t, false);
+    }
+}
+
 fn blocks(c: &mut Criterion) {
     const K: usize = 2048;
     let mut g = c.benchmark_group("dequant_row");
@@ -325,6 +338,6 @@ fn config() -> Criterion {
 criterion_group! {
     name = benches;
     config = config();
-    targets = decode, prefill, blocks
+    targets = decode, prefill, batch_rows, blocks
 }
 criterion_main!(benches);

@@ -33,7 +33,7 @@ and paged KV. Below, **S0–S10** are spec phases. Phase numbers without the S s
 | S5 | HTTP server | 9 | Production | Yes |
 | S6 | Streaming | 9 | Production | Yes |
 | S7 | Concurrent scheduler | 9 | Production | Yes: `qubivex-scheduler` (ADR-015) |
-| S8 | Continuous batching | 10 | Missing | No |
+| S8 | Continuous batching | 10 | Missing (job 7: prototype pass, ADR-017) | No |
 | S9 | Hardware acceleration | 8 | Partial | CPU and Metal yes; CUDA blocked (B2), Vulkan not started |
 | S10 | Production readiness | 10–11 | Partial | No |
 
@@ -185,8 +185,8 @@ Owner rules for this plan (2026-11-06):
 | 4 | Analyse and manifest v1.1 (**done**) | S2, S3 | 2 | `models analyse`; source, revision and checksums in the manifest, with a migration test |
 | 5 | Concurrency correctness and scheduler (gate) (**done**) | S4, S7 | 1 | Every §12.3 test passes, including 1, 2, 6, 9, 11, 12, 13, with a sanitizer run where supported; queue bounded by count, priorities, deadlines, load dedup |
 | 6 | KV subsystem (**done**) | S4 | 1 | Prefix reuse with a bit-identity test; bounded and evictable |
-| 7 | Batching design | S8 | 5 (gate), 6 | ADR with a measured prototype |
-| 8 | Batching, stages 2 and 3 | S8 | 7 | Sequences share a pass; tokens bit-identical; measured on power |
+| 7 | Batching design (**done**) | S8 | 5 (gate), 6 | ADR with a measured prototype |
+| 8 | Batching, stages 2 and 3 | S8 | 7 | A 2-to-5-row CPU kernel first (ADR-017 measurements); then sequences share a pass; tokens bit-identical; measured on power |
 | 9 | Hardening | S10 | 5 | Rate limits, request limits, CORS, non-localhost refusal, config files |
 | 10 | Observability | S10 | 5 | The §8 metrics; structured logs with no prompt text |
 | 11 | Deployment | S10 | 9, 10 | Docker, runbooks, the §14 docs |
