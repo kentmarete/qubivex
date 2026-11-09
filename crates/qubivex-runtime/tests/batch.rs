@@ -266,3 +266,113 @@ fn an_empty_batch_and_empty_segments_return_nothing() {
     assert!(!out[1].is_empty());
     assert_eq!((a.len(), b.len()), (0, 1));
 }
+
+/// Greedy decoding of `n` tokens after `prompt`, through [`Engine::forward`].
+fn decode(e: &Engine, prompt: &[u32], n: usize) -> Vec<u32> {
+    let mut c = e.new_cache();
+    let mut next = argmax(&e.forward(prompt, &mut c, Logits::Last, None).unwrap());
+    let mut out = vec![next];
+    while out.len() < n {
+        next = argmax(&e.forward(&[next], &mut c, Logits::Last, None).unwrap());
+        out.push(next);
+    }
+    out
+}
+
+/// Threads calling `forward` at once share passes at the engine's turn (ADR-017
+/// section 2), and each still gets the tokens it gets alone, with a full expert cache
+/// and with one expert slot (where a pass waits for the union of its experts).
+#[test]
+fn concurrent_callers_share_passes_and_keep_their_tokens() {
+    const STEPS: [usize; 4] = [24, 7, 16, 24];
+    let mut widest = 0;
+    for id in ALL {
+        let full = engine(id, None, 256);
+        let largest = full.metadata().bytes().largest_expert;
+        let mut engines = vec![full];
+        if id != "dense-tiny" {
+            engines.push(engine(id, Some(largest), 256));
+        }
+        for e in &engines {
+            let want: Vec<Vec<u32>> = PROMPTS
+                .iter()
+                .zip(STEPS)
+                .map(|(p, n)| decode(e, p, n))
+                .collect();
+            let before = e.batch_stats();
+            let start = std::sync::Barrier::new(PROMPTS.len());
+            let got: Vec<Vec<u32>> = std::thread::scope(|s| {
+                let handles: Vec<_> = PROMPTS
+                    .iter()
+                    .zip(STEPS)
+                    .map(|(p, n)| {
+                        let start = &start;
+                        s.spawn(move || {
+                            start.wait();
+                            decode(e, p, n)
+                        })
+                    })
+                    .collect();
+                handles.into_iter().map(|h| h.join().unwrap()).collect()
+            });
+            assert_eq!(got, want, "{id}");
+            let after = e.batch_stats();
+            // Every step ran exactly once: 4 prompts and the decode steps after them.
+            let steps: usize = STEPS.iter().sum();
+            assert_eq!(after.steps - before.steps, steps as u64, "{id}");
+            widest = widest.max(after.widest);
+        }
+    }
+    // Four threads starting together post steps while each pass runs.
+    assert!(widest > 1, "no pass combined two callers");
+}
+
+/// A caller whose own step is bad (a token out of range, a full context) gets its
+/// error alone; the callers sharing its passes get their tokens unchanged.
+#[test]
+fn a_bad_step_fails_only_its_caller() {
+    for id in ALL {
+        let e = engine(id, None, 32);
+        let want: Vec<Vec<u32>> = PROMPTS[..3].iter().map(|p| decode(&e, p, 8)).collect();
+        let start = std::sync::Barrier::new(5);
+        std::thread::scope(|s| {
+            let good: Vec<_> = PROMPTS[..3]
+                .iter()
+                .map(|p| {
+                    let (e, start) = (&e, &start);
+                    s.spawn(move || {
+                        start.wait();
+                        decode(e, p, 8)
+                    })
+                })
+                .collect();
+            let (e1, s1) = (&e, &start);
+            let bad_token = s.spawn(move || {
+                s1.wait();
+                let mut c = e1.new_cache();
+                let mut errs = 0;
+                for _ in 0..8 {
+                    let r = e1.forward(&[3, u32::MAX], &mut c, Logits::Last, None);
+                    errs += usize::from(r.is_err());
+                }
+                (errs, c.len())
+            });
+            let (e2, s2) = (&e, &start);
+            let full = s.spawn(move || {
+                let mut c = e2.new_cache();
+                e2.forward(&[1; 30], &mut c, Logits::Last, None).unwrap();
+                s2.wait();
+                let mut errs = 0;
+                for _ in 0..8 {
+                    let r = e2.forward(&[1, 2, 3], &mut c, Logits::Last, None);
+                    errs += usize::from(r.is_err());
+                }
+                (errs, c.len())
+            });
+            let got: Vec<Vec<u32>> = good.into_iter().map(|h| h.join().unwrap()).collect();
+            assert_eq!(got, want, "{id}");
+            assert_eq!(bad_token.join().unwrap(), (8, 0), "{id}");
+            assert_eq!(full.join().unwrap(), (8, 30), "{id}");
+        });
+    }
+}

@@ -1,8 +1,14 @@
 # QUBIVEX Implementation Status
 
-Last updated: 2026-11-08
+Last updated: 2026-11-09
 
 ## Current phase
+**Batching in progress (job 8, ADR-017 stages 2 and 3).**
+- Fused CPU matmul for 2 to 5 activation rows (Q4_K, Q6_K, Q8_0, bf16), with the one-row kernel's bits. On battery, A/B against the portable path: a two-row Q4_K expert 126 → 60 µs, the two-row Q6_K head 11.95 → 3.18 ms. The `batch_s<N>` table on power is still to run.
+- The combining point at the engine turn (ADR-017 §2–5): `Engine::forward` posts its step and the caller that takes the turn runs every waiting step in one `forward_batch`, decode steps first, then prefill within `EngineOptions::batch_tokens` (default 256). Each step is checked alone first (`Transformer::check_segment`), so a full context or an out-of-range token fails only its own caller. The memory plan prices the pass's caches together, and a step that does not fit waits for the next pass. A panic in a pass answers every waiting caller. `Engine::batch_stats` counts passes, steps and the widest pass. Traced passes and the whole-layer Metal pass still run one caller at a time.
+- Tests: `tests/batch.rs` adds concurrent callers sharing passes on the four fixtures, all resident and with one expert slot, with tokens equal to each run alone, and a bad step failing only its caller. Disabling the per-step check fails the second test.
+- **Next:** on power, the `batch_s<N>` table and `examples/batch.rs` concurrent decode on OLMoE against job 7's table; then Metal batching (§6, both placements) and the prefetch measurement (§7).
+
 **Batching design done (2026-11-08); ADR-017, accepted 2026-11-08.** Job 7 of the platform plan.
 - `Transformer::forward_batch` over `Segment`s (a sequence's new tokens, its own `KvCache`, the logits it wants): everything per token runs once over the batch; RoPE, the KV write and attention use each token's own sequence. `forward` is `forward_batch` with one segment. `Engine::forward_batch` is public, CPU only, and not yet used by generation. Caches advance only after the whole pass succeeds, so `KvCache::rollback` was deleted.
 - Tests: 464 passed, 0 failed, 1 ignored. `tests/batch.rs`, 5 tests on the four fixtures (mixed decode and prefill segments, lock-step decode with sequences leaving, failure isolation, a one-expert cache, empty batches), each bit-identical to the sequences run alone. Three wrong rules (attention on the first cache, unshifted positions, RoPE at the batch index) each fail them.
