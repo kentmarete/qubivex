@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, PoisonError, RwLockReadGuard, RwLockWriteGuard, Weak};
 use std::time::Instant;
 
-use axum::http::StatusCode;
+use kerniq_server::axum::http::StatusCode;
 use qubivex_model::{ArchitectureRegistry, find};
 use qubivex_runtime::scheduler::{Limits, Scheduler};
 use qubivex_runtime::{Engine, KvAdmission};
