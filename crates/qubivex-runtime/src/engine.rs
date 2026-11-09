@@ -1447,12 +1447,12 @@ impl Engine {
     /// step in it, and no cache in it advances. Nothing waits for a batch to fill: a
     /// lone caller runs at once.
     ///
-    /// A traced pass, and the whole-layer Metal pass until it can batch, run one
-    /// caller at a time in arrival order instead; [`Engine::generate_with`] splits
-    /// long prompts into chunks so a prompt never holds the turn for long.
+    /// The whole-layer Metal pass combines the same way (ADR-017 §6). A traced pass
+    /// runs one caller at a time in arrival order instead; [`Engine::generate_with`]
+    /// splits long prompts into chunks so a prompt never holds the turn for long.
     ///
     /// # Errors
-    /// Architecture errors.
+    /// Architecture errors; a traced pass with layers on Metal.
     pub fn forward(
         &self,
         tokens: &[u32],
@@ -1460,7 +1460,7 @@ impl Engine {
         logits: Logits,
         trace: Option<Tracer<'_>>,
     ) -> Result<Vec<f32>, RuntimeError> {
-        if trace.is_none() && self.gpu.is_none() {
+        if trace.is_none() {
             let step = Step {
                 tokens: tokens.to_vec(),
                 cache: std::mem::take(cache),
@@ -1474,26 +1474,13 @@ impl Engine {
             *cache = back;
             return out;
         }
+        if self.gpu.is_some() {
+            return Err(RuntimeError::Model(
+                "tracing needs the CPU forward pass (not --metal-ops layers)".into(),
+            ));
+        }
         let _turn = self.steps.wait();
         let predictor = self.start_pass();
-        if let Some(g) = &self.gpu {
-            if trace.is_some() {
-                return Err(RuntimeError::Model(
-                    "tracing needs the CPU forward pass (not --metal-ops layers)".into(),
-                ));
-            }
-            self.fit_room(cache, tokens.len())?;
-            let out = g.forward(
-                tokens,
-                cache,
-                &self.dense,
-                &self.store,
-                &self.source,
-                logits,
-            );
-            self.account(cache.allocated_bytes());
-            return Ok(out?);
-        }
         let provider = StoreProvider {
             store: &self.store,
             source: &self.source,
@@ -1550,17 +1537,6 @@ impl Engine {
         }
         let run: Vec<usize> = (0..steps.len()).filter(|&i| out[i].is_none()).collect();
         if !run.is_empty() {
-            let predictor = self.start_pass();
-            let provider = StoreProvider {
-                store: &self.store,
-                source: &self.source,
-                predictor,
-            };
-            let src = Sources {
-                dense: &self.dense,
-                experts: &provider,
-                backend: &self.backend,
-            };
             let mut segments: Vec<Segment<'_>> = steps
                 .iter_mut()
                 .zip(&out)
@@ -1571,9 +1547,7 @@ impl Engine {
                     logits: st.logits,
                 })
                 .collect();
-            let result = self
-                .pool
-                .install(|| self.model.forward_batch(&mut segments, src));
+            let result = self.pass(&mut segments);
             let bytes = segments.iter().map(|g| g.cache.allocated_bytes()).sum();
             drop(segments);
             // Failed passes too: the ledger follows what the store and caches hold.
@@ -1628,21 +1602,30 @@ impl Engine {
     /// [`Engine::forward`] gives that segment alone.
     ///
     /// For a caller driving its own batches; [`Engine::forward`] combines concurrent
-    /// callers by itself. The CPU forward pass only, until the Metal pass batches.
+    /// callers by itself. Runs on the CPU pass and on whole Metal layers alike.
     ///
     /// # Errors
-    /// Architecture errors; [`RuntimeError::Model`] when layers run on Metal.
+    /// Architecture errors.
     pub fn forward_batch(
         &self,
         segments: &mut [Segment<'_>],
     ) -> Result<Vec<Vec<f32>>, RuntimeError> {
-        if self.gpu.is_some() {
-            return Err(RuntimeError::Model(
-                "batched passes need the CPU forward pass (not --metal-ops layers)".into(),
-            ));
-        }
         let _turn = self.steps.wait();
+        for g in segments.iter() {
+            self.fit_room(g.cache, g.tokens.len())?;
+        }
+        let out = self.pass(segments);
+        let bytes = segments.iter().map(|g| g.cache.allocated_bytes()).sum();
+        self.account(bytes);
+        Ok(out?)
+    }
+
+    /// One pass over `segments`, on whole Metal layers or the CPU, under the turn.
+    fn pass(&self, segments: &mut [Segment<'_>]) -> Result<Vec<Vec<f32>>, ArchError> {
         let predictor = self.start_pass();
+        if let Some(g) = &self.gpu {
+            return g.forward_batch(segments, &self.dense, &self.store, &self.source);
+        }
         let provider = StoreProvider {
             store: &self.store,
             source: &self.source,
@@ -1653,15 +1636,8 @@ impl Engine {
             experts: &provider,
             backend: &self.backend,
         };
-        for g in segments.iter() {
-            self.fit_room(g.cache, g.tokens.len())?;
-        }
-        let out = self
-            .pool
-            .install(|| self.model.forward_batch(segments, src));
-        let bytes = segments.iter().map(|g| g.cache.allocated_bytes()).sum();
-        self.account(bytes);
-        Ok(out?)
+        self.pool
+            .install(|| self.model.forward_batch(segments, src))
     }
 
     /// Generates up to `max_new` tokens after `prompt`, calling `on_token` for each;

@@ -118,8 +118,12 @@ The Metal pass (ADR-011) already runs `s` tokens per layer submission, and its k
 reproduce the CPU bits. Batching it means one KV write and one attention dispatch per
 segment, against that segment's device buffers and positions, inside the same command
 buffer; every other kernel runs over all tokens unchanged. Job 8 adds this with the same
-bit-identity tests, on both Metal placements. Until then `Engine::forward_batch` refuses
-an engine with layers on Metal, and the combining point runs one segment per pass there.
+bit-identity tests, on both Metal placements.
+
+Built in job 8: attention is three dependent dispatches (scores, softmax, values), so the
+segments' attentions run stage by stage (`Batch::attention_many`), each stage for every
+segment at once, not as one group of whole attentions, which races. The combining point
+and `Engine::forward_batch` run on Metal as on the CPU.
 
 ### 7. Prefetch
 The lookahead router runs only when a pass has one token: a batch routes to the union of

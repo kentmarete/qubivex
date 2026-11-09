@@ -7,15 +7,19 @@
 //!
 //! ```text
 //! cargo run --release -p qubivex-runtime --example batch -- \
-//!     <MODEL_DIR> <TOKENIZER_JSON> [--cache-mb N] [--steps N] [--runs N] [--sizes 1,2,4,8]
+//!     <MODEL_DIR> <TOKENIZER_JSON> [--cache-mb N] [--steps N] [--runs N] [--sizes 1,2,4,8] \
+//!     [--metal layers|token]
 //! ```
+//!
+//! `--metal` runs whole layers on Metal, routed on the host (`layers`) or on the GPU
+//! (`token`).
 
 use std::error::Error;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use qubivex_model::{ArchitectureRegistry, ModelMetadata};
-use qubivex_runtime::{Engine, EngineOptions, KvCache, Logits, Segment};
+use qubivex_runtime::{BackendKind, Engine, EngineOptions, KvCache, Logits, MetalOps, Segment};
 use qubivex_tokenizer::Tokenizer;
 
 const PROMPTS: [&str; 8] = [
@@ -136,18 +140,30 @@ fn median(mut v: Vec<Duration>) -> Duration {
 }
 
 fn main() -> Result<(), Box<dyn Error>> {
-    let usage = "usage: batch <MODEL_DIR> <TOKENIZER_JSON> [--cache-mb N] [--steps N] [--runs N] [--sizes 1,2,4,8]";
+    let usage = "usage: batch <MODEL_DIR> <TOKENIZER_JSON> [--cache-mb N] [--steps N] [--runs N] [--sizes 1,2,4,8] [--metal layers|token]";
     let mut args = std::env::args().skip(1);
     let dir = PathBuf::from(args.next().ok_or(usage)?);
     let tok = Tokenizer::from_hf_dir(&PathBuf::from(args.next().ok_or(usage)?))?;
     let (mut cache_mb, mut steps, mut runs) = (None, 32usize, 3usize);
     let mut sizes = vec![1usize, 2, 4, 8];
+    let mut metal = None;
     while let Some(flag) = args.next() {
         let value = args.next().ok_or(usage)?;
         match flag.as_str() {
             "--cache-mb" => cache_mb = Some(value.parse::<u64>()?),
             "--steps" => steps = value.parse()?,
             "--runs" => runs = value.parse()?,
+            "--metal" => {
+                let token = MetalOps::default();
+                metal = Some(match value.as_str() {
+                    "layers" => MetalOps {
+                        token: false,
+                        ..token
+                    },
+                    "token" => token,
+                    _ => return Err(usage.into()),
+                });
+            }
             "--sizes" => {
                 sizes = value.split(',').map(str::parse).collect::<Result<_, _>>()?;
             }
@@ -160,15 +176,26 @@ fn main() -> Result<(), Box<dyn Error>> {
         EngineOptions {
             expert_cache_bytes: cache_mb.map(|m| m << 20),
             max_context: Some(512),
+            backend: if metal.is_some() {
+                BackendKind::Metal
+            } else {
+                BackendKind::Cpu
+            },
+            metal_ops: metal.unwrap_or_default(),
             ..EngineOptions::default()
         },
     )?;
+    let p = e.placement();
+    if let Some(why) = &p.fallback {
+        println!("not on Metal: {why}");
+    }
     let prompts: Vec<Vec<u32>> = PROMPTS
         .iter()
         .map(|p| tok.encode(p, true))
         .collect::<Result<_, _>>()?;
     println!(
-        "expert cache: {}; {steps} tokens per sequence, median of {runs} runs",
+        "{}; expert cache: {}; {steps} tokens per sequence, median of {runs} runs",
+        metal.map_or("CPU".into(), |o| format!("Metal {}", o.describe())),
         cache_mb.map_or("all resident".into(), |m| format!("{m} MiB"))
     );
     println!(

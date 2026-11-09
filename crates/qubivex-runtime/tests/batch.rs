@@ -5,7 +5,7 @@
 use std::path::{Path, PathBuf};
 
 use qubivex_model::{ArchitectureRegistry, ModelMetadata};
-use qubivex_runtime::{Engine, EngineOptions, KvCache, Logits, Segment};
+use qubivex_runtime::{BackendKind, Engine, EngineOptions, KvCache, Logits, MetalOps, Segment};
 
 fn dir(id: &str) -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -332,21 +332,26 @@ fn concurrent_callers_share_passes_and_keep_their_tokens() {
 #[test]
 fn a_bad_step_fails_only_its_caller() {
     for id in ALL {
-        let e = engine(id, None, 32);
-        let want: Vec<Vec<u32>> = PROMPTS[..3].iter().map(|p| decode(&e, p, 8)).collect();
+        bad_step_fails_only_its_caller(&engine(id, None, 32), id);
+    }
+}
+
+fn bad_step_fails_only_its_caller(e: &Engine, id: &str) {
+    {
+        let want: Vec<Vec<u32>> = PROMPTS[..3].iter().map(|p| decode(e, p, 8)).collect();
         let start = std::sync::Barrier::new(5);
         std::thread::scope(|s| {
             let good: Vec<_> = PROMPTS[..3]
                 .iter()
                 .map(|p| {
-                    let (e, start) = (&e, &start);
+                    let start = &start;
                     s.spawn(move || {
                         start.wait();
                         decode(e, p, 8)
                     })
                 })
                 .collect();
-            let (e1, s1) = (&e, &start);
+            let (e1, s1) = (e, &start);
             let bad_token = s.spawn(move || {
                 s1.wait();
                 let mut c = e1.new_cache();
@@ -357,7 +362,7 @@ fn a_bad_step_fails_only_its_caller() {
                 }
                 (errs, c.len())
             });
-            let (e2, s2) = (&e, &start);
+            let (e2, s2) = (e, &start);
             let full = s.spawn(move || {
                 let mut c = e2.new_cache();
                 e2.forward(&[1; 30], &mut c, Logits::Last, None).unwrap();
@@ -374,5 +379,152 @@ fn a_bad_step_fails_only_its_caller() {
             assert_eq!(bad_token.join().unwrap(), (8, 0), "{id}");
             assert_eq!(full.join().unwrap(), (8, 30), "{id}");
         });
+    }
+}
+
+/// The fixtures with routed experts, which whole Metal layers need.
+const MOE: [&str; 3] = ["olmoe-tiny", "olmoe-tiny-gguf", "qwen3-moe-tiny"];
+
+/// Whole layers on Metal, routed on the host (`layers`) or on the GPU (`token`, with
+/// the experts loaded at the first pass so every pass is routed); `None` without a
+/// Metal device.
+fn metal_engine(id: &str, ops: MetalOps, context: usize) -> Option<Engine> {
+    match qubivex_backend_metal::MetalBackend::new() {
+        Err(qubivex_backend_metal::MetalError::Unavailable(e)) => {
+            eprintln!("skipping: {e}");
+            return None;
+        }
+        Err(e) => panic!("{e}"),
+        Ok(_) => {}
+    }
+    let meta = ModelMetadata::load(&dir(id), &ArchitectureRegistry::with_builtins()).unwrap();
+    let e = Engine::load(
+        meta,
+        EngineOptions {
+            backend: BackendKind::Metal,
+            metal_ops: ops,
+            io_threads: ops.token.then_some(0),
+            max_context: Some(context),
+            ..EngineOptions::default()
+        },
+    )
+    .unwrap();
+    let p = e.placement();
+    assert!(
+        p.fallback.is_none() && p.tensors > 0,
+        "{id}: not on Metal: {p:?}"
+    );
+    Some(e)
+}
+
+fn placements() -> [MetalOps; 2] {
+    let token = MetalOps::default();
+    [
+        MetalOps {
+            token: false,
+            ..token
+        },
+        token,
+    ]
+}
+
+/// The mixed pass of [`a_mixed_batch_equals_separate_passes`]: each step's logits,
+/// from separate passes or from one batch.
+fn mixed_step(e: &Engine, batched: bool) -> Vec<Vec<f32>> {
+    let mut caches: Vec<KvCache> = (0..4).map(|_| e.new_cache()).collect();
+    for i in [0, 2] {
+        e.forward(PROMPTS[i], &mut caches[i], Logits::Last, None)
+            .unwrap();
+    }
+    let step: [(&[u32], Logits); 4] = [
+        (&[7], Logits::Last),
+        (PROMPTS[1], Logits::All),
+        (&[8, 9, 10], Logits::Last),
+        (PROMPTS[3], Logits::Last),
+    ];
+    if !batched {
+        return caches
+            .iter_mut()
+            .zip(&step)
+            .map(|(c, (t, l))| e.forward(t, c, *l, None).unwrap())
+            .collect();
+    }
+    let mut segments: Vec<Segment<'_>> = caches
+        .iter_mut()
+        .zip(&step)
+        .map(|(cache, &(tokens, logits))| Segment {
+            tokens,
+            cache,
+            logits,
+        })
+        .collect();
+    e.forward_batch(&mut segments).unwrap()
+}
+
+/// ADR-017 §6: on both Metal placements, a mixed batch gives each segment the CPU
+/// pass's bits, and concurrent callers share passes and get the CPU's tokens.
+#[test]
+fn metal_batches_give_the_cpu_bits() {
+    const STEPS: [usize; 4] = [24, 7, 16, 24];
+    let mut widest = 0;
+    for id in MOE {
+        let cpu = engine(id, None, 256);
+        let want = mixed_step(&cpu, false);
+        let want_tokens: Vec<Vec<u32>> = PROMPTS
+            .iter()
+            .zip(STEPS)
+            .map(|(p, n)| decode(&cpu, p, n))
+            .collect();
+        for ops in placements() {
+            let Some(e) = metal_engine(id, ops, 256) else {
+                return;
+            };
+            let what = format!("{id} {}", ops.describe());
+            let routed = e.gpu_routed_passes();
+            let got = mixed_step(&e, true);
+            assert_eq!(got.len(), 4, "{what}");
+            for (i, (g, w)) in got.iter().zip(&want).enumerate() {
+                assert_eq!(bits(g), bits(w), "{what} segment {i}");
+            }
+            if ops.token {
+                // Two prefills and the batch, each one routed submission.
+                assert_eq!(e.gpu_routed_passes() - routed, 3, "{what}");
+            }
+            let before = e.batch_stats();
+            let start = std::sync::Barrier::new(PROMPTS.len());
+            let got: Vec<Vec<u32>> = std::thread::scope(|s| {
+                let handles: Vec<_> = PROMPTS
+                    .iter()
+                    .zip(STEPS)
+                    .map(|(p, n)| {
+                        let (e, start) = (&e, &start);
+                        s.spawn(move || {
+                            start.wait();
+                            decode(e, p, n)
+                        })
+                    })
+                    .collect();
+                handles.into_iter().map(|h| h.join().unwrap()).collect()
+            });
+            assert_eq!(got, want_tokens, "{what}");
+            let after = e.batch_stats();
+            let steps: usize = STEPS.iter().sum();
+            assert_eq!(after.steps - before.steps, steps as u64, "{what}");
+            widest = widest.max(after.widest);
+        }
+    }
+    assert!(widest > 1, "no Metal pass combined two callers");
+}
+
+/// A bad step on Metal fails only its caller, as on the CPU.
+#[test]
+fn a_bad_step_on_metal_fails_only_its_caller() {
+    for id in MOE {
+        for ops in placements() {
+            let Some(e) = metal_engine(id, ops, 32) else {
+                return;
+            };
+            bad_step_fails_only_its_caller(&e, &format!("{id} {}", ops.describe()));
+        }
     }
 }
