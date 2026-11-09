@@ -97,7 +97,15 @@ pub struct EngineOptions {
     /// Most tokens of prefill one shared forward pass takes beside its decode steps
     /// (ADR-017 section 3). `None`: [`DEFAULT_BATCH_TOKENS`].
     pub batch_tokens: Option<usize>,
+    /// How long, in microseconds, a shared pass waits for the callers the previous
+    /// pass answered to post their next step, so they stay in one pass. `None`:
+    /// [`DEFAULT_BATCH_WAIT_US`]; `Some(0)`: no wait. A lone caller never waits.
+    pub batch_wait_us: Option<u64>,
 }
+
+/// The default [`EngineOptions::batch_wait_us`]: sampling a token takes microseconds and
+/// a pass tens of milliseconds, so the bound is only reached when a caller has stopped.
+pub const DEFAULT_BATCH_WAIT_US: u64 = 1000;
 
 /// The default [`EngineOptions::batch_tokens`]: one prefill chunk, so a long prompt
 /// delays the others' next token by at most one chunk.
@@ -752,6 +760,7 @@ pub struct Engine {
     /// Where concurrent [`Engine::forward`] steps meet to share a pass (ADR-017).
     combiner: Combiner,
     batch_tokens: usize,
+    batch_wait: Duration,
     /// Finished KV kept for later prompts (`None`: off).
     retained: Option<Arc<Retained>>,
     /// KV bytes per position (keys and values of every layer).
@@ -1112,6 +1121,7 @@ impl Engine {
             steps: StepQueue::default(),
             combiner: Combiner::default(),
             batch_tokens: opts.batch_tokens.unwrap_or(DEFAULT_BATCH_TOKENS).max(1),
+            batch_wait: Duration::from_micros(opts.batch_wait_us.unwrap_or(DEFAULT_BATCH_WAIT_US)),
             kv_position_bytes,
             verification: Verification::Off,
             model,
@@ -1456,9 +1466,11 @@ impl Engine {
                 cache: std::mem::take(cache),
                 logits,
             };
-            let (back, out) = self
-                .combiner
-                .run(step, self.batch_tokens, |steps| self.run_steps(steps));
+            let (back, out) =
+                self.combiner
+                    .run(step, self.batch_tokens, self.batch_wait, |steps| {
+                        self.run_steps(steps)
+                    });
             *cache = back;
             return out;
         }

@@ -78,6 +78,19 @@ Consequences of this shape:
   slot and receives it back, so the leader owns every cache it computes on and no cache
   is reachable from two threads at once. This is safe Rust and needs no new `unsafe`.
 
+**Amendment 1 (2026-11-09, owner decision): a bounded wait keeps callers together.**
+Measured in job 8, the rule above splits passes: the callers a pass answers are still
+sampling their next token when the next leader takes the queue, so at N = 2 passes
+mostly alternated one step each, and concurrent callers on OLMoE got 0.99x to 1.22x
+where caller-driven batches got 1.17x to 1.46x. A leader now waits, up to
+`EngineOptions::batch_wait_us` (default 1 ms; 0 turns it off), for as many posts as the
+last pass answered with logits. Any post counts, so a lone caller never waits, and a
+caller that has stopped costs one bounded wait, after which it is no longer expected
+(`BatchStats::wait_timeouts` counts these). Sampling takes microseconds and a pass tens
+of milliseconds, so the bound is reached only when a caller left. With the wait,
+concurrent callers matched caller-driven batches: 1.19x to 1.53x at N = 2 to 8, every
+pass at full width.
+
 ### 3. Pass composition: a token budget
 A pass takes every waiting decode step first (one token each), then prefill chunks while
 the total stays within a token budget (default: the prefill chunk, 256). A long prompt
