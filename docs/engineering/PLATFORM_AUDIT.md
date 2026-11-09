@@ -86,14 +86,14 @@ applies only to what remains.
 | Priorities, deadlines, per-client fairness | Production | `priority` and `timeout` request fields, aging, fewest-running-first by `user`. `user` is not authenticated (job 9) |
 | Memory admission | Production | Against the plan through the scheduler; queues or refuses by `--memory-policy` |
 | Batching | **Missing** | See §3 |
-| Auth | Partial | Optional API key and admin token, constant-time. No key refuses a non-localhost bind |
-| Rate limiting | Missing | The 429 means queue timeout only |
-| Request limits | Partial | Axum's default body limit only; no configured prompt length, no explicit limit |
-| CORS | Missing | |
+| Auth | Partial | Optional API key and admin token, constant-time. Job 9: no key refuses a listener beyond loopback unless allowed explicitly (before, it only warned). One key for every client; no per-client keys |
+| Rate limiting | Production (job 9) | Token bucket per peer address on `/v1`, 429 with `retry-after`; health and metrics exempt; bounded client table |
+| Request limits | Production (job 9) | Body bytes (413), prompt tokens after the template and `max_tokens` (400), all configurable |
+| CORS | Production (job 9) | Configured origins or `*`; preflights answered, other origins refused; no credentials |
 | Graceful shutdown | Production | Waiters end at once, running requests get `--shutdown-grace`, then stop with an error. Tested over HTTP |
 | Metrics | Partial | Requests, tokens, active, cancelled, failed, KV, cache bytes, slots, queue depth, rejections. No TTFT, tokens/s, latency histograms, hit rate, evictions or disk throughput |
 | Structured logs | **Missing** | `eprintln!` with a request id. No model or sequence ids, levels or format |
-| Config files | **Missing** | Flags and three environment variables. No TOML, no precedence rule |
+| Config files | Production (job 9) | `serve --config` TOML `[serve]` table; flag > environment > file > default; unknown keys refused; a file holding secrets must be private |
 
 ### CLI
 
@@ -186,8 +186,8 @@ Owner rules for this plan (2026-11-06):
 | 5 | Concurrency correctness and scheduler (gate) (**done**) | S4, S7 | 1 | Every §12.3 test passes, including 1, 2, 6, 9, 11, 12, 13, with a sanitizer run where supported; queue bounded by count, priorities, deadlines, load dedup |
 | 6 | KV subsystem (**done**) | S4 | 1 | Prefix reuse with a bit-identity test; bounded and evictable |
 | 7 | Batching design (**done**) | S8 | 5 (gate), 6 | ADR with a measured prototype |
-| 8 | Batching, stages 2 and 3 | S8 | 7 | A 2-to-5-row CPU kernel first (ADR-017 measurements); then sequences share a pass; tokens bit-identical; measured on power |
-| 9 | Hardening | S10 | 5 | Rate limits, request limits, CORS, non-localhost refusal, config files |
+| 8 | Batching, stages 2 and 3 (**done**) | S8 | 7 | A 2-to-5-row CPU kernel first (ADR-017 measurements); then sequences share a pass; tokens bit-identical; measured on power |
+| 9 | Hardening (**done**) | S10 | 5 | Rate limits, request limits, CORS, non-localhost refusal, config files |
 | 10 | Observability | S10 | 5 | The §8 metrics; structured logs with no prompt text |
 | 11 | Deployment | S10 | 9, 10 | Docker, runbooks, the §14 docs |
 | Blocked | CUDA | S9 | B2 | Needs NVIDIA hardware; abstraction only until then |

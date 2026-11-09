@@ -349,9 +349,17 @@ r = client.chat.completions.create(model="qwen3-0.6b",
 
 | Option | Default | |
 |---|---|---|
-| `--listen ADDR` | `127.0.0.1:8080` | |
+| `--config FILE` | `$QUBIVEX_CONFIG` | A TOML file with a `[serve]` table of these settings (below) |
+| `--listen ADDR` | `127.0.0.1:8080` | Anything but loopback is refused without `--api-key` or `--allow-unauthenticated` |
 | `--api-key KEY` | `$QUBIVEX_API_KEY` | Required as a bearer token on `/v1` when set |
 | `--admin-token T` | `$QUBIVEX_ADMIN_TOKEN` | Enables the admin endpoints |
+| `--allow-unauthenticated` | off | Serve beyond loopback with no API key |
+| `--rate-limit N` | unlimited | Requests per minute each client address may make to `/v1`; more get a 429 with `retry-after`. `/health` and `/metrics` are never limited |
+| `--rate-limit-burst N` | `--rate-limit` | Requests a client may make at once after being idle |
+| `--cors-origin O` | none | An origin browsers may call from, such as `https://app.example.com`, or `*` (repeatable) |
+| `--max-body-bytes N` | 4194304 | A larger request body gets a 413 |
+| `--max-prompt-tokens N` | the context | A longer prompt (after the chat template) gets a 400 |
+| `--max-generation-tokens N` | the context | A larger `max_tokens` gets a 400 |
 | `--max-concurrent N` | 4 | Generations per model at once; more wait up to `--queue-timeout` (30 s), then 429 |
 | `--max-queue N` | 32 | Requests per model that may wait; more get a 429 at once |
 | `--memory-policy queue\|refuse` | `queue` | When a request's memory is not free yet: wait for it, or answer 503 |
@@ -369,6 +377,27 @@ passes of running conversations take turns, first come first served, and long pr
 in chunks, so one request cannot hold the others up for long. A client that disconnects
 cancels its generation within one chunk or one token. Errors follow OpenAI's shape, carry
 the `x-request-id`, and never contain file paths. ADR-015 has the concurrency model.
+
+Settings come from, highest first: a flag, its environment variable, the config file, then
+the default. In the file each key is the flag's name with `_` for `-`, and the repeatable
+flags are lists named `models`, `dirs` and `cors_origins`; flags given on the command line
+replace the file's list. Unknown keys are errors, everything is checked before a model
+loads, and a file holding `api_key` or `admin_token` must not be readable by other users
+(`chmod 600`).
+
+```toml
+[serve]
+listen = "0.0.0.0:8080"
+models = ["olmoe-1b-7b-0125-instruct"]
+api_key = "sk-local"
+rate_limit = 120
+cors_origins = ["https://app.example.com"]
+max_prompt_tokens = 8192
+queue_timeout = 30
+```
+
+The rate limit counts by peer address (an IPv6 client by its /64), so behind a reverse
+proxy every client shares one allowance: limit at the proxy there instead.
 
 With `--prefix-cache-mb`, a finished conversation's KV is kept, and the next request from
 the same `user` that starts with the same tokens copies it instead of running them again. On

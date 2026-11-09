@@ -85,6 +85,26 @@ priorities, per-request deadlines and memory admission that can wait. Loads are 
 a loaded model reloads as a 200 rather than a 409, shutdown drains, and a stream nobody reads
 ends. The threads, the turn lock and the cancellation flag described above are unchanged.
 
+## Amendment 3 (2026-11-10): hardening (platform plan job 9)
+- **Listening beyond loopback.** `Gateway::serve` and `qubivex serve` refuse a listener
+  that is not loopback when no API key is set, unless `allow_unauthenticated_remote`
+  (`--allow-unauthenticated`) says otherwise. Before, the CLI only warned.
+- **Rate limit.** Optional token bucket per peer address on `/v1/*` (`--rate-limit`,
+  `--rate-limit-burst`): 429 `rate_limit_exceeded` with `retry-after`. IPv6 counts by
+  /64. The table holds at most 4096 clients. A single API key cannot tell clients apart,
+  so the address is the client; behind a proxy, limit at the proxy.
+- **Request limits.** Body bytes (`--max-body-bytes`, 4 MiB, 413), prompt tokens after
+  the template (`--max-prompt-tokens`, 400 `prompt_too_long`) and `max_tokens`
+  (`--max-generation-tokens`, 400). The prompt check runs after tokenization, before
+  admission.
+- **CORS.** Hand-written middleware rather than `tower-http`: configured origins or
+  `*`, preflights answered with a 204 or refused with a 403, `x-request-id` and
+  `retry-after` exposed, never credentials.
+- **Config file.** `qubivex serve --config` (or `$QUBIVEX_CONFIG`) reads a TOML `[serve]`
+  table; flag > environment > file > default. Unknown keys are errors, and a file
+  holding a key or token must not be readable by others. `toml` joins the CLI's
+  dependencies.
+
 ## Consequences
 - The exit criteria are met: `crates/qubivex-api/tests/gateway.rs` (over HTTP, tiny
   fixtures: shapes, streaming equals non-streaming, concurrent equals sequential,

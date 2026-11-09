@@ -127,77 +127,7 @@ enum Command {
     },
     /// Serve models over an OpenAI-compatible HTTP API (/v1/chat/completions,
     /// /v1/completions, /v1/models, /health, /metrics).
-    Serve {
-        /// A model id or directory to load at start (repeatable).
-        #[arg(long = "model")]
-        models: Vec<String>,
-        /// A model directory to search for ids (repeatable); also where the admin load
-        /// endpoint looks.
-        #[arg(long = "dir")]
-        dirs: Vec<PathBuf>,
-        /// Address to listen on.
-        #[arg(long, default_value = "127.0.0.1:8080")]
-        listen: std::net::SocketAddr,
-        /// Require `Authorization: Bearer <key>` on /v1 (default: $QUBIVEX_API_KEY).
-        #[arg(long, env = "QUBIVEX_API_KEY", hide_env_values = true)]
-        api_key: Option<String>,
-        /// Enable the admin endpoints with this bearer token (default:
-        /// $QUBIVEX_ADMIN_TOKEN; without one they are off).
-        #[arg(long, env = "QUBIVEX_ADMIN_TOKEN", hide_env_values = true)]
-        admin_token: Option<String>,
-        /// Generations that run at once per model; more wait for a slot.
-        #[arg(long, default_value_t = 4)]
-        max_concurrent: usize,
-        /// max_tokens when a request does not set it.
-        #[arg(long, default_value_t = 512)]
-        default_max_tokens: usize,
-        /// Requests per model that may wait beyond those running; more get a 429 at once.
-        #[arg(long, default_value_t = 32)]
-        max_queue: usize,
-        /// Seconds a request waits to start before a 429.
-        #[arg(long, default_value_t = 30)]
-        queue_timeout: u64,
-        /// When a request's memory is not free yet: queue (wait for it) or refuse (503).
-        #[arg(long, default_value = "queue")]
-        memory_policy: String,
-        /// Seconds a generation may run.
-        #[arg(long, default_value_t = 600)]
-        request_timeout: u64,
-        /// Seconds a stream may go without the client reading before it ends.
-        #[arg(long, default_value_t = 30)]
-        stall_timeout: u64,
-        /// Seconds running requests get to finish at shutdown before they are stopped.
-        #[arg(long, default_value_t = 30)]
-        shutdown_grace: u64,
-        /// MiB per model of finished KV to keep, so a prompt that repeats a prefix skips
-        /// it. Counts against the memory plan. Requests with different `user` values
-        /// never share it. 0 keeps none.
-        #[arg(long, default_value_t = 0)]
-        prefix_cache_mb: u64,
-        /// A fixed expert cache in MiB per model, bypassing the memory planner.
-        #[arg(long)]
-        expert_cache_mb: Option<u64>,
-        /// Memory profile: performance (0.88 of available RAM), balanced (0.75) or saver (0.50).
-        #[arg(long, default_value = "performance")]
-        profile: String,
-        /// A custom fraction of available RAM, in (0, 1].
-        #[arg(long)]
-        ram_fraction: Option<f64>,
-        /// An explicit RAM budget per model, for example 8GiB.
-        #[arg(long)]
-        ram_budget: Option<String>,
-        /// Threads reading experts from disk. Default: 4.
-        #[arg(long)]
-        io_threads: Option<usize>,
-        #[command(flatten)]
-        device: DeviceArgs,
-        /// Context limit per conversation, in tokens (default: the model's).
-        #[arg(long)]
-        context: Option<usize>,
-        /// Compute threads (default: the CPU's performance cores).
-        #[arg(long)]
-        threads: Option<usize>,
-    },
+    Serve(serve::ServeFlags),
     /// Time prefill and decode, and record them with hardware, build flags, peak
     /// memory and a token check (docs/performance/BENCHMARKING.md).
     Bench {
@@ -939,58 +869,7 @@ fn execute(cmd: &Command) -> Result<(), String> {
             threads: *threads,
             quiet: *quiet,
         }),
-        Command::Serve {
-            models,
-            dirs,
-            listen,
-            api_key,
-            admin_token,
-            max_concurrent,
-            default_max_tokens,
-            max_queue,
-            queue_timeout,
-            memory_policy,
-            request_timeout,
-            stall_timeout,
-            shutdown_grace,
-            prefix_cache_mb,
-            expert_cache_mb,
-            profile,
-            ram_fraction,
-            ram_budget,
-            io_threads,
-            device,
-            context,
-            threads,
-        } => serve::serve(&serve::ServeArgs {
-            models,
-            dirs,
-            addr: *listen,
-            api_key: api_key.clone(),
-            admin_token: admin_token.clone(),
-            max_concurrent: *max_concurrent,
-            default_max_tokens: *default_max_tokens,
-            max_queue: *max_queue,
-            queue_timeout: std::time::Duration::from_secs(*queue_timeout),
-            memory_policy: serve::memory_policy(memory_policy)?,
-            request_timeout: std::time::Duration::from_secs(*request_timeout),
-            stall_timeout: std::time::Duration::from_secs(*stall_timeout),
-            shutdown_grace: std::time::Duration::from_secs(*shutdown_grace),
-            engine: qubivex_runtime::EngineOptions {
-                prefix_cache_bytes: prefix_cache_mb.saturating_mul(1 << 20),
-                ..memory_options(
-                    *expert_cache_mb,
-                    profile,
-                    *ram_fraction,
-                    ram_budget.as_deref(),
-                    "lfru",
-                    *io_threads,
-                    false,
-                )?
-                .with_device(device.options()?)
-                .engine(*context, *threads)
-            },
-        }),
+        Command::Serve(flags) => serve::serve(serve::plan(flags.clone())?),
         Command::Bench {
             model,
             dirs,

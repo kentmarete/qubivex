@@ -3,6 +3,16 @@
 Last updated: 2026-11-09
 
 ## Current phase
+**Hardening done (2026-11-10; job 9, ADR-013 amendment 3).** Spec §11 limits on the gateway.
+- Listening beyond loopback without an API key is now refused by `Gateway::serve` and `qubivex serve` (it only warned before), unless `--allow-unauthenticated`.
+- Per-client rate limit on `/v1/*` (`--rate-limit`, `--rate-limit-burst`): a token bucket per peer address (IPv6 by /64), 429 `rate_limit_exceeded` with `retry-after`, health and metrics exempt, at most 4096 clients remembered.
+- Request limits: body bytes (`--max-body-bytes`, 4 MiB default, 413), prompt tokens after the template (`--max-prompt-tokens`, 400 `prompt_too_long`) and `max_tokens` (`--max-generation-tokens`, 400).
+- CORS for configured origins or `*` (`--cors-origin`): preflights answered or refused with a 403, no credentials.
+- `qubivex serve --config` (or `$QUBIVEX_CONFIG`): a TOML `[serve]` table; flag > environment > file > default; unknown keys refused; a file holding a key or token must be `chmod 600`. New dependency `toml` (CLI only).
+- Tests: 492 passed, 0 failed, 1 ignored. New: 7 unit tests in `limits.rs`, 5 over HTTP in `tests/hardening.rs`, 5 precedence and validation tests in `serve.rs`, 3 through the binary in `tests/serve_config.rs`.
+- Limits: one API key serves every client, so `user` (prefix-cache scopes, fairness) is still unauthenticated, and the rate limit counts addresses, so behind a proxy every client shares one allowance. Per-client keys would fix both.
+- **Next:** job 10, observability (PLATFORM_AUDIT §4).
+
 **Batching done (2026-11-10; job 8, ADR-017 stages 2 and 3).** Sequences share forward passes on the CPU and on whole Metal layers.
 - Fused CPU matmul for 2 to 5 activation rows (Q4_K, Q6_K, Q8_0, bf16), with the one-row kernel's bits. `batch_s<N>` on power, 5 threads, median (job 7's portable path in brackets): Q4_K expert 1024×2048 at 1, 2, 3, 4, 5 rows 39.2, 59.5 (129.9), 70.2 (155.2), 85.6 (180.2), 103.6 µs; Q6_K head 50304×2048 2.75, 3.07 (12.06), 4.01 (13.45), 4.12 (14.20), 4.80 ms. 6 to 12 rows now run through the same kernels in balanced groups of up to 5 (6 as 3 + 3, 8 as 4 + 4), each weight row once per group, same bits; `tile` starts at 13 rows for these dtypes. Grouped against `tile` (in brackets): expert at 6, 8, 12, 16 rows 136.7 (216.0), 169.9 (253.1), 252.2 (295.5), 375.5 (351.1) µs; head 7.23 (15.60), 8.20 (17.54), 12.34 (18.88), 16.81 (21.23) ms. 16 rows is even on the expert, so the cut-off is 12.
 - OLMoE-1B-7B Q4_K_M on power (`examples/batch.rs`, 32 tokens per sequence, median of 3 rotated runs), decode tok/s, tokens identical in every cell. "Concurrent" is N threads each calling `Engine::forward` through the combining point, with the 1 ms bounded wait:
