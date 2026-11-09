@@ -127,6 +127,37 @@ impl ApiError {
         )
     }
 
+    /// 429: the client has used its allowance of requests (the rate limit).
+    pub fn rate_limited() -> Self {
+        Self::new(
+            StatusCode::TOO_MANY_REQUESTS,
+            "rate_limit_error",
+            "rate_limit_exceeded",
+            "too many requests from this client; retry after the time in retry-after".into(),
+        )
+    }
+
+    /// 413: the request body is larger than the server takes.
+    pub fn too_large(limit: usize) -> Self {
+        Self::new(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "invalid_request_error",
+            "request_too_large",
+            format!("the request body is larger than this server takes ({limit} bytes)"),
+        )
+    }
+
+    /// 400: the prompt is longer than the server takes.
+    pub fn prompt_too_long(param: &'static str, tokens: usize, limit: usize) -> Self {
+        Self {
+            param: Some(param),
+            code: "prompt_too_long",
+            ..Self::invalid(format!(
+                "the prompt is {tokens} tokens; this server takes at most {limit}"
+            ))
+        }
+    }
+
     /// 504: the request's own time limit passed before it could start.
     pub fn deadline_exceeded() -> Self {
         Self::new(

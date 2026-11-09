@@ -15,8 +15,13 @@
 //! a stream that stops being read ends after [`ServerConfig::stall_timeout`]. Every
 //! response carries an `x-request-id`; errors are OpenAI-shaped and never contain file
 //! paths.
+//!
+//! Spec §11: an optional per-client rate limit, limits on the body, the prompt and
+//! `max_tokens`, CORS for configured origins, and no listening beyond loopback without
+//! an API key unless that is asked for explicitly.
 
 mod error;
+mod limits;
 mod metrics;
 mod models;
 mod openai;
@@ -31,13 +36,14 @@ use std::sync::{Arc, Mutex, RwLock, Weak};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use axum::extract::rejection::JsonRejection;
-use axum::extract::{Path, State};
+use axum::extract::{DefaultBodyLimit, Path, State};
 use axum::http::{HeaderMap, HeaderValue, StatusCode};
 use axum::response::sse::{Event as SseEvent, Sse};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, post};
 use axum::{Json, Router};
 pub use error::ApiError;
+pub use limits::RateLimit;
 pub use metrics::Metrics;
 use qubivex_runtime::scheduler::{EnterError, Outcome, RequestInfo};
 pub use qubivex_runtime::scheduler::{MemoryPolicy, Stats};
@@ -46,6 +52,7 @@ use serde_json::{Value, json};
 use tokio::sync::{mpsc, oneshot, watch};
 use tokio_stream::wrappers::ReceiverStream;
 
+use crate::limits::RateLimiter;
 use crate::models::Entry;
 use crate::openai::{ChatRequest, CompletionRequest, Params};
 use crate::worker::{CancelOnDrop, Event, FinishReason, Input, Job};
@@ -61,6 +68,22 @@ pub struct ServerConfig {
     pub api_key: Option<String>,
     /// Required on the admin endpoints, which are disabled without it.
     pub admin_token: Option<String>,
+    /// Serve beyond loopback without `api_key`. Off: [`Gateway::serve`] refuses such a
+    /// listener ([`ServerConfig::check_listen`]).
+    pub allow_unauthenticated_remote: bool,
+    /// Requests per client (by peer address) on `/v1/*`. `None`: unlimited.
+    pub rate_limit: Option<RateLimit>,
+    /// Origins browsers may call the API from (`scheme://host[:port]`, or `*`). Empty:
+    /// no CORS headers.
+    pub cors_origins: Vec<String>,
+    /// Largest request body, in bytes; a larger one gets a 413.
+    pub max_body_bytes: usize,
+    /// Longest prompt, in tokens after the chat template; a longer one gets a 400.
+    /// `None`: only the context limits it.
+    pub max_prompt_tokens: Option<usize>,
+    /// Largest `max_tokens` a request may ask for; more gets a 400. `None`: only the
+    /// context limits it.
+    pub max_generation_tokens: Option<usize>,
     /// Generations that run at once per model; more wait for a slot.
     pub max_concurrent: usize,
     /// Requests per model that may wait beyond those running. More get a 429 at once.
@@ -94,6 +117,12 @@ impl Default for ServerConfig {
         Self {
             api_key: None,
             admin_token: None,
+            allow_unauthenticated_remote: false,
+            rate_limit: None,
+            cors_origins: Vec::new(),
+            max_body_bytes: 4 << 20,
+            max_prompt_tokens: None,
+            max_generation_tokens: None,
             max_concurrent: 4,
             max_queue: 32,
             queue_timeout: Duration::from_secs(30),
@@ -112,6 +141,7 @@ impl Default for ServerConfig {
 
 struct AppState {
     cfg: ServerConfig,
+    limiter: Option<RateLimiter>,
     /// Never held across an `.await`.
     models: RwLock<BTreeMap<String, Entry>>,
     /// Unloaded engines, to see when running requests have let go of them.
@@ -162,6 +192,7 @@ impl Gateway {
     pub fn new(cfg: ServerConfig) -> Self {
         Self {
             state: Arc::new(AppState {
+                limiter: cfg.rate_limit.map(RateLimiter::new),
                 cfg,
                 models: RwLock::new(BTreeMap::new()),
                 unloaded: Mutex::new(Vec::new()),
@@ -225,6 +256,17 @@ impl Gateway {
             .route("/v1/admin/models", post(admin_load))
             .route("/v1/admin/models/{id}", delete(admin_unload))
             .fallback(|| async { ApiError::not_found() })
+            .layer(DefaultBodyLimit::max(self.state.cfg.max_body_bytes))
+            // The last layer runs first: CORS answers preflights before the rate limit,
+            // and adds its headers to the rate limit's 429s.
+            .layer(axum::middleware::from_fn_with_state(
+                Arc::clone(&self.state),
+                limits::rate_limit,
+            ))
+            .layer(axum::middleware::from_fn_with_state(
+                Arc::clone(&self.state),
+                limits::cors,
+            ))
             .with_state(Arc::clone(&self.state))
     }
 
@@ -233,14 +275,22 @@ impl Gateway {
     /// [`ServerConfig::shutdown_grace`] to finish, and are stopped after that. Returns
     /// when they have ended; a connection that will not close cannot hold it up.
     ///
+    /// Refuses (`InvalidInput`) settings that [`ServerConfig::validate`] rejects, and a
+    /// listener beyond loopback without an API key ([`ServerConfig::check_listen`]).
+    ///
     /// # Errors
-    /// I/O errors from the listener.
+    /// Those refusals, and I/O errors from the listener.
     pub async fn serve(
         self,
         listener: tokio::net::TcpListener,
         shutdown: impl Future<Output = ()> + Send + 'static,
     ) -> std::io::Result<()> {
         let st = Arc::clone(&self.state);
+        let refuse = |m: String| std::io::Error::new(std::io::ErrorKind::InvalidInput, m);
+        st.cfg.validate().map_err(refuse)?;
+        st.cfg
+            .check_listen(listener.local_addr()?)
+            .map_err(refuse)?;
         let grace = st.cfg.shutdown_grace;
         let (began_tx, began_rx) = oneshot::channel::<()>();
         let begin = Arc::clone(&st);
@@ -249,7 +299,11 @@ impl Gateway {
             begin.begin_shutdown();
             let _ = began_tx.send(());
         };
-        let server = axum::serve(listener, self.router())
+        // The peer address is what the rate limit counts by.
+        let app = self
+            .router()
+            .into_make_service_with_connect_info::<std::net::SocketAddr>();
+        let server = axum::serve(listener, app)
             .with_graceful_shutdown(signal)
             .into_future();
         let stopper = async {
@@ -468,8 +522,11 @@ async fn get_model(
     st.finish("models", &rid, r)
 }
 
-fn json_body<T>(body: Result<Json<T>, JsonRejection>) -> Result<T, ApiError> {
+fn json_body<T>(st: &AppState, body: Result<Json<T>, JsonRejection>) -> Result<T, ApiError> {
     body.map(|Json(b)| b).map_err(|e| {
+        if e.status() == StatusCode::PAYLOAD_TOO_LARGE {
+            return ApiError::too_large(st.cfg.max_body_bytes);
+        }
         // The rejection text names the field and the problem, never a path.
         ApiError::invalid(format!("invalid request body: {}", e.body_text()))
     })
@@ -490,7 +547,7 @@ async fn chat(
     let rid = st.request_id(&headers);
     let r = async {
         st.check_key(&headers)?;
-        let req = json_body(body)?;
+        let req = json_body(&st, body)?;
         let messages = req.messages()?;
         let max = req.max_completion_tokens.or(req.common.max_tokens);
         let params = req.common.params(max)?;
@@ -516,7 +573,7 @@ async fn completions(
     let rid = st.request_id(&headers);
     let r = async {
         st.check_key(&headers)?;
-        let req = json_body(body)?;
+        let req = json_body(&st, body)?;
         let prompt = req.prompt()?;
         let max = req.common.max_tokens;
         let params = req.common.params(max)?;
@@ -550,6 +607,14 @@ async fn generate(
     params: Params,
     kind: Kind,
 ) -> Result<Response, ApiError> {
+    if let (Some(asked), Some(cap)) = (params.max_tokens, st.cfg.max_generation_tokens) {
+        if asked > cap {
+            return Err(ApiError::invalid_param(
+                "max_tokens",
+                format!("max_tokens is {asked}; this server allows at most {cap}"),
+            ));
+        }
+    }
     let arrived = Instant::now();
     let limit = params.timeout.map(|t| arrived + t);
     let queue_until = arrived + st.cfg.queue_timeout;
@@ -582,6 +647,16 @@ async fn generate(
     .map_err(|_| ApiError::internal(rid))?;
     request = returned;
     let prepared = prepared.map_err(|e| ApiError::from_request(&e, rid))?;
+    if let Some(cap) = st.cfg.max_prompt_tokens {
+        let n = prepared.prompt_tokens();
+        if n > cap {
+            let param = match kind {
+                Kind::Chat => "messages",
+                Kind::Text => "prompt",
+            };
+            return Err(ApiError::prompt_too_long(param, n, cap));
+        }
+    }
     let (grant_tx, grant_rx) = oneshot::channel();
     ticket.ready(prepared.positions() as u64, move |o| {
         let _ = grant_tx.send(o);
@@ -821,7 +896,7 @@ async fn admin_load(
     let rid = st.request_id(&headers);
     let r = async {
         st.check_admin(&headers)?;
-        let body = json_body(body)?;
+        let body = json_body(&st, body)?;
         let what = body
             .get("model")
             .and_then(Value::as_str)
@@ -860,7 +935,7 @@ async fn models_unload(
 ) -> Response {
     let rid = st.request_id(&headers);
     let r = st.check_admin(&headers).and_then(|()| {
-        let body = json_body(body)?;
+        let body = json_body(&st, body)?;
         let id = body
             .get("model")
             .and_then(Value::as_str)
