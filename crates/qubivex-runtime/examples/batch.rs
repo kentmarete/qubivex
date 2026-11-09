@@ -1,19 +1,28 @@
-//! ADR-017 measurement: greedy decoding of N sequences, one pass per sequence per step
-//! (as the engine runs concurrent requests today) against one shared pass per step
-//! ([`Engine::forward_batch`]). Checks the tokens are identical and prints decode
-//! throughput. Prefill runs per sequence and is not timed.
+//! ADR-017 measurement: greedy decoding of N sequences three ways: one pass per sequence
+//! per step on one thread (taking turns), one shared pass per step driven by the caller
+//! ([`Engine::forward_batch`]), and N threads each calling [`Engine::forward`], which
+//! combine at the engine's turn (how a server runs concurrent requests). Checks the
+//! tokens are identical and prints decode throughput. Prefill runs per sequence and is
+//! not timed.
 //!
 //! ```text
 //! cargo run --release -p qubivex-runtime --example batch -- \
-//!     <MODEL_DIR> <TOKENIZER_JSON> [--cache-mb N] [--steps N] [--runs N] [--sizes 1,2,4,8]
+//!     <MODEL_DIR> <TOKENIZER_JSON> [--cache-mb N] [--steps N] [--runs N] [--sizes 1,2,4,8] \
+//!     [--metal layers|token]
 //! ```
+//!
+//! `--metal` runs whole layers on Metal, routed on the host (`layers`) or on the GPU
+//! (`token`).
 
 use std::error::Error;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
+use qubivex_expert_stream::predict::LookaheadConfig;
 use qubivex_model::{ArchitectureRegistry, ModelMetadata};
-use qubivex_runtime::{Engine, EngineOptions, KvCache, Logits, Segment};
+use qubivex_runtime::{
+    BackendKind, Engine, EngineOptions, KvCache, Logits, MetalOps, PrefetchOptions, Segment,
+};
 use qubivex_tokenizer::Tokenizer;
 
 const PROMPTS: [&str; 8] = [
@@ -49,18 +58,71 @@ fn prefill(e: &Engine, prompts: &[Vec<u32>]) -> Result<(Vec<KvCache>, Vec<u32>),
     Ok((caches, next))
 }
 
-/// Each sequence's tokens and the decode time.
-type Run = (Vec<Vec<u32>>, Duration);
+/// Each sequence's tokens, the decode time, and the store's blocked time and loads
+/// during it.
+type Run = (Vec<Vec<u32>>, Duration, Duration, u64);
+
+/// The store's blocked time and loads so far.
+fn reads(e: &Engine) -> (u64, u64) {
+    let st = e.store_stats();
+    (st.wait_ns, st.loads)
+}
+
+fn run_since(e: &Engine, out: Vec<Vec<u32>>, start: Instant, r0: (u64, u64)) -> Run {
+    let took = start.elapsed();
+    let r1 = reads(e);
+    (out, took, Duration::from_nanos(r1.0 - r0.0), r1.1 - r0.1)
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Mode {
+    Sequential,
+    Batched,
+    Concurrent,
+}
 
 /// Decodes `steps` tokens per sequence.
 fn decode(
     e: &Engine,
     prompts: &[Vec<u32>],
     steps: usize,
-    batched: bool,
+    mode: Mode,
 ) -> Result<Run, Box<dyn Error>> {
     let (mut caches, mut next) = prefill(e, prompts)?;
     let mut out: Vec<Vec<u32>> = next.iter().map(|&t| vec![t]).collect();
+    if mode == Mode::Concurrent {
+        let r0 = reads(e);
+        let start = Instant::now();
+        let done: Vec<Result<(), String>> = std::thread::scope(|s| {
+            let handles: Vec<_> = caches
+                .iter_mut()
+                .zip(&mut out)
+                .map(|(c, o)| {
+                    s.spawn(move || {
+                        for _ in 1..steps {
+                            let t = o[o.len() - 1];
+                            let l = e
+                                .forward(&[t], c, Logits::Last, None)
+                                .map_err(|x| x.to_string())?;
+                            o.push(argmax(&l));
+                        }
+                        Ok(())
+                    })
+                })
+                .collect();
+            handles
+                .into_iter()
+                .map(|h| h.join().unwrap_or_else(|_| Err("panicked".into())))
+                .collect()
+        });
+        let run = run_since(e, out, start, r0);
+        for d in done {
+            d?;
+        }
+        return Ok(run);
+    }
+    let batched = mode == Mode::Batched;
+    let r0 = reads(e);
     let start = Instant::now();
     for _ in 1..steps {
         let feed: Vec<[u32; 1]> = next.iter().map(|&t| [t]).collect();
@@ -87,7 +149,7 @@ fn decode(
             o.push(*n);
         }
     }
-    Ok((out, start.elapsed()))
+    Ok(run_since(e, out, start, r0))
 }
 
 fn median(mut v: Vec<Duration>) -> Duration {
@@ -96,18 +158,42 @@ fn median(mut v: Vec<Duration>) -> Duration {
 }
 
 fn main() -> Result<(), Box<dyn Error>> {
-    let usage = "usage: batch <MODEL_DIR> <TOKENIZER_JSON> [--cache-mb N] [--steps N] [--runs N] [--sizes 1,2,4,8]";
+    let usage = "usage: batch <MODEL_DIR> <TOKENIZER_JSON> [--cache-mb N] [--steps N] [--runs N] [--sizes 1,2,4,8] [--metal layers|token] [--prefetch on|off]";
     let mut args = std::env::args().skip(1);
     let dir = PathBuf::from(args.next().ok_or(usage)?);
     let tok = Tokenizer::from_hf_dir(&PathBuf::from(args.next().ok_or(usage)?))?;
     let (mut cache_mb, mut steps, mut runs) = (None, 32usize, 3usize);
     let mut sizes = vec![1usize, 2, 4, 8];
+    let mut metal = None;
+    let mut prefetch = None;
     while let Some(flag) = args.next() {
         let value = args.next().ok_or(usage)?;
         match flag.as_str() {
             "--cache-mb" => cache_mb = Some(value.parse::<u64>()?),
             "--steps" => steps = value.parse()?,
             "--runs" => runs = value.parse()?,
+            "--prefetch" => {
+                prefetch = match value.as_str() {
+                    "on" => Some(PrefetchOptions {
+                        lookahead: LookaheadConfig::default(),
+                        guard: true,
+                        throttle: true,
+                    }),
+                    "off" => None,
+                    _ => return Err(usage.into()),
+                };
+            }
+            "--metal" => {
+                let token = MetalOps::default();
+                metal = Some(match value.as_str() {
+                    "layers" => MetalOps {
+                        token: false,
+                        ..token
+                    },
+                    "token" => token,
+                    _ => return Err(usage.into()),
+                });
+            }
             "--sizes" => {
                 sizes = value.split(',').map(str::parse).collect::<Result<_, _>>()?;
             }
@@ -120,50 +206,87 @@ fn main() -> Result<(), Box<dyn Error>> {
         EngineOptions {
             expert_cache_bytes: cache_mb.map(|m| m << 20),
             max_context: Some(512),
+            backend: if metal.is_some() {
+                BackendKind::Metal
+            } else {
+                BackendKind::Cpu
+            },
+            metal_ops: metal.unwrap_or_default(),
+            prefetch,
             ..EngineOptions::default()
         },
     )?;
+    let p = e.placement();
+    if let Some(why) = &p.fallback {
+        println!("not on Metal: {why}");
+    }
     let prompts: Vec<Vec<u32>> = PROMPTS
         .iter()
         .map(|p| tok.encode(p, true))
         .collect::<Result<_, _>>()?;
     println!(
-        "expert cache: {}; {steps} tokens per sequence, median of {runs} runs",
+        "{}; prefetch {}; expert cache: {}; {steps} tokens per sequence, median of {runs} runs",
+        metal.map_or("CPU".into(), |o| format!("Metal {}", o.describe())),
+        if prefetch.is_some() { "on" } else { "off" },
         cache_mb.map_or("all resident".into(), |m| format!("{m} MiB"))
     );
-    println!("| N | sequential tok/s | batched tok/s | speed-up | tokens identical |");
-    println!("|---:|---:|---:|---:|---|");
+    println!(
+        "| N | sequential tok/s | batched tok/s | speed-up | concurrent tok/s | speed-up | widest pass | tokens identical | read wait seq / conc | loads per token seq / conc |"
+    );
+    println!("|---:|---:|---:|---:|---:|---:|---:|---|---:|---:|");
     for n in sizes {
         let ps = &prompts[..n.min(prompts.len())];
         // Warm-up: fills the expert cache the way the measured runs will use it.
-        decode(&e, ps, steps.min(4), true)?;
-        let (mut seq_t, mut bat_t) = (Vec::new(), Vec::new());
+        decode(&e, ps, steps.min(4), Mode::Batched)?;
+        let mut times: [Vec<Duration>; 3] = Default::default();
+        let mut waits: [Vec<Duration>; 3] = Default::default();
+        let mut loads: [Vec<u64>; 3] = Default::default();
         let mut same = true;
+        let mut widest = 0;
+        let modes = [Mode::Sequential, Mode::Batched, Mode::Concurrent];
         for r in 0..runs {
-            // Alternate which goes first, so drift does not favour either.
-            let order = if r % 2 == 0 {
-                [false, true]
-            } else {
-                [true, false]
-            };
+            // Rotate which goes first, so drift does not favour any.
             let mut tokens = Vec::new();
-            for batched in order {
-                let (t, d) = decode(&e, ps, steps, batched)?;
-                if batched { &mut bat_t } else { &mut seq_t }.push(d);
+            for k in 0..3 {
+                let i = (k + r) % 3;
+                let before = e.batch_stats().widest;
+                let (t, d, w, l) = decode(&e, ps, steps, modes[i])?;
+                waits[i].push(w);
+                loads[i].push(l);
+                if modes[i] == Mode::Concurrent {
+                    // The engine keeps its widest pass; reset per size is not
+                    // possible, so this is the widest so far.
+                    widest = widest.max(e.batch_stats().widest.max(before));
+                }
+                times[i].push(d);
                 tokens.push(t);
             }
-            same &= tokens[0] == tokens[1];
+            same &= tokens.windows(2).all(|w| w[0] == w[1]);
         }
         #[allow(clippy::cast_precision_loss)]
         let generated = (ps.len() * (steps - 1)) as f64;
-        let (s, b) = (median(seq_t), median(bat_t));
+        let [s, b, c] = times.map(median);
+        let [ws, _, wc] = waits.map(median);
+        let [ls, _, lc] = loads.map(|mut v| {
+            v.sort_unstable();
+            v[v.len() / 2]
+        });
+        #[allow(clippy::cast_precision_loss)]
+        let per_token = |l: u64| l as f64 / generated;
         println!(
-            "| {} | {:.2} | {:.2} | {:.2}x | {} |",
+            "| {} | {:.2} | {:.2} | {:.2}x | {:.2} | {:.2}x | {} | {} | {:.0}% / {:.0}% | {:.1} / {:.1} |",
             ps.len(),
             generated / s.as_secs_f64(),
             generated / b.as_secs_f64(),
             s.as_secs_f64() / b.as_secs_f64(),
-            if same { "yes" } else { "NO" }
+            generated / c.as_secs_f64(),
+            s.as_secs_f64() / c.as_secs_f64(),
+            widest,
+            if same { "yes" } else { "NO" },
+            100.0 * ws.as_secs_f64() / s.as_secs_f64(),
+            100.0 * wc.as_secs_f64() / c.as_secs_f64(),
+            per_token(ls),
+            per_token(lc),
         );
     }
     Ok(())

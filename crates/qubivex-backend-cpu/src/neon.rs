@@ -485,6 +485,382 @@ unsafe fn bf16_impl(row: &[u8], x: &[f32]) -> f32 {
     }
 }
 
+// Several activation rows (2 to `MAX_ROWS`).
+//
+// The 64 accumulator lanes of an output split into four groups of 16 (vectors
+// `4g..4g + 4`). Each `*_group::<N, G>` makes one pass over the weight row,
+// dequantises only the weights that land in group `G`, and accumulates each into all
+// `N` activation rows: `4N` accumulator vectors, which fit in registers for N ≤ 5.
+// Every weight is still dequantised once, by the same operations as the one-row
+// kernel, and every lane receives the same fused multiply-adds in the same order
+// (chunks ascending), so each output has the bits of the one-row kernel (and so of
+// the portable path). Only per-block scale unpacking runs once per group.
+
+/// The most activation rows the multi-row kernels take.
+pub(crate) const MAX_ROWS: usize = 5;
+
+/// One lane group's accumulators for `N` rows.
+type Group<const N: usize> = [[float32x4_t; 4]; N];
+
+#[inline]
+fn zeros<const N: usize>() -> Group<N> {
+    // SAFETY: register-only NEON; NEON is part of the aarch64 baseline.
+    unsafe { [[vdupq_n_f32(0.0); 4]; N] }
+}
+
+/// `acc[t][i] = fma(w[i], x_t[off + 4i..], acc[t][i])` for every row `t`.
+///
+/// # Safety
+/// `(N − 1) · k + off + 16 <= xs.len()`.
+#[inline(always)]
+unsafe fn fma_rows<const N: usize>(
+    acc: &mut Group<N>,
+    w: [float32x4_t; 4],
+    xs: &[f32],
+    k: usize,
+    off: usize,
+) {
+    // SAFETY: the caller guarantees each row's 16 activations are in bounds.
+    unsafe {
+        for (t, a) in acc.iter_mut().enumerate() {
+            let x = load_x16(xs, t * k + off);
+            for i in 0..4 {
+                a[i] = vfmaq_f32(a[i], w[i], x[i]);
+            }
+        }
+    }
+}
+
+/// The four groups' lanes of each row, as one row's 64 lanes.
+#[inline(always)]
+fn lanes_of<const N: usize>(g: &[Group<N>; 4], t: usize) -> [float32x4_t; V] {
+    std::array::from_fn(|j| g[j / 4][t][j % 4])
+}
+
+/// Q4_K, lane group `G`, with FEAT_FHM: the weights of [`q4_k_fhm_impl`].
+///
+/// # Safety
+/// The CPU must support FEAT_FP16 and FEAT_FHM; `xs` holds `N` rows of `k`, and the
+/// row `k / 256` blocks.
+#[inline]
+#[target_feature(enable = "fp16,fhm")]
+unsafe fn q4_k_fhm_group<const N: usize, const G: usize>(
+    row: &[u8],
+    xs: &[f32],
+    k: usize,
+) -> Group<N> {
+    // SAFETY: as `q4_k_fhm_impl`; the caller fixes the lengths, and each load notes
+    // its bound.
+    unsafe {
+        let mut acc = zeros::<N>();
+        let mask = vdupq_n_u8(0x0F);
+        // Low nibbles (groups 0, 1) use the even sub-block's scale, high ones the odd.
+        let half = G / 2;
+        for (b, blk) in row.chunks_exact(Q4_K_BYTES).enumerate() {
+            let d = vreinterpretq_f32_u16(vdupq_n_u16(u16::from_le_bytes([blk[0], blk[1]])));
+            let nmin = -f16_at(blk, 2);
+            let sm = q4_k_scales_mins(&blk[4..16]);
+            for j in 0..4 {
+                // SAFETY: 16 + 32j + 16(G & 1) + 16 <= 144 = Q4_K_BYTES.
+                let qv = vld1q_u8(blk.as_ptr().add(16 + 32 * j + 16 * (G & 1)));
+                let qv = if G < 2 {
+                    vandq_u8(qv, mask)
+                } else {
+                    vshrq_n_u8::<4>(qv)
+                };
+                let sc = vdupq_n_u8(sm[2 * j + half]);
+                // −dmin · m: exact, as `nm` in `q4_k_fhm_impl`.
+                let m = vdupq_n_f32(nmin * f32::from(sm[8 + 2 * j + half]));
+                let lo = u16x8_to_f16(vmull_u8(vget_low_u8(qv), vget_low_u8(sc)));
+                let hi = u16x8_to_f16(vmull_high_u8(qv, sc));
+                let w = [
+                    fmlal::<false>(m, lo, d),
+                    fmlal::<true>(m, lo, d),
+                    fmlal::<false>(m, hi, d),
+                    fmlal::<true>(m, hi, d),
+                ];
+                // SAFETY: off + 16 <= (b + 1) · 256 <= k, per row.
+                fma_rows(&mut acc, w, xs, k, b * QK_K + 64 * j + 16 * G);
+            }
+        }
+        acc
+    }
+}
+
+/// `N` Q4_K dot products of one row with FEAT_FHM.
+///
+/// # Safety
+/// The CPU must support FEAT_FP16 and FEAT_FHM; lengths are asserted.
+#[target_feature(enable = "fp16,fhm")]
+unsafe fn q4_k_fhm_rows_impl<const N: usize>(row: &[u8], xs: &[f32], out: &mut [f32]) {
+    let k = row.len() / Q4_K_BYTES * QK_K;
+    assert_eq!(xs.len(), N * k);
+    assert_eq!(out.len(), N);
+    // SAFETY: the features are the caller's; the lengths were just asserted.
+    let g = unsafe {
+        [
+            q4_k_fhm_group::<N, 0>(row, xs, k),
+            q4_k_fhm_group::<N, 1>(row, xs, k),
+            q4_k_fhm_group::<N, 2>(row, xs, k),
+            q4_k_fhm_group::<N, 3>(row, xs, k),
+        ]
+    };
+    for (t, o) in out.iter_mut().enumerate() {
+        *o = reduce(lanes_of(&g, t));
+    }
+}
+
+/// Q6_K, lane group `G`: the weights of [`q6_k_impl`].
+///
+/// # Safety
+/// `xs` holds `N` rows of `k`, and the row `k / 256` blocks.
+#[inline(always)]
+unsafe fn q6_k_group<const N: usize, const G: usize>(row: &[u8], xs: &[f32], k: usize) -> Group<N> {
+    // SAFETY: as `q6_k_impl`; the caller fixes the lengths, and each load notes its
+    // bound.
+    unsafe {
+        let mut acc = zeros::<N>();
+        let m4 = vdupq_n_u8(0x0F);
+        let m2 = vdupq_n_u8(0x03);
+        let k32 = vdupq_n_s8(32);
+        // Group G holds elements e with (e mod 64) in 16G..16G + 16: in each 128-weight
+        // half, l in lo..lo + 16 of q1 and q3 (G < 2) or of q2 and q4 (G ≥ 2).
+        let v16 = G % 2;
+        let lo = 16 * v16;
+        let to_q = |low: uint8x16_t, high: uint8x16_t| -> int8x16_t {
+            vsubq_s8(
+                vreinterpretq_s8_u8(vorrq_u8(low, vshlq_n_u8::<4>(vandq_u8(high, m2)))),
+                k32,
+            )
+        };
+        for (b, blk) in row.chunks_exact(Q6_K_BYTES).enumerate() {
+            let d = f16_at(blk, 208);
+            for half in 0..2 {
+                let ql = &blk[64 * half..64 * half + 64];
+                let qh = &blk[128 + 32 * half..128 + 32 * half + 32];
+                let sc = &blk[192 + 8 * half..192 + 8 * half + 8];
+                let s = |i: usize| vdupq_n_f32(d * f32::from(sc[i] as i8));
+                // SAFETY: ql has 64 bytes and qh 32; lo + 16 <= 32 and lo + 32 + 16 <= 64.
+                let qs = if G < 2 {
+                    let (a, h) = (vld1q_u8(ql.as_ptr().add(lo)), vld1q_u8(qh.as_ptr().add(lo)));
+                    [
+                        (to_q(vandq_u8(a, m4), h), 0, s(v16)),
+                        (to_q(vshrq_n_u8::<4>(a), vshrq_n_u8::<4>(h)), 64, s(v16 + 4)),
+                    ]
+                } else {
+                    let (c, h) = (
+                        vld1q_u8(ql.as_ptr().add(lo + 32)),
+                        vld1q_u8(qh.as_ptr().add(lo)),
+                    );
+                    [
+                        (to_q(vandq_u8(c, m4), vshrq_n_u8::<2>(h)), 32, s(v16 + 2)),
+                        (to_q(vshrq_n_u8::<4>(c), vshrq_n_u8::<6>(h)), 96, s(v16 + 6)),
+                    ]
+                };
+                for (q, base, scale) in qs {
+                    let mut w = i8x16_to_f32(q);
+                    for v in &mut w {
+                        *v = vmulq_f32(scale, *v);
+                    }
+                    // SAFETY: b · 256 + e + 16 <= (b + 1) · 256 <= k, per row.
+                    fma_rows(&mut acc, w, xs, k, b * QK_K + 128 * half + base + lo);
+                }
+            }
+        }
+        acc
+    }
+}
+
+/// `N` Q6_K dot products of one row.
+///
+/// # Safety
+/// None beyond running on aarch64; lengths are asserted.
+unsafe fn q6_k_rows_impl<const N: usize>(row: &[u8], xs: &[f32], out: &mut [f32]) {
+    let k = row.len() / Q6_K_BYTES * QK_K;
+    assert_eq!(xs.len(), N * k);
+    assert_eq!(out.len(), N);
+    // SAFETY: the lengths were just asserted.
+    let g = unsafe {
+        [
+            q6_k_group::<N, 0>(row, xs, k),
+            q6_k_group::<N, 1>(row, xs, k),
+            q6_k_group::<N, 2>(row, xs, k),
+            q6_k_group::<N, 3>(row, xs, k),
+        ]
+    };
+    for (t, o) in out.iter_mut().enumerate() {
+        *o = reduce(lanes_of(&g, t));
+    }
+}
+
+/// Q8_0, lane group `G`: half `G mod 2` of every block whose index is `G / 2` mod 2,
+/// the weights of [`q8_0_impl`].
+///
+/// # Safety
+/// `xs` holds `N` rows of `k`, and the row `k / 32` blocks.
+#[inline(always)]
+unsafe fn q8_0_group<const N: usize, const G: usize>(row: &[u8], xs: &[f32], k: usize) -> Group<N> {
+    // SAFETY: as `q8_0_impl`; the caller fixes the lengths, and each load notes its
+    // bound.
+    unsafe {
+        let mut acc = zeros::<N>();
+        let h = G % 2;
+        for (bi, blk) in row
+            .chunks_exact(Q8_0_BYTES)
+            .enumerate()
+            .skip(G / 2)
+            .step_by(2)
+        {
+            let d = vdupq_n_f32(f16_at(blk, 0));
+            // SAFETY: the block has 34 bytes; 2 + 16h + 16 <= 34.
+            let q = core::arch::aarch64::vld1q_s8(blk.as_ptr().add(2 + 16 * h).cast());
+            let mut w = i8x16_to_f32(q);
+            for v in &mut w {
+                *v = vmulq_f32(*v, d);
+            }
+            // SAFETY: 32 · bi + 16h + 16 <= 32 · (bi + 1) <= k, per row.
+            fma_rows(&mut acc, w, xs, k, 32 * bi + 16 * h);
+        }
+        acc
+    }
+}
+
+/// `N` Q8_0 dot products of one row.
+///
+/// # Safety
+/// None beyond running on aarch64; lengths are asserted.
+unsafe fn q8_0_rows_impl<const N: usize>(row: &[u8], xs: &[f32], out: &mut [f32]) {
+    let k = row.len() / Q8_0_BYTES * 32;
+    assert_eq!(xs.len(), N * k);
+    assert_eq!(out.len(), N);
+    // SAFETY: the lengths were just asserted.
+    let g = unsafe {
+        [
+            q8_0_group::<N, 0>(row, xs, k),
+            q8_0_group::<N, 1>(row, xs, k),
+            q8_0_group::<N, 2>(row, xs, k),
+            q8_0_group::<N, 3>(row, xs, k),
+        ]
+    };
+    for (t, o) in out.iter_mut().enumerate() {
+        *o = reduce(lanes_of(&g, t));
+    }
+}
+
+/// bf16, lane group `G`: elements `64c + 16G ..` of the whole 16-element runs, the
+/// weights of [`bf16_impl`].
+///
+/// # Safety
+/// `xs` holds `N` rows of `k`, and the row `2k` bytes.
+#[inline(always)]
+unsafe fn bf16_group<const N: usize, const G: usize>(row: &[u8], xs: &[f32], k: usize) -> Group<N> {
+    // SAFETY: as `bf16_impl`; the caller fixes the lengths, and each load notes its
+    // bound.
+    unsafe {
+        let mut acc = zeros::<N>();
+        let full16 = k / 16 * 16;
+        let mut e = 16 * G;
+        while e < full16 {
+            // SAFETY: 32 bytes from 2e are in bounds (e + 16 <= k).
+            let p = row.as_ptr().add(2 * e).cast::<u16>();
+            let (lo, hi) = (vld1q_u16(p), vld1q_u16(p.add(8)));
+            let w = [
+                vreinterpretq_f32_u32(vshlq_n_u32::<16>(vmovl_u16(vget_low_u16(lo)))),
+                vreinterpretq_f32_u32(vshlq_n_u32::<16>(vmovl_high_u16(lo))),
+                vreinterpretq_f32_u32(vshlq_n_u32::<16>(vmovl_u16(vget_low_u16(hi)))),
+                vreinterpretq_f32_u32(vshlq_n_u32::<16>(vmovl_high_u16(hi))),
+            ];
+            // SAFETY: e + 16 <= k, per row.
+            fma_rows(&mut acc, w, xs, k, e);
+            e += LANES;
+        }
+        acc
+    }
+}
+
+/// `N` bf16 dot products of one row; a tail shorter than 16 goes to lanes
+/// `full16 mod 64 ..`, as in [`bf16_impl`].
+///
+/// # Safety
+/// None beyond running on aarch64; lengths are asserted.
+unsafe fn bf16_rows_impl<const N: usize>(row: &[u8], xs: &[f32], out: &mut [f32]) {
+    let k = row.len() / 2;
+    assert_eq!(xs.len(), N * k);
+    assert_eq!(out.len(), N);
+    // SAFETY: the lengths were just asserted.
+    let g = unsafe {
+        [
+            bf16_group::<N, 0>(row, xs, k),
+            bf16_group::<N, 1>(row, xs, k),
+            bf16_group::<N, 2>(row, xs, k),
+            bf16_group::<N, 3>(row, xs, k),
+        ]
+    };
+    let full16 = k / 16 * 16;
+    for (t, o) in out.iter_mut().enumerate() {
+        let mut a = [0f32; LANES];
+        for (j, v) in lanes_of(&g, t).iter().enumerate() {
+            // SAFETY: `a` has 64 floats; 4j + 4 <= 64.
+            unsafe { vst1q_f32(a.as_mut_ptr().add(4 * j), *v) };
+        }
+        let x = &xs[t * k..(t + 1) * k];
+        for i in full16..k {
+            let w =
+                f32::from_bits(u32::from(u16::from_le_bytes([row[2 * i], row[2 * i + 1]])) << 16);
+            a[i % LANES] = w.mul_add(x[i], a[i % LANES]);
+        }
+        *o = crate::reduce::reduce(&a);
+    }
+}
+
+/// `out.len()` (2 to [`MAX_ROWS`]) dot products of one weight row with as many
+/// activation rows (`xs`, row-major): the bits of the one-row kernel per output.
+pub(crate) type RowsDot = fn(&[u8], &[f32], &mut [f32]);
+
+/// Calls `$f::<N>` for `N = out.len()`.
+macro_rules! by_rows {
+    ($f:ident, $row:expr, $xs:expr, $out:expr) => {
+        match $out.len() {
+            2 => $f::<2>($row, $xs, $out),
+            3 => $f::<3>($row, $xs, $out),
+            4 => $f::<4>($row, $xs, $out),
+            5 => $f::<5>($row, $xs, $out),
+            n => unreachable!("{n} rows: the multi-row kernels take 2 to {MAX_ROWS}"),
+        }
+    };
+}
+
+/// Q4_K multi-row dot. Without FEAT_FHM it is the one-row kernel per row (same bits).
+pub(crate) fn q4_k_rows(row: &[u8], xs: &[f32], out: &mut [f32]) {
+    if has_fhm() {
+        // SAFETY: FP16 and FHM were detected just above.
+        unsafe { by_rows!(q4_k_fhm_rows_impl, row, xs, out) }
+    } else {
+        let k = xs.len() / out.len();
+        for (o, x) in out.iter_mut().zip(xs.chunks_exact(k)) {
+            *o = q4_k_base(row, x);
+        }
+    }
+}
+
+/// Q6_K multi-row dot.
+pub(crate) fn q6_k_rows(row: &[u8], xs: &[f32], out: &mut [f32]) {
+    // SAFETY: NEON is always available on aarch64.
+    unsafe { by_rows!(q6_k_rows_impl, row, xs, out) }
+}
+
+/// Q8_0 multi-row dot.
+pub(crate) fn q8_0_rows(row: &[u8], xs: &[f32], out: &mut [f32]) {
+    // SAFETY: NEON is always available on aarch64.
+    unsafe { by_rows!(q8_0_rows_impl, row, xs, out) }
+}
+
+/// bf16 multi-row dot.
+pub(crate) fn bf16_rows(row: &[u8], xs: &[f32], out: &mut [f32]) {
+    // SAFETY: NEON is always available on aarch64.
+    unsafe { by_rows!(bf16_rows_impl, row, xs, out) }
+}
+
 // Safe entry points.
 
 /// Q4_K row dot: the FEAT_FHM kernel where the CPU has it, else the baseline NEON one.

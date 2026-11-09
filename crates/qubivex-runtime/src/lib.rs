@@ -6,16 +6,18 @@
 //! expert store.
 
 pub mod checksums;
+mod combine;
 mod engine;
 mod experts;
 mod metal_forward;
 mod placement;
 mod request;
 
+pub use combine::BatchStats;
 pub use engine::{
-    DEFAULT_IO_THREADS, DEFAULT_READ_RETRIES, Engine, EngineOptions, Finish, GenerateOptions,
-    Generation, KvReservation, PredictionStats, PrefetchOptions, PrefetchReport, Sampling,
-    Verification, VerifyExperts, cpu_pass_reason,
+    DEFAULT_BATCH_TOKENS, DEFAULT_BATCH_WAIT_US, DEFAULT_IO_THREADS, DEFAULT_READ_RETRIES, Engine,
+    EngineOptions, Finish, GenerateOptions, Generation, KvReservation, PredictionStats,
+    PrefetchOptions, PrefetchReport, Sampling, Verification, VerifyExperts, cpu_pass_reason,
 };
 pub use experts::{ExpertIo, ExpertLayout, IoPath, ModelExpertSource, PartLayout};
 pub use placement::{BackendKind, MetalOps, PlacementReport};

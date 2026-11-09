@@ -251,6 +251,23 @@ impl std::fmt::Debug for KvCache {
     }
 }
 
+/// A cache of no layers and no context, which no model accepts: what a cache moved
+/// out of its owner leaves behind.
+impl Default for KvCache {
+    fn default() -> Self {
+        Self {
+            k: Vec::new(),
+            v: Vec::new(),
+            kv_heads: 0,
+            head_dim: 0,
+            len: 0,
+            max: 0,
+            device: None,
+            device_bytes: 0,
+        }
+    }
+}
+
 impl KvCache {
     /// Positions per allocation step. The cache grows by whole chunks (never past its
     /// context limit) instead of doubling, so what it allocates stays within one chunk
@@ -815,6 +832,46 @@ impl Transformer {
         self.forward_segments(segments, src, None)
     }
 
+    /// Checks one segment on its own, as a pass over it would: its cache has this
+    /// model's layers, its tokens fit the context, and every token id is in the
+    /// vocabulary. A scheduler combining sequences answers a failing segment alone
+    /// with this error instead of failing everything that shares its pass (ADR-017).
+    ///
+    /// # Errors
+    /// The [`ArchError::Input`] a pass over the segment would return.
+    pub fn check_segment(
+        &self,
+        tokens: &[u32],
+        cache: &KvCache,
+        dense: &dyn DenseWeights,
+    ) -> Result<(), ArchError> {
+        self.check_room(cache, tokens.len())?;
+        let rows = dense.view(&self.cfg.names.embedding)?.rows();
+        match tokens.iter().find(|&&id| id as usize >= rows) {
+            Some(id) => Err(ArchError::Input(format!(
+                "token id {id} >= vocabulary {rows}"
+            ))),
+            None => Ok(()),
+        }
+    }
+
+    fn check_room(&self, cache: &KvCache, n: usize) -> Result<(), ArchError> {
+        if cache.k.len() != self.norms.len() || cache.v.len() != self.norms.len() {
+            return Err(ArchError::Input(format!(
+                "KV cache has {} layers, the model {}",
+                cache.k.len(),
+                self.norms.len()
+            )));
+        }
+        if cache.len + n > cache.max {
+            return Err(ArchError::Input(format!(
+                "context full: {} positions + {n} new > {}",
+                cache.len, cache.max
+            )));
+        }
+        Ok(())
+    }
+
     /// Positions are counted in the caches only once the whole pass has succeeded, so
     /// a failure anywhere leaves every cache as it was.
     #[allow(clippy::too_many_lines)]
@@ -831,19 +888,7 @@ impl Transformer {
         let mut tokens = Vec::new();
         for g in segments.iter() {
             let (p0, n) = (g.cache.len, g.tokens.len());
-            if g.cache.k.len() != self.norms.len() || g.cache.v.len() != self.norms.len() {
-                return Err(ArchError::Input(format!(
-                    "KV cache has {} layers, the model {}",
-                    g.cache.k.len(),
-                    self.norms.len()
-                )));
-            }
-            if p0 + n > g.cache.max {
-                return Err(ArchError::Input(format!(
-                    "context full: {} positions + {n} new > {}",
-                    p0, g.cache.max
-                )));
-            }
+            self.check_room(g.cache, n)?;
             layout.push((tokens.len(), n, p0));
             tokens.extend_from_slice(g.tokens);
         }

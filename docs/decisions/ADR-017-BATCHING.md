@@ -78,6 +78,19 @@ Consequences of this shape:
   slot and receives it back, so the leader owns every cache it computes on and no cache
   is reachable from two threads at once. This is safe Rust and needs no new `unsafe`.
 
+**Amendment 1 (2026-11-09, owner decision): a bounded wait keeps callers together.**
+Measured in job 8, the rule above splits passes: the callers a pass answers are still
+sampling their next token when the next leader takes the queue, so at N = 2 passes
+mostly alternated one step each, and concurrent callers on OLMoE got 0.99x to 1.22x
+where caller-driven batches got 1.17x to 1.46x. A leader now waits, up to
+`EngineOptions::batch_wait_us` (default 1 ms; 0 turns it off), for as many posts as the
+last pass answered with logits. Any post counts, so a lone caller never waits, and a
+caller that has stopped costs one bounded wait, after which it is no longer expected
+(`BatchStats::wait_timeouts` counts these). Sampling takes microseconds and a pass tens
+of milliseconds, so the bound is reached only when a caller left. With the wait,
+concurrent callers matched caller-driven batches: 1.19x to 1.53x at N = 2 to 8, every
+pass at full width.
+
 ### 3. Pass composition: a token budget
 A pass takes every waiting decode step first (one token each), then prefill chunks while
 the total stays within a token budget (default: the prefill chunk, 256). A long prompt
@@ -105,13 +118,28 @@ The Metal pass (ADR-011) already runs `s` tokens per layer submission, and its k
 reproduce the CPU bits. Batching it means one KV write and one attention dispatch per
 segment, against that segment's device buffers and positions, inside the same command
 buffer; every other kernel runs over all tokens unchanged. Job 8 adds this with the same
-bit-identity tests, on both Metal placements. Until then `Engine::forward_batch` refuses
-an engine with layers on Metal, and the combining point runs one segment per pass there.
+bit-identity tests, on both Metal placements.
+
+Built in job 8: attention is three dependent dispatches (scores, softmax, values), so the
+segments' attentions run stage by stage (`Batch::attention_many`), each stage for every
+segment at once, not as one group of whole attentions, which races. The combining point
+and `Engine::forward_batch` run on Metal as on the CPU.
 
 ### 7. Prefetch
 The lookahead router runs only when a pass has one token: a batch routes to the union of
 its tokens' experts, which one token's prediction does not cover. Job 8 measures whether
 predicting the union is worth adding when experts stream; it changes no bits either way.
+
+Measured in job 8 (2026-11-10, on power, OLMoE Q4_K_M, CPU, `examples/batch.rs`, which
+reports the store's blocked time as a share of decode time): **not worth adding.**
+Predicting the union could save at most the time a batched pass waits on reads, and
+batching already hides most of it. Experts load in the background while the pass computes
+the experts it already holds, and a wider pass gives each load more compute to overlap.
+With prefetch off, sequences taking turns wait 5% to 19% of the time; concurrent callers in
+shared passes, at N = 2 to 8, wait 0% to 2% with a 1024 MiB expert cache and 2% to 5% with
+512 MiB. No union predictor is built, and the lookahead stays for one-token passes. This
+fits the owner's rule from 2026-11-06 that prefetch gets no further work unless a real
+workload shows a gain.
 
 ## The prototype (job 7)
 Built in this job: `Transformer::forward_batch`, `Segment`, `Engine::forward_batch` (CPU

@@ -19,11 +19,11 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use qubivex_arch::ops::{Rope, route};
-use qubivex_arch::{ArchError, DenseWeights, KvCache, Logits, layer_name};
+use qubivex_arch::{ArchError, DenseWeights, KvCache, Logits, Segment, layer_name};
 use qubivex_backend_cpu::CpuBackend;
 use qubivex_backend_metal::{
-    AttentionShape, Batch, DeviceVec, GROUPED_ENTRIES_PER_EXPERT, MAX_ROUTED_EXPERTS, MetalBackend,
-    MetalHost, MetalWeights, RoutedInput, Routing,
+    Attend, AttentionShape, Batch, DeviceVec, GROUPED_ENTRIES_PER_EXPERT, MAX_ROUTED_EXPERTS,
+    MetalBackend, MetalHost, MetalWeights, RoutedInput, Routing,
 };
 use qubivex_compute::{ComputeBackend, ComputeError, WeightView};
 use qubivex_core::{ExpertIdx, LayerIdx};
@@ -74,8 +74,18 @@ struct GpuKv {
 #[derive(Default)]
 struct Work {
     tokens: usize,
-    span: usize,
+    /// Elements of `bufs.scores`.
+    scores: usize,
     bufs: Option<Bufs>,
+}
+
+/// One segment's attention in a pass (ADR-017 §6): its own device keys and values,
+/// its first token in the pass and its first score in the scores buffer.
+struct Part<'k> {
+    kv: &'k GpuKv,
+    at: usize,
+    attn: AttentionShape,
+    scores_at: usize,
 }
 
 struct Bufs {
@@ -370,16 +380,10 @@ impl MetalForward {
         cache.advance(positions)
     }
 
-    /// Makes the activation buffers hold `s` tokens attending over `span` positions.
-    fn ensure_work(&self, work: &mut Work, s: usize, span: usize) -> Result<(), ArchError> {
-        if work.bufs.is_some() && work.tokens >= s && work.span >= span {
-            return Ok(());
-        }
-        let s = s.max(work.tokens);
-        // Scores grow with the context; reserve for the whole context at decode sizes.
-        let span = span
-            .max(work.span)
-            .max(if s == 1 { self.max_context } else { 0 });
+    /// Makes the activation buffers hold `s` tokens and `scores` attention scores.
+    /// Scores alone grow by doubling, so a batch of decode steps, whose positions grow
+    /// every pass, does not reallocate every buffer every pass.
+    fn ensure_work(&self, work: &mut Work, s: usize, scores: usize) -> Result<(), ArchError> {
         let Dims {
             h,
             d,
@@ -392,7 +396,19 @@ impl MetalForward {
             vocab,
             ..
         } = self.dims;
+        // Scores grow with the context; reserve for the whole context at decode sizes.
+        let scores = scores.max(if s == 1 { heads * self.max_context } else { 0 });
         let v = |n: usize| self.be.vec(n).map_err(dev);
+        if let Some(bufs) = work.bufs.as_mut().filter(|_| work.tokens >= s) {
+            if work.scores < scores {
+                let n = scores.max((2 * work.scores).min(s * heads * self.max_context));
+                bufs.scores = v(n)?;
+                work.scores = n;
+            }
+            return Ok(());
+        }
+        let s = s.max(work.tokens);
+        let scores = scores.max(work.scores);
         work.bufs = Some(Bufs {
             hs: v(s * h)?,
             x: v(s * h)?,
@@ -403,7 +419,7 @@ impl MetalForward {
             o: v(s * h)?,
             router: v(s * ne)?,
             table: v(s * d)?,
-            scores: v(s * heads * span)?,
+            scores: v(scores)?,
             xe: v(s * k_top * h)?,
             g: v(s * k_top * ffn)?,
             u: v(s * k_top * ffn)?,
@@ -417,7 +433,7 @@ impl MetalForward {
             offsets: v(ne + 1)?,
         });
         work.tokens = s;
-        work.span = span;
+        work.scores = scores;
         Ok(())
     }
 
@@ -511,19 +527,21 @@ impl MetalForward {
     }
 
     /// Records layer `l`'s attention block (into the residual stream `hs`), then its
-    /// MoE norm (into `x`) and router (into `router`), for `attn.tokens` tokens.
+    /// MoE norm (into `x`) and router (into `router`), for `s` tokens. Every step runs
+    /// over all of them but the KV write and attention, which run per part against
+    /// that part's own cache.
     fn record_attention(
         &self,
         b: &mut Batch<'_, '_>,
         w: &Bufs,
-        kv: &GpuKv,
+        parts: &[Part<'_>],
+        s: usize,
         l: usize,
         ly: &LayerOnMetal,
-        attn: AttentionShape,
     ) -> Result<(), ComputeError> {
         let c = &self.cfg;
         let dm = self.dims;
-        let (s, h, d) = (attn.tokens, dm.h, dm.d);
+        let (h, d) = (dm.h, dm.d);
         #[allow(clippy::cast_possible_truncation)]
         let clip = c.clip_qkv.map(|v| v as f32);
         let x = w.x.span(0, s * h)?;
@@ -563,19 +581,39 @@ impl MetalForward {
             b.rope(&q, s, dm.heads, d / 2, &tb)?;
             b.rope(&k, s, dm.kvh, d / 2, &tb)
         })?;
+        // Parts own distinct caches, token rows and score ranges.
         b.concurrent(|b| {
-            b.kv_store(&kv.k[l].all(), &k, attn)?;
-            b.kv_store(&kv.v[l].all(), &v, attn)
+            for p in parts {
+                let n = p.attn.tokens;
+                b.kv_store(
+                    &p.kv.k[l].all(),
+                    &w.k.span(p.at * dm.kv_out, n * dm.kv_out)?,
+                    p.attn,
+                )?;
+                b.kv_store(
+                    &p.kv.v[l].all(),
+                    &w.v.span(p.at * dm.kv_out, n * dm.kv_out)?,
+                    p.attn,
+                )?;
+            }
+            Ok(())
         })?;
+        let attend = parts
+            .iter()
+            .map(|p| {
+                let n = p.attn.tokens;
+                Ok(Attend {
+                    q: w.q.span(p.at * dm.q_out, n * dm.q_out)?,
+                    k: p.kv.k[l].all(),
+                    v: p.kv.v[l].all(),
+                    scores: w.scores.span(p.scores_at, n * dm.heads * (p.attn.p0 + n))?,
+                    out: w.att.span(p.at * dm.q_out, n * dm.q_out)?,
+                    shape: p.attn,
+                })
+            })
+            .collect::<Result<Vec<_>, ComputeError>>()?;
+        b.attention_many(&attend)?;
         let att = w.att.span(0, s * dm.q_out)?;
-        b.attention(
-            &q,
-            &kv.k[l].all(),
-            &kv.v[l].all(),
-            &w.scores.all(),
-            &att,
-            attn,
-        )?;
         let o = w.o.span(0, s * h)?;
         b.matmul(&ly.o, &att, s, &o)?;
         b.add(&w.hs.all(), &o, s * h)?;
@@ -585,18 +623,22 @@ impl MetalForward {
         b.matmul(&ly.router, &x, s, &w.router.span(0, s * dm.ne)?)
     }
 
-    /// Records the final norm and the head on tokens `first..first + m` (into
-    /// `logits`).
+    /// Records the final norm and the head on the token `rows` (into `logits`, in
+    /// that order).
     fn record_head(
         &self,
         b: &mut Batch<'_, '_>,
         w: &Bufs,
-        first: usize,
-        m: usize,
+        rows: &[u32],
     ) -> Result<(), ComputeError> {
-        let h = self.dims.h;
+        let (h, m) = (self.dims.h, rows.len());
         let xf = w.xf.span(0, m * h)?;
-        b.copy(&xf, &w.hs.span(first * h, m * h)?, m * h)?;
+        let first = rows.first().map_or(0, |&r| r as usize);
+        if rows.iter().zip(first..).all(|(&r, i)| r as usize == i) {
+            b.copy(&xf, &w.hs.span(first * h, m * h)?, m * h)?;
+        } else {
+            b.gather_rows(&xf, &w.hs.all(), rows, h)?;
+        }
         b.rms_norm(&xf, m, &self.final_norm.all(), self.cfg.rms_eps)?;
         b.matmul(&self.head, &xf, m, &w.logits.span(0, m * self.dims.vocab)?)
     }
@@ -667,13 +709,12 @@ impl MetalForward {
     fn routed(
         &self,
         w: &Bufs,
-        kv: &GpuKv,
         held: &[Vec<Lease<'_>>],
         source: &ModelExpertSource,
         store: &ExpertStore,
-        attn: AttentionShape,
-        first: usize,
-        m: usize,
+        parts: &[Part<'_>],
+        s: usize,
+        rows: &[u32],
     ) -> Result<Option<Vec<f32>>, ArchError> {
         type Table<'t> = (
             Vec<&'t MetalWeights>,
@@ -681,7 +722,7 @@ impl MetalForward {
             Vec<&'t MetalWeights>,
         );
         let dm = self.dims;
-        let (s, h, ffn, k) = (attn.tokens, dm.h, dm.ffn, dm.k_top);
+        let (h, ffn, k, m) = (dm.h, dm.ffn, dm.k_top, rows.len());
         let shape = |w: &MetalWeights| (w.dtype(), w.rows(), w.cols(), w.row_bytes());
         let mut tables: Vec<Table<'_>> = Vec::with_capacity(held.len());
         for leases in held {
@@ -718,7 +759,7 @@ impl MetalForward {
                 let order = w.order.span(0, entries)?;
                 let offsets = w.offsets.all();
                 for (l, ly) in self.layers.iter().enumerate() {
-                    self.record_attention(b, w, kv, l, ly, attn)?;
+                    self.record_attention(b, w, parts, s, l, ly)?;
                     let ids = w.routes.span(l * entries, entries)?;
                     b.moe_route(&router, s, dm.ne, k, self.cfg.norm_topk_prob, &ids, &wts)?;
                     let (gate, up, down) = &tables[l];
@@ -742,7 +783,7 @@ impl MetalForward {
                     b.moe_combine(&contrib, &wts, &o, s, k, h)?;
                     b.add(&w.hs.all(), &o, s * h)?;
                 }
-                self.record_head(b, w, first, m)
+                self.record_head(b, w, rows)
             })
             .map_err(dev)?;
         // Tell the store what was used, as the per-layer pass's acquires would: per
@@ -780,52 +821,130 @@ impl MetalForward {
             .collect()
     }
 
-    /// Runs `tokens` at positions `cache.len()..` and returns logits as
-    /// [`Transformer::forward`] does, with the same bits.
+    /// Runs several sequences in one pass (ADR-017 §6): each segment's tokens at
+    /// positions `cache.len()..` of its own cache. Returns each segment's logits as
+    /// [`Transformer::forward`] returns them for that segment alone, with the same
+    /// bits. On an error no cache advances.
     ///
     /// [`Transformer::forward`]: qubivex_arch::Transformer::forward
-    #[allow(clippy::too_many_lines)]
-    pub(crate) fn forward(
+    pub(crate) fn forward_batch(
         &self,
-        tokens: &[u32],
-        cache: &mut KvCache,
+        segments: &mut [Segment<'_>],
         dense: &dyn DenseWeights,
         store: &ExpertStore,
         source: &ModelExpertSource,
-        logits: Logits,
+    ) -> Result<Vec<Vec<f32>>, ArchError> {
+        // Each segment's first token in the pass, token count and first position.
+        let mut layout = Vec::with_capacity(segments.len());
+        let mut tokens = Vec::new();
+        for g in segments.iter() {
+            let (p0, n) = (g.cache.len(), g.tokens.len());
+            if p0 + n > g.cache.capacity() {
+                return Err(ArchError::Input(format!(
+                    "context full: {p0} positions + {n} new > {}",
+                    g.cache.capacity()
+                )));
+            }
+            layout.push((tokens.len(), n, p0));
+            tokens.extend_from_slice(g.tokens);
+        }
+        if tokens.is_empty() {
+            return Ok(vec![Vec::new(); segments.len()]);
+        }
+        for (g, &(_, n, p0)) in segments.iter_mut().zip(&layout) {
+            if n > 0 {
+                let kv_bytes = self.ensure_kv(g.cache, p0 + n)?;
+                g.cache.set_device_bytes(kv_bytes);
+            }
+        }
+        // The rows each segment wants logits for, in segment order.
+        let mut rows = Vec::new();
+        let mut wanted = Vec::with_capacity(segments.len());
+        for (g, &(at, n, _)) in segments.iter().zip(&layout) {
+            let first = match g.logits {
+                Logits::Last => at + n.saturating_sub(1),
+                Logits::All => at,
+            };
+            let row =
+                |r: usize| u32::try_from(r).map_err(|_| ArchError::Input("pass too long".into()));
+            let m = (at + n).saturating_sub(first).min(n);
+            for r in first..first + m {
+                rows.push(row(r)?);
+            }
+            wanted.push(m);
+        }
+        let logits = {
+            let mut parts = Vec::with_capacity(segments.len());
+            let mut scores = 0;
+            for (g, &(at, n, p0)) in segments.iter().zip(&layout) {
+                if n == 0 {
+                    continue;
+                }
+                let kv = g
+                    .cache
+                    .device()
+                    .and_then(|b| b.downcast_ref::<GpuKv>())
+                    .ok_or_else(|| ArchError::Input("no device cache".into()))?;
+                parts.push(Part {
+                    kv,
+                    at,
+                    attn: AttentionShape {
+                        tokens: n,
+                        heads: self.dims.heads,
+                        kv_heads: self.dims.kvh,
+                        head_dim: self.dims.d,
+                        p0,
+                        capacity: kv.capacity,
+                    },
+                    scores_at: scores,
+                });
+                scores += n * self.dims.heads * (p0 + n);
+            }
+            let pos: Vec<usize> = layout.iter().flat_map(|&(_, n, p0)| p0..p0 + n).collect();
+            self.pass(&tokens, &pos, &parts, scores, &rows, dense, store, source)?
+        };
+        for (g, &(_, n, _)) in segments.iter_mut().zip(&layout) {
+            g.cache.advance(n)?;
+        }
+        let vocab = self.dims.vocab;
+        let mut out = Vec::with_capacity(wanted.len());
+        let mut at = 0;
+        for m in wanted {
+            out.push(logits[at * vocab..(at + m) * vocab].to_vec());
+            at += m;
+        }
+        Ok(out)
+    }
+
+    /// One pass over `tokens` at positions `pos`, attention per part; returns the
+    /// logits of `rows`.
+    #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+    fn pass(
+        &self,
+        tokens: &[u32],
+        pos: &[usize],
+        parts: &[Part<'_>],
+        scores: usize,
+        rows: &[u32],
+        dense: &dyn DenseWeights,
+        store: &ExpertStore,
+        source: &ModelExpertSource,
     ) -> Result<Vec<f32>, ArchError> {
         let s = tokens.len();
-        if s == 0 {
-            return Ok(Vec::new());
-        }
-        let p0 = cache.len();
-        if p0 + s > cache.capacity() {
-            return Err(ArchError::Input(format!(
-                "context full: {p0} positions + {s} new > {}",
-                cache.capacity()
-            )));
-        }
         let c = &self.cfg;
         let dm = self.dims;
         let (h, d) = (dm.h, dm.d);
-        let kv_bytes = self.ensure_kv(cache, p0 + s)?;
-        cache.set_device_bytes(kv_bytes);
         let mut work = self
             .work
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        self.ensure_work(&mut work, s, p0 + s)?;
+        self.ensure_work(&mut work, s, scores)?;
         let w = work
             .bufs
             .as_ref()
             .ok_or_else(|| ArchError::Input("no buffers".into()))?;
-        let kv = cache
-            .device_mut()
-            .as_ref()
-            .and_then(|b| b.downcast_ref::<GpuKv>())
-            .ok_or_else(|| ArchError::Input("no device cache".into()))?;
 
-        // Host: embeddings and the RoPE table.
+        // Host: embeddings and the RoPE table, at each token's own position.
         let emb = dense.view(&c.names.embedding)?;
         let cpu = CpuBackend::new();
         let mut host = vec![0f32; s * h];
@@ -842,34 +961,18 @@ impl MetalForward {
             .write(&w.hs.span(0, s * h).map_err(dev)?, &host)
             .map_err(dev)?;
         let mut table = vec![0f32; s * d];
-        for t in 0..s {
-            self.rope.table(p0 + t, &mut table[t * d..(t + 1) * d]);
+        for (t, &p) in pos.iter().enumerate() {
+            self.rope.table(p, &mut table[t * d..(t + 1) * d]);
         }
         self.be
             .write(&w.table.span(0, s * d).map_err(dev)?, &table)
             .map_err(dev)?;
-
-        let attn = AttentionShape {
-            tokens: s,
-            heads: dm.heads,
-            kv_heads: dm.kvh,
-            head_dim: d,
-            p0,
-            capacity: kv.capacity,
-        };
-        let first = match logits {
-            Logits::Last => s - 1,
-            Logits::All => 0,
-        };
-        let m = s - first;
+        let m = rows.len();
 
         // Every expert resident: the whole token is one submission, routed on the GPU.
         if let Some(held) = self.hold_all(store)? {
-            if let Some(out) = self.routed(w, kv, &held, source, store, attn, first, m)? {
+            if let Some(out) = self.routed(w, &held, source, store, parts, s, rows)? {
                 self.routed_passes.fetch_add(1, Ordering::Relaxed);
-                drop(held);
-                drop(work);
-                cache.advance(s)?;
                 return Ok(out);
             }
         }
@@ -899,8 +1002,8 @@ impl MetalForward {
                         b.add(&w.hs.all(), &o, s * h)?;
                     }
                     match layer {
-                        Some(ly) => self.record_attention(b, w, kv, l, ly, attn),
-                        None => self.record_head(b, w, first, m),
+                        Some(ly) => self.record_attention(b, w, parts, s, l, ly),
+                        None => self.record_head(b, w, rows),
                     }
                 })
                 .map_err(dev)?;
@@ -985,8 +1088,6 @@ impl MetalForward {
         self.be
             .read(&w.logits.span(0, m * dm.vocab).map_err(dev)?, &mut out)
             .map_err(dev)?;
-        drop(work);
-        cache.advance(s)?;
         Ok(out)
     }
 }

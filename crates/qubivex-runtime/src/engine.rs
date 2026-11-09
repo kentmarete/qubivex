@@ -34,6 +34,7 @@ use qubivex_model::{ExpertPart, ModelMetadata, TensorRole};
 use qubivex_tokenizer::Tokenizer;
 
 use crate::checksums::{ExpertSums, SUMS_FILE, SumsState};
+use crate::combine::{BatchStats, Combiner, Outcome, Step};
 use crate::metal_forward::MetalForward;
 use crate::placement::{BackendKind, MetalOps, Placed, PlacementReport};
 use crate::{ExpertIo, IoPath, ModelExpertSource, RuntimeError, load_tokenizer};
@@ -93,7 +94,22 @@ pub struct EngineOptions {
     /// and every prompt runs in full. It counts against the memory plan, and running
     /// requests and memory pressure take it back first.
     pub prefix_cache_bytes: u64,
+    /// Most tokens of prefill one shared forward pass takes beside its decode steps
+    /// (ADR-017 section 3). `None`: [`DEFAULT_BATCH_TOKENS`].
+    pub batch_tokens: Option<usize>,
+    /// How long, in microseconds, a shared pass waits for the callers the previous
+    /// pass answered to post their next step, so they stay in one pass. `None`:
+    /// [`DEFAULT_BATCH_WAIT_US`]; `Some(0)`: no wait. A lone caller never waits.
+    pub batch_wait_us: Option<u64>,
 }
+
+/// The default [`EngineOptions::batch_wait_us`]: sampling a token takes microseconds and
+/// a pass tens of milliseconds, so the bound is only reached when a caller has stopped.
+pub const DEFAULT_BATCH_WAIT_US: u64 = 1000;
+
+/// The default [`EngineOptions::batch_tokens`]: one prefill chunk, so a long prompt
+/// delays the others' next token by at most one chunk.
+pub const DEFAULT_BATCH_TOKENS: usize = 256;
 
 /// Router-lookahead prefetch settings (Phase 7).
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
@@ -741,6 +757,10 @@ pub struct Engine {
     /// Forward passes run one at a time, first come first served (see
     /// [`Engine::forward`]).
     steps: StepQueue,
+    /// Where concurrent [`Engine::forward`] steps meet to share a pass (ADR-017).
+    combiner: Combiner,
+    batch_tokens: usize,
+    batch_wait: Duration,
     /// Finished KV kept for later prompts (`None`: off).
     retained: Option<Arc<Retained>>,
     /// KV bytes per position (keys and values of every layer).
@@ -1099,6 +1119,9 @@ impl Engine {
             kv_reserved: Arc::new(AtomicUsize::new(0)),
             retained,
             steps: StepQueue::default(),
+            combiner: Combiner::default(),
+            batch_tokens: opts.batch_tokens.unwrap_or(DEFAULT_BATCH_TOKENS).max(1),
+            batch_wait: Duration::from_micros(opts.batch_wait_us.unwrap_or(DEFAULT_BATCH_WAIT_US)),
             kv_position_bytes,
             verification: Verification::Off,
             model,
@@ -1284,12 +1307,19 @@ impl Engine {
     /// Shrinks the expert cache to leave room for `cache` growing by `tokens`
     /// (Colibri's `kv_room_fit`), or refuses if that would cross the floor.
     fn fit_room(&self, cache: &KvCache, tokens: usize) -> Result<(), RuntimeError> {
+        self.fit_positions(KvCache::reserved_for(
+            cache.len() + tokens,
+            cache.capacity(),
+        ))
+    }
+
+    /// [`Engine::fit_room`] for caches that reserve `positions` together after a pass.
+    fn fit_positions(&self, positions: usize) -> Result<(), RuntimeError> {
         let Some(plan) = &self.memory.plan else {
             return Ok(());
         };
         // With concurrent conversations, the plan prices every reservation together.
-        let projected = KvCache::reserved_for(cache.len() + tokens, cache.capacity())
-            .max(self.kv_reserved.load(Ordering::Relaxed));
+        let projected = positions.max(self.kv_reserved.load(Ordering::Relaxed));
         let retained = self.make_room(projected);
         let mut cap = plan
             .expert_cache_for(projected as u64 + retained)
@@ -1408,15 +1438,21 @@ impl Engine {
 
     /// One forward pass (see [`Transformer::forward`]).
     ///
-    /// Concurrent callers (conversations of a server) take turns, first come first
-    /// served: each pass already uses every compute thread, and passes running at
-    /// once would compete for expert-cache slots (two layers' worth of leases in a
-    /// one-slot pool fail instead of waiting). A conversation therefore waits at most
-    /// one pass of each conversation ahead of it; [`Engine::generate_with`] splits long
-    /// prompts into chunks so a prompt never holds the turn for long.
+    /// Concurrent callers (conversations of a server) share passes (ADR-017): each
+    /// posts its step and waits, and the caller that takes the turn runs every waiting
+    /// step in one [`Transformer::forward_batch`], decode steps first, then prefill
+    /// within [`EngineOptions::batch_tokens`]. Each caller gets the logits its step
+    /// gives alone, with the same bits, and its own error if its step alone is bad
+    /// (a full context, a token out of range); an error inside the pass reaches every
+    /// step in it, and no cache in it advances. Nothing waits for a batch to fill: a
+    /// lone caller runs at once.
+    ///
+    /// The whole-layer Metal pass combines the same way (ADR-017 §6). A traced pass
+    /// runs one caller at a time in arrival order instead; [`Engine::generate_with`]
+    /// splits long prompts into chunks so a prompt never holds the turn for long.
     ///
     /// # Errors
-    /// Architecture errors.
+    /// Architecture errors; a traced pass with layers on Metal.
     pub fn forward(
         &self,
         tokens: &[u32],
@@ -1424,26 +1460,27 @@ impl Engine {
         logits: Logits,
         trace: Option<Tracer<'_>>,
     ) -> Result<Vec<f32>, RuntimeError> {
+        if trace.is_none() {
+            let step = Step {
+                tokens: tokens.to_vec(),
+                cache: std::mem::take(cache),
+                logits,
+            };
+            let (back, out) =
+                self.combiner
+                    .run(step, self.batch_tokens, self.batch_wait, |steps| {
+                        self.run_steps(steps)
+                    });
+            *cache = back;
+            return out;
+        }
+        if self.gpu.is_some() {
+            return Err(RuntimeError::Model(
+                "tracing needs the CPU forward pass (not --metal-ops layers)".into(),
+            ));
+        }
         let _turn = self.steps.wait();
         let predictor = self.start_pass();
-        if let Some(g) = &self.gpu {
-            if trace.is_some() {
-                return Err(RuntimeError::Model(
-                    "tracing needs the CPU forward pass (not --metal-ops layers)".into(),
-                ));
-            }
-            self.fit_room(cache, tokens.len())?;
-            let out = g.forward(
-                tokens,
-                cache,
-                &self.dense,
-                &self.store,
-                &self.source,
-                logits,
-            );
-            self.account(cache.allocated_bytes());
-            return Ok(out?);
-        }
         let provider = StoreProvider {
             store: &self.store,
             source: &self.source,
@@ -1461,6 +1498,85 @@ impl Engine {
         // Failed passes too: the ledger follows what the store and cache hold.
         self.account(cache.allocated_bytes());
         Ok(out?)
+    }
+
+    /// Runs the steps the combining point gathered as one pass, under the turn.
+    fn run_steps(&self, steps: &mut [Step]) -> Vec<Outcome> {
+        let _turn = self.steps.wait();
+        // Each step's own faults are answered alone (section 4).
+        let mut out: Vec<Option<Outcome>> = steps
+            .iter()
+            .map(|st| {
+                self.model
+                    .check_segment(&st.tokens, &st.cache, &self.dense)
+                    .err()
+                    .map(|e| Outcome::Done(Err(e.into())))
+            })
+            .collect();
+        // The memory plan prices the pass's caches together (section 5). What does not
+        // fit waits for the next pass, latest first; a step that cannot fit alone gets
+        // the plan's refusal.
+        let reserved = |out: &[Option<Outcome>]| -> usize {
+            steps
+                .iter()
+                .zip(out)
+                .filter(|(_, o)| o.is_none())
+                .map(|(st, _)| {
+                    KvCache::reserved_for(st.cache.len() + st.tokens.len(), st.cache.capacity())
+                })
+                .sum()
+        };
+        loop {
+            let live: Vec<usize> = (0..steps.len()).filter(|&i| out[i].is_none()).collect();
+            let Some(&last) = live.last() else { break };
+            match self.fit_positions(reserved(&out)) {
+                Ok(()) => break,
+                Err(e) if live.len() == 1 => out[last] = Some(Outcome::Done(Err(e))),
+                Err(_) => out[last] = Some(Outcome::Deferred),
+            }
+        }
+        let run: Vec<usize> = (0..steps.len()).filter(|&i| out[i].is_none()).collect();
+        if !run.is_empty() {
+            let mut segments: Vec<Segment<'_>> = steps
+                .iter_mut()
+                .zip(&out)
+                .filter(|(_, o)| o.is_none())
+                .map(|(st, _)| Segment {
+                    tokens: &st.tokens,
+                    cache: &mut st.cache,
+                    logits: st.logits,
+                })
+                .collect();
+            let result = self.pass(&mut segments);
+            let bytes = segments.iter().map(|g| g.cache.allocated_bytes()).sum();
+            drop(segments);
+            // Failed passes too: the ledger follows what the store and caches hold.
+            self.account(bytes);
+            match result {
+                Ok(logits) => {
+                    for (i, l) in run.into_iter().zip(logits) {
+                        out[i] = Some(Outcome::Done(Ok(l)));
+                    }
+                }
+                Err(e) => {
+                    // The model's error, not a sequence's: every step in the pass gets
+                    // it, as it would have alone.
+                    for &i in &run[1..] {
+                        out[i] = Some(Outcome::Done(Err(copy_arch_err(&e).into())));
+                    }
+                    out[run[0]] = Some(Outcome::Done(Err(e.into())));
+                }
+            }
+        }
+        out.into_iter()
+            .map(|o| o.unwrap_or(Outcome::Deferred))
+            .collect()
+    }
+
+    /// How [`Engine::forward`] callers have shared passes so far.
+    #[must_use]
+    pub fn batch_stats(&self) -> BatchStats {
+        self.combiner.stats()
     }
 
     /// The predictor a pass may use, with its state reset; `None` while memory
@@ -1485,22 +1601,31 @@ impl Engine {
     /// [`Transformer::forward_batch`]). Each segment's logits have the bits
     /// [`Engine::forward`] gives that segment alone.
     ///
-    /// A prototype for ADR-017: the CPU forward pass only, and nothing schedules it
-    /// yet.
+    /// For a caller driving its own batches; [`Engine::forward`] combines concurrent
+    /// callers by itself. Runs on the CPU pass and on whole Metal layers alike.
     ///
     /// # Errors
-    /// Architecture errors; [`RuntimeError::Model`] when layers run on Metal.
+    /// Architecture errors.
     pub fn forward_batch(
         &self,
         segments: &mut [Segment<'_>],
     ) -> Result<Vec<Vec<f32>>, RuntimeError> {
-        if self.gpu.is_some() {
-            return Err(RuntimeError::Model(
-                "batched passes need the CPU forward pass (not --metal-ops layers)".into(),
-            ));
-        }
         let _turn = self.steps.wait();
+        for g in segments.iter() {
+            self.fit_room(g.cache, g.tokens.len())?;
+        }
+        let out = self.pass(segments);
+        let bytes = segments.iter().map(|g| g.cache.allocated_bytes()).sum();
+        self.account(bytes);
+        Ok(out?)
+    }
+
+    /// One pass over `segments`, on whole Metal layers or the CPU, under the turn.
+    fn pass(&self, segments: &mut [Segment<'_>]) -> Result<Vec<Vec<f32>>, ArchError> {
         let predictor = self.start_pass();
+        if let Some(g) = &self.gpu {
+            return g.forward_batch(segments, &self.dense, &self.store, &self.source);
+        }
         let provider = StoreProvider {
             store: &self.store,
             source: &self.source,
@@ -1511,15 +1636,8 @@ impl Engine {
             experts: &provider,
             backend: &self.backend,
         };
-        for g in segments.iter() {
-            self.fit_room(g.cache, g.tokens.len())?;
-        }
-        let out = self
-            .pool
-            .install(|| self.model.forward_batch(segments, src));
-        let bytes = segments.iter().map(|g| g.cache.allocated_bytes()).sum();
-        self.account(bytes);
-        Ok(out?)
+        self.pool
+            .install(|| self.model.forward_batch(segments, src))
     }
 
     /// Generates up to `max_new` tokens after `prompt`, calling `on_token` for each;
@@ -1716,6 +1834,24 @@ impl Engine {
             // Advisory: a poisoned store fails the next forward pass anyway.
             let _ = self.store.cancel_prefetch(None);
         }
+    }
+}
+
+/// A copy of a pass's error for each other step in that pass. `ArchError` holds a
+/// kernel error that cannot be cloned; it is kept as its message.
+fn copy_arch_err(e: &ArchError) -> ArchError {
+    match e {
+        ArchError::Missing(w) => ArchError::Missing(w.clone()),
+        ArchError::Expert {
+            layer,
+            expert,
+            detail,
+        } => ArchError::Expert {
+            layer: *layer,
+            expert: *expert,
+            detail: detail.clone(),
+        },
+        other => ArchError::Input(other.to_string()),
     }
 }
 

@@ -488,6 +488,65 @@ fn groups(n: usize) -> [usize; 3] {
     [n.div_ceil(TG).max(1), 1, 1]
 }
 
+/// One sequence's attention for [`Batch::attention_many`]; the operands of
+/// [`Batch::attention`].
+#[derive(Clone, Copy, Debug)]
+pub struct Attend<'a> {
+    /// Queries, `[t][head][d]`.
+    pub q: Span<'a>,
+    /// The sequence's key cache.
+    pub k: Span<'a>,
+    /// The sequence's value cache.
+    pub v: Span<'a>,
+    /// Scratch of `tokens × heads × (p0 + tokens)`.
+    pub scores: Span<'a>,
+    /// Receives `[t][head][d]`.
+    pub out: Span<'a>,
+    /// The tokens, positions and cache.
+    pub shape: AttentionShape,
+}
+
+/// Checks one attention's operands; `None` if it has no queries.
+fn attention_params(it: &Attend<'_>) -> Result<Option<AttnParams>, ComputeError> {
+    let a = it.shape;
+    if a.kv_heads == 0 || a.heads % a.kv_heads != 0 {
+        return Err(shape(
+            "attention",
+            format!("{} heads over {} KV heads", a.heads, a.kv_heads),
+        ));
+    }
+    let span = a.p0 + a.tokens;
+    if span > a.capacity {
+        return Err(shape(
+            "attention",
+            format!("{span} positions exceed {}", a.capacity),
+        ));
+    }
+    let qn = a.tokens * a.heads * a.head_dim;
+    need("attention", "q", &it.q, qn)?;
+    need("attention", "out", &it.out, qn)?;
+    let cn = a.kv_heads * a.capacity * a.head_dim;
+    need("attention", "k", &it.k, cn)?;
+    need("attention", "v", &it.v, cn)?;
+    need("attention", "scores", &it.scores, a.tokens * a.heads * span)?;
+    if qn == 0 {
+        return Ok(None);
+    }
+    #[allow(clippy::cast_precision_loss)]
+    let scale = 1.0 / (a.head_dim as f32).sqrt();
+    u32_of(a.tokens * a.heads * span, "attention")?;
+    Ok(Some(AttnParams {
+        s: u32_of(a.tokens, "attention")?,
+        heads: u32_of(a.heads, "attention")?,
+        group: u32_of(a.heads / a.kv_heads, "attention")?,
+        d: u32_of(a.head_dim, "attention")?,
+        p0: u32_of(a.p0, "attention")?,
+        span: u32_of(span, "attention")?,
+        kv_heads: u32_of(a.kv_heads, "attention")?,
+        scale,
+    }))
+}
+
 impl Batch<'_, '_> {
     /// Records what `f` records so that the GPU may run its operations at once (ADR-011
     /// amendment 4). They must be independent: none reads what another writes, and no
@@ -787,66 +846,73 @@ impl Batch<'_, '_> {
         out: &Span<'_>,
         a: AttentionShape,
     ) -> Result<(), ComputeError> {
-        if a.kv_heads == 0 || a.heads % a.kv_heads != 0 {
-            return Err(shape(
-                "attention",
-                format!("{} heads over {} KV heads", a.heads, a.kv_heads),
-            ));
+        self.attention_many(&[Attend {
+            q: *q,
+            k: *k,
+            v: *v,
+            scores: *scores,
+            out: *out,
+            shape: a,
+        }])
+    }
+
+    /// [`Batch::attention`] for several independent sequences (ADR-017 §6): each
+    /// stage (scores, softmax, values) runs for all of them at once, and each stage
+    /// waits for the one before. They must not share `scores` or `out` elements.
+    ///
+    /// # Errors
+    /// As [`Batch::attention`], for any of them.
+    pub fn attention_many(&mut self, items: &[Attend<'_>]) -> Result<(), ComputeError> {
+        let mut run = Vec::with_capacity(items.len());
+        for it in items {
+            if let Some(p) = attention_params(it)? {
+                run.push((it, p));
+            }
         }
-        let span = a.p0 + a.tokens;
-        if span > a.capacity {
-            return Err(shape(
-                "attention",
-                format!("{span} positions exceed {}", a.capacity),
-            ));
-        }
-        let qn = a.tokens * a.heads * a.head_dim;
-        need("attention", "q", q, qn)?;
-        need("attention", "out", out, qn)?;
-        let cn = a.kv_heads * a.capacity * a.head_dim;
-        need("attention", "k", k, cn)?;
-        need("attention", "v", v, cn)?;
-        need("attention", "scores", scores, a.tokens * a.heads * span)?;
-        if qn == 0 {
+        if run.is_empty() {
             return Ok(());
         }
-        #[allow(clippy::cast_precision_loss)]
-        let scale = 1.0 / (a.head_dim as f32).sqrt();
-        let p = AttnParams {
-            s: u32_of(a.tokens, "attention")?,
-            heads: u32_of(a.heads, "attention")?,
-            group: u32_of(a.heads / a.kv_heads, "attention")?,
-            d: u32_of(a.head_dim, "attention")?,
-            p0: u32_of(a.p0, "attention")?,
-            span: u32_of(span, "attention")?,
-            kv_heads: u32_of(a.kv_heads, "attention")?,
-            scale,
-        };
-        u32_of(a.tokens * a.heads * span, "attention")?;
         #[cfg(target_os = "macos")]
         {
-            let pb = bytes_of(&p);
-            self.rec.dispatch(
-                op("attn_scores"),
-                &[q.arg(), k.arg(), scores.arg(), Arg::Bytes(&pb)],
-                [span.div_ceil(64), a.heads, a.tokens],
-                [64, 1, 1],
-            );
-            self.rec.dispatch(
-                op("attn_softmax"),
-                &[scores.arg(), Arg::Bytes(&pb)],
-                groups(a.tokens * a.heads),
-                [TG, 1, 1],
-            );
-            self.rec.dispatch(
-                op("attn_values"),
-                &[scores.arg(), v.arg(), out.arg(), Arg::Bytes(&pb)],
-                [(a.heads * a.head_dim).div_ceil(64), a.tokens, 1],
-                [64, 1, 1],
-            );
+            self.concurrent(|b| {
+                for (it, p) in &run {
+                    let (a, pb) = (it.shape, bytes_of(p));
+                    b.rec.dispatch(
+                        op("attn_scores"),
+                        &[it.q.arg(), it.k.arg(), it.scores.arg(), Arg::Bytes(&pb)],
+                        [(a.p0 + a.tokens).div_ceil(64), a.heads, a.tokens],
+                        [64, 1, 1],
+                    );
+                }
+                Ok(())
+            })?;
+            self.concurrent(|b| {
+                for (it, p) in &run {
+                    let pb = bytes_of(p);
+                    b.rec.dispatch(
+                        op("attn_softmax"),
+                        &[it.scores.arg(), Arg::Bytes(&pb)],
+                        groups(it.shape.tokens * it.shape.heads),
+                        [TG, 1, 1],
+                    );
+                }
+                Ok(())
+            })?;
+            self.concurrent(|b| {
+                for (it, p) in &run {
+                    let (a, pb) = (it.shape, bytes_of(p));
+                    b.rec.dispatch(
+                        op("attn_values"),
+                        &[it.scores.arg(), it.v.arg(), it.out.arg(), Arg::Bytes(&pb)],
+                        [(a.heads * a.head_dim).div_ceil(64), a.tokens, 1],
+                        [64, 1, 1],
+                    );
+                }
+                Ok(())
+            })?;
         }
         #[cfg(not(target_os = "macos"))]
-        let _ = p;
+        let _ = run;
         Ok(())
     }
 
