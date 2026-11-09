@@ -130,6 +130,17 @@ The lookahead router runs only when a pass has one token: a batch routes to the 
 its tokens' experts, which one token's prediction does not cover. Job 8 measures whether
 predicting the union is worth adding when experts stream; it changes no bits either way.
 
+Measured in job 8 (2026-11-10, on power, OLMoE Q4_K_M, CPU, `examples/batch.rs`, which
+reports the store's blocked time as a share of decode time): **not worth adding.**
+Predicting the union could save at most the time a batched pass waits on reads, and
+batching already hides most of it. Experts load in the background while the pass computes
+the experts it already holds, and a wider pass gives each load more compute to overlap.
+With prefetch off, sequences taking turns wait 5% to 19% of the time; concurrent callers in
+shared passes, at N = 2 to 8, wait 0% to 2% with a 1024 MiB expert cache and 2% to 5% with
+512 MiB. No union predictor is built, and the lookahead stays for one-token passes. This
+fits the owner's rule from 2026-11-06 that prefetch gets no further work unless a real
+workload shows a gain.
+
 ## The prototype (job 7)
 Built in this job: `Transformer::forward_batch`, `Segment`, `Engine::forward_batch` (CPU
 only, not yet called by the generation loop), `tests/batch.rs`, the measurement

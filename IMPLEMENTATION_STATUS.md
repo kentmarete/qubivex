@@ -3,7 +3,7 @@
 Last updated: 2026-11-09
 
 ## Current phase
-**Batching in progress (job 8, ADR-017 stages 2 and 3).**
+**Batching done (2026-11-10; job 8, ADR-017 stages 2 and 3).** Sequences share forward passes on the CPU and on whole Metal layers.
 - Fused CPU matmul for 2 to 5 activation rows (Q4_K, Q6_K, Q8_0, bf16), with the one-row kernel's bits. `batch_s<N>` on power, 5 threads, median (job 7's portable path in brackets): Q4_K expert 1024×2048 at 1, 2, 3, 4, 5 rows 39.2, 59.5 (129.9), 70.2 (155.2), 85.6 (180.2), 103.6 µs; Q6_K head 50304×2048 2.75, 3.07 (12.06), 4.01 (13.45), 4.12 (14.20), 4.80 ms. 6 to 12 rows now run through the same kernels in balanced groups of up to 5 (6 as 3 + 3, 8 as 4 + 4), each weight row once per group, same bits; `tile` starts at 13 rows for these dtypes. Grouped against `tile` (in brackets): expert at 6, 8, 12, 16 rows 136.7 (216.0), 169.9 (253.1), 252.2 (295.5), 375.5 (351.1) µs; head 7.23 (15.60), 8.20 (17.54), 12.34 (18.88), 16.81 (21.23) ms. 16 rows is even on the expert, so the cut-off is 12.
 - OLMoE-1B-7B Q4_K_M on power (`examples/batch.rs`, 32 tokens per sequence, median of 3 rotated runs), decode tok/s, tokens identical in every cell. "Concurrent" is N threads each calling `Engine::forward` through the combining point, with the 1 ms bounded wait:
 
@@ -20,7 +20,24 @@ Last updated: 2026-11-09
 
   Sharing a pass now pays (job 7: 0.59x to 1.00x). Without the wait, concurrent callers reached only 0.99x to 1.22x: a caller answered by a pass is still sampling when the next leader takes the queue, so at N = 2 passes mostly alternated one step each. The owner chose a bounded wait (2026-11-09; ADR-017 §2 amended): a leader waits up to `EngineOptions::batch_wait_us` (1 ms) for as many posts as the last pass answered. All resident, N = 8 fell below N = 4 because 8 rows used the `tile` path. With the grouped kernel (same run, N = 1, 2, 4, 6, 8, tokens identical): all resident, concurrent 42.27, 48.66, 54.37, 57.08, 61.63 tok/s (N = 8: 1.50x sequential; 51.89 before); 1024 MiB, concurrent 35.18, 38.72, 43.54, 44.45, 49.26 (N = 8: 1.73x; 43.98 before). Batched at N = 8: 63.18 and 49.57.
 - Metal batching (ADR-017 §6), on both whole-layer placements (`layers`, routed on the host, and `token`, routed on the GPU): one submission per layer as before, every kernel over all the pass's tokens, and per segment one KV write and one attention against that segment's own device cache and positions. `Batch::attention_many` runs each attention stage (scores, softmax, values) for every segment at once, with a barrier between stages; a first version grouped whole attentions and raced. The head gathers the rows each segment wants. `Engine::forward_batch` and the combining point now run on Metal too; only a traced pass stays per caller. New tests in `tests/batch.rs` on the three MoE fixtures: a mixed batch gives the CPU's bits, concurrent callers get the CPU's tokens in shared passes, and a bad step fails only its caller, on both placements; attention on the first segment's cache, one shared scores range, and RoPE at the batch index each fail them. OLMoE `engine_on_metal_gives_the_cpu_tokens` passes on every placement. `examples/batch.rs --metal layers|token` gives identical tokens at N = 2, 4, 8 with every pass at full width (on battery, so no timings recorded yet).
-- **Next:** Metal batching measured on power (`examples/batch.rs --metal`), then the prefetch measurement (§7).
+- Metal on power (OLMoE Q4_K_M, all experts resident, `examples/batch.rs --metal`, 32 tokens per sequence, median of 3 rotated runs), decode tok/s, tokens identical in every cell, every pass at full width:
+
+  | placement | N | sequential | batched (caller-driven) | concurrent |
+  |---|---:|---:|---:|---:|
+  | layers | 1 | 54.26 | 54.25 | 54.26 |
+  | layers | 2 | 54.04 | 66.84 (1.24x) | 66.07 (1.22x) |
+  | layers | 4 | 53.96 | 82.18 (1.52x) | 81.49 (1.51x) |
+  | layers | 6 | 54.06 | 94.14 (1.74x) | 93.36 (1.73x) |
+  | layers | 8 | 54.13 | 102.99 (1.90x) | 102.20 (1.89x) |
+  | token | 1 | 60.35 | 60.33 | 60.25 |
+  | token | 2 | 60.46 | 72.53 (1.20x) | 72.13 (1.19x) |
+  | token | 4 | 60.48 | 86.92 (1.44x) | 86.48 (1.43x) |
+  | token | 6 | 59.43 | 96.03 (1.62x) | 93.31 (1.57x) |
+  | token | 8 | 58.59 | 101.31 (1.73x) | 102.20 (1.74x) |
+
+  `token` (routing on the GPU) is faster for one sequence. From N = 2 the two placements are close, and at N = 8 `layers` slightly leads.
+- Prefetch for batches (ADR-017 §7): not worth adding. `examples/batch.rs` now reports the store's blocked time as a share of decode time, and loads per token, and takes `--prefetch on|off`. On the CPU with experts streaming and prefetch off, concurrent callers at N = 2, 4, 8 wait on reads 1%, 2%, 1% of the time with a 1024 MiB cache and 5%, 2%, 2% with 512 MiB, against 5% to 19% for the same sequences taking turns. Predicting the union of a batch's experts could save at most that wait, so it is not built. With prefetch on (1024 MiB), concurrent decode measured 37.92, 43.73, 50.85 tok/s at N = 2, 4, 8 against 35.22, 38.91, 48.48 off. The lookahead never runs in those passes, so the gap is the cache state that earlier one-token passes leave behind, plus run-to-run spread: in the same prefetch-off run, N = 1 measured 30.79 tok/s sequential and 34.43 batched for identical work. Tokens identical in every cell.
+- Job 8's done-when is met: the fused kernel, the combining point (§2–7, Metal included), bit-identical tokens on the CPU and both Metal placements, and concurrent decode measured on power.
 
 **Batching design done (2026-11-08); ADR-017, accepted 2026-11-08.** Job 7 of the platform plan.
 - `Transformer::forward_batch` over `Segment`s (a sequence's new tokens, its own `KvCache`, the logits it wants): everything per token runs once over the batch; RoPE, the KV write and attention use each token's own sequence. `forward` is `forward_batch` with one segment. `Engine::forward_batch` is public, CPU only, and not yet used by generation. Caches advance only after the whole pass succeeds, so `KvCache::rollback` was deleted.
