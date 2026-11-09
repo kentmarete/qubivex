@@ -396,7 +396,7 @@ for the benchmark spike (ADR-002).
 | CLI | `clap` (derive) | |
 | Logging and tracing | `tracing`, `tracing-subscriber` | Spans per request and per layer, off on the hot path by default |
 | Metrics | `metrics` + `metrics-exporter-prometheus` | Cheap atomic counters |
-| HTTP | `axum` + `tokio` (gateway only) | |
+| HTTP | `kerniq-server` (over `axum`) + `tokio` (gateway only) | ADR-013 |
 | CPU parallelism | Dedicated pinned thread pool. `rayon` is evaluated against it in the spike | Colibri's OpenMP team uses P-cores only, with a barrier per matmul; rayon's work-stealing may cost on short GEMVs |
 | SafeTensors | `safetensors` crate (header parse only) + own `pread` reader | We need positional reads into our own slabs, not whole-file mmap |
 | GGUF | Own reader (small, spec is stable). `candle`'s reader is evaluated | |

@@ -385,7 +385,13 @@ fn async_submissions_are_ordered_and_keep_host_memory_alive() {
     let w: Vec<f32> = rng.vec(rows * cols, 0.05);
     let x = rng.vec(cols, 1.0);
     let mut region = PageAligned::zeroed(rows * cols * 4);
-    for (dst, v) in region.as_mut_slice().chunks_exact_mut(4).zip(&w) {
+    for (dst, v) in region
+        .as_mut_slice()
+        .as_chunks_mut::<4>()
+        .0
+        .iter_mut()
+        .zip(&w)
+    {
         dst.copy_from_slice(&v.to_le_bytes());
     }
     let region = Arc::new(region);

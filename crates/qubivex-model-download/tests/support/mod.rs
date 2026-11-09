@@ -324,10 +324,10 @@ fn serve(mut stream: TcpStream, state: &State) -> std::io::Result<()> {
         range,
         auth,
     });
-    if path.starts_with("/api/") {
-        if let Some(code) = state.api_faults.lock().unwrap().pop_front() {
-            return respond(&mut stream, code, "", b"");
-        }
+    if path.starts_with("/api/")
+        && let Some(code) = state.api_faults.lock().unwrap().pop_front()
+    {
+        return respond(&mut stream, code, "", b"");
     }
     let api = format!("/api/models/{}", state.repo);
     if path.starts_with(&format!("{api}/tree/")) {

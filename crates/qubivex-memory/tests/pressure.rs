@@ -44,11 +44,10 @@ proptest! {
                 prop_assert_eq!(d.level, PressureLevel::Critical);
             }
             // The cap never grows while pressure lasts.
-            if let (Some(p), Some(c)) = (prev.cache_cap, d.cache_cap) {
-                if d.level >= PressureLevel::High || c.0 > floor {
+            if let (Some(p), Some(c)) = (prev.cache_cap, d.cache_cap)
+                && (d.level >= PressureLevel::High || c.0 > floor) {
                     prop_assert!(c <= p || prev.level == PressureLevel::Normal);
                 }
-            }
             // Leaving a level needs the hysteresis margin.
             if d.level < prev.level {
                 prop_assert!(a >= cfg.critical.0.min(cfg.high.0) + cfg.hysteresis.0);

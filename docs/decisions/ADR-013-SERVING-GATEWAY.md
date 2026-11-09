@@ -61,7 +61,8 @@ the design allows either).
 - **Metrics.** Hand-written Prometheus text from atomics (requests by endpoint and
   status, active, tokens, cancelled, timed out, failed; per model: reserved KV, expert
   cache, free slots). No `metrics` crate: the counters are few and fixed.
-- **Dependencies:** `axum` 0.8 (`http1`, `json`, `tokio`, `query`), `tokio`,
+- **Dependencies:** `axum` 0.8 (`http1`, `json`, `tokio`, `query`; Kerniq Server since
+  Amendment 4), `tokio`,
   `tokio-stream`; licences checked by `cargo deny`.
 
 ## Amendment 1 (2026-11-06): the generation contract moves to the runtime
@@ -104,6 +105,26 @@ ends. The threads, the turn lock and the cancellation flag described above are u
   table; flag > environment > file > default. Unknown keys are errors, and a file
   holding a key or token must not be readable by others. `toml` joins the CLI's
   dependencies.
+
+## Amendment 4 (2026-11-10): Kerniq Server over Axum
+The owner chose Kerniq Server (`kerniq-server`, a thin layer over Axum, Tower and Hyper)
+in place of bare Axum. It is a thin swap: the handlers, the OpenAI-shaped errors, the
+body limit, the rate limit and CORS (`limits.rs`) are unchanged and run as Tower layers on
+a Kerniq `App`, in the same order. What changes:
+
+- `Gateway::serve` runs `App::serve` with our shutdown signal, so the accept loop is
+  Kerniq's (hyper-util, HTTP/1 and HTTP/2 auto-detected). It adds a 30 s header read
+  timeout and closes connections still open after `shutdown_grace` plus the stop margin;
+  the grace and stop logic around it are as before.
+- A wrong method on a known path answers 405 with Kerniq's JSON error body instead of an
+  empty one.
+- `Gateway::router` still returns an `axum::Router` (`App::into_axum_router`).
+- Kerniq's request timeout, concurrency limit and body limit stay off: streams run for
+  minutes, the schedulers queue, and our body limit answers in the OpenAI shape.
+- The crate is pinned `=0.1.3`: its first release was 2026-11-07, from an organisation
+  with no named maintainer. Its `axum` re-export is the gateway's Axum. It needs Rust
+  1.88, so the MSRV moves from 1.85 to 1.88. `cargo xtask check` also keeps
+  `kerniq-server` out of the runtime.
 
 ## Consequences
 - The exit criteria are met: `crates/qubivex-api/tests/gateway.rs` (over HTTP, tiny

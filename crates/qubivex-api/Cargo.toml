@@ -9,7 +9,7 @@ repository.workspace = true
 publish.workspace = true
 
 [dependencies]
-axum = { workspace = true }
+kerniq-server = { workspace = true }
 qubivex-hardware = { workspace = true }
 qubivex-memory = { workspace = true }
 qubivex-model = { workspace = true }

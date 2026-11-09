@@ -374,7 +374,7 @@ cmd_verify() {
     'RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --locked'
     'cargo xtask check'
     'cargo deny check'
-    'cargo +1.85 test --workspace --locked'
+    'cargo +1.88 test --workspace --locked'
     'CARGO_TARGET_DIR=target/loom RUSTFLAGS="--cfg loom -D warnings" cargo test --release --locked -p qubivex-expert-stream --test loom'
     'CARGO_TARGET_DIR=target/loom RUSTFLAGS="--cfg loom -D warnings" cargo test --release --locked -p qubivex-scheduler --test loom'
   )

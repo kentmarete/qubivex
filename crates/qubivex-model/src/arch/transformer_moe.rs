@@ -258,19 +258,19 @@ struct ManifestOptions {
 
 /// Rejects config features this architecture does not implement yet.
 fn unsupported(v: &Values<'_>) -> Result<(), ModelError> {
-    if let Some(s) = v.u64("decoder_sparse_step", None)? {
-        if s != 1 {
-            return Err(cfg_err(format!(
-                "decoder_sparse_step = {s}: dense FFN layers are not supported yet"
-            )));
-        }
+    if let Some(s) = v.u64("decoder_sparse_step", None)?
+        && s != 1
+    {
+        return Err(cfg_err(format!(
+            "decoder_sparse_step = {s}: dense FFN layers are not supported yet"
+        )));
     }
-    if let Some(Value::Array(a)) = v.get("mlp_only_layers", None)? {
-        if !a.is_empty() {
-            return Err(cfg_err(
-                "mlp_only_layers is not empty: dense FFN layers are not supported yet",
-            ));
-        }
+    if let Some(Value::Array(a)) = v.get("mlp_only_layers", None)?
+        && !a.is_empty()
+    {
+        return Err(cfg_err(
+            "mlp_only_layers is not empty: dense FFN layers are not supported yet",
+        ));
     }
     for key in [
         "first_k_dense_replace",

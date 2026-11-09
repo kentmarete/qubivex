@@ -2,9 +2,9 @@
 //! may (a model file that cannot be read, say) are logged with the request id and the
 //! client gets a generic message naming that id.
 
-use axum::Json;
-use axum::http::StatusCode;
-use axum::response::{IntoResponse, Response};
+use kerniq_server::axum::Json;
+use kerniq_server::axum::http::StatusCode;
+use kerniq_server::axum::response::{IntoResponse, Response};
 use qubivex_runtime::{RequestError, RuntimeError};
 use serde_json::json;
 

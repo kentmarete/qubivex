@@ -246,7 +246,7 @@ fn raw_gguf(
         v.extend_from_slice(&ty.to_le_bytes());
         v.extend_from_slice(&off.to_le_bytes());
     }
-    while v.len() % 32 != 0 {
+    while !v.len().is_multiple_of(32) {
         v.push(0);
     }
     v.resize(v.len() + data, 0);

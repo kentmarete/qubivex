@@ -149,10 +149,10 @@ impl Http {
         let mut url = url.to_owned();
         for _ in 0..=MAX_REDIRECTS {
             let mut request = self.agent.get(&url);
-            if origin == self.origin {
-                if let Some(token) = &self.token {
-                    request = request.header("Authorization", format!("Bearer {token}"));
-                }
+            if origin == self.origin
+                && let Some(token) = &self.token
+            {
+                request = request.header("Authorization", format!("Bearer {token}"));
             }
             if let Some(from) = range_from {
                 request = request.header("Range", format!("bytes={from}-"));

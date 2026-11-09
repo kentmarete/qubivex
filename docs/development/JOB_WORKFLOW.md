@@ -154,7 +154,7 @@ memory, or `qubivex-backup-2026-11-03.bundle`.
 
 - Run one job at a time in a working tree. For a parallel job, use a `git worktree` with
   its own branch, and don't benchmark while the other job builds.
-- Before pushing, run `job verify`. It covers the checks CI runs, including Rust 1.85 and
+- Before pushing, run `job verify`. It covers the checks CI runs, including Rust 1.88 and
   loom.
 - Push with `job pr`. It uses HTTPS, because SSH to `origin` fails from this environment.
 - Commits and PRs carry no Claude attribution. `job commit` and `job pr` enforce this.
