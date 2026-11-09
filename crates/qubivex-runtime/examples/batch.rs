@@ -1,7 +1,9 @@
-//! ADR-017 measurement: greedy decoding of N sequences, one pass per sequence per step
-//! (as the engine runs concurrent requests today) against one shared pass per step
-//! ([`Engine::forward_batch`]). Checks the tokens are identical and prints decode
-//! throughput. Prefill runs per sequence and is not timed.
+//! ADR-017 measurement: greedy decoding of N sequences three ways: one pass per sequence
+//! per step on one thread (taking turns), one shared pass per step driven by the caller
+//! ([`Engine::forward_batch`]), and N threads each calling [`Engine::forward`], which
+//! combine at the engine's turn (how a server runs concurrent requests). Checks the
+//! tokens are identical and prints decode throughput. Prefill runs per sequence and is
+//! not timed.
 //!
 //! ```text
 //! cargo run --release -p qubivex-runtime --example batch -- \
@@ -52,15 +54,53 @@ fn prefill(e: &Engine, prompts: &[Vec<u32>]) -> Result<(Vec<KvCache>, Vec<u32>),
 /// Each sequence's tokens and the decode time.
 type Run = (Vec<Vec<u32>>, Duration);
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Mode {
+    Sequential,
+    Batched,
+    Concurrent,
+}
+
 /// Decodes `steps` tokens per sequence.
 fn decode(
     e: &Engine,
     prompts: &[Vec<u32>],
     steps: usize,
-    batched: bool,
+    mode: Mode,
 ) -> Result<Run, Box<dyn Error>> {
     let (mut caches, mut next) = prefill(e, prompts)?;
     let mut out: Vec<Vec<u32>> = next.iter().map(|&t| vec![t]).collect();
+    if mode == Mode::Concurrent {
+        let start = Instant::now();
+        let done: Vec<Result<(), String>> = std::thread::scope(|s| {
+            let handles: Vec<_> = caches
+                .iter_mut()
+                .zip(&mut out)
+                .map(|(c, o)| {
+                    s.spawn(move || {
+                        for _ in 1..steps {
+                            let t = o[o.len() - 1];
+                            let l = e
+                                .forward(&[t], c, Logits::Last, None)
+                                .map_err(|x| x.to_string())?;
+                            o.push(argmax(&l));
+                        }
+                        Ok(())
+                    })
+                })
+                .collect();
+            handles
+                .into_iter()
+                .map(|h| h.join().unwrap_or_else(|_| Err("panicked".into())))
+                .collect()
+        });
+        let took = start.elapsed();
+        for d in done {
+            d?;
+        }
+        return Ok((out, took));
+    }
+    let batched = mode == Mode::Batched;
     let start = Instant::now();
     for _ in 1..steps {
         let feed: Vec<[u32; 1]> = next.iter().map(|&t| [t]).collect();
@@ -131,38 +171,47 @@ fn main() -> Result<(), Box<dyn Error>> {
         "expert cache: {}; {steps} tokens per sequence, median of {runs} runs",
         cache_mb.map_or("all resident".into(), |m| format!("{m} MiB"))
     );
-    println!("| N | sequential tok/s | batched tok/s | speed-up | tokens identical |");
-    println!("|---:|---:|---:|---:|---|");
+    println!(
+        "| N | sequential tok/s | batched tok/s | speed-up | concurrent tok/s | speed-up | widest pass | tokens identical |"
+    );
+    println!("|---:|---:|---:|---:|---:|---:|---:|---|");
     for n in sizes {
         let ps = &prompts[..n.min(prompts.len())];
         // Warm-up: fills the expert cache the way the measured runs will use it.
-        decode(&e, ps, steps.min(4), true)?;
-        let (mut seq_t, mut bat_t) = (Vec::new(), Vec::new());
+        decode(&e, ps, steps.min(4), Mode::Batched)?;
+        let mut times: [Vec<Duration>; 3] = Default::default();
         let mut same = true;
+        let mut widest = 0;
+        let modes = [Mode::Sequential, Mode::Batched, Mode::Concurrent];
         for r in 0..runs {
-            // Alternate which goes first, so drift does not favour either.
-            let order = if r % 2 == 0 {
-                [false, true]
-            } else {
-                [true, false]
-            };
+            // Rotate which goes first, so drift does not favour any.
             let mut tokens = Vec::new();
-            for batched in order {
-                let (t, d) = decode(&e, ps, steps, batched)?;
-                if batched { &mut bat_t } else { &mut seq_t }.push(d);
+            for k in 0..3 {
+                let i = (k + r) % 3;
+                let before = e.batch_stats().widest;
+                let (t, d) = decode(&e, ps, steps, modes[i])?;
+                if modes[i] == Mode::Concurrent {
+                    // The engine keeps its widest pass; reset per size is not
+                    // possible, so this is the widest so far.
+                    widest = widest.max(e.batch_stats().widest.max(before));
+                }
+                times[i].push(d);
                 tokens.push(t);
             }
-            same &= tokens[0] == tokens[1];
+            same &= tokens.windows(2).all(|w| w[0] == w[1]);
         }
         #[allow(clippy::cast_precision_loss)]
         let generated = (ps.len() * (steps - 1)) as f64;
-        let (s, b) = (median(seq_t), median(bat_t));
+        let [s, b, c] = times.map(median);
         println!(
-            "| {} | {:.2} | {:.2} | {:.2}x | {} |",
+            "| {} | {:.2} | {:.2} | {:.2}x | {:.2} | {:.2}x | {} | {} |",
             ps.len(),
             generated / s.as_secs_f64(),
             generated / b.as_secs_f64(),
             s.as_secs_f64() / b.as_secs_f64(),
+            generated / c.as_secs_f64(),
+            s.as_secs_f64() / c.as_secs_f64(),
+            widest,
             if same { "yes" } else { "NO" }
         );
     }

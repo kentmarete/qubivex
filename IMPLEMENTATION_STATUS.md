@@ -4,10 +4,24 @@ Last updated: 2026-11-09
 
 ## Current phase
 **Batching in progress (job 8, ADR-017 stages 2 and 3).**
-- Fused CPU matmul for 2 to 5 activation rows (Q4_K, Q6_K, Q8_0, bf16), with the one-row kernel's bits. On battery, A/B against the portable path: a two-row Q4_K expert 126 → 60 µs, the two-row Q6_K head 11.95 → 3.18 ms. The `batch_s<N>` table on power is still to run.
+- Fused CPU matmul for 2 to 5 activation rows (Q4_K, Q6_K, Q8_0, bf16), with the one-row kernel's bits. `batch_s<N>` on power, 5 threads, median (job 7's portable path in brackets): Q4_K expert 1024×2048 at 1, 2, 3, 4, 5 rows 39.2, 59.5 (129.9), 70.2 (155.2), 85.6 (180.2), 103.6 µs; Q6_K head 50304×2048 2.75, 3.07 (12.06), 4.01 (13.45), 4.12 (14.20), 4.80 ms. At 6 and 8 rows the register-blocked `tile` path is unchanged and now much slower than 5 rows: expert 215.7 and 253.8 µs, head 15.46 and 17.44 ms.
+- OLMoE-1B-7B Q4_K_M on power (`examples/batch.rs`, 32 tokens per sequence, median of 3 rotated runs), decode tok/s, tokens identical in every cell. "Concurrent" is N threads each calling `Engine::forward` through the combining point:
+
+  | cache | N | sequential | batched (caller-driven) | concurrent | widest pass |
+  |---|---:|---:|---:|---:|---:|
+  | all resident | 1 | 43.43 | 43.12 (0.99x) | 43.32 (1.00x) | 1 |
+  | | 2 | 42.62 | 50.01 (1.17x) | 42.40 (0.99x) | 2 |
+  | | 4 | 42.61 | 58.27 (1.37x) | 50.28 (1.18x) | 3 |
+  | | 8 | 38.99 | 54.24 (1.39x) | 46.51 (1.19x) | 7 |
+  | 1024 MiB | 1 | 35.59 | 35.57 (1.00x) | 35.55 (1.00x) | 1 |
+  | | 2 | 28.72 | 35.14 (1.22x) | 29.93 (1.04x) | 1 |
+  | | 4 | 26.95 | 38.05 (1.41x) | 31.97 (1.19x) | 3 |
+  | | 8 | 27.65 | 40.34 (1.46x) | 33.65 (1.22x) | 7 |
+
+  Sharing a pass now pays (job 7: 0.59x to 1.00x). Concurrent callers get less than lock-step batching: a caller answered by a pass is still sampling when the next leader takes the waiting steps, so passes split (at N = 2 they mostly alternate one step each).
 - The combining point at the engine turn (ADR-017 §2–5): `Engine::forward` posts its step and the caller that takes the turn runs every waiting step in one `forward_batch`, decode steps first, then prefill within `EngineOptions::batch_tokens` (default 256). Each step is checked alone first (`Transformer::check_segment`), so a full context or an out-of-range token fails only its own caller. The memory plan prices the pass's caches together, and a step that does not fit waits for the next pass. A panic in a pass answers every waiting caller. `Engine::batch_stats` counts passes, steps and the widest pass. Traced passes and the whole-layer Metal pass still run one caller at a time.
 - Tests: `tests/batch.rs` adds concurrent callers sharing passes on the four fixtures, all resident and with one expert slot, with tokens equal to each run alone, and a bad step failing only its caller. Disabling the per-step check fails the second test.
-- **Next:** on power, the `batch_s<N>` table and `examples/batch.rs` concurrent decode on OLMoE against job 7's table; then Metal batching (§6, both placements) and the prefetch measurement (§7).
+- **Next:** keep concurrent callers together in one pass (owner decision pending: a bounded wait for callers answered by the last pass), run 6 to 8 rows through the fused kernel in groups of up to 5, then Metal batching (§6, both placements) and the prefetch measurement (§7).
 
 **Batching design done (2026-11-08); ADR-017, accepted 2026-11-08.** Job 7 of the platform plan.
 - `Transformer::forward_batch` over `Segment`s (a sequence's new tokens, its own `KvCache`, the logits it wants): everything per token runs once over the batch; RoPE, the KV write and attention use each token's own sequence. `forward` is `forward_batch` with one segment. `Engine::forward_batch` is public, CPU only, and not yet used by generation. Caches advance only after the whole pass succeeds, so `KvCache::rollback` was deleted.
