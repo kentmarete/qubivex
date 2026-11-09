@@ -9,11 +9,11 @@
 //! Supported dtypes: f32, f16, bf16, Q8_0, Q4_K and Q6_K.
 //!
 //! Paths, all with the same bits: one activation row (decode) uses a fused NEON row dot
-//! where there is one, and two to five rows (a decode step over a few sequences) its
-//! multi-row form, which dequantises each weight once into every row; six or more rows
-//! (prefill) use the register-blocked kernel in `tile`, which computes the same 64
-//! lanes in a different grouping; everything else dequantises a row and takes one
-//! portable dot per output.
+//! where there is one, and two to twelve rows (a decode step over a few sequences) its
+//! multi-row form, which dequantises each weight once into groups of up to five rows;
+//! otherwise six or more rows (prefill) use the register-blocked kernel in `tile`,
+//! which computes the same 64 lanes in a different grouping; everything else
+//! dequantises a row and takes one portable dot per output.
 //!
 //! On x86-64 the same portable source is also compiled with `avx2,fma` and selected
 //! at run time; `f32::mul_add` is correctly rounded either way, so both give the
@@ -118,6 +118,26 @@ fn fused(dtype: DType) -> Option<RowDot> {
     }
 }
 
+/// The most activation rows that take the fused multi-row kernels (in groups of up to
+/// `neon::MAX_ROWS`) instead of the tiled kernel. Measured on an M3 Pro (`batch_s<N>`):
+/// grouped is 1.5x faster on a Q4_K expert and 2.2x on the Q6_K head at 6 to 8 rows,
+/// still ahead at 12, and even with `tile` on the expert at 16.
+#[cfg(target_arch = "aarch64")]
+const GROUPED_MAX_ROWS: usize = 12;
+
+/// Whether `s` rows of `dtype` take the fused multi-row kernels rather than `tile`.
+fn grouped(dtype: DType, s: usize) -> bool {
+    #[cfg(target_arch = "aarch64")]
+    {
+        s <= GROUPED_MAX_ROWS && fused_rows(dtype).is_some()
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        let _ = (dtype, s);
+        false
+    }
+}
+
 /// A fused multi-row dot for `dtype` (2 to `neon::MAX_ROWS` activation rows), if this
 /// CPU has one.
 #[cfg(target_arch = "aarch64")]
@@ -144,13 +164,23 @@ fn rows(w: &WeightView<'_>, xs: &[f32], s: usize, r0: usize, out: &mut [f32], bu
             return;
         }
     }
-    // Two to five rows (a decode step over a few sequences): dequantise each weight
-    // once, in registers, into every row, with each row's lanes unchanged (`neon`).
+    // Two to `GROUPED_MAX_ROWS` rows (a decode step over a few sequences): dequantise
+    // each weight once, in registers, into every row of a group, each row's lanes unchanged
+    // (`neon`). Past five rows the activation rows go in balanced groups of up to five
+    // (6 as 3 + 3, 8 as 4 + 4), each weight row once per group while it is in L1.
     #[cfg(target_arch = "aarch64")]
-    if (2..=neon::MAX_ROWS).contains(&s) {
+    if (2..=GROUPED_MAX_ROWS).contains(&s) {
         if let Some(dot) = fused_rows(w.dtype()) {
+            let k = w.cols();
+            let groups = s.div_ceil(neon::MAX_ROWS);
             for (j, o) in out.chunks_exact_mut(s).enumerate() {
-                dot(w.row(r0 + j), xs, o);
+                let row = w.row(r0 + j);
+                let mut a = 0;
+                for g in 0..groups {
+                    let b = a + (s - a) / (groups - g);
+                    dot(row, &xs[a * k..b * k], &mut o[a..b]);
+                    a = b;
+                }
             }
             return;
         }
@@ -244,7 +274,7 @@ fn matmul_with(
     }
     // Rows are independent: compute them row-major (n × s), then transpose for s > 1.
     let run = |yt: &mut [f32]| match path {
-        Path::Tiled(_) if tile::applies(s) => {
+        Path::Tiled(_) if tile::applies(s) && !grouped(w.dtype(), s) => {
             let xp = tile::PackedX::new(xs, s, k);
             yt.par_chunks_mut(ROWS_PER_TASK * s)
                 .enumerate()

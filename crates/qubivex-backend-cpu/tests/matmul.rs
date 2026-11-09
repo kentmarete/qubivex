@@ -89,9 +89,10 @@ fn batching_threads_and_isa_never_change_bits() {
         for &(n, k) in shapes(d) {
             let wb = weights(d, n, k, &mut rng);
             let w = WeightView::new(d, n, k, &wb).unwrap();
-            // Batch sizes on both sides of the tiled kernel's threshold (6), and every
-            // width of its last tile (7 to 11 leave 1 to 5 rows; 12 and 13 two tiles).
-            for s in [2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 13] {
+            // Batch sizes on both sides of the tiled kernel's threshold (6 rows, or 13
+            // where the fused multi-row kernels take up to 12 in groups of up to 5),
+            // and every width of its last 6-row tile from either threshold.
+            for s in [2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17] {
                 check_batch(&be, d, &w, s, &mut rng);
             }
         }
