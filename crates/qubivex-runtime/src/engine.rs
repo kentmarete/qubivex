@@ -263,22 +263,22 @@ impl StoreProvider<'_> {
     fn after_demand(&self, layer: LayerIdx, routed: &[ExpertIdx]) {
         let Some(p) = self.predictor else { return };
         let mut p = p.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        if let Some((l, ids)) = p.issued.take() {
-            if l == layer {
-                let correct = routed.iter().filter(|e| ids.contains(e)).count();
-                p.stats.layers += 1;
-                p.stats.predicted += ids.len() as u64;
-                p.stats.routed += routed.len() as u64;
-                p.stats.correct += correct as u64;
-            }
+        if let Some((l, ids)) = p.issued.take()
+            && l == layer
+        {
+            let correct = routed.iter().filter(|e| ids.contains(e)).count();
+            p.stats.layers += 1;
+            p.stats.predicted += ids.len() as u64;
+            p.stats.routed += routed.len() as u64;
+            p.stats.correct += correct as u64;
         }
-        if let Some((l, ids)) = p.pending.take() {
-            if l.0 == layer.0 + 1 {
-                let keys: Vec<ExpertKey> = ids.iter().map(|&e| (l, e)).collect();
-                // Advisory: a poisoned store fails the demand that follows anyway.
-                let _ = self.store.prefetch(&keys, p.guard);
-                p.issued = Some((l, ids));
-            }
+        if let Some((l, ids)) = p.pending.take()
+            && l.0 == layer.0 + 1
+        {
+            let keys: Vec<ExpertKey> = ids.iter().map(|&e| (l, e)).collect();
+            // Advisory: a poisoned store fails the demand that follows anyway.
+            let _ = self.store.prefetch(&keys, p.guard);
+            p.issued = Some((l, ids));
         }
     }
 }
@@ -686,10 +686,10 @@ impl Pressure {
         let decision = self.lock().observe(available, used);
         // Speculation goes first (ADR-005), and retained KV is speculation. This runs on
         // the sampling thread, so an idle server gives it back too.
-        if !decision.prefetch {
-            if let Some(r) = &self.retained {
-                lock_retained(r).clear();
-            }
+        if !decision.prefetch
+            && let Some(r) = &self.retained
+        {
+            lock_retained(r).clear();
         }
         decision
     }
@@ -710,10 +710,10 @@ impl Watcher {
             .spawn(move || {
                 let probe = SystemProbe::new(Host::live());
                 while !flag.load(Ordering::Acquire) {
-                    if let Ok(s) = probe.snapshot() {
-                        if let Probed::Known(a) = s.ram_available {
-                            pressure.observe(a);
-                        }
+                    if let Ok(s) = probe.snapshot()
+                        && let Probed::Known(a) = s.ram_available
+                    {
+                        pressure.observe(a);
                     }
                     std::thread::park_timeout(interval);
                 }

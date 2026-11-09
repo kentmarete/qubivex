@@ -757,16 +757,16 @@ impl<'a> Batch<'a> {
             }
             waited.get_or_insert_with(std::time::Instant::now);
             // Nothing ready: read something ourselves without I/O threads, else wait.
-            if shared.io_threads == 0 {
-                if let Some(req) = g.next_request() {
-                    drop(g);
-                    self.store.execute(req);
-                    g = match shared.inner.lock() {
-                        Ok(g) => g,
-                        Err(_) => break Next::Lease(Err(StoreError::Poisoned)),
-                    };
-                    continue;
-                }
+            if shared.io_threads == 0
+                && let Some(req) = g.next_request()
+            {
+                drop(g);
+                self.store.execute(req);
+                g = match shared.inner.lock() {
+                    Ok(g) => g,
+                    Err(_) => break Next::Lease(Err(StoreError::Poisoned)),
+                };
+                continue;
             }
             let woke = match self.next_deadline(&g) {
                 Some(d) => shared.loaded.wait_timeout(g, d).map(|(g, _)| g).ok(),
@@ -847,16 +847,16 @@ impl<'a> Batch<'a> {
             .unwrap_or_default();
         self.unpend(i);
         let queued = g.queue.iter().any(|r| r.key == key);
-        if let Some(pool) = g.pools.get_mut(&key.0) {
-            if let Some(Entry::Loading { bytes, waiters, .. }) = pool.entries.get_mut(&key.1.0) {
-                *waiters -= 1;
-                if *waiters == 0 && queued {
-                    let bytes = *bytes;
-                    pool.entries.remove(&key.1.0);
-                    g.used -= bytes;
-                    g.queue.retain(|r| r.key != key);
-                    self.store.shared.cancelled.fetch_add(1, Ordering::Relaxed);
-                }
+        if let Some(pool) = g.pools.get_mut(&key.0)
+            && let Some(Entry::Loading { bytes, waiters, .. }) = pool.entries.get_mut(&key.1.0)
+        {
+            *waiters -= 1;
+            if *waiters == 0 && queued {
+                let bytes = *bytes;
+                pool.entries.remove(&key.1.0);
+                g.used -= bytes;
+                g.queue.retain(|r| r.key != key);
+                self.store.shared.cancelled.fetch_add(1, Ordering::Relaxed);
             }
         }
         self.store.shared.timeouts.fetch_add(1, Ordering::Relaxed);
@@ -1466,17 +1466,15 @@ impl ExpertStore {
                     r.refused += 1;
                     continue;
                 };
-                if guard {
-                    if let Policy::Lfru { .. } = policy {
-                        let age = match pool.entries.get(&v) {
-                            Some(Entry::Ready { last_use, .. }) => pool.tick - last_use,
-                            _ => 0,
-                        };
-                        let victim = policy::lfru_score(pool.heat.get(v), age);
-                        if !policy::speculation_beats(pool.heat.get(e), victim) {
-                            r.refused += 1;
-                            continue;
-                        }
+                if guard && let Policy::Lfru { .. } = policy {
+                    let age = match pool.entries.get(&v) {
+                        Some(Entry::Ready { last_use, .. }) => pool.tick - last_use,
+                        _ => 0,
+                    };
+                    let victim = policy::lfru_score(pool.heat.get(v), age);
+                    if !policy::speculation_beats(pool.heat.get(e), victim) {
+                        r.refused += 1;
+                        continue;
                     }
                 }
                 if let Some(data) = pool.evict(v, &mut g.prefetch) {

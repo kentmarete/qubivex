@@ -156,34 +156,34 @@ fn rows(w: &WeightView<'_>, xs: &[f32], s: usize, r0: usize, out: &mut [f32], bu
     // One activation row (decode): fuse dequantization into the dot, without the
     // scratch row. The bits equal the portable path's (see `neon`).
     #[cfg(target_arch = "aarch64")]
-    if s == 1 {
-        if let Some(dot) = fused(w.dtype()) {
-            for (j, y) in out.iter_mut().enumerate() {
-                *y = dot(w.row(r0 + j), xs);
-            }
-            return;
+    if s == 1
+        && let Some(dot) = fused(w.dtype())
+    {
+        for (j, y) in out.iter_mut().enumerate() {
+            *y = dot(w.row(r0 + j), xs);
         }
+        return;
     }
     // Two to `GROUPED_MAX_ROWS` rows (a decode step over a few sequences): dequantise
     // each weight once, in registers, into every row of a group, each row's lanes unchanged
     // (`neon`). Past five rows the activation rows go in balanced groups of up to five
     // (6 as 3 + 3, 8 as 4 + 4), each weight row once per group while it is in L1.
     #[cfg(target_arch = "aarch64")]
-    if (2..=GROUPED_MAX_ROWS).contains(&s) {
-        if let Some(dot) = fused_rows(w.dtype()) {
-            let k = w.cols();
-            let groups = s.div_ceil(neon::MAX_ROWS);
-            for (j, o) in out.chunks_exact_mut(s).enumerate() {
-                let row = w.row(r0 + j);
-                let mut a = 0;
-                for g in 0..groups {
-                    let b = a + (s - a) / (groups - g);
-                    dot(row, &xs[a * k..b * k], &mut o[a..b]);
-                    a = b;
-                }
+    if (2..=GROUPED_MAX_ROWS).contains(&s)
+        && let Some(dot) = fused_rows(w.dtype())
+    {
+        let k = w.cols();
+        let groups = s.div_ceil(neon::MAX_ROWS);
+        for (j, o) in out.chunks_exact_mut(s).enumerate() {
+            let row = w.row(r0 + j);
+            let mut a = 0;
+            for g in 0..groups {
+                let b = a + (s - a) / (groups - g);
+                dot(row, &xs[a * k..b * k], &mut o[a..b]);
+                a = b;
             }
-            return;
         }
+        return;
     }
     #[cfg(target_arch = "x86_64")]
     if std::arch::is_x86_feature_detected!("avx2") && std::arch::is_x86_feature_detected!("fma") {

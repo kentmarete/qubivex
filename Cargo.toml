@@ -9,7 +9,7 @@ exclude = ["spikes"]
 [workspace.package]
 version = "0.1.0"
 edition = "2024"
-rust-version = "1.85"
+rust-version = "1.88"
 license = "Apache-2.0"
 repository = "https://github.com/kentmarete/qubivex"
 publish = false
@@ -82,6 +82,9 @@ undocumented_unsafe_blocks = "deny"
 missing_safety_doc = "deny"
 cast_possible_truncation = "warn"
 float_cmp = "deny"
+# New with MSRV 1.88. The kernels' `chunks_exact` loops are measured and bit-checked;
+# moving them to `as_chunks` is kernel work, not something to do for a lint.
+chunks_exact_to_as_chunks = "allow"
 
 [profile.release]
 lto = "fat"

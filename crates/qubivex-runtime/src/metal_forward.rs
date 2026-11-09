@@ -226,7 +226,7 @@ impl MetalForward {
             ffn: usize_of(c.expert_ffn)?,
             vocab: usize_of(c.vocab)?,
         };
-        if dims.kvh == 0 || dims.heads % dims.kvh != 0 {
+        if dims.kvh == 0 || !dims.heads.is_multiple_of(dims.kvh) {
             return Err(ArchError::Input(
                 "heads must be a multiple of KV heads".into(),
             ));
@@ -970,11 +970,11 @@ impl MetalForward {
         let m = rows.len();
 
         // Every expert resident: the whole token is one submission, routed on the GPU.
-        if let Some(held) = self.hold_all(store)? {
-            if let Some(out) = self.routed(w, &held, source, store, parts, s, rows)? {
-                self.routed_passes.fetch_add(1, Ordering::Relaxed);
-                return Ok(out);
-            }
+        if let Some(held) = self.hold_all(store)?
+            && let Some(out) = self.routed(w, &held, source, store, parts, s, rows)?
+        {
+            self.routed_passes.fetch_add(1, Ordering::Relaxed);
+            return Ok(out);
         }
 
         // The previous layer's last wave of experts, recorded at the start of the next

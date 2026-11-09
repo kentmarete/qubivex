@@ -122,16 +122,16 @@ pub(crate) fn index_files(dir: &Path, manifest: &Manifest) -> Result<TensorIndex
             ManifestFormat::Gguf => tensors.add_gguf(&path)?,
         }
         let actual = tensors.files().last().map_or(0, |f| f.size);
-        if let Some(want) = s.size {
-            if want != actual {
-                return Err(ModelError::Manifest {
-                    path: dir.join(MANIFEST_FILE),
-                    detail: format!(
-                        "shard {:?} is {actual} bytes, the manifest says {want}",
-                        s.path
-                    ),
-                });
-            }
+        if let Some(want) = s.size
+            && want != actual
+        {
+            return Err(ModelError::Manifest {
+                path: dir.join(MANIFEST_FILE),
+                detail: format!(
+                    "shard {:?} is {actual} bytes, the manifest says {want}",
+                    s.path
+                ),
+            });
         }
     }
     Ok(tensors)
@@ -202,13 +202,13 @@ fn validate(
                 spec.shape
             )),
             Some(t) => {
-                if let TensorRole::RoutedExpertStack { experts, .. } = spec.role {
-                    if t.tensor.bytes % u64::from(experts.max(1)) != 0 {
-                        problems.push(format!(
-                            "tensor {:?} does not split into {experts} equal experts",
-                            spec.name
-                        ));
-                    }
+                if let TensorRole::RoutedExpertStack { experts, .. } = spec.role
+                    && t.tensor.bytes % u64::from(experts.max(1)) != 0
+                {
+                    problems.push(format!(
+                        "tensor {:?} does not split into {experts} equal experts",
+                        spec.name
+                    ));
                 }
                 if roles.insert(spec.name.clone(), spec.role).is_some() {
                     problems.push(format!(

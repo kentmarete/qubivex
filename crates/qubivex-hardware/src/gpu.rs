@@ -176,12 +176,12 @@ pub(crate) fn parse_vulkan(out: &str) -> Vec<GpuDevice> {
     };
     for line in out.lines() {
         let t = line.trim();
-        if let Some(n) = t.strip_prefix("GPU").and_then(|r| r.strip_suffix(':')) {
-            if let Ok(i) = n.parse() {
-                flush(cur.take(), &mut devs);
-                cur = Some((i, Vec::new()));
-                continue;
-            }
+        if let Some(n) = t.strip_prefix("GPU").and_then(|r| r.strip_suffix(':'))
+            && let Ok(i) = n.parse()
+        {
+            flush(cur.take(), &mut devs);
+            cur = Some((i, Vec::new()));
+            continue;
         }
         if let (Some((_, kv)), Some((k, v))) = (cur.as_mut(), t.split_once('=')) {
             kv.push((k.trim().to_owned(), v.trim().to_owned()));

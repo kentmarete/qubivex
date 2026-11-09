@@ -60,10 +60,10 @@ pub fn global_lru_hits(trace: &[ExpertKey], capacity: usize) -> u64 {
         if let Some(old) = last.insert(k, t) {
             order.remove(&old);
             hits += 1;
-        } else if last.len() > capacity {
-            if let Some((_, v)) = order.pop_first() {
-                last.remove(&v);
-            }
+        } else if last.len() > capacity
+            && let Some((_, v)) = order.pop_first()
+        {
+            last.remove(&v);
         }
         order.insert(t, k);
     }

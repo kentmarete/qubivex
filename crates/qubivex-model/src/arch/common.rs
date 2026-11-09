@@ -232,12 +232,12 @@ pub(crate) fn unsupported_common(v: &Values<'_>) -> Result<(), ModelError> {
             "attention_bias = true: attention biases are not supported yet",
         ));
     }
-    if let Some(act) = v.get("hidden_act", None)? {
-        if act != "silu" {
-            return Err(cfg_err(format!(
-                "hidden_act = {act}: only silu (SwiGLU) is supported"
-            )));
-        }
+    if let Some(act) = v.get("hidden_act", None)?
+        && act != "silu"
+    {
+        return Err(cfg_err(format!(
+            "hidden_act = {act}: only silu (SwiGLU) is supported"
+        )));
     }
     if v.bool("mlp_bias", None)? == Some(true) {
         return Err(cfg_err("mlp_bias = true: FFN biases are not supported yet"));

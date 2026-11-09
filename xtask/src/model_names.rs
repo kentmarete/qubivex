@@ -75,10 +75,10 @@ fn collect(dir: &Path, out: &mut Vec<PathBuf>) -> io::Result<()> {
 fn find_model_name(line: &str) -> Option<&str> {
     // An explicit, reviewable exemption for format identifiers that happen to be model
     // names (for example GGUF's `tokenizer.ggml.pre` values). A reason is required.
-    if let Some((_, reason)) = line.split_once("model-name-ok:") {
-        if !reason.trim().is_empty() {
-            return None;
-        }
+    if let Some((_, reason)) = line.split_once("model-name-ok:")
+        && !reason.trim().is_empty()
+    {
+        return None;
     }
     line.split(|c: char| !c.is_ascii_alphanumeric())
         .filter(|t| !t.is_empty())

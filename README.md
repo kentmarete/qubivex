@@ -182,7 +182,7 @@ QUBIVEX is not published to crates.io yet. Build it from source.
 
 **Requirements**
 
-- Rust 1.85 or newer (`rustup` recommended). The workspace uses edition 2024.
+- Rust 1.88 or newer (`rustup` recommended). The workspace uses edition 2024.
 - Linux (x86-64 or arm64) or macOS (arm64 or x86-64). CI tests Linux x86-64 and macOS arm64.
 - No C toolchain, Python or GPU SDK is needed for the current features.
 
@@ -729,7 +729,7 @@ cargo deny check                                         # advisories, licences,
 ```
 
 CI runs all of these on Linux x86-64 and macOS arm64, plus a build and test on the
-minimum supported Rust version, 1.85.
+minimum supported Rust version, 1.88.
 
 **Fixtures.** `fixtures/models/` is generated deterministically by
 `cargo xtask gen-fixtures`, and `cargo xtask check` fails if the committed files drift

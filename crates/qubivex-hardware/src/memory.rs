@@ -220,10 +220,8 @@ pub(crate) fn cgroup(host: &Host) -> Probed<Option<CgroupRoom>> {
     }
     let mut acc = Acc::default();
     let seen_v2 = v2.is_some_and(|p| walk(host, "/sys/fs/cgroup", p, false, &mut acc));
-    if !seen_v2 {
-        if let Some(p) = v1 {
-            walk(host, "/sys/fs/cgroup/memory", p, true, &mut acc);
-        }
+    if !seen_v2 && let Some(p) = v1 {
+        walk(host, "/sys/fs/cgroup/memory", p, true, &mut acc);
     }
     Probed::Known(acc.limit.map(|limit| CgroupRoom {
         limit: Bytes(limit),

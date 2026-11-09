@@ -65,14 +65,13 @@ struct Extent {
 fn coalesce(parts: &[PartLayout]) -> Vec<Extent> {
     let mut out: Vec<Extent> = Vec::new();
     for p in parts {
-        if let Some(last) = out.last_mut() {
-            if last.file == p.file
-                && last.file_offset + last.len as u64 == p.file_offset
-                && last.offset + last.len == p.offset
-            {
-                last.len += p.len;
-                continue;
-            }
+        if let Some(last) = out.last_mut()
+            && last.file == p.file
+            && last.file_offset + last.len as u64 == p.file_offset
+            && last.offset + last.len == p.offset
+        {
+            last.len += p.len;
+            continue;
         }
         out.push(Extent {
             file: p.file,
