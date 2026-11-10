@@ -134,9 +134,8 @@ journalctl -u qubivex -f
 curl -s http://127.0.0.1:8080/health
 ```
 
-`ReadOnlyPaths` suits a server that only reads models. Drop that line if you run
-`qubivex models pull` as the service user while the service's sandbox applies to it
-(it does not apply to `sudo -u qubivex` from a shell).
+`ReadOnlyPaths` suits a server, which only reads models. It applies to the service
+alone: `sudo -u qubivex qubivex models pull ...` from a shell can still write there.
 
 With `MemoryMax` set, `qubivex system` run inside the same cgroup shows the limit as the
 "cgroup limit", and the planner budgets against the cgroup's room, not the machine's free
