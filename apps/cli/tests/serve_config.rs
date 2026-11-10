@@ -75,3 +75,50 @@ fn a_config_file_with_a_key_must_be_private() {
     assert!(!e.contains("chmod"), "{e}");
     assert!(e.contains("nonexistent"), "{e}");
 }
+
+/// `docker stop`, systemd and Kubernetes stop a service with SIGTERM. It must start the
+/// same drain as Ctrl-C and end with status 0, not kill the process mid-request.
+#[cfg(unix)]
+#[test]
+fn sigterm_drains_and_exits_zero() {
+    use std::io::{BufRead, BufReader, Read};
+    use std::process::Stdio;
+
+    let models = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/models");
+    let mut child = Command::new(env!("CARGO_BIN_EXE_qubivex"))
+        .args(["serve", "--model", "olmoe-tiny", "--listen", "127.0.0.1:0"])
+        .arg("--dir")
+        .arg(&models)
+        .env_remove("QUBIVEX_API_KEY")
+        .env_remove("QUBIVEX_ADMIN_TOKEN")
+        .env_remove("QUBIVEX_CONFIG")
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut err = BufReader::new(child.stderr.take().unwrap());
+    let mut seen = String::new();
+    // The "serving" line is printed once the port is open and the handler can be installed.
+    loop {
+        let mut line = String::new();
+        if err.read_line(&mut line).unwrap() == 0 {
+            let _ = child.kill();
+            panic!("the server ended before listening: {seen}");
+        }
+        seen.push_str(&line);
+        if line.contains("serving") {
+            break;
+        }
+    }
+    // The handler is installed just after that line; a moment covers the gap.
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    let killed = Command::new("kill")
+        .args(["-TERM", &child.id().to_string()])
+        .status()
+        .unwrap();
+    assert!(killed.success());
+    let status = child.wait().unwrap();
+    err.read_to_string(&mut seen).unwrap();
+    assert!(status.success(), "{status:?}: {seen}");
+    assert!(seen.contains("shutting down"), "{seen}");
+}

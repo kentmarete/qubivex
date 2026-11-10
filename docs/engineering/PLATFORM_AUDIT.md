@@ -130,8 +130,14 @@ as the spec asks.
 
 ### Docs and packaging
 
-No `docs/deployment/`, `docs/runtime/`, `docs/serving/` or `docs/model-management/`, no
-Dockerfile, and no `examples/`. CI covers Linux and macOS, MSRV 1.85, loom and `cargo deny`.
+Done in job 11 (2026-11-10): the §14 documents exist under `docs/architecture`,
+`docs/runtime`, `docs/model-management`, `docs/serving`, `docs/performance` and
+`docs/deployment`, indexed by `docs/README.md`, and there is a `Dockerfile`. Examples live
+with their crate (`crates/qubivex-runtime/examples`), not in a top-level `examples/`. CI
+covers Linux and macOS, MSRV 1.88, loom, ThreadSanitizer, `cargo deny` and the image.
+
+At the time of the audit: no `docs/deployment/`, `docs/runtime/`, `docs/serving/` or
+`docs/model-management/`, no Dockerfile, and no `examples/`.
 
 ## 3. Findings that need more than filling a gap
 
@@ -189,7 +195,7 @@ Owner rules for this plan (2026-11-06):
 | 8 | Batching, stages 2 and 3 (**done**) | S8 | 7 | A 2-to-5-row CPU kernel first (ADR-017 measurements); then sequences share a pass; tokens bit-identical; measured on power |
 | 9 | Hardening (**done**) | S10 | 5 | Rate limits, request limits, CORS, non-localhost refusal, config files |
 | 10 | Observability (**done**) | S10 | 5 | The §8 metrics; structured logs with no prompt text |
-| 11 | Deployment | S10 | 9, 10 | Docker, runbooks, the §14 docs |
+| 11 | Deployment (**done**) | S10 | 9, 10 | Docker, runbooks, the §14 docs |
 | Blocked | CUDA | S9 | B2 | Needs NVIDIA hardware; abstraction only until then |
 | Later | Vulkan | S9 | | Spec says "where practical" |
 

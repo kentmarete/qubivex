@@ -76,6 +76,36 @@ jobs:
           --test scheduler --test concurrency --test gateway --test store --test prefetch
           --test requests --test prefix
 
+  docker:
+    name: docker image
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build
+        run: docker build -t qubivex .
+      - name: Refuses to listen beyond loopback without a key
+        run: |
+          out=$(timeout 60 docker run --rm qubivex 2>&1 || true)
+          echo "$out"
+          echo "$out" | grep -q "without an API key"
+      - name: Serve the fixture model, call it, and stop with SIGTERM
+        run: |
+          docker run -d --name qubivex --read-only -p 127.0.0.1:8080:8080 \
+            -e QUBIVEX_API_KEY=sk-ci qubivex \
+            serve --listen 0.0.0.0:8080 --dir /usr/share/qubivex/models --model olmoe-tiny
+          for i in $(seq 1 30); do
+            curl -sf http://127.0.0.1:8080/health && break
+            sleep 1
+          done
+          curl -sf http://127.0.0.1:8080/health
+          test "$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:8080/v1/models)" = 401
+          curl -sf http://127.0.0.1:8080/v1/chat/completions \
+            -H 'Authorization: Bearer sk-ci' -H 'content-type: application/json' \
+            -d '{"model":"olmoe-tiny","messages":[{"role":"user","content":"Hello"}],"max_tokens":4}'
+          docker stop -t 45 qubivex
+          docker logs qubivex
+          test "$(docker inspect -f '{{.State.ExitCode}}' qubivex)" = 0
+
   deny:
     name: cargo deny
     runs-on: ubuntu-latest
