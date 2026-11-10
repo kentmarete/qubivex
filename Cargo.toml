@@ -31,6 +31,7 @@ qubivex-expert-stream = { path = "crates/qubivex-expert-stream", version = "0.1.
 qubivex-arch = { path = "crates/qubivex-arch", version = "0.1.0" }
 qubivex-memory = { path = "crates/qubivex-memory", version = "0.1.0" }
 qubivex-backend-metal = { path = "crates/qubivex-backend-metal", version = "0.1.0" }
+qubivex-backend-vulkan = { path = "crates/qubivex-backend-vulkan", version = "0.1.0" }
 qubivex-api = { path = "crates/qubivex-api", version = "0.1.0" }
 
 # Third-party versions are declared here once (ADR-001); members use `{ workspace = true }`.

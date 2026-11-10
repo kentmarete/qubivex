@@ -26,6 +26,7 @@ pub use experts::{ExpertIo, ExpertLayout, IoPath, ModelExpertSource, PartLayout}
 pub use placement::{BackendKind, MetalOps, PlacementReport};
 pub use qubivex_arch::{KvCache, Logits, Segment};
 pub use qubivex_backend_cpu::sim::SimConfig;
+pub use qubivex_backend_vulkan::VulkanConfig;
 pub use qubivex_compute::discrete::{DeviceUsage, TransferStats};
 pub use qubivex_expert_stream::fault::DiskLimit;
 pub use qubivex_kv_cache::PrefixStats;

@@ -1436,6 +1436,7 @@ dependencies = [
  "qubivex-arch",
  "qubivex-backend-cpu",
  "qubivex-backend-metal",
+ "qubivex-backend-vulkan",
  "qubivex-compute",
  "qubivex-core",
  "qubivex-expert-stream",
