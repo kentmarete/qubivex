@@ -89,6 +89,8 @@ impl AppState {
             )));
         }
         m.insert(id.to_owned(), entry);
+        drop(m);
+        self.log.info("model_added", &[("model", id.into())]);
         Ok(())
     }
 
@@ -273,20 +275,45 @@ impl LoadJob {
         let (what, rid) = (&self.what, &self.rid);
         let reg = ArchitectureRegistry::with_builtins();
         let meta = find(what, &st.cfg.model_dirs, &reg).map_err(|e| {
-            eprintln!("qubivex-api: request {rid}: cannot find {what:?}: {e}");
+            st.log.warn(
+                "model_not_found",
+                &[
+                    ("request_id", rid.as_str().into()),
+                    ("detail", e.to_string().into()),
+                ],
+            );
             ApiError::model_not_found(what)
         })?;
         st.claim_dir(&self.id, &resolved(&meta.dir))?;
-        Engine::load(meta, st.cfg.engine).map_err(|e| ApiError::from_runtime(&e, rid))
+        Engine::load(meta, st.cfg.engine).map_err(|e| ApiError::from_runtime(&e, rid, &st.log))
     }
 
     async fn run(self, done: watch::Sender<LoadResult>) {
         let job = Arc::new(self);
         let j = Arc::clone(&job);
+        let st = &job.st;
+        let ids = [
+            ("request_id", job.rid.as_str().into()),
+            ("model", job.id.as_str().into()),
+        ];
+        st.log.info("model_load_started", &ids);
+        let began = Instant::now();
         let loaded = tokio::task::spawn_blocking(move || j.load())
             .await
             .unwrap_or_else(|_| Err(ApiError::internal(&job.rid)));
-        let st = &job.st;
+        let took = began.elapsed();
+        let mut fields = ids.to_vec();
+        fields.push(("duration_ms", crate::log::millis(took)));
+        match &loaded {
+            Ok(_) => {
+                st.metrics.model(&job.id).load.observe_duration(took);
+                st.log.info("model_loaded", &fields);
+            }
+            Err(e) => {
+                fields.push(("error", e.code.into()));
+                st.log.warn("model_load_failed", &fields);
+            }
+        }
         let (entry, result) = match loaded {
             Ok(engine) => (Some(st.entry_ready(engine, job.what.clone())), Ok(())),
             // Nothing was found to load, or another id serves it: no state to keep.

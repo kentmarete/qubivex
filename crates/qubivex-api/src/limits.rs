@@ -144,7 +144,12 @@ pub(crate) async fn rate_limit(
         Ok(()) => next.run(req).await,
         Err(wait) => {
             let rid = st.request_id(req.headers());
-            let mut resp = st.finish("rate_limit", &rid, Err(ApiError::rate_limited()));
+            let mut resp = st.finish(
+                "rate_limit",
+                &rid,
+                Instant::now(),
+                Err(ApiError::rate_limited()),
+            );
             let secs = wait.as_secs() + u64::from(wait.subsec_nanos() > 0);
             resp.headers_mut()
                 .insert(header::RETRY_AFTER, HeaderValue::from(secs.max(1)));

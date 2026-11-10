@@ -60,7 +60,8 @@ the design allows either).
   `--default-max-tokens` (512) so a reservation is not the whole context.
 - **Metrics.** Hand-written Prometheus text from atomics (requests by endpoint and
   status, active, tokens, cancelled, timed out, failed; per model: reserved KV, expert
-  cache, free slots). No `metrics` crate: the counters are few and fixed.
+  cache, free slots). No `metrics` crate: the counters are few and fixed. (Amendment 5
+  adds histograms and the engine's counters, still hand-written.)
 - **Dependencies:** `axum` 0.8 (`http1`, `json`, `tokio`, `query`; Kerniq Server since
   Amendment 4), `tokio`,
   `tokio-stream`; licences checked by `cargo deny`.
@@ -125,6 +126,43 @@ a Kerniq `App`, in the same order. What changes:
   with no named maintainer. Its `axum` re-export is the gateway's Axum. It needs Rust
   1.88, so the MSRV moves from 1.85 to 1.88. `cargo xtask check` also keeps
   `kerniq-server` out of the runtime.
+
+## Amendment 5 (2026-11-10): observability (platform plan job 10)
+Spec §8 asks for inference, memory and serving metrics in a Prometheus-compatible form,
+and structured logs with request, model and sequence ids and no private text.
+
+- **Still hand-written.** The owner chose (2026-11-10) to extend the gateway's own
+  metrics over Kerniq Observe (OpenTelemetry): no new dependency, the `qubivex_*` names
+  stay, and the "no `metrics` crate" decision above stands although the counters are no
+  longer few. The cost: no OTLP export and no traces.
+- **Histograms** are fixed buckets of atomics (`metrics.rs`), per model: scheduler wait,
+  time to first token and total latency (all from the request's arrival), the gap
+  between tokens, prompt and generation tokens per second, and model load time; and per
+  endpoint, the time to answer. A token costs one clock read and a few atomic adds.
+- **Engine numbers are read at scrape**, not copied: expert store counters (hits, loads,
+  evictions, bytes read, time blocked on reads, retries, timeouts), batch passes and
+  steps, the memory ledger by owner and the plan's budget. Expert load latency is a sum
+  to divide by loads, not a histogram: the store keeps only the total.
+- **Process memory** comes from `qubivex-hardware`. On macOS that runs `ps` (off the
+  Tokio workers), and the peak is the highest value a scrape has read.
+- **Not measured:** peak VRAM (the ledger has no GPU tier while Metal shares host
+  memory and CUDA is blocked) and fragmentation.
+- **Logs** (`log.rs`) are one line per event on standard error, text by default or JSON
+  (`--log-format text|json|off`, `ServerConfig::log_format`), with a level and a UTC
+  timestamp. `request` is written for every API request, `/health` and `/metrics`
+  excepted. A **sequence id** is new: the generation's number among those the server has
+  admitted, given at the grant, so lines about sequences that share forward passes can
+  be told apart. A host embedding the gateway can take the lines
+  (`Gateway::with_log_writer`).
+- **No prompt text, by construction and by test.** A log line is an event name plus
+  fields of ids, counts, durations and codes; no logging call receives a prompt, a
+  message or generated text. `tests/observability.rs` sends marked prompts through both
+  endpoints and a failing request and searches the log for them. The one free-text field
+  is `detail` on `internal_error` and `model_not_found`: the runtime's description of an
+  internal failure, which may name a file and never reaches the client.
+- `--no-metrics` (`ServerConfig::metrics_enabled`) turns `/metrics` into a 404.
+  `/metrics` still needs no key, so it belongs behind the same network boundary as the
+  server.
 
 ## Consequences
 - The exit criteria are met: `crates/qubivex-api/tests/gateway.rs` (over HTTP, tiny

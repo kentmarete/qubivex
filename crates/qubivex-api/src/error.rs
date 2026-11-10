@@ -8,6 +8,8 @@ use kerniq_server::axum::response::{IntoResponse, Response};
 use qubivex_runtime::{RequestError, RuntimeError};
 use serde_json::json;
 
+use crate::log::Log;
+
 /// An error returned to the client.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ApiError {
@@ -202,21 +204,27 @@ impl ApiError {
 
     /// A runtime error as the client should see it. Errors whose text can carry paths
     /// or internals are logged and replaced by [`ApiError::internal`].
-    pub fn from_runtime(e: &RuntimeError, request_id: &str) -> Self {
+    pub(crate) fn from_runtime(e: &RuntimeError, request_id: &str, log: &Log) -> Self {
         match e {
             // Memory and storage refusals are about capacity, and their text is built
             // from sizes and counts only.
             RuntimeError::Memory(m) => Self::overloaded(format!("memory: {m}")),
             RuntimeError::Storage(m) => Self::overloaded(format!("storage: {m}")),
             other => {
-                eprintln!("qubivex-api: request {request_id}: {other}");
+                log.error(
+                    "internal_error",
+                    &[
+                        ("request_id", request_id.into()),
+                        ("detail", other.to_string().into()),
+                    ],
+                );
                 Self::internal(request_id)
             }
         }
     }
 
     /// A request's failure as the client should see it.
-    pub fn from_request(e: &RequestError, request_id: &str) -> Self {
+    pub(crate) fn from_request(e: &RequestError, request_id: &str, log: &Log) -> Self {
         match e {
             RequestError::Invalid {
                 param: Some(param),
@@ -227,7 +235,7 @@ impl ApiError {
                 message,
             } => Self::invalid(message.clone()),
             RequestError::Admission(err) | RequestError::Generation(err) => {
-                Self::from_runtime(err, request_id)
+                Self::from_runtime(err, request_id, log)
             }
             _ => Self::internal(request_id),
         }

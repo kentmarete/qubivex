@@ -16,12 +16,17 @@
 //! response carries an `x-request-id`; errors are OpenAI-shaped and never contain file
 //! paths.
 //!
+//! Spec §8: `/metrics` reports the inference, memory and serving numbers (`metrics`),
+//! and the log is one line per event, as text or JSON, with request, model and
+//! sequence ids and never a prompt or generated text (`log`).
+//!
 //! Spec §11: an optional per-client rate limit, limits on the body, the prompt and
 //! `max_tokens`, CORS for configured origins, and no listening beyond loopback without
 //! an API key unless that is asked for explicitly.
 
 mod error;
 mod limits;
+mod log;
 mod metrics;
 mod models;
 mod openai;
@@ -46,6 +51,7 @@ use kerniq_server::axum::{Json, Router};
 use kerniq_server::config::ServerConfig as ServeConfig;
 use kerniq_server::routing::Router as Routes;
 pub use limits::RateLimit;
+pub use log::LogFormat;
 pub use metrics::Metrics;
 use qubivex_runtime::scheduler::{EnterError, Outcome, RequestInfo};
 pub use qubivex_runtime::scheduler::{MemoryPolicy, Stats};
@@ -55,6 +61,7 @@ use tokio::sync::{mpsc, oneshot, watch};
 use tokio_stream::wrappers::ReceiverStream;
 
 use crate::limits::RateLimiter;
+use crate::log::{Log, millis};
 use crate::models::Entry;
 use crate::openai::{ChatRequest, CompletionRequest, Params};
 use crate::worker::{CancelOnDrop, Event, FinishReason, Input, Job};
@@ -112,6 +119,10 @@ pub struct ServerConfig {
     pub model_dirs: Vec<PathBuf>,
     /// How the admin load endpoint loads models.
     pub engine: EngineOptions,
+    /// How the log is written: text, JSON lines, or not at all.
+    pub log_format: LogFormat,
+    /// Serve `GET /metrics`. Off: it answers 404.
+    pub metrics_enabled: bool,
 }
 
 impl Default for ServerConfig {
@@ -137,6 +148,8 @@ impl Default for ServerConfig {
             prefill_chunk: 256,
             model_dirs: Vec::new(),
             engine: EngineOptions::default(),
+            log_format: LogFormat::default(),
+            metrics_enabled: true,
         }
     }
 }
@@ -149,7 +162,10 @@ struct AppState {
     /// Unloaded engines, to see when running requests have let go of them.
     unloaded: Mutex<Vec<Weak<Engine>>>,
     metrics: Arc<Metrics>,
+    log: Arc<Log>,
     next_id: AtomicU64,
+    /// The next sequence id: one per admitted generation, in order of admission.
+    next_sequence: AtomicU64,
     /// Set when the shutdown grace ends: running requests stop.
     stop_now: watch::Sender<bool>,
 }
@@ -189,9 +205,22 @@ fn bearer(headers: &HeaderMap) -> Option<&str> {
 }
 
 impl Gateway {
-    /// A gateway with no models.
+    /// A gateway with no models, logging to standard error.
     #[must_use]
     pub fn new(cfg: ServerConfig) -> Self {
+        let log = Log::stderr(cfg.log_format);
+        Self::with(cfg, log)
+    }
+
+    /// A gateway with no models that writes its log lines to `log` instead of standard
+    /// error, in [`ServerConfig::log_format`].
+    #[must_use]
+    pub fn with_log_writer(cfg: ServerConfig, log: Box<dyn std::io::Write + Send>) -> Self {
+        let log = Log::to(cfg.log_format, log);
+        Self::with(cfg, log)
+    }
+
+    fn with(cfg: ServerConfig, log: Log) -> Self {
         Self {
             state: Arc::new(AppState {
                 limiter: cfg.rate_limit.map(RateLimiter::new),
@@ -199,7 +228,9 @@ impl Gateway {
                 models: RwLock::new(BTreeMap::new()),
                 unloaded: Mutex::new(Vec::new()),
                 metrics: Arc::new(Metrics::default()),
+                log: Arc::new(log),
                 next_id: AtomicU64::new(1),
+                next_sequence: AtomicU64::new(1),
                 stop_now: watch::Sender::new(false),
             }),
         }
@@ -307,10 +338,27 @@ impl Gateway {
             .check_listen(listener.local_addr()?)
             .map_err(refuse)?;
         let grace = st.cfg.shutdown_grace;
+        if st.cfg.api_key.is_none() && !listener.local_addr()?.ip().is_loopback() {
+            st.log.warn(
+                "serving_without_api_key",
+                &[("listen", listener.local_addr()?.to_string().into())],
+            );
+        }
+        st.log.info(
+            "server_started",
+            &[
+                ("listen", listener.local_addr()?.to_string().into()),
+                ("models", st.ready().len().into()),
+            ],
+        );
         let (began_tx, began_rx) = oneshot::channel::<()>();
         let begin = Arc::clone(&st);
         let signal = async move {
             shutdown.await;
+            begin.log.info(
+                "server_stopping",
+                &[("generations_active", begin.metrics.active().into())],
+            );
             begin.begin_shutdown();
             let _ = began_tx.send(());
         };
@@ -335,6 +383,10 @@ impl Gateway {
         while st.metrics.active() > 0 && waited.elapsed() < STOP_MARGIN {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
+        st.log.info(
+            "server_stopped",
+            &[("generations_active", st.metrics.active().into())],
+        );
         served
     }
 }
@@ -384,10 +436,35 @@ impl AppState {
         }
     }
 
-    /// Adds the request id header and counts the request.
-    fn finish(&self, endpoint: &'static str, rid: &str, r: Result<Response, ApiError>) -> Response {
+    /// Adds the request id header, and counts and logs the request. `began` is when it
+    /// arrived.
+    fn finish(
+        &self,
+        endpoint: &'static str,
+        rid: &str,
+        began: Instant,
+        r: Result<Response, ApiError>,
+    ) -> Response {
+        let code = r.as_ref().err().map(|e| e.code);
         let mut resp = r.unwrap_or_else(IntoResponse::into_response);
-        self.metrics.request(endpoint, resp.status().as_u16());
+        let status = resp.status().as_u16();
+        let took = began.elapsed();
+        self.metrics.request(endpoint, status);
+        self.metrics.answered(endpoint, took);
+        let mut fields = vec![
+            ("request_id", rid.into()),
+            ("endpoint", endpoint.into()),
+            ("status", status.into()),
+            ("duration_ms", millis(took)),
+        ];
+        if let Some(code) = code {
+            fields.push(("error", code.into()));
+        }
+        if status >= 500 {
+            self.log.warn("request", &fields);
+        } else {
+            self.log.info("request", &fields);
+        }
         if let Ok(v) = HeaderValue::from_str(rid) {
             resp.headers_mut().insert("x-request-id", v);
         }
@@ -399,42 +476,103 @@ async fn health(State(st): State<Arc<AppState>>) -> Json<Value> {
     Json(json!({ "status": "ok", "models": st.ready().len() }))
 }
 
+/// What `/metrics` reports for one loaded model, by the names in
+/// [`metrics::MODEL_VALUES`].
+fn model_values(cfg: &ServerConfig, l: &models::Loaded) -> metrics::ModelValues {
+    let e = &l.engine;
+    let q = l.scheduler.stats();
+    let p = e.prefix_stats();
+    let s = e.store_stats();
+    let b = e.batch_stats();
+    let ram = e.ledger().snapshot(qubivex_memory::Tier::Ram);
+    let budget = e.memory_plan().map_or(0, |p| p.ram.budget.bytes.0);
+    vec![
+        ("qubivex_kv_reserved_positions", e.kv_reserved() as f64),
+        ("qubivex_expert_cache_bytes", e.expert_cache_bytes() as f64),
+        (
+            "qubivex_generation_slots_free",
+            cfg.max_concurrent.saturating_sub(q.running) as f64,
+        ),
+        ("qubivex_queue_depth", q.queued as f64),
+        ("qubivex_queue_rejected_total", q.rejected as f64),
+        ("qubivex_queue_granted_total", q.granted as f64),
+        ("qubivex_prefix_cache_lookups_total", p.lookups as f64),
+        ("qubivex_prefix_cache_hits_total", p.hits as f64),
+        (
+            "qubivex_prefix_cache_tokens_reused_total",
+            p.tokens_reused as f64,
+        ),
+        ("qubivex_prefix_cache_evictions_total", p.evicted as f64),
+        ("qubivex_prefix_cache_positions", p.cost as f64),
+        ("qubivex_expert_cache_hits_total", s.hits as f64),
+        ("qubivex_expert_cache_loads_total", s.loads as f64),
+        ("qubivex_expert_cache_evictions_total", s.evictions as f64),
+        ("qubivex_expert_read_bytes_total", s.bytes_read as f64),
+        (
+            "qubivex_expert_load_wait_seconds_total",
+            Duration::from_nanos(s.wait_ns).as_secs_f64(),
+        ),
+        ("qubivex_expert_read_retries_total", s.retried as f64),
+        ("qubivex_expert_read_timeouts_total", s.timeouts as f64),
+        ("qubivex_batch_passes_total", b.passes as f64),
+        ("qubivex_batch_steps_total", b.steps as f64),
+        ("qubivex_memory_dense_bytes", ram.dense.0 as f64),
+        (
+            "qubivex_memory_expert_cache_bytes",
+            ram.expert_cache.0 as f64,
+        ),
+        ("qubivex_memory_kv_bytes", ram.kv.0 as f64),
+        ("qubivex_memory_activations_bytes", ram.activations.0 as f64),
+        ("qubivex_memory_budget_bytes", budget as f64),
+    ]
+}
+
+/// This process's resident set size and its peak, where the OS says.
+fn process_memory() -> (Option<u64>, Option<u64>) {
+    let host = qubivex_hardware::Host::live();
+    let known = |p: qubivex_hardware::Probed<_>| match p {
+        qubivex_hardware::Probed::Known(bytes) => Some(bytes),
+        qubivex_hardware::Probed::Unknown(_) => None,
+    };
+    (
+        known(qubivex_hardware::process_rss(&host)).map(|b| b.0),
+        known(qubivex_hardware::process_peak_rss(&host)).map(|b| b.0),
+    )
+}
+
 async fn metrics_text(State(st): State<Arc<AppState>>) -> Response {
+    if !st.cfg.metrics_enabled {
+        return ApiError::not_found().into_response();
+    }
     let mut out = String::new();
     st.metrics.render(&mut out);
-    let models = st.ready();
-    for (name, kind) in [
-        ("qubivex_kv_reserved_positions", "gauge"),
-        ("qubivex_expert_cache_bytes", "gauge"),
-        ("qubivex_generation_slots_free", "gauge"),
-        ("qubivex_queue_depth", "gauge"),
-        ("qubivex_queue_rejected_total", "counter"),
-        ("qubivex_prefix_cache_lookups_total", "counter"),
-        ("qubivex_prefix_cache_hits_total", "counter"),
-        ("qubivex_prefix_cache_tokens_reused_total", "counter"),
-        ("qubivex_prefix_cache_evictions_total", "counter"),
-        ("qubivex_prefix_cache_positions", "gauge"),
-    ] {
-        out.push_str(&format!("# TYPE {name} {kind}\n"));
-        for (id, l) in &models {
-            let q = l.scheduler.stats();
-            let p = l.engine.prefix_stats();
-            let v = match name {
-                "qubivex_kv_reserved_positions" => l.engine.kv_reserved() as u64,
-                "qubivex_expert_cache_bytes" => l.engine.expert_cache_bytes(),
-                "qubivex_generation_slots_free" => {
-                    st.cfg.max_concurrent.saturating_sub(q.running) as u64
-                }
-                "qubivex_queue_depth" => q.queued as u64,
-                "qubivex_queue_rejected_total" => q.rejected,
-                "qubivex_prefix_cache_lookups_total" => p.lookups,
-                "qubivex_prefix_cache_hits_total" => p.hits,
-                "qubivex_prefix_cache_tokens_reused_total" => p.tokens_reused,
-                "qubivex_prefix_cache_evictions_total" => p.evicted,
-                _ => p.cost,
-            };
-            out.push_str(&format!("{name}{{model=\"{id}\"}} {v}\n"));
-        }
+    let models: Vec<(String, metrics::ModelValues)> = st
+        .ready()
+        .iter()
+        .map(|(id, l)| (id.clone(), model_values(&st.cfg, l)))
+        .collect();
+    metrics::render_models(&mut out, &models);
+    // Reading the process's memory can run a command (macOS): off the Tokio workers.
+    let (rss, peak) = tokio::task::spawn_blocking(process_memory)
+        .await
+        .unwrap_or((None, None));
+    if let Some(rss) = rss {
+        metrics::render_value(
+            &mut out,
+            "qubivex_process_resident_bytes",
+            "gauge",
+            "Resident set size of the serving process.",
+            rss as f64,
+        );
+        // Where the OS keeps no high-water mark we can read, the highest scrape stands in.
+        let seen = st.metrics.note_rss(rss);
+        metrics::render_value(
+            &mut out,
+            "qubivex_process_peak_resident_bytes",
+            "gauge",
+            "Peak resident set size: the kernel's high-water mark on Linux, elsewhere the highest value a scrape has read.",
+            peak.unwrap_or(seen).max(rss) as f64,
+        );
     }
     (
         [("content-type", "text/plain; version=0.0.4; charset=utf-8")],
@@ -444,6 +582,7 @@ async fn metrics_text(State(st): State<Arc<AppState>>) -> Response {
 }
 
 async fn system(State(st): State<Arc<AppState>>, headers: HeaderMap) -> Response {
+    let began = Instant::now();
     let rid = st.request_id(&headers);
     let r = async {
         st.check_key(&headers)?;
@@ -500,7 +639,7 @@ async fn system(State(st): State<Arc<AppState>>, headers: HeaderMap) -> Response
         .into_response())
     }
     .await;
-    st.finish("system", &rid, r)
+    st.finish("system", &rid, began, r)
 }
 
 fn model_card(id: &str, created: u64) -> Value {
@@ -508,6 +647,7 @@ fn model_card(id: &str, created: u64) -> Value {
 }
 
 async fn list_models(State(st): State<Arc<AppState>>, headers: HeaderMap) -> Response {
+    let began = Instant::now();
     let rid = st.request_id(&headers);
     let r = st.check_key(&headers).map(|()| {
         let data: Vec<Value> = st
@@ -517,7 +657,7 @@ async fn list_models(State(st): State<Arc<AppState>>, headers: HeaderMap) -> Res
             .collect();
         Json(json!({ "object": "list", "data": data })).into_response()
     });
-    st.finish("models", &rid, r)
+    st.finish("models", &rid, began, r)
 }
 
 async fn get_model(
@@ -525,12 +665,13 @@ async fn get_model(
     Path(id): Path<String>,
     headers: HeaderMap,
 ) -> Response {
+    let began = Instant::now();
     let rid = st.request_id(&headers);
     let r = st
         .check_key(&headers)
         .and_then(|()| st.model(&id))
         .map(|l| Json(model_card(&id, l.created)).into_response());
-    st.finish("models", &rid, r)
+    st.finish("models", &rid, began, r)
 }
 
 fn json_body<T>(st: &AppState, body: Result<Json<T>, JsonRejection>) -> Result<T, ApiError> {
@@ -555,6 +696,7 @@ async fn chat(
     headers: HeaderMap,
     body: Result<Json<ChatRequest>, JsonRejection>,
 ) -> Response {
+    let began = Instant::now();
     let rid = st.request_id(&headers);
     let r = async {
         st.check_key(&headers)?;
@@ -573,7 +715,7 @@ async fn chat(
         .await
     }
     .await;
-    st.finish("chat_completions", &rid, r)
+    st.finish("chat_completions", &rid, began, r)
 }
 
 async fn completions(
@@ -581,6 +723,7 @@ async fn completions(
     headers: HeaderMap,
     body: Result<Json<CompletionRequest>, JsonRejection>,
 ) -> Response {
+    let began = Instant::now();
     let rid = st.request_id(&headers);
     let r = async {
         st.check_key(&headers)?;
@@ -599,7 +742,7 @@ async fn completions(
         .await
     }
     .await;
-    st.finish("completions", &rid, r)
+    st.finish("completions", &rid, began, r)
 }
 
 /// Completes when the server has told running requests to stop.
@@ -631,6 +774,7 @@ async fn generate(
     let queue_until = arrived + st.cfg.queue_timeout;
     let wait_until = limit.map_or(queue_until, |l| l.min(queue_until));
     let loaded = st.model_ready(model, wait_until).await?;
+    let timings = st.metrics.model(model);
     // The place is taken before any work, so a burst past the limit costs nothing.
     let ticket = loaded
         .scheduler
@@ -657,7 +801,7 @@ async fn generate(
     .await
     .map_err(|_| ApiError::internal(rid))?;
     request = returned;
-    let prepared = prepared.map_err(|e| ApiError::from_request(&e, rid))?;
+    let prepared = prepared.map_err(|e| ApiError::from_request(&e, rid, &st.log))?;
     if let Some(cap) = st.cfg.max_prompt_tokens {
         let n = prepared.prompt_tokens();
         if n > cap {
@@ -674,7 +818,7 @@ async fn generate(
     });
     let grant = match tokio::time::timeout_at(wait_until.into(), grant_rx).await {
         Ok(Ok(Outcome::Granted(g))) => g,
-        Ok(Ok(Outcome::Refused(e))) => return Err(ApiError::from_runtime(&e, rid)),
+        Ok(Ok(Outcome::Refused(e))) => return Err(ApiError::from_runtime(&e, rid, &st.log)),
         Ok(Ok(Outcome::Closed) | Err(_)) => return Err(ApiError::model_closing()),
         // Dropping the ticket on the way out leaves the queue.
         Err(_) if limit.is_some_and(|l| l <= queue_until) => {
@@ -683,6 +827,20 @@ async fn generate(
         Err(_) => return Err(ApiError::busy(st.cfg.max_concurrent)),
     };
     let now = Instant::now();
+    let waited = now - arrived;
+    timings.queue_wait.observe_duration(waited);
+    let sequence = st.next_sequence.fetch_add(1, Ordering::Relaxed);
+    st.log.info(
+        "generation_started",
+        &[
+            ("request_id", rid.into()),
+            ("model", model.into()),
+            ("sequence_id", sequence.into()),
+            ("prompt_tokens", prepared.prompt_tokens().into()),
+            ("stream", params.stream.into()),
+            ("queue_ms", millis(waited)),
+        ],
+    );
     let run_limit = now + st.cfg.request_timeout;
     request.deadline = Some(limit.map_or(run_limit, |l| l.min(run_limit)));
     let cancel = Arc::new(AtomicBool::new(false));
@@ -699,7 +857,12 @@ async fn generate(
             grant,
             cancel,
             request_id: rid.to_owned(),
+            model: model.to_owned(),
+            sequence,
+            arrived,
             metrics: Arc::clone(&st.metrics),
+            timings,
+            log: Arc::clone(&st.log),
         },
         tx,
     );
@@ -904,6 +1067,7 @@ async fn admin_load(
     headers: HeaderMap,
     body: Result<Json<Value>, JsonRejection>,
 ) -> Response {
+    let began = Instant::now();
     let rid = st.request_id(&headers);
     let r = async {
         st.check_admin(&headers)?;
@@ -926,7 +1090,7 @@ async fn admin_load(
         Ok((status, Json(model_card(&id, l.created))).into_response())
     }
     .await;
-    st.finish("admin", &rid, r)
+    st.finish("admin", &rid, began, r)
 }
 
 async fn admin_unload(
@@ -934,9 +1098,10 @@ async fn admin_unload(
     Path(id): Path<String>,
     headers: HeaderMap,
 ) -> Response {
+    let began = Instant::now();
     let rid = st.request_id(&headers);
     let r = st.check_admin(&headers).and_then(|()| unload(&st, &id));
-    st.finish("admin", &rid, r)
+    st.finish("admin", &rid, began, r)
 }
 
 async fn models_unload(
@@ -944,6 +1109,7 @@ async fn models_unload(
     headers: HeaderMap,
     body: Result<Json<Value>, JsonRejection>,
 ) -> Response {
+    let began = Instant::now();
     let rid = st.request_id(&headers);
     let r = st.check_admin(&headers).and_then(|()| {
         let body = json_body(&st, body)?;
@@ -953,13 +1119,17 @@ async fn models_unload(
             .ok_or_else(|| ApiError::invalid_param("model", "give the model id to unload"))?;
         unload(&st, id)
     });
-    st.finish("admin", &rid, r)
+    st.finish("admin", &rid, began, r)
 }
 
 /// Requests already running hold the model and finish; new ones get 404. The weights are
 /// freed when the last of them ends.
 fn unload(st: &AppState, id: &str) -> Result<Response, ApiError> {
     let draining = st.unload(id)?;
+    st.log.info(
+        "model_unloaded",
+        &[("model", id.into()), ("draining", draining.into())],
+    );
     Ok(
         Json(json!({ "id": id, "object": "model", "deleted": true, "draining": draining }))
             .into_response(),

@@ -343,7 +343,7 @@ r = client.chat.completions.create(model="qwen3-0.6b",
 |---|---|
 | `POST /v1/chat/completions`, `POST /v1/completions` | Streaming (SSE, `stream_options.include_usage`) or not; `max_tokens`, `temperature`, `top_k`, `top_p`, `seed`, `stop`. Scheduling: `priority` (`low`, `normal`, `high`), `timeout` (seconds, queue included), `user` (the client, for fairness). Refused, not ignored: `n > 1`, tools, logprobs, penalties |
 | `GET /v1/models`, `GET /v1/models/{id}` | The loaded models |
-| `GET /health`, `GET /metrics` | Liveness; Prometheus counters (requests, tokens, cancellations, reserved KV, queue depth, prefix cache) |
+| `GET /health`, `GET /metrics` | Liveness; Prometheus metrics (below) |
 | `GET /v1/system` | Hardware, each model's memory (plan, ledger, reserved KV, prefix cache, free slots, queue) and state |
 | `POST /v1/models/load` `{"model": ID}`, `POST /v1/models/unload` `{"model": ID}` | With `--admin-token` only. Concurrent loads share one load. `POST /v1/admin/models` and `DELETE /v1/admin/models/{id}` are aliases |
 
@@ -368,6 +368,8 @@ r = client.chat.completions.create(model="qwen3-0.6b",
 | `--prefix-cache-mb N` | 0 | Finished KV to keep per model, so a prompt that repeats a prefix (a chat's earlier turns) skips it. Same tokens; reported as `usage.prompt_tokens_details.cached_tokens`. Not shared between `user` values (ADR-016) |
 | `--default-max-tokens N` | 512 | When a request does not set `max_tokens` |
 | `--request-timeout S` | 600 | A generation then ends with `finish_reason: "length"` |
+| `--log-format text\|json\|off` | `text` | The log on standard error. `json` is one object per line |
+| `--no-metrics` | off | Do not serve `GET /metrics` (it answers 404) |
 | memory, device, `--context`, `--threads` | as `qubivex run` | Per model |
 
 Each conversation has its own KV cache and runs only when the memory plan can hold every
@@ -377,6 +379,43 @@ passes of running conversations take turns, first come first served, and long pr
 in chunks, so one request cannot hold the others up for long. A client that disconnects
 cancels its generation within one chunk or one token. Errors follow OpenAI's shape, carry
 the `x-request-id`, and never contain file paths. ADR-015 has the concurrency model.
+
+**Metrics.** `GET /metrics` is Prometheus text. It needs no key, so keep it off the public
+network. Per model (`model` label) unless noted:
+
+| What | Series |
+|---|---|
+| Time to first token, total latency, scheduler wait | `qubivex_time_to_first_token_seconds`, `qubivex_generation_duration_seconds`, `qubivex_queue_wait_seconds` (histograms, from the request's arrival) |
+| Inter-token latency | `qubivex_inter_token_seconds` (histogram) |
+| Prompt and generation speed | `qubivex_prompt_tokens_per_second`, `qubivex_generation_tokens_per_second` (histograms, one observation per generation) |
+| Model load time | `qubivex_model_load_seconds` (histogram; loads through the admin endpoint) |
+| Memory | `qubivex_memory_{dense,expert_cache,kv,activations}_bytes`, `qubivex_memory_budget_bytes`, `qubivex_kv_reserved_positions`; for the process, `qubivex_process_resident_bytes` and `qubivex_process_peak_resident_bytes` |
+| Expert cache | `qubivex_expert_cache_{hits,loads,evictions}_total` (hit rate is hits over hits plus loads), `qubivex_expert_cache_bytes` |
+| Disk | `qubivex_expert_read_bytes_total` (its rate is the read throughput), `qubivex_expert_load_wait_seconds_total` (over loads: the load latency), `qubivex_expert_read_{retries,timeouts}_total` |
+| Serving | `qubivex_generations_active`, `qubivex_queue_depth`, `qubivex_generation_slots_free`, `qubivex_queue_{granted,rejected}_total`, `qubivex_generations_{cancelled,timed_out,failed}_total`, `qubivex_batch_{passes,steps}_total` |
+| Requests and tokens, server-wide | `qubivex_requests_total{endpoint,status}`, `qubivex_http_request_duration_seconds{endpoint}`, `qubivex_prompt_tokens_total`, `qubivex_generated_tokens_total` |
+| Retained KV | `qubivex_prefix_cache_*` |
+
+Not measured: peak VRAM (Metal shares host memory, and there is no CUDA backend yet) and
+memory fragmentation. On macOS the peak resident size is the highest value a scrape has
+read, because the kernel's own figure needs FFI.
+
+**Logs.** One line per event on standard error. With `--log-format json`:
+
+```json
+{"ts":"2026-11-10T01:14:46.414Z","level":"info","event":"generation_finished","request_id":"req-6af27006-1","model":"olmoe-tiny","sequence_id":1,"finish":"length","prompt_tokens":18,"cached_tokens":0,"completion_tokens":6,"ttft_ms":30.149,"tokens_per_second":1185.95,"duration_ms":34.387}
+```
+
+Events: `request` (every API request: endpoint, status, duration and the error code if
+any), `generation_started`, `generation_finished`, `generation_failed`, `model_added`,
+`model_load_started`, `model_loaded`, `model_load_failed`, `model_unloaded`,
+`model_not_found`, `server_started`, `server_stopping`, `server_stopped`,
+`serving_without_api_key`, `generation_panicked` and `internal_error`. Lines about a
+generation carry the request id, the model id and a sequence id (the generation's number
+among those the server has admitted). No line holds a prompt, a message or generated
+text: a line is built only from ids, counts, durations and codes. `internal_error` and
+`model_not_found` add the runtime's own description, which may name a file and is never
+sent to the client.
 
 Settings come from, highest first: a flag, its environment variable, the config file, then
 the default. In the file each key is the flag's name with `_` for `-`, and the repeatable
