@@ -9,7 +9,7 @@ exclude = ["spikes"]
 [workspace.package]
 version = "0.1.0"
 edition = "2024"
-rust-version = "1.85"
+rust-version = "1.88"
 license = "Apache-2.0"
 repository = "https://github.com/kentmarete/qubivex"
 publish = false
@@ -37,7 +37,9 @@ qubivex-api = { path = "crates/qubivex-api", version = "0.1.0" }
 # Requirements stay at the oldest version we need. Exact versions live in Cargo.lock,
 # which resolver 3 fills with the newest releases compatible with `rust-version`.
 # HTTP gateway only (qubivex-api): Tokio at the edge, inference on dedicated threads.
-axum = { version = "0.8", default-features = false, features = ["http1", "json", "tokio", "query"] }
+# Kerniq Server is a thin layer over Axum, Tower and Hyper; its `axum` re-export is
+# the gateway's Axum. Pinned exactly while the crate is new (first release 2026-11-07).
+kerniq-server = { version = "=0.1.3", default-features = false, features = ["json"] }
 clap = { version = "4.5", features = ["derive"] }
 # Kernel benchmarks only (dev-dependency); no plotters, no HTML reports.
 criterion = { version = "0.7", default-features = false, features = ["cargo_bench_support"] }
@@ -82,6 +84,9 @@ undocumented_unsafe_blocks = "deny"
 missing_safety_doc = "deny"
 cast_possible_truncation = "warn"
 float_cmp = "deny"
+# New with MSRV 1.88. The kernels' `chunks_exact` loops are measured and bit-checked;
+# moving them to `as_chunks` is kernel work, not something to do for a lint.
+chunks_exact_to_as_chunks = "allow"
 
 [profile.release]
 lto = "fat"

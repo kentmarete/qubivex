@@ -373,12 +373,12 @@ pub fn plan(
     // The budget.
     let budget = if let Some(b) = req.ram_budget {
         reasons.push(format!("RAM budget {b}, as requested."));
-        if let Probed::Known(t) = host.total {
-            if b > t {
-                reasons.push(format!(
-                    "Warning: the requested budget exceeds this machine's {t} of RAM; the OS will page."
-                ));
-            }
+        if let Probed::Known(t) = host.total
+            && b > t
+        {
+            reasons.push(format!(
+                "Warning: the requested budget exceeds this machine's {t} of RAM; the OS will page."
+            ));
         }
         Quantity {
             bytes: b,

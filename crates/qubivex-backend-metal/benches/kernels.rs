@@ -53,17 +53,17 @@ fn weights(dtype: DType, rows: usize, cols: usize, rng: &mut Rng) -> Vec<u8> {
     let mut put = |off: usize| b[off..off + 2].copy_from_slice(&scale);
     match dtype {
         DType::F32 => {
-            for c in b.chunks_exact_mut(4) {
+            for c in b.as_chunks_mut::<4>().0 {
                 c.copy_from_slice(&(rng.f() * 0.05).to_le_bytes());
             }
         }
         DType::F16 => {
-            for c in b.chunks_exact_mut(2) {
+            for c in b.as_chunks_mut::<2>().0 {
                 c.copy_from_slice(&(0x2000u16 + (rng.next() >> 54) as u16).to_le_bytes());
             }
         }
         DType::BF16 => {
-            for c in b.chunks_exact_mut(2) {
+            for c in b.as_chunks_mut::<2>().0 {
                 c.copy_from_slice(&(((rng.f() * 0.05).to_bits() >> 16) as u16).to_le_bytes());
             }
         }

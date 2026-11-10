@@ -8,10 +8,10 @@ use std::net::{IpAddr, Ipv6Addr, SocketAddr};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use axum::extract::{ConnectInfo, Request, State};
-use axum::http::{HeaderMap, HeaderValue, Method, StatusCode, header};
-use axum::middleware::Next;
-use axum::response::{IntoResponse, Response};
+use kerniq_server::axum::extract::{ConnectInfo, Request, State};
+use kerniq_server::axum::http::{HeaderMap, HeaderValue, Method, StatusCode, header};
+use kerniq_server::axum::middleware::Next;
+use kerniq_server::axum::response::{IntoResponse, Response};
 
 use crate::error::ApiError;
 use crate::{AppState, ServerConfig};
@@ -96,10 +96,10 @@ impl RateLimiter {
             b.retain(|_, k| {
                 k.tokens + now.saturating_duration_since(k.seen).as_secs_f64() * per_sec < cap
             });
-            if b.len() >= MAX_CLIENTS {
-                if let Some(oldest) = b.iter().min_by_key(|(_, k)| k.seen).map(|(ip, _)| *ip) {
-                    b.remove(&oldest);
-                }
+            if b.len() >= MAX_CLIENTS
+                && let Some(oldest) = b.iter().min_by_key(|(_, k)| k.seen).map(|(ip, _)| *ip)
+            {
+                b.remove(&oldest);
             }
         }
         let k = b.entry(client).or_insert(Bucket {

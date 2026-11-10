@@ -6,7 +6,7 @@
 //! - `POST /v1/models/load` and `POST /v1/models/unload`, behind the admin token, with
 //!   `POST /v1/admin/models` and `DELETE /v1/admin/models/{id}` as aliases
 //!
-//! Tokio and Axum stay at the edge: every generation runs on its own dedicated thread
+//! Tokio and Kerniq Server (over Axum and Hyper) stay at the edge: every generation runs on its own dedicated thread
 //! (`worker`) and reaches the request over a bounded channel (QUBIVEX_DESIGN §4.7,
 //! RUST_GUIDELINES §4). Each model has a [`Scheduler`](qubivex_runtime::scheduler) that
 //! decides when a request runs: its queue is bounded, and memory admission holds each
@@ -29,20 +29,22 @@ mod worker;
 
 use std::collections::BTreeMap;
 use std::convert::Infallible;
-use std::future::{Future, IntoFuture};
+use std::future::Future;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock, Weak};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use axum::extract::rejection::JsonRejection;
-use axum::extract::{DefaultBodyLimit, Path, State};
-use axum::http::{HeaderMap, HeaderValue, StatusCode};
-use axum::response::sse::{Event as SseEvent, Sse};
-use axum::response::{IntoResponse, Response};
-use axum::routing::{delete, get, post};
-use axum::{Json, Router};
 pub use error::ApiError;
+use kerniq_server::App;
+use kerniq_server::axum::extract::rejection::JsonRejection;
+use kerniq_server::axum::extract::{DefaultBodyLimit, Path, State};
+use kerniq_server::axum::http::{HeaderMap, HeaderValue, StatusCode};
+use kerniq_server::axum::response::sse::{Event as SseEvent, Sse};
+use kerniq_server::axum::response::{IntoResponse, Response};
+use kerniq_server::axum::{Json, Router};
+use kerniq_server::config::ServerConfig as ServeConfig;
+use kerniq_server::routing::Router as Routes;
 pub use limits::RateLimit;
 pub use metrics::Metrics;
 use qubivex_runtime::scheduler::{EnterError, Outcome, RequestInfo};
@@ -241,33 +243,46 @@ impl Gateway {
         Arc::clone(&self.state.metrics)
     }
 
-    /// The Axum router.
-    pub fn router(&self) -> Router {
-        Router::new()
-            .route("/health", get(health))
-            .route("/metrics", get(metrics_text))
-            .route("/v1/system", get(system))
-            .route("/v1/models", get(list_models))
-            .route("/v1/models/load", post(admin_load))
-            .route("/v1/models/unload", post(models_unload))
-            .route("/v1/models/{id}", get(get_model))
-            .route("/v1/chat/completions", post(chat))
-            .route("/v1/completions", post(completions))
-            .route("/v1/admin/models", post(admin_load))
-            .route("/v1/admin/models/{id}", delete(admin_unload))
+    /// The routes, middleware and state, as a Kerniq application.
+    fn app(&self) -> App<Arc<AppState>> {
+        let routes = Routes::new()
+            .get("/health", health)
+            .get("/metrics", metrics_text)
+            .get("/v1/system", system)
+            .get("/v1/models", list_models)
+            .post("/v1/models/load", admin_load)
+            .post("/v1/models/unload", models_unload)
+            .get("/v1/models/{id}", get_model)
+            .post("/v1/chat/completions", chat)
+            .post("/v1/completions", completions)
+            .post("/v1/admin/models", admin_load)
+            .delete("/v1/admin/models/{id}", admin_unload);
+        // Kerniq's defaults add no request timeout (a stream may run for minutes), no
+        // concurrency limit (the schedulers queue) and no body limit of its own (ours
+        // below answers in the OpenAI shape).
+        let serve =
+            ServeConfig::default().shutdown_timeout(self.state.cfg.shutdown_grace + STOP_MARGIN);
+        App::new()
+            .state(Arc::clone(&self.state))
+            .config(serve)
+            .merge(routes)
             .fallback(|| async { ApiError::not_found() })
-            .layer(DefaultBodyLimit::max(self.state.cfg.max_body_bytes))
-            // The last layer runs first: CORS answers preflights before the rate limit,
-            // and adds its headers to the rate limit's 429s.
-            .layer(axum::middleware::from_fn_with_state(
-                Arc::clone(&self.state),
-                limits::rate_limit,
-            ))
-            .layer(axum::middleware::from_fn_with_state(
+            // The first declared is the outermost: CORS answers preflights before the
+            // rate limit, and adds its headers to the rate limit's 429s.
+            .layer(kerniq_server::axum::middleware::from_fn_with_state(
                 Arc::clone(&self.state),
                 limits::cors,
             ))
-            .with_state(Arc::clone(&self.state))
+            .layer(kerniq_server::axum::middleware::from_fn_with_state(
+                Arc::clone(&self.state),
+                limits::rate_limit,
+            ))
+            .layer(DefaultBodyLimit::max(self.state.cfg.max_body_bytes))
+    }
+
+    /// The gateway as an Axum router, for tests and for embedding in another server.
+    pub fn router(&self) -> Router {
+        self.app().into_axum_router()
     }
 
     /// Serves on `listener` until `shutdown` completes. New requests are then refused
@@ -299,13 +314,9 @@ impl Gateway {
             begin.begin_shutdown();
             let _ = began_tx.send(());
         };
-        // The peer address is what the rate limit counts by.
-        let app = self
-            .router()
-            .into_make_service_with_connect_info::<std::net::SocketAddr>();
-        let server = axum::serve(listener, app)
-            .with_graceful_shutdown(signal)
-            .into_future();
+        // Kerniq inserts the peer address, which the rate limit counts by, and closes
+        // connections still open after the grace and the stop margin.
+        let server = self.app().shutdown_signal(signal).serve(listener);
         let stopper = async {
             if began_rx.await.is_err() {
                 std::future::pending::<()>().await;
@@ -315,7 +326,7 @@ impl Gateway {
             tokio::time::sleep(STOP_MARGIN).await;
         };
         let served = tokio::select! {
-            r = server => r,
+            r = server => r.map_err(|e| std::io::Error::other(e.to_string())),
             () = stopper => Ok(()),
         };
         // A server that drained early never reached the grace's end.
@@ -607,13 +618,13 @@ async fn generate(
     params: Params,
     kind: Kind,
 ) -> Result<Response, ApiError> {
-    if let (Some(asked), Some(cap)) = (params.max_tokens, st.cfg.max_generation_tokens) {
-        if asked > cap {
-            return Err(ApiError::invalid_param(
-                "max_tokens",
-                format!("max_tokens is {asked}; this server allows at most {cap}"),
-            ));
-        }
+    if let (Some(asked), Some(cap)) = (params.max_tokens, st.cfg.max_generation_tokens)
+        && asked > cap
+    {
+        return Err(ApiError::invalid_param(
+            "max_tokens",
+            format!("max_tokens is {asked}; this server allows at most {cap}"),
+        ));
     }
     let arrived = Instant::now();
     let limit = params.timeout.map(|t| arrived + t);

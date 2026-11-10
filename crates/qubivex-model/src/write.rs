@@ -53,7 +53,7 @@ pub fn safetensors(tensors: &[TensorData<'_>], metadata: &BTreeMap<String, Strin
     }
     let mut json = serde_json::Value::Object(header).to_string().into_bytes();
     // Pad with spaces to 8 bytes, as the reference writer does.
-    while json.len() % 8 != 0 {
+    while !json.len().is_multiple_of(8) {
         json.push(b' ');
     }
     let mut out = Vec::with_capacity(8 + json.len() + usize::try_from(off).unwrap_or(0));
@@ -160,7 +160,7 @@ pub fn gguf(metadata: &[(&str, GgufValue)], tensors: &[TensorData<'_>]) -> Vec<u
         off = (off + t.data.len() as u64).div_ceil(ALIGN) * ALIGN;
     }
     let pad = |out: &mut Vec<u8>| {
-        while out.len() as u64 % ALIGN != 0 {
+        while !(out.len() as u64).is_multiple_of(ALIGN) {
             out.push(0);
         }
     };

@@ -311,24 +311,24 @@ impl Transfer<'_> {
         let mut mismatched = false;
         loop {
             self.check()?;
-            if offset < size {
-                if let Err(e) = self.receive(sel, (&mut file, &part), &mut hasher, &mut offset) {
-                    if matches!(e, DownloadError::TooLarge { .. }) {
-                        fs::remove_file(&part).map_err(io_err(&part))?;
-                    }
-                    // A request that moved the file forward is not a failure. Budgets end
-                    // requests on healthy links, and a bad link should only give up when
-                    // it stops moving, so this continues at once with fresh attempts.
-                    if offset > furthest {
-                        furthest = offset;
-                        backoff.reset();
-                        if matches!(e, DownloadError::Transient { .. }) {
-                            continue;
-                        }
-                    }
-                    backoff.wait(&what, e, &retrying)?;
-                    continue;
+            if offset < size
+                && let Err(e) = self.receive(sel, (&mut file, &part), &mut hasher, &mut offset)
+            {
+                if matches!(e, DownloadError::TooLarge { .. }) {
+                    fs::remove_file(&part).map_err(io_err(&part))?;
                 }
+                // A request that moved the file forward is not a failure. Budgets end
+                // requests on healthy links, and a bad link should only give up when
+                // it stops moving, so this continues at once with fresh attempts.
+                if offset > furthest {
+                    furthest = offset;
+                    backoff.reset();
+                    if matches!(e, DownloadError::Transient { .. }) {
+                        continue;
+                    }
+                }
+                backoff.wait(&what, e, &retrying)?;
+                continue;
             }
             let actual = std::mem::replace(&mut hasher, Hasher::new(&sel.remote)).hex();
             match expected(&sel.remote) {
@@ -373,10 +373,11 @@ impl Transfer<'_> {
                         let Some(file) = next else { return };
                         if let Err(e) = self.fetch(file) {
                             let cancelled = matches!(e, DownloadError::Cancelled);
-                            if let Ok(mut slot) = first.lock() {
-                                if slot.is_none() && !cancelled {
-                                    *slot = Some(e);
-                                }
+                            if let Ok(mut slot) = first.lock()
+                                && slot.is_none()
+                                && !cancelled
+                            {
+                                *slot = Some(e);
                             }
                             if !cancelled {
                                 self.failed.store(true, Ordering::Relaxed);

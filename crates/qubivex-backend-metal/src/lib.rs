@@ -144,7 +144,7 @@ pub(crate) const Q4_K_ALIGN: usize = 16;
 
 /// Whether weights of `dtype` may start at byte `offset` of a device buffer.
 pub(crate) const fn offset_ok(dtype: DType, offset: usize) -> bool {
-    !matches!(dtype, DType::Ggml(GgmlType::Q4_K)) || offset % Q4_K_ALIGN == 0
+    !matches!(dtype, DType::Ggml(GgmlType::Q4_K)) || offset.is_multiple_of(Q4_K_ALIGN)
 }
 
 pub(crate) fn check_dtype(dtype: DType, op: &'static str) -> Result<usize, ComputeError> {

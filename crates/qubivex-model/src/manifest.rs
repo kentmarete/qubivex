@@ -245,12 +245,12 @@ impl Manifest {
                 m.schema_version
             )));
         }
-        if let Some(s) = &m.source {
-            if s.provider.is_empty() || s.repository.is_empty() || s.revision.is_empty() {
-                return Err(bad(
-                    "source needs a provider, a repository and a revision".into()
-                ));
-            }
+        if let Some(s) = &m.source
+            && (s.provider.is_empty() || s.repository.is_empty() || s.revision.is_empty())
+        {
+            return Err(bad(
+                "source needs a provider, a repository and a revision".into()
+            ));
         }
         let id_ok = !m.model.id.is_empty()
             && m.model.id.len() <= 128
@@ -277,17 +277,16 @@ impl Manifest {
             check_relative(p).map_err(bad)?;
         }
         for s in m.weights.shards.iter().chain(&m.files) {
-            if let Some(h) = &s.sha256 {
-                if h.len() != 64
+            if let Some(h) = &s.sha256
+                && (h.len() != 64
                     || !h
                         .bytes()
-                        .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
-                {
-                    return Err(bad(format!(
-                        "file {:?}: sha256 must be 64 lowercase hex digits",
-                        s.path
-                    )));
-                }
+                        .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)))
+            {
+                return Err(bad(format!(
+                    "file {:?}: sha256 must be 64 lowercase hex digits",
+                    s.path
+                )));
             }
         }
         match m.weights.format {

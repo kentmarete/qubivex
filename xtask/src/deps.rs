@@ -127,6 +127,7 @@ const NOT_IN_RUNTIME: &[&str] = &[
     "axum",
     "clap",
     "hyper",
+    "kerniq-server",
     "qubivex-api",
     "qubivex-cli",
     "tokio",

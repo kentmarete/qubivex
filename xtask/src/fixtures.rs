@@ -70,7 +70,7 @@ fn f16(x: f32) -> u16 {
 /// Q8_0: per 32 values, an f16 scale then 32 int8.
 fn q8_0(v: &[f32]) -> Vec<u8> {
     let mut out = Vec::with_capacity(v.len() / 32 * 34);
-    for blk in v.chunks_exact(32) {
+    for blk in v.as_chunks::<32>().0 {
         let amax = blk.iter().fold(0f32, |a, x| a.max(x.abs()));
         let d = amax / 127.0;
         out.extend_from_slice(&f16(d).to_le_bytes());

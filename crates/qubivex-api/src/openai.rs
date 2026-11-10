@@ -235,16 +235,15 @@ impl ChatRequest {
                 "tool calls are not supported",
             ));
         }
-        if let Some(f) = &self.response_format {
-            if f.get("type")
+        if let Some(f) = &self.response_format
+            && f.get("type")
                 .and_then(Value::as_str)
                 .is_some_and(|t| t != "text")
-            {
-                return Err(ApiError::invalid_param(
-                    "response_format",
-                    "only the text response format is supported",
-                ));
-            }
+        {
+            return Err(ApiError::invalid_param(
+                "response_format",
+                "only the text response format is supported",
+            ));
         }
         if self.messages.is_empty() {
             return Err(ApiError::invalid_param("messages", "messages is empty"));

@@ -509,7 +509,7 @@ pub struct Attend<'a> {
 /// Checks one attention's operands; `None` if it has no queries.
 fn attention_params(it: &Attend<'_>) -> Result<Option<AttnParams>, ComputeError> {
     let a = it.shape;
-    if a.kv_heads == 0 || a.heads % a.kv_heads != 0 {
+    if a.kv_heads == 0 || !a.heads.is_multiple_of(a.kv_heads) {
         return Err(shape(
             "attention",
             format!("{} heads over {} KV heads", a.heads, a.kv_heads),

@@ -222,7 +222,7 @@ fn write_scratch(path: &Path, blocks: u64) -> Result<(), HardwareError> {
     let _ = rustix::fs::fcntl_nocache(&f, true);
     let mut rng = Rng(0x5851_f42d_4c95_7f2d);
     let mut data = vec![0u8; SEQ_BLOCK];
-    for chunk in data.chunks_exact_mut(8) {
+    for chunk in data.as_chunks_mut::<8>().0 {
         chunk.copy_from_slice(&rng.next().to_le_bytes());
     }
     for b in 0..blocks {

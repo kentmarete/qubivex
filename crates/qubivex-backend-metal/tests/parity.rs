@@ -78,7 +78,7 @@ fn weights(dtype: DType, rows: usize, cols: usize, fill: Fill, rng: &mut Rng) ->
     };
     match dtype {
         DType::F32 => {
-            for c in b.chunks_exact_mut(4) {
+            for c in b.as_chunks_mut::<4>().0 {
                 let v = if wild {
                     // Any exponent from 1e-15 to 1e18.
                     loop {
@@ -94,7 +94,7 @@ fn weights(dtype: DType, rows: usize, cols: usize, fill: Fill, rng: &mut Rng) ->
             }
         }
         DType::F16 => {
-            for c in b.chunks_exact_mut(2) {
+            for c in b.as_chunks_mut::<2>().0 {
                 let h = if wild {
                     finite_f16(rng)
                 } else {
@@ -104,7 +104,7 @@ fn weights(dtype: DType, rows: usize, cols: usize, fill: Fill, rng: &mut Rng) ->
             }
         }
         DType::BF16 => {
-            for c in b.chunks_exact_mut(2) {
+            for c in b.as_chunks_mut::<2>().0 {
                 let h = if wild {
                     loop {
                         let h = (rng.next() >> 48) as u16;
@@ -371,7 +371,7 @@ fn batched_and_wrapped_weights_give_the_cpu_bits() {
         let shared = activations(s * k, Fill::Typical, &mut rng);
         let own = activations(s * k, Fill::Typical, &mut rng);
         // Even ops read the shared input, odd ones their own.
-        let input = |i: usize| if i % 2 == 0 { &shared } else { &own };
+        let input = |i: usize| if i.is_multiple_of(2) { &shared } else { &own };
         let want: Vec<Vec<f32>> = views
             .iter()
             .enumerate()

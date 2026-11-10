@@ -291,8 +291,8 @@ fn prefetch_under_contention_never_changes_what_demand_gets() {
                         let ks: Vec<ExpertKey> = (0..3)
                             .map(|i| key((x >> 3) % 2, (x >> (5 + i)) % 8))
                             .collect();
-                        s.prefetch(&ks, x % 3 == 0).unwrap();
-                        if x % 17 == 0 {
+                        s.prefetch(&ks, x.is_multiple_of(3)).unwrap();
+                        if x.is_multiple_of(17) {
                             s.cancel_prefetch(None).unwrap();
                         }
                     }
