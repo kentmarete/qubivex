@@ -164,6 +164,23 @@ and structured logs with request, model and sequence ids and no private text.
   `/metrics` still needs no key, so it belongs behind the same network boundary as the
   server.
 
+## Amendment 6 (2026-11-10): deployment (platform plan job 11)
+- **SIGTERM drains, as SIGINT does.** `qubivex serve` stopped only on Ctrl-C. `docker stop`,
+  systemd and Kubernetes send SIGTERM, which then ended the process mid-request, or, as
+  process 1 in a container, was ignored until Docker killed it after 10 s. Both signals
+  now start the same shutdown (ADR-015). `apps/cli/tests/serve_config.rs` sends SIGTERM to
+  the real binary and expects status 0. In the image, `docker stop` during a stream gave
+  the error event, `[DONE]` and status 0 at the grace.
+- **A `Dockerfile`:** a Debian image with the release binary and the fixture models,
+  running as a non-root user, with a health check on `/health`. Its default command
+  listens on `0.0.0.0`, so it starts only with an API key or `--allow-unauthenticated`:
+  amendment 3's refusal is what makes the image safe by default. CI builds it and runs
+  the smoke test.
+- **No TLS in the server.** The runbooks put a proxy in front. Kerniq Server is still
+  built with the `json` feature only.
+- **Not built:** published images or packages, a system-wide launchd daemon, and
+  Kubernetes manifests. `docs/deployment/` says so.
+
 ## Consequences
 - The exit criteria are met: `crates/qubivex-api/tests/gateway.rs` (over HTTP, tiny
   fixtures: shapes, streaming equals non-streaming, concurrent equals sequential,

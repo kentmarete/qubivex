@@ -173,6 +173,7 @@ What QUBIVEX adds over a straight port:
 | Tokenizers | Hugging Face `tokenizer.json`, or rebuilt from a GGUF file's vocabulary (verified identical to the official tokenizer) |
 | Serving | `qubivex serve`: OpenAI-compatible `/v1/chat/completions` and `/v1/completions` (streaming or not), `/v1/models`, `/health`, `/metrics`, `/v1/system`, model load and unload; a bounded queue with priorities and deadlines, shared load of a model, independent KV per conversation, prefix reuse of retained KV (ADR-016), admission against the memory plan, cancellation when a client disconnects, a shutdown that drains (ADR-015) |
 | CLI | `qubivex run`, `qubivex serve`, `qubivex bench`, `qubivex system`, `qubivex doctor --storage`, `qubivex models search / pull / list / inspect / analyse / import / migrate / verify / remove / architectures` |
+| Deployment | A `Dockerfile` for a non-root Linux image (x86-64 or arm64) with a health check; a drain on SIGTERM as on Ctrl-C; runbooks for systemd, Docker and launchd, and for operating the server ([`docs/deployment/`](docs/deployment)) |
 
 See the [Roadmap](#roadmap) for what is next.
 
@@ -184,7 +185,8 @@ QUBIVEX is not published to crates.io yet. Build it from source.
 
 - Rust 1.88 or newer (`rustup` recommended). The workspace uses edition 2024.
 - Linux (x86-64 or arm64) or macOS (arm64 or x86-64). CI tests Linux x86-64 and macOS arm64.
-- No C toolchain, Python or GPU SDK is needed for the current features.
+- A C compiler, for `ring` (the TLS library behind `qubivex models pull`). No Python or
+  GPU SDK is needed.
 
 **Build and install**
 
@@ -197,6 +199,17 @@ cargo build --release
 # or put `qubivex` on your PATH:
 cargo install --path apps/cli
 ```
+
+**Or as a container** (Linux, CPU backend):
+
+```sh
+docker build -t qubivex .
+docker run --rm -p 8080:8080 -e QUBIVEX_API_KEY=sk-local qubivex \
+  serve --listen 0.0.0.0:8080 --dir /usr/share/qubivex/models --model olmoe-tiny
+```
+
+[Linux deployment](docs/deployment/linux-deployment.md) and
+[macOS deployment](docs/deployment/macos-deployment.md) cover running it as a service.
 
 ## Quick start
 
@@ -379,6 +392,11 @@ passes of running conversations take turns, first come first served, and long pr
 in chunks, so one request cannot hold the others up for long. A client that disconnects
 cancels its generation within one chunk or one token. Errors follow OpenAI's shape, carry
 the `x-request-id`, and never contain file paths. ADR-015 has the concurrency model.
+
+Ctrl-C (SIGINT) and SIGTERM, which `docker stop` and systemd send, both start the same
+drain: the listener closes, running requests get `--shutdown-grace` to finish, and the
+process exits with status 0. The full reference is
+[`docs/serving/http-api.md`](docs/serving/http-api.md).
 
 **Metrics.** `GET /metrics` is Prometheus text. It needs no key, so keep it off the public
 network. Per model (`model` label) unless noted:
@@ -722,7 +740,7 @@ These invariants are enforced by tests and CI
 | 7 | Predictive expert prefetching | Router lookahead and the disk-saturation throttle done; off by default |
 | 8 | GPU backends: CUDA, Vulkan, Metal | Metal slices 1–6 done (bit-identical; 1.4× the CPU at decode, 2× at prefill); CUDA next |
 | 9 | OpenAI-compatible HTTP server and serving | Done: `qubivex serve` (ADR-013); the OpenAI SDK works against real models |
-| 10–11 | Hardening, packaging, documentation | Planned |
+| 10–11 | Hardening, packaging, documentation | Done: limits, metrics and logs on the gateway; a Docker image; deployment runbooks and the documentation set under [`docs/`](docs/README.md) |
 
 The phase plan, exit criteria and risks are in
 [`docs/architecture/MIGRATION_PLAN.md`](docs/architecture/MIGRATION_PLAN.md).
@@ -750,7 +768,9 @@ crates/qubivex-kv-cache/  which retained KV a prompt can reuse: prefix index, bu
 xtask/                    repository checks and fixture generator (`cargo xtask ...`)
 fixtures/models/          tiny generated models used by tests and the quick start
 spikes/                   standalone experiments (ADR-002 tensor-engine benchmark)
-docs/                     architecture, decisions (ADRs), guidelines, performance data
+docs/                     architecture, runtime, model management, serving, deployment,
+                          performance, decisions (ADRs), guidelines
+Dockerfile                the server image
 ```
 
 Crates are added in the phase that first gives them tested code (ADR-001). A dependency
@@ -794,12 +814,21 @@ Architectural changes go through an ADR in [`docs/decisions/`](docs/decisions).
 
 ## Documentation
 
+The index is [`docs/README.md`](docs/README.md), which also lists everything that is
+not supported.
+
 | Document | Contents |
 |---|---|
+| [`docs/architecture/`](docs/architecture/overview.md) | Overview, workspace structure, dependency rules, concurrency model |
+| [`docs/runtime/`](docs/runtime/inference-engine.md) | The inference engine, tensor engine, MoE routing, expert streaming, memory planner, KV cache |
+| [`docs/model-management/`](docs/model-management/model-lifecycle.md) | Downloads, the manifest, the registry, the model lifecycle |
+| [`docs/serving/`](docs/serving/http-api.md) | The HTTP API with real payloads, OpenAI compatibility, streaming, the scheduler, concurrent inference |
+| [`docs/deployment/`](docs/deployment/linux-deployment.md) | Local development, Linux and macOS deployment, production operations |
+| [`docs/performance/`](docs/performance/BENCHMARKING.md) | Benchmarking, memory profiling, the optimisation guide |
 | [`QUBIVEX_DESIGN.md`](docs/architecture/QUBIVEX_DESIGN.md) | Architecture, invariants, crate layering, core interfaces |
 | [`MIGRATION_PLAN.md`](docs/architecture/MIGRATION_PLAN.md) | Phases, exit criteria, reference model, risks |
 | [`COLIBRI_ANALYSIS.md`](docs/architecture/COLIBRI_ANALYSIS.md) | What QUBIVEX keeps, and changes, from Colibri |
-| [`docs/decisions/`](docs/decisions) | ADR-001 to ADR-008: workspace, compute, registry, manifest, planner, streaming, backends, cache |
+| [`docs/decisions/`](docs/decisions) | ADR-001 to ADR-017: workspace, compute, registry, manifest, planner, streaming, backends, cache, descriptors, precision, device execution, gateway, downloads, scheduler, KV, batching |
 | [`ADR-002-SPIKE.md`](docs/performance/ADR-002-SPIKE.md) | Kernel benchmarks against Candle and Colibri |
 | [`COLIBRI-OLMOE-BENCHMARK.md`](docs/performance/COLIBRI-OLMOE-BENCHMARK.md) | End-to-end decode against Colibri `olmoe` on OLMoE-1B-7B Q4_K_M |
 | [`manifest.schema.json`](docs/model-support/manifest.schema.json) | Manifest JSON Schema |

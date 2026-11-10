@@ -1,0 +1,11 @@
+# Keep the build context to the sources: `target/` alone can be tens of gigabytes.
+/target
+/spikes
+/.git
+/.github
+/docs
+/scripts
+*.profraw
+*.bundle
+Dockerfile
+.dockerignore

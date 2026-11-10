@@ -404,7 +404,7 @@ pub(crate) fn serve(p: Plan) -> Result<(), String> {
             );
         }
         gw.serve(listener, async move {
-            let _ = tokio::signal::ctrl_c().await;
+            stop_signal().await;
             if text {
                 eprintln!("qubivex: shutting down; letting open requests finish");
             }
@@ -412,6 +412,24 @@ pub(crate) fn serve(p: Plan) -> Result<(), String> {
         .await
         .map_err(|e| format!("server error: {e}"))
     })
+}
+
+/// Resolves when the process is asked to stop: Ctrl-C (SIGINT) or, on Unix, SIGTERM,
+/// which is what `docker stop`, systemd and Kubernetes send. Both start the same drain.
+async fn stop_signal() {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{SignalKind, signal};
+        // If the handler cannot be installed, Ctrl-C still works.
+        if let Ok(mut term) = signal(SignalKind::terminate()) {
+            tokio::select! {
+                _ = tokio::signal::ctrl_c() => {}
+                _ = term.recv() => {}
+            }
+            return;
+        }
+    }
+    let _ = tokio::signal::ctrl_c().await;
 }
 
 #[cfg(test)]
