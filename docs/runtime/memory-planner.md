@@ -187,14 +187,32 @@ models loaded one after the other each take their fraction of what was free at t
 own load, and nothing arbitrates between them afterwards. Give each an explicit
 `--ram-budget`, or run one model per server.
 
+## A discrete GPU (ADR-018)
+
+Metal on Apple Silicon shares host RAM and is counted there. A GPU with its own memory
+gets a separate VRAM budget, never summed with the RAM one. `qubivex plan --vram 16GiB`
+plans one without loading anything. `--vram-budget` replaces the profile's fraction of
+the device's memory. From the budget, the planner takes:
+
+- the dense weights' device copy (the host keeps its copy for the work done there);
+- a 256 MiB device reserve;
+- a device expert cache from the rest, never larger than the RAM expert cache at full
+  context, because the device only holds copies of experts the RAM cache holds.
+
+No CUDA or Vulkan backend exists yet. `qubivex run --backend sim --sim-vram SIZE`
+runs on a simulated device that copies weights into its own memory with a hard
+capacity, so the plan, the ledger's VRAM tier and the device expert cache can be
+checked on any machine. The output bits are the CPU's.
+
 ## Not supported
 
-- **A VRAM budget.** Metal on Apple Silicon shares host RAM and is counted there. There
-  is no discrete-GPU backend, so RAM and VRAM are never planned as separate tiers.
+- **A real discrete GPU.** The VRAM budget is planned and simulated (`--backend sim`);
+  CUDA and Vulkan are not built.
 - **A shared budget across models** in one server, or across servers on one machine.
 - **Per-layer slot counts from measured demand.** Slots are spread evenly.
 - **Swap-aware planning.** The planner budgets RAM and treats swapping as a failure of
   the budget, not a resource.
 - **NUMA placement** and huge pages.
-- **Peak VRAM and fragmentation metrics.**
+- **Fragmentation metrics.** Peak VRAM is reported for a discrete device
+  (`qubivex_vram_peak_bytes`); there is none to measure on Metal.
 - **Changing the budget of a loaded model.** Reload it.

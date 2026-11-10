@@ -12,7 +12,9 @@ use qubivex_arch::{
     ArchError, DenseWeights, ExpertProvider, ExpertWeights, KvCache, Logits, Segment, Sources,
     Tracer, Transformer,
 };
+use qubivex_backend_cpu::sim::{SimConfig, SimDevice};
 use qubivex_compute::WeightView;
+use qubivex_compute::discrete::DeviceBuffer;
 use qubivex_compute::host::PageAligned;
 use qubivex_compute::tensor::TensorView;
 use qubivex_core::{Bytes, ExpertIdx, LayerIdx, Shape, TensorDesc};
@@ -28,13 +30,15 @@ use qubivex_hardware::{Host, Probed, ResourceProbe, SystemProbe};
 use qubivex_kv_cache::{PrefixCache, PrefixStats};
 use qubivex_memory::{
     Charge, HostMemory, LayerExperts, MemoryLedger, MemoryPlan, ModelFootprint, Owner, PlanRequest,
-    PressureConfig, PressureDecision, PressureMonitor, Profile, Tier,
+    PressureConfig, PressureDecision, PressureMonitor, Profile, Tier, VRAM_ACTIVATION_RESERVE,
+    VramRequest,
 };
 use qubivex_model::{ExpertPart, ModelMetadata, TensorRole};
 use qubivex_tokenizer::Tokenizer;
 
 use crate::checksums::{ExpertSums, SUMS_FILE, SumsState};
 use crate::combine::{BatchStats, Combiner, Outcome, Step};
+use crate::discrete::{DeviceReport, OnDevice};
 use crate::metal_forward::MetalForward;
 use crate::placement::{BackendKind, MetalOps, Placed, PlacementReport};
 use crate::{ExpertIo, IoPath, ModelExpertSource, RuntimeError, load_tokenizer};
@@ -90,6 +94,12 @@ pub struct EngineOptions {
     pub backend: BackendKind,
     /// The dense matmuls placed on Metal with [`BackendKind::Metal`].
     pub metal_ops: MetalOps,
+    /// The simulated device for [`BackendKind::Sim`]. `None`: [`DEFAULT_SIM_VRAM`]
+    /// with PCIe 4.0 transfer costs, counted but not slept.
+    pub sim: Option<SimConfig>,
+    /// An explicit VRAM budget in bytes for a discrete device, replacing the
+    /// profile's fraction of its memory (ADR-018).
+    pub vram_budget: Option<u64>,
     /// Most bytes of finished KV to keep for later prompts to reuse (ADR-016). 0: none,
     /// and every prompt runs in full. It counts against the memory plan, and running
     /// requests and memory pressure take it back first.
@@ -102,6 +112,9 @@ pub struct EngineOptions {
     /// [`DEFAULT_BATCH_WAIT_US`]; `Some(0)`: no wait. A lone caller never waits.
     pub batch_wait_us: Option<u64>,
 }
+
+/// The simulated device's memory when [`EngineOptions::sim`] is `None`: 8 GiB.
+pub const DEFAULT_SIM_VRAM: u64 = 8 << 30;
 
 /// The default [`EngineOptions::batch_wait_us`]: sampling a token takes microseconds and
 /// a pass tens of milliseconds, so the bound is only reached when a caller has stopped.
@@ -255,6 +268,8 @@ struct StoreProvider<'a> {
     source: &'a ModelExpertSource,
     /// Set when prefetch is on and memory pressure allows it.
     predictor: Option<&'a Mutex<Predictor>>,
+    /// A discrete device: each expert is copied there before it is computed.
+    device: Option<&'a OnDevice>,
 }
 
 impl StoreProvider<'_> {
@@ -291,6 +306,14 @@ impl StoreProvider<'_> {
         bytes: &'b [u8],
     ) -> Result<ExpertWeights<'b>, ArchError> {
         expert_weights(self.source, layer, expert, bytes)
+    }
+
+    /// The expert's device copy, if there is a device: hold it while computing.
+    fn pin(&self, lease: &Lease<'_>) -> Result<Option<DeviceBuffer>, ArchError> {
+        self.device
+            .map(|d| d.ensure(lease.key(), lease.slab()))
+            .transpose()
+            .map_err(ArchError::from)
     }
 }
 
@@ -397,10 +420,11 @@ impl<'p> Wave<'p, '_, '_> {
                 return;
             }
             let expert = lease.key().1;
-            let r = self
-                .provider
-                .weights(self.layer, expert, lease.bytes())
-                .and_then(|w| (self.f)(expert, &w));
+            let r = self.provider.pin(&lease).and_then(|_pin| {
+                self.provider
+                    .weights(self.layer, expert, lease.bytes())
+                    .and_then(|w| (self.f)(expert, &w))
+            });
             drop(lease);
             match r {
                 Ok(()) => self.start_ready(sc),
@@ -436,6 +460,7 @@ impl ExpertProvider for StoreProvider<'_> {
             .store
             .acquire((layer, expert))
             .map_err(|e| store_err(layer, expert, &e))?;
+        let _pin = self.pin(&lease)?;
         f(&self.weights(layer, expert, lease.bytes())?)
     }
 
@@ -739,6 +764,8 @@ impl Drop for Watcher {
 
 /// A model ready to generate.
 pub struct Engine {
+    /// A discrete device running every matmul ([`BackendKind::Sim`], ADR-018).
+    device: Option<Arc<OnDevice>>,
     verification: Verification,
     memory: Memory,
     /// `None` without a plan (a fixed cache was requested).
@@ -971,7 +998,8 @@ impl Engine {
         // The whole-layer pass is built once the context limit is known (below).
         let mut layers_on = None;
         let backend = match opts.backend {
-            BackendKind::Cpu => Placed::cpu(),
+            // Placed once the ledger exists (below).
+            BackendKind::Cpu | BackendKind::Sim => Placed::cpu(),
             // Whole layers exist for routed experts only; a dense model places its
             // matmuls one by one instead (below), with the same bits.
             BackendKind::Metal if opts.metal_ops.layers && model.is_moe() => {
@@ -1047,7 +1075,33 @@ impl Engine {
             .set_read_timeout(opts.read_timeout.unwrap_or(ReadTimeout::DEFAULT))
             .map_err(|e| RuntimeError::Model(e.to_string()))?;
         store.set_read_retries(opts.read_retries.unwrap_or(DEFAULT_READ_RETRIES));
-        let ledger = MemoryLedger::new(0);
+        let sim = (opts.backend == BackendKind::Sim).then(|| {
+            Arc::new(SimDevice::new(
+                opts.sim.unwrap_or_else(|| SimConfig::new(DEFAULT_SIM_VRAM)),
+            ))
+        });
+        let ledger = MemoryLedger::new(u32::from(sim.is_some()));
+        let device = match sim {
+            None => None,
+            Some(dev) => {
+                let budget = match plan.as_ref().and_then(|p| p.vram.first()) {
+                    Some(v) => v.expert_cache.bytes.0,
+                    // A fixed RAM cache: the device's room after the dense copy.
+                    None => opts
+                        .vram_budget
+                        .unwrap_or(dev.config().capacity)
+                        .saturating_sub(dense.arena.len() as u64)
+                        .saturating_sub(VRAM_ACTIVATION_RESERVE.0),
+                };
+                let on = OnDevice::new(dev, Arc::clone(&ledger), &dense.arena, budget)
+                    .map_err(|e| RuntimeError::Model(format!("cannot place on the device: {e}")))?;
+                Some(Arc::new(on))
+            }
+        };
+        let backend = match &device {
+            Some(d) => Placed::discrete(Arc::clone(d), model.dense_matmuls().len()),
+            None => backend,
+        };
         let charges = Charges {
             _dense: ledger.charge(Tier::Ram, Owner::Dense, Bytes(dense_bytes)),
             experts: ledger.charge(Tier::Ram, Owner::ExpertCache, Bytes(0)),
@@ -1099,6 +1153,7 @@ impl Engine {
             })
         });
         Ok(Self {
+            device,
             gpu,
             predictor,
             pressure,
@@ -1128,6 +1183,13 @@ impl Engine {
             tokenizer,
             backend,
         })
+    }
+
+    /// The discrete device's memory, copies and expert cache, with
+    /// [`BackendKind::Sim`].
+    #[must_use]
+    pub fn device_report(&self) -> Option<DeviceReport> {
+        self.device.as_ref().map(|d| d.report())
     }
 
     /// Forward passes so far that ran as one Metal submission with routing on the GPU
@@ -1485,6 +1547,7 @@ impl Engine {
             store: &self.store,
             source: &self.source,
             predictor,
+            device: self.device.as_deref(),
         };
         let src = Sources {
             dense: &self.dense,
@@ -1630,6 +1693,7 @@ impl Engine {
             store: &self.store,
             source: &self.source,
             predictor,
+            device: self.device.as_deref(),
         };
         let src = Sources {
             dense: &self.dense,
@@ -1923,6 +1987,11 @@ fn plan_at_load(
         context: context.map(|c| c as u64),
         sequences: 1,
         layer_weights: None,
+        vram: (opts.backend == BackendKind::Sim).then(|| VramRequest {
+            device: 0,
+            available: Bytes(opts.sim.map_or(DEFAULT_SIM_VRAM, |c| c.capacity)),
+            budget: opts.vram_budget.map(Bytes),
+        }),
     };
     qubivex_memory::plan(fp, &hm, &req).map_err(|e| RuntimeError::Memory(e.to_string()))
 }

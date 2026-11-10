@@ -139,7 +139,23 @@ pub struct PlanRequest {
     /// Relative cache demand per expert layer (non-uniform budgets), one weight per
     /// entry of [`ModelFootprint::layers`]. `None`: uniform.
     pub layer_weights: Option<Vec<f64>>,
+    /// A discrete GPU to plan for (ADR-018). `None`: no VRAM budget.
+    pub vram: Option<VramRequest>,
 }
+
+/// A discrete GPU's memory, for [`PlanRequest::vram`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct VramRequest {
+    /// Device index.
+    pub device: u32,
+    /// The device's free memory (or its capacity, for a simulated device).
+    pub available: Bytes,
+    /// An explicit VRAM budget, replacing the profile's fraction of `available`.
+    pub budget: Option<Bytes>,
+}
+
+/// Device scratch reserve: activations and kernel workspace on a discrete GPU.
+pub const VRAM_ACTIVATION_RESERVE: Bytes = Bytes(256 << 20);
 
 impl Default for PlanRequest {
     fn default() -> Self {
@@ -149,6 +165,7 @@ impl Default for PlanRequest {
             context: None,
             sequences: 1,
             layer_weights: None,
+            vram: None,
         }
     }
 }
@@ -178,14 +195,24 @@ pub struct RamBudget {
     pub expert_cache_full_context: Quantity,
 }
 
-/// One device's VRAM budget. None exist until a discrete-GPU backend (CUDA or Vulkan)
-/// is built; Metal shares host memory and is planned as RAM.
+/// One discrete GPU's budget (ADR-018). Metal shares host memory and is planned as RAM.
+///
+/// The dense weights are copied to the device once, and the device keeps an expert
+/// cache of its own. That cache only holds copies of experts in the RAM cache, so it is
+/// at most as large as the RAM cache. The KV stays in RAM.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct VramBudget {
     /// Device index.
     pub device: u32,
     /// Everything the model may use on the device.
     pub budget: Quantity,
+    /// The dense weights' device copy.
+    pub dense: Quantity,
+    /// Device scratch reserve.
+    pub activations: Quantity,
+    /// The device expert cache: what is left, up to the RAM expert cache at full
+    /// context.
+    pub expert_cache: Quantity,
 }
 
 /// Cache slots of one expert layer.
@@ -218,6 +245,11 @@ pub enum Location {
     RamCache,
     /// Read from the model file when needed.
     Disk,
+    /// Resident in a discrete GPU's memory (device index) for the model's lifetime.
+    Vram(u32),
+    /// In a discrete GPU's expert cache (device index), copied from the RAM cache on
+    /// first use there and evictable.
+    VramCache(u32),
 }
 
 /// One placement decision.
@@ -244,7 +276,7 @@ pub struct MemoryPlan {
     pub sequences: u32,
     /// RAM.
     pub ram: RamBudget,
-    /// VRAM, per device (empty: no GPU backend yet).
+    /// VRAM, per discrete GPU (empty: none planned).
     pub vram: Vec<VramBudget>,
     /// Per-layer expert-cache slots.
     pub expert_cache: CacheBudget,
@@ -317,6 +349,79 @@ fn slots(layers: &[LayerExperts], bytes: Bytes, weights: Option<&[f64]>) -> Vec<
             experts: l.experts,
         })
         .collect()
+}
+
+/// The budget of the discrete GPU `v`, given a RAM expert cache of `ram_cache` at full
+/// context.
+fn plan_vram(
+    model: &ModelFootprint,
+    v: &VramRequest,
+    profile: Profile,
+    ram_cache: Bytes,
+    reasons: &mut Vec<String>,
+) -> Result<VramBudget, PlanningError> {
+    let dense = model.dense_bytes();
+    let floor = model.cache_floor();
+    let d = v.device;
+    let budget = if let Some(b) = v.budget {
+        reasons.push(format!("VRAM budget {b} on device {d}, as requested."));
+        if b > v.available {
+            reasons.push(format!(
+                "Warning: the requested VRAM budget exceeds the device's {} available; allocations will fail.",
+                v.available
+            ));
+        }
+        Quantity {
+            bytes: b,
+            source: Source::Requested,
+        }
+    } else {
+        let f = profile.fraction();
+        let b = scale(v.available, f);
+        reasons.push(format!(
+            "VRAM budget = {f:.2} × {} available on device {d} ({} profile).",
+            v.available,
+            profile.name()
+        ));
+        Quantity::estimated(b)
+    };
+    let needed = dense
+        .0
+        .saturating_add(VRAM_ACTIVATION_RESERVE.0)
+        .saturating_add(floor.0);
+    if budget.bytes.0 < needed {
+        return Err(PlanningError::DoesNotFit {
+            needed,
+            budget: budget.bytes.0,
+            detail: format!(
+                "on device {d}: dense {dense} + device reserve {VRAM_ACTIVATION_RESERVE} + one expert per layer {floor} exceed the {} VRAM budget",
+                budget.bytes
+            ),
+        });
+    }
+    let room = Bytes(budget.bytes.0 - dense.0 - VRAM_ACTIVATION_RESERVE.0);
+    let cache = Bytes(room.0.min(ram_cache.0));
+    if model.layers.is_empty() {
+        reasons.push(format!(
+            "Device {d}: dense {dense} + reserve {VRAM_ACTIVATION_RESERVE}; no routed experts."
+        ));
+    } else {
+        reasons.push(format!(
+            "Device {d} expert cache = VRAM budget − dense {dense} − device reserve {VRAM_ACTIVATION_RESERVE} = {room}{}. It holds copies of experts in the RAM cache only, so it is never larger than that cache.",
+            if cache < room {
+                format!(", limited to the RAM expert cache at full context ({cache})")
+            } else {
+                String::new()
+            }
+        ));
+    }
+    Ok(VramBudget {
+        device: d,
+        budget,
+        dense: Quantity::measured(dense),
+        activations: Quantity::estimated(VRAM_ACTIVATION_RESERVE),
+        expert_cache: Quantity::estimated(cache),
+    })
 }
 
 /// Plans `model` on a machine with `host` memory.
@@ -538,10 +643,35 @@ pub fn plan(
             });
         }
     }
-    reasons.push(
-        "No VRAM budget: Metal shares host memory, so its buffers count against the RAM budget. Discrete GPUs (CUDA, Vulkan) are not supported yet."
-            .to_owned(),
-    );
+    let vram = match req.vram {
+        None => {
+            reasons.push(
+                "No VRAM budget: no discrete GPU was asked for. Metal shares host memory, so its buffers count against the RAM budget."
+                    .to_owned(),
+            );
+            Vec::new()
+        }
+        Some(v) => {
+            let b = plan_vram(model, &v, req.profile, cache_full, &mut reasons)?;
+            placements.push(Placement {
+                what: "dense weights".to_owned(),
+                bytes: b.dense,
+                location: Location::Vram(v.device),
+                reason: "copied once at load; the RAM copy stays for the work done on the host"
+                    .to_owned(),
+            });
+            if !model.layers.is_empty() {
+                placements.push(Placement {
+                    what: "routed experts".to_owned(),
+                    bytes: b.expert_cache,
+                    location: Location::VramCache(v.device),
+                    reason: "copied from the RAM cache on first use; evicted least recently used"
+                        .to_owned(),
+                });
+            }
+            vec![b]
+        }
+    };
 
     Ok(MemoryPlan {
         profile: req.profile,
@@ -559,7 +689,7 @@ pub fn plan(
             expert_cache_start: Quantity::estimated(cache_start),
             expert_cache_full_context: Quantity::estimated(cache_full),
         },
-        vram: Vec::new(),
+        vram,
         expert_cache: CacheBudget {
             at_start,
             at_full_context: at_full,

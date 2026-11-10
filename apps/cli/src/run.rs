@@ -116,6 +116,9 @@ pub(crate) fn run(a: &RunArgs<'_>) -> Result<(), String> {
                 Bytes(place.bytes)
             );
         }
+        if let Some(line) = device_line(&engine) {
+            eprintln!("{line}");
+        }
         if let Some(p) = engine.prefetch_report() {
             let f = p.store;
             eprintln!(
@@ -131,6 +134,38 @@ pub(crate) fn run(a: &RunArgs<'_>) -> Result<(), String> {
         }
     }
     Ok(())
+}
+
+/// A discrete device's memory, expert cache and copies, for the stats line.
+pub(crate) fn device_line(engine: &Engine) -> Option<String> {
+    let r = engine.device_report()?;
+    let (u, t, x) = (r.usage, r.transfers, r.experts);
+    #[allow(clippy::cast_precision_loss)]
+    let ms = t.transfer_ns as f64 / 1e6;
+    Some(format!(
+        "[backend: {} on {} | VRAM {} used, peak {} of {} | device experts: cache {} of {}, {} hits, {} copies, {} evictions, {} dropped with the RAM cache{} | copies: {} weights ({}), {} activations in, {} out, {} submissions, {ms:.1} ms modelled]",
+        engine.placement().backend.name(),
+        r.device,
+        Bytes(u.used),
+        Bytes(u.peak),
+        Bytes(u.capacity),
+        Bytes(x.used),
+        Bytes(x.budget),
+        x.hits,
+        x.misses,
+        x.evictions,
+        x.detached,
+        if x.over_budget > 0 {
+            format!(", {} over budget", x.over_budget)
+        } else {
+            String::new()
+        },
+        t.uploads,
+        Bytes(t.upload_bytes),
+        Bytes(t.activations_in),
+        Bytes(t.activations_out),
+        t.submissions,
+    ))
 }
 
 /// The plan's budget and the ledger's totals, for the stats line.

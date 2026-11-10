@@ -5,13 +5,15 @@
 //! weight is used exactly) and deterministic (results do not depend on the thread
 //! count). Placement may change speed, never bits (invariant 1).
 //!
-//! Phase 4 defines the host-memory form used by the CPU backend. Device buffers,
-//! uploads and events join the trait with the first GPU backend (Phase 8).
+//! Phase 4 defines the host-memory form used by the CPU backend. Unified-memory GPUs
+//! (Metal) use host memory in place; devices with their own memory implement
+//! [`discrete::DiscreteDevice`] (ADR-018).
 //!
 //! [`tensor`] holds host tensors and views described by a
 //! [`TensorDesc`](qubivex_core::TensorDesc); kernels take a [`WeightView`], which a
 //! contiguous rank-2 byte view converts into.
 
+pub mod discrete;
 pub mod host;
 pub mod math;
 pub mod reduce;
@@ -56,6 +58,20 @@ pub enum ComputeError {
     /// Mutation needs unique storage, but another tensor shares it.
     #[error("tensor storage is shared; mutation needs a unique owner")]
     Shared,
+    /// A device does not have the memory for an allocation.
+    #[error(
+        "{backend} device is out of memory: {requested} bytes requested, {used} of {capacity} in use"
+    )]
+    OutOfDeviceMemory {
+        /// Backend name.
+        backend: &'static str,
+        /// Bytes asked for.
+        requested: u64,
+        /// Bytes in use.
+        used: u64,
+        /// The device's capacity.
+        capacity: u64,
+    },
     /// A device backend failed (driver, allocation or execution).
     #[error("{backend} device error: {detail}")]
     Device {

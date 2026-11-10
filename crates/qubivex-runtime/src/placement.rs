@@ -8,6 +8,8 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use crate::discrete::OnDevice;
+
 use qubivex_arch::DenseMatmul;
 use qubivex_backend_cpu::CpuBackend;
 use qubivex_backend_metal::{MetalBackend, MetalWeights, ResidentMatMul};
@@ -23,6 +25,9 @@ pub enum BackendKind {
     Cpu,
     /// The dense matmuls [`MetalOps`] selects on the Metal GPU, the rest on the CPU.
     Metal,
+    /// Every matmul on a simulated discrete GPU with its own memory (ADR-018); the
+    /// rest (norms, attention, routing, sampling) on the CPU.
+    Sim,
 }
 
 impl BackendKind {
@@ -32,6 +37,7 @@ impl BackendKind {
         match self {
             Self::Cpu => "cpu",
             Self::Metal => "metal",
+            Self::Sim => "sim",
         }
     }
 }
@@ -141,6 +147,8 @@ struct OnMetal {
 pub(crate) struct Placed {
     cpu: CpuBackend,
     metal: Option<OnMetal>,
+    /// A discrete device that runs every matmul (ADR-018).
+    device: Option<Arc<OnDevice>>,
     report: PlacementReport,
 }
 
@@ -158,6 +166,7 @@ impl Placed {
         Self {
             cpu: CpuBackend::new(),
             metal: None,
+            device: None,
             report: PlacementReport {
                 backend: BackendKind::Cpu,
                 device: None,
@@ -190,6 +199,7 @@ impl Placed {
         Self {
             cpu: CpuBackend::new(),
             metal: None,
+            device: None,
             report: PlacementReport {
                 backend: BackendKind::Metal,
                 device: Some(device),
@@ -241,8 +251,28 @@ impl Placed {
                 backend,
                 weights: on,
             }),
+            device: None,
             report,
         })
+    }
+
+    /// Every matmul on the discrete device `on`, whose copy of the dense weights holds
+    /// `tensors` matrices.
+    pub(crate) fn discrete(on: Arc<OnDevice>, tensors: usize) -> Self {
+        let report = PlacementReport {
+            backend: BackendKind::Sim,
+            device: Some(on.describe()),
+            ops: None,
+            tensors,
+            bytes: on.dense_bytes(),
+            fallback: None,
+        };
+        Self {
+            cpu: CpuBackend::new(),
+            metal: None,
+            device: Some(on),
+            report,
+        }
     }
 
     pub(crate) const fn report(&self) -> &PlacementReport {
@@ -262,13 +292,18 @@ impl ComputeBackend for Placed {
     fn name(&self) -> &'static str {
         if self.metal.is_some() {
             "cpu+metal"
+        } else if self.device.is_some() {
+            "cpu+sim"
         } else {
             "cpu"
         }
     }
 
     fn supports(&self, dtype: DType) -> bool {
-        self.cpu.supports(dtype)
+        match &self.device {
+            Some(d) => d.supports(dtype),
+            None => self.cpu.supports(dtype),
+        }
     }
 
     fn matmul(
@@ -278,6 +313,9 @@ impl ComputeBackend for Placed {
         s: usize,
         ys: &mut [f32],
     ) -> Result<(), ComputeError> {
+        if let Some(d) = &self.device {
+            return d.matmul_many(&mut [MatMul { w: *w, xs, s, ys }]);
+        }
         match self.placed(w) {
             Some((m, r)) => m.matmul_resident(r, xs, s, ys),
             None => self.cpu.matmul(w, xs, s, ys),
@@ -286,6 +324,9 @@ impl ComputeBackend for Placed {
 
     /// One Metal submission when every op is placed there; otherwise op by op.
     fn matmul_many(&self, ops: &mut [MatMul<'_>]) -> Result<(), ComputeError> {
+        if let Some(d) = &self.device {
+            return d.matmul_many(ops);
+        }
         let placed: Option<Vec<_>> = ops.iter().map(|op| self.placed(&op.w)).collect();
         match placed {
             Some(p) if !p.is_empty() => {

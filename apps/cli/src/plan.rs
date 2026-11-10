@@ -7,7 +7,7 @@ use qubivex_core::Bytes;
 use qubivex_hardware::{Host, ResourceProbe, SystemProbe};
 use qubivex_memory::{
     HostMemory, LayerSlots, Location, MemoryPlan, ModelFootprint, PlanRequest, Profile, Quantity,
-    Source, plan,
+    Source, VramRequest, plan,
 };
 use qubivex_model::{ArchitectureRegistry, find};
 use serde::Serialize;
@@ -23,6 +23,10 @@ pub(crate) struct PlanArgs<'a> {
     pub(crate) ram_budget: Option<&'a str>,
     pub(crate) context: Option<u64>,
     pub(crate) sequences: u32,
+    /// A discrete GPU's memory to plan for (`--vram`).
+    pub(crate) vram: Option<&'a str>,
+    /// An explicit VRAM budget (`--vram-budget`).
+    pub(crate) vram_budget: Option<&'a str>,
     pub(crate) json: bool,
 }
 
@@ -34,6 +38,15 @@ impl PlanArgs<'_> {
             context: self.context,
             sequences: self.sequences,
             layer_weights: None,
+            vram: match (self.vram, self.vram_budget) {
+                (None, None) => None,
+                (None, Some(_)) => return Err("--vram-budget needs --vram".to_owned()),
+                (Some(v), b) => Some(VramRequest {
+                    device: 0,
+                    available: parse_bytes(v)?,
+                    budget: b.map(parse_bytes).transpose()?,
+                }),
+            },
         })
     }
 }
@@ -176,13 +189,28 @@ fn render(id: &str, fp: &ModelFootprint, p: &MemoryPlan) -> String {
         let _ = writeln!(s, "  {name:<26}{}", tag(q));
     }
     let _ = writeln!(s, "  {:<26}{}", "KV per token", tag(&r.kv_per_token));
-    let _ = writeln!(s, "VRAM\n  none");
+    if p.vram.is_empty() {
+        let _ = writeln!(s, "VRAM\n  none");
+    }
+    for v in &p.vram {
+        let _ = writeln!(s, "VRAM, device {}", v.device);
+        for (name, q) in [
+            ("budget", &v.budget),
+            ("dense weights", &v.dense),
+            ("activations", &v.activations),
+            ("expert cache", &v.expert_cache),
+        ] {
+            let _ = writeln!(s, "  {name:<26}{}", tag(q));
+        }
+    }
     let _ = writeln!(s, "\nPlacement");
     for pl in &p.placements {
         let loc = match pl.location {
             Location::Ram => "RAM",
             Location::RamCache => "RAM cache",
             Location::Disk => "disk",
+            Location::Vram(_) => "VRAM",
+            Location::VramCache(_) => "VRAM cache",
         };
         let _ = writeln!(
             s,

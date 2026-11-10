@@ -240,3 +240,54 @@ fn metrics_can_be_switched_off_and_the_log_too() {
     drop(s);
     assert_eq!(log.text(), "");
 }
+
+/// ADR-018: a model on a discrete device reports its VRAM and copies; a model on the
+/// CPU reports none of them.
+#[test]
+fn metrics_report_a_discrete_device() {
+    let gw = Gateway::new(ServerConfig::default());
+    let sim = qubivex_runtime::Engine::load(
+        common::meta("olmoe-tiny"),
+        qubivex_runtime::EngineOptions {
+            backend: qubivex_runtime::BackendKind::Sim,
+            sim: Some(qubivex_runtime::SimConfig::new(1 << 30)),
+            ..common::opts()
+        },
+    )
+    .unwrap();
+    gw.add_model("on-sim", sim).unwrap();
+    gw.add_model("on-cpu", engine("olmoe-tiny")).unwrap();
+    let s = start(&gw);
+    for model in ["on-sim", "on-cpu"] {
+        let body = json!({ "model": model, "prompt": PROMPT, "max_tokens": 4 });
+        assert_eq!(post(s.addr, "/v1/completions", &body).status, 200);
+    }
+    let m = String::from_utf8(http(s.addr, "GET", "/metrics", &[], None).body).unwrap();
+    let on = "model=\"on-sim\"";
+    for name in [
+        "qubivex_vram_dense_bytes",
+        "qubivex_vram_expert_cache_bytes",
+        "qubivex_vram_used_bytes",
+        "qubivex_vram_peak_bytes",
+        "qubivex_vram_capacity_bytes",
+        "qubivex_vram_budget_bytes",
+        "qubivex_device_expert_copies_total",
+        "qubivex_device_upload_bytes_total",
+        "qubivex_device_activation_bytes_total",
+        "qubivex_device_transfer_seconds_total",
+    ] {
+        assert!(series(&m, name, on) > 0.0, "{name}\n{m}");
+    }
+    assert!(
+        (series(&m, "qubivex_vram_used_bytes", on)
+            - series(&m, "qubivex_vram_dense_bytes", on)
+            - series(&m, "qubivex_vram_expert_cache_bytes", on))
+        .abs()
+            < 0.5,
+        "the ledger's VRAM tier is the device's memory"
+    );
+    assert!(
+        !m.contains("qubivex_vram_used_bytes{model=\"on-cpu\"}"),
+        "{m}"
+    );
+}
