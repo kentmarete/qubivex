@@ -305,6 +305,10 @@ impl ServeFlags {
                 .or(file.backend)
                 .unwrap_or_else(|| "cpu".to_owned()),
             metal_ops: self.metal_ops.or(file.metal_ops),
+            sim_vram: None,
+            sim_bandwidth: None,
+            sim_delay: false,
+            vram_budget: None,
         };
         let profile = self
             .profile

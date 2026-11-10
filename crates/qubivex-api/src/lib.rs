@@ -519,7 +519,7 @@ fn model_values(cfg: &ServerConfig, l: &models::Loaded) -> metrics::ModelValues 
     let b = e.batch_stats();
     let ram = e.ledger().snapshot(qubivex_memory::Tier::Ram);
     let budget = e.memory_plan().map_or(0, |p| p.ram.budget.bytes.0);
-    vec![
+    let mut values = vec![
         ("qubivex_kv_reserved_positions", e.kv_reserved() as f64),
         ("qubivex_expert_cache_bytes", e.expert_cache_bytes() as f64),
         (
@@ -557,7 +557,47 @@ fn model_values(cfg: &ServerConfig, l: &models::Loaded) -> metrics::ModelValues 
         ("qubivex_memory_kv_bytes", ram.kv.0 as f64),
         ("qubivex_memory_activations_bytes", ram.activations.0 as f64),
         ("qubivex_memory_budget_bytes", budget as f64),
-    ]
+    ];
+    if let Some(d) = e.device_report() {
+        let vram = e.ledger().snapshot(qubivex_memory::Tier::Vram(0));
+        let vram_budget = e
+            .memory_plan()
+            .and_then(|p| p.vram.first())
+            .map_or(0, |v| v.budget.bytes.0);
+        values.extend([
+            ("qubivex_vram_dense_bytes", vram.dense.0 as f64),
+            (
+                "qubivex_vram_expert_cache_bytes",
+                vram.expert_cache.0 as f64,
+            ),
+            ("qubivex_vram_used_bytes", d.usage.used as f64),
+            ("qubivex_vram_peak_bytes", d.usage.peak as f64),
+            ("qubivex_vram_capacity_bytes", d.usage.capacity as f64),
+            ("qubivex_vram_budget_bytes", vram_budget as f64),
+            ("qubivex_device_expert_hits_total", d.experts.hits as f64),
+            (
+                "qubivex_device_expert_copies_total",
+                d.experts.misses as f64,
+            ),
+            (
+                "qubivex_device_expert_evictions_total",
+                d.experts.evictions as f64,
+            ),
+            (
+                "qubivex_device_upload_bytes_total",
+                d.transfers.upload_bytes as f64,
+            ),
+            (
+                "qubivex_device_activation_bytes_total",
+                (d.transfers.activations_in + d.transfers.activations_out) as f64,
+            ),
+            (
+                "qubivex_device_transfer_seconds_total",
+                Duration::from_nanos(d.transfers.transfer_ns).as_secs_f64(),
+            ),
+        ]);
+    }
+    values
 }
 
 /// This process's resident set size and its peak, where the OS says.

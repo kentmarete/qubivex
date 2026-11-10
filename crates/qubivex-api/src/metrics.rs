@@ -294,6 +294,66 @@ pub(crate) const MODEL_VALUES: &[(&str, &str, &str)] = &[
         "gauge",
         "The memory plan's host budget (0 without a plan).",
     ),
+    (
+        "qubivex_vram_dense_bytes",
+        "gauge",
+        "Discrete-GPU memory of the dense weights' copy (ADR-018; only with such a device).",
+    ),
+    (
+        "qubivex_vram_expert_cache_bytes",
+        "gauge",
+        "Discrete-GPU memory of the experts' copies cached now.",
+    ),
+    (
+        "qubivex_vram_used_bytes",
+        "gauge",
+        "Discrete-GPU memory allocated now, by the device's count.",
+    ),
+    (
+        "qubivex_vram_peak_bytes",
+        "gauge",
+        "The most discrete-GPU memory allocated at once.",
+    ),
+    (
+        "qubivex_vram_capacity_bytes",
+        "gauge",
+        "The discrete GPU's memory.",
+    ),
+    (
+        "qubivex_vram_budget_bytes",
+        "gauge",
+        "The memory plan's VRAM budget (0 without a plan).",
+    ),
+    (
+        "qubivex_device_expert_hits_total",
+        "counter",
+        "Experts found in the device expert cache.",
+    ),
+    (
+        "qubivex_device_expert_copies_total",
+        "counter",
+        "Experts copied to the device.",
+    ),
+    (
+        "qubivex_device_expert_evictions_total",
+        "counter",
+        "Expert copies evicted from the device to make room.",
+    ),
+    (
+        "qubivex_device_upload_bytes_total",
+        "counter",
+        "Weight bytes copied from host to device.",
+    ),
+    (
+        "qubivex_device_activation_bytes_total",
+        "counter",
+        "Activation bytes copied to and from the device.",
+    ),
+    (
+        "qubivex_device_transfer_seconds_total",
+        "counter",
+        "Time host-device copies took (modelled on a simulated device).",
+    ),
 ];
 
 /// One loaded model's values for [`MODEL_VALUES`], by name.

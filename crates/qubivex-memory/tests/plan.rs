@@ -9,8 +9,9 @@ use proptest::prelude::*;
 use qubivex_core::{Bytes, LayerIdx};
 use qubivex_hardware::Probed;
 use qubivex_memory::{
-    ACTIVATION_RESERVE, DenseGroup, HostMemory, LayerExperts, ModelFootprint, PlanRequest,
-    PlanningError, Profile, RoleGroup, Source, Verdict, assess, distribute, plan,
+    ACTIVATION_RESERVE, DenseGroup, HostMemory, LayerExperts, Location, ModelFootprint,
+    PlanRequest, PlanningError, Profile, RoleGroup, Source, VRAM_ACTIVATION_RESERVE, Verdict,
+    VramRequest, assess, distribute, plan,
 };
 use qubivex_model::{ArchitectureRegistry, ModelMetadata};
 
@@ -96,6 +97,59 @@ fn everything_resident_when_ram_allows() {
     let expect = 400 * MIB + ((12 * GIB - 400 * MIB) as f64 * 0.88) as u64;
     assert_eq!(p.ram.budget.bytes, Bytes(expect));
     assert_eq!(p.ram.budget.source, Source::Estimated);
+}
+
+/// ADR-018: a discrete GPU gets the dense weights and an expert cache bounded by both
+/// its own room and the RAM cache it copies from.
+#[test]
+fn vram_budget_for_a_discrete_gpu() {
+    let fp = reference_like();
+    let ram = 400 * MIB + ACTIVATION_RESERVE.0 + 2 * GIB;
+    let vram = |available: u64, budget: Option<u64>| PlanRequest {
+        ram_budget: Some(Bytes(ram)),
+        vram: Some(VramRequest {
+            device: 0,
+            available: Bytes(available),
+            budget: budget.map(Bytes),
+        }),
+        ..PlanRequest::default()
+    };
+    let host = host(12 * GIB, 18 * GIB);
+
+    // A small device: its own room limits the cache.
+    let p = plan(&fp, &host, &vram(4 * GIB, Some(GIB))).unwrap();
+    let v = &p.vram[0];
+    assert_eq!(v.budget.source, Source::Requested);
+    assert_eq!(v.dense.bytes, Bytes(400 * MIB));
+    assert_eq!(
+        v.expert_cache.bytes,
+        Bytes(GIB - 400 * MIB - VRAM_ACTIVATION_RESERVE.0)
+    );
+    assert!(p.placements.iter().any(|x| x.location == Location::Vram(0)));
+    assert!(
+        p.placements
+            .iter()
+            .any(|x| x.location == Location::VramCache(0))
+    );
+
+    // A large device: the RAM cache at full context (1 GiB) limits it.
+    let p = plan(&fp, &host, &vram(24 * GIB, None)).unwrap();
+    let v = &p.vram[0];
+    assert_eq!(v.budget.source, Source::Estimated);
+    assert_eq!(v.budget.bytes, Bytes((24 * GIB) as f64 as u64 * 88 / 100));
+    assert_eq!(v.expert_cache.bytes, p.ram.expert_cache_full_context.bytes);
+
+    // Too small for dense + reserve + one expert per layer.
+    let e = plan(&fp, &host, &vram(4 * GIB, Some(600 * MIB))).unwrap_err();
+    assert!(matches!(e, PlanningError::DoesNotFit { .. }), "{e}");
+    assert!(e.to_string().contains("device 0"), "{e}");
+
+    // No device asked for: no VRAM budget.
+    let none = PlanRequest {
+        ram_budget: Some(Bytes(ram)),
+        ..PlanRequest::default()
+    };
+    assert!(plan(&fp, &host, &none).unwrap().vram.is_empty());
 }
 
 #[test]
@@ -281,6 +335,7 @@ fn arb_request(layers: usize) -> impl Strategy<Value = PlanRequest> {
                 context,
                 sequences,
                 layer_weights,
+                vram: None,
             },
         )
 }

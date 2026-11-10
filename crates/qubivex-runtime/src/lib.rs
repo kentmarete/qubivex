@@ -7,6 +7,7 @@
 
 pub mod checksums;
 mod combine;
+mod discrete;
 mod engine;
 mod experts;
 mod metal_forward;
@@ -14,14 +15,18 @@ mod placement;
 mod request;
 
 pub use combine::BatchStats;
+pub use discrete::{DeviceCacheStats, DeviceReport};
 pub use engine::{
-    DEFAULT_BATCH_TOKENS, DEFAULT_BATCH_WAIT_US, DEFAULT_IO_THREADS, DEFAULT_READ_RETRIES, Engine,
-    EngineOptions, Finish, GenerateOptions, Generation, KvReservation, PredictionStats,
-    PrefetchOptions, PrefetchReport, Sampling, Verification, VerifyExperts, cpu_pass_reason,
+    DEFAULT_BATCH_TOKENS, DEFAULT_BATCH_WAIT_US, DEFAULT_IO_THREADS, DEFAULT_READ_RETRIES,
+    DEFAULT_SIM_VRAM, Engine, EngineOptions, Finish, GenerateOptions, Generation, KvReservation,
+    PredictionStats, PrefetchOptions, PrefetchReport, Sampling, Verification, VerifyExperts,
+    cpu_pass_reason,
 };
 pub use experts::{ExpertIo, ExpertLayout, IoPath, ModelExpertSource, PartLayout};
 pub use placement::{BackendKind, MetalOps, PlacementReport};
 pub use qubivex_arch::{KvCache, Logits, Segment};
+pub use qubivex_backend_cpu::sim::SimConfig;
+pub use qubivex_compute::discrete::{DeviceUsage, TransferStats};
 pub use qubivex_expert_stream::fault::DiskLimit;
 pub use qubivex_kv_cache::PrefixStats;
 use qubivex_model::manifest::TokenizerSection;

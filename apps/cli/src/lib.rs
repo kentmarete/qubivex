@@ -238,6 +238,13 @@ enum Command {
         /// Sequences whose KV must fit at once.
         #[arg(long, default_value_t = 1)]
         sequences: u32,
+        /// Also plan a discrete GPU with this much free memory, for example 16GiB
+        /// (CUDA and Vulkan are not built yet; `run --backend sim` simulates one).
+        #[arg(long)]
+        vram: Option<String>,
+        /// With --vram: an explicit VRAM budget; replaces the profile's fraction.
+        #[arg(long)]
+        vram_budget: Option<String>,
         /// Print JSON instead of text.
         #[arg(long)]
         json: bool,
@@ -469,15 +476,41 @@ pub(crate) struct MemoryOptions {
     verify: qubivex_runtime::VerifyExperts,
     backend: qubivex_runtime::BackendKind,
     metal_ops: qubivex_runtime::MetalOps,
+    sim: Option<qubivex_runtime::SimConfig>,
+    vram_budget: Option<u64>,
+}
+
+/// What [`DeviceArgs`] chose.
+pub(crate) struct DeviceChoice {
+    backend: qubivex_runtime::BackendKind,
+    metal_ops: qubivex_runtime::MetalOps,
+    sim: Option<qubivex_runtime::SimConfig>,
+    vram_budget: Option<u64>,
 }
 
 /// The compute backend and device placement (Phase 8), shared by `run` and `bench`.
 #[derive(clap::Args, Clone, Debug)]
 pub(crate) struct DeviceArgs {
-    /// Compute backend: cpu, or metal (the Apple GPU runs what --metal-ops chooses, the
-    /// CPU the rest). Output bits are the same on both.
+    /// Compute backend: cpu, metal (the Apple GPU runs what --metal-ops chooses, the
+    /// CPU the rest), or sim (a simulated discrete GPU with its own memory runs every
+    /// matmul; for testing VRAM planning without CUDA or Vulkan). Output bits are the
+    /// same on all three.
     #[arg(long, default_value = "cpu")]
     backend: String,
+    /// With --backend sim: the simulated device's memory, for example 8GiB.
+    #[arg(long)]
+    sim_vram: Option<String>,
+    /// With --backend sim: host-to-device bandwidth in GB/s (default 25, PCIe 4.0).
+    #[arg(long)]
+    sim_bandwidth: Option<f64>,
+    /// With --backend sim: sleep for each copy's modelled time instead of only
+    /// counting it.
+    #[arg(long)]
+    sim_delay: bool,
+    /// With a discrete device: an explicit VRAM budget, for example 6GiB; replaces the
+    /// profile's fraction of the device's memory.
+    #[arg(long)]
+    vram_budget: Option<String>,
     /// With --backend metal: what runs on the GPU. token (the default): whole layers,
     /// experts included, with routing on the GPU so a token is one submission while
     /// every expert is resident. layers: whole layers with routing on the host, one
@@ -488,14 +521,64 @@ pub(crate) struct DeviceArgs {
 }
 
 impl DeviceArgs {
-    fn options(&self) -> Result<(qubivex_runtime::BackendKind, qubivex_runtime::MetalOps), String> {
+    fn options(&self) -> Result<DeviceChoice, String> {
         let backend = match self.backend.as_str() {
             "cpu" => qubivex_runtime::BackendKind::Cpu,
             "metal" => qubivex_runtime::BackendKind::Metal,
-            other => return Err(format!("unknown --backend {other:?}; use cpu or metal")),
+            "sim" => qubivex_runtime::BackendKind::Sim,
+            other => {
+                return Err(format!(
+                    "unknown --backend {other:?}; use cpu, metal or sim"
+                ));
+            }
+        };
+        let sim = backend == qubivex_runtime::BackendKind::Sim;
+        if !sim && (self.sim_vram.is_some() || self.sim_bandwidth.is_some() || self.sim_delay) {
+            return Err(
+                "--sim-vram, --sim-bandwidth and --sim-delay need --backend sim".to_owned(),
+            );
+        }
+        if !sim && self.vram_budget.is_some() {
+            return Err("--vram-budget needs a discrete device (--backend sim)".to_owned());
+        }
+        let vram_budget = self
+            .vram_budget
+            .as_deref()
+            .map(plan::parse_bytes)
+            .transpose()?
+            .map(|b| b.0);
+        let sim = if sim {
+            let capacity = self
+                .sim_vram
+                .as_deref()
+                .map(plan::parse_bytes)
+                .transpose()?
+                .map_or(qubivex_runtime::DEFAULT_SIM_VRAM, |b| b.0);
+            let mut c = qubivex_runtime::SimConfig::new(capacity);
+            if let Some(gbs) = self.sim_bandwidth {
+                if !(gbs.is_finite() && gbs >= 0.0) {
+                    return Err(format!(
+                        "--sim-bandwidth must be a non-negative number, got {gbs}"
+                    ));
+                }
+                #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+                {
+                    c.bandwidth = (gbs * 1e9) as u64;
+                }
+            }
+            c.delay = self.sim_delay;
+            Some(c)
+        } else {
+            None
+        };
+        let choice = |metal_ops| DeviceChoice {
+            backend,
+            metal_ops,
+            sim,
+            vram_budget,
         };
         let Some(list) = &self.metal_ops else {
-            return Ok((backend, qubivex_runtime::MetalOps::default()));
+            return Ok(choice(qubivex_runtime::MetalOps::default()));
         };
         if backend != qubivex_runtime::BackendKind::Metal {
             return Err("--metal-ops needs --backend metal".to_owned());
@@ -524,7 +607,7 @@ impl DeviceArgs {
                 }
             }
         }
-        Ok((backend, ops))
+        Ok(choice(ops))
     }
 }
 
@@ -690,12 +773,11 @@ impl MemoryOptions {
     }
 
     /// The same options with this backend and placement.
-    const fn with_device(
-        mut self,
-        (backend, ops): (qubivex_runtime::BackendKind, qubivex_runtime::MetalOps),
-    ) -> Self {
-        self.backend = backend;
-        self.metal_ops = ops;
+    const fn with_device(mut self, d: DeviceChoice) -> Self {
+        self.backend = d.backend;
+        self.metal_ops = d.metal_ops;
+        self.sim = d.sim;
+        self.vram_budget = d.vram_budget;
         self
     }
 
@@ -737,6 +819,8 @@ impl MemoryOptions {
             verify: self.verify,
             backend: self.backend,
             metal_ops: self.metal_ops,
+            sim: self.sim,
+            vram_budget: self.vram_budget,
             ..qubivex_runtime::EngineOptions::default()
         }
     }
@@ -759,6 +843,8 @@ fn memory_options(
         verify: qubivex_runtime::VerifyExperts::Auto,
         backend: qubivex_runtime::BackendKind::Cpu,
         metal_ops: qubivex_runtime::MetalOps::default(),
+        sim: None,
+        vram_budget: None,
         io_threads,
         expert_io: if direct_io {
             qubivex_runtime::ExpertIo::Direct
@@ -964,6 +1050,8 @@ fn execute(cmd: &Command) -> Result<(), String> {
             ram_budget,
             context,
             sequences,
+            vram,
+            vram_budget,
             json,
         } => emit(&plan::run(&plan::PlanArgs {
             model,
@@ -973,6 +1061,8 @@ fn execute(cmd: &Command) -> Result<(), String> {
             ram_budget: ram_budget.as_deref(),
             context: *context,
             sequences: *sequences,
+            vram: vram.as_deref(),
+            vram_budget: vram_budget.as_deref(),
             json: *json,
         })?),
         Command::Models { command } => emit(&match command {
@@ -1023,6 +1113,8 @@ fn execute(cmd: &Command) -> Result<(), String> {
                 ram_budget: ram_budget.as_deref(),
                 context: *context,
                 sequences: *sequences,
+                vram: None,
+                vram_budget: None,
                 json: *json,
             })?,
             ModelsCommand::Migrate {

@@ -15,8 +15,8 @@
 //!   prefetch, shrink the expert cache, refuse new requests. It never kills an active
 //!   request.
 //!
-//! RAM and VRAM budgets are separate and never summed. There is no VRAM budget until
-//! a GPU backend exists (Phase 8).
+//! RAM and VRAM budgets are separate and never summed. A VRAM budget is planned only
+//! for a discrete GPU ([`PlanRequest::vram`], ADR-018); Metal is planned as RAM.
 
 mod assess;
 mod footprint;
@@ -29,7 +29,8 @@ pub use footprint::{DenseGroup, KV_ELEMENT_BYTES, LayerExperts, ModelFootprint, 
 pub use ledger::{Charge, LedgerSnapshot, MemoryLedger, Owner, Tier};
 pub use plan::{
     ACTIVATION_RESERVE, CacheBudget, DEFAULT_CONTEXT, HostMemory, LayerSlots, Location, MemoryPlan,
-    Placement, PlanRequest, Profile, Quantity, RamBudget, Refusal, Source, VramBudget, plan,
+    Placement, PlanRequest, Profile, Quantity, RamBudget, Refusal, Source, VRAM_ACTIVATION_RESERVE,
+    VramBudget, VramRequest, plan,
 };
 pub use pressure::{PressureConfig, PressureDecision, PressureLevel, PressureMonitor};
 use qubivex_core::Bytes;
