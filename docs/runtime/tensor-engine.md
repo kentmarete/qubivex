@@ -129,7 +129,7 @@ time and is slower than the CPU.
 
 - **A general tensor library.** There is no autograd, no training, no elementwise
   arithmetic API and no broadcasting kernels. Broadcasting exists as a view operation.
-- **CUDA and Vulkan.** `ComputeBackend` is the boundary they would implement.
+- **CUDA.** Vulkan implements `DiscreteDevice` (ADR-019), not `ComputeBackend`.
 - **Hand-written AVX2 or AVX-512 kernels.**
 - **Lossy fast paths:** integer dot products over quantised activations, `f16` KV,
   reduced-precision accumulation.

@@ -1,8 +1,35 @@
 #!/bin/sh
 # Compiles the Vulkan shaders to the SPIR-V checked in under src/ (ADR-019).
-# Needs glslc (shaderc). The unit test `spirv_is_current` fails when the checked-in
-# SPIR-V differs from what this produces, if glslc is installed.
+# Usage: build.sh [OUT_DIR] (default: ../src). Needs glslc, spirv-dis, spirv-as and
+# spirv-val (shaderc and SPIRV-Tools). The unit test `spirv_is_current` runs this into
+# a temporary directory and fails when the checked-in SPIR-V differs, if the tools are
+# installed.
+#
+# glslang decorates `precise` arithmetic with NoContraction but not the GLSL.std.450
+# Fma instructions, and without that decoration a driver may split fma into a
+# multiply and an add (lavapipe does). So every Fma result is decorated here.
 set -eu
-cd "$(dirname "$0")"
-glslc --target-env=vulkan1.1 -O -o ../src/matmul.spv matmul.comp
-if command -v spirv-val >/dev/null; then spirv-val --target-env vulkan1.1 ../src/matmul.spv; fi
+here="$(cd "$(dirname "$0")" && pwd)"
+out="${1:-$here/../src}"
+tmp="$(mktemp -d)"
+trap 'rm -rf "$tmp"' EXIT
+glslc --target-env=vulkan1.1 -O -o "$tmp/matmul.spv" "$here/matmul.comp"
+spirv-dis --raw-id "$tmp/matmul.spv" > "$tmp/matmul.spvasm"
+awk '
+    / = OpExtInst .* Fma / { fma[n++] = $1 }
+    { line[m++] = $0 }
+    END {
+        done = 0
+        for (i = 0; i < m; i++) {
+            if (!done && line[i] ~ /^ *OpDecorate /) {
+                for (j = 0; j < n; j++) print "OpDecorate " fma[j] " NoContraction"
+                done = 1
+            }
+            print line[i]
+        }
+        if (n == 0 || !done) exit 1
+    }
+' "$tmp/matmul.spvasm" > "$tmp/fixed.spvasm"
+spirv-as --target-env vulkan1.1 -o "$tmp/fixed.spv" "$tmp/fixed.spvasm"
+spirv-val --target-env vulkan1.1 "$tmp/fixed.spv"
+cp "$tmp/fixed.spv" "$out/matmul.spv"

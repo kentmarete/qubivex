@@ -34,7 +34,7 @@ and paged KV. Below, **S0–S10** are spec phases. Phase numbers without the S s
 | S6 | Streaming | 9 | Production | Yes |
 | S7 | Concurrent scheduler | 9 | Production | Yes: `qubivex-scheduler` (ADR-015) |
 | S8 | Continuous batching | 10 | Missing (job 7: prototype pass, ADR-017) | No |
-| S9 | Hardware acceleration | 8 | Partial | CPU and Metal yes; CUDA blocked (B2), Vulkan not started |
+| S9 | Hardware acceleration | 8 | Partial | CPU and Metal yes; Vulkan correct, not fast (ADR-019); CUDA blocked (B2) |
 | S10 | Production readiness | 10–11 | Partial | No |
 
 The spec orders S1 to S10, but the repo reached S9's Metal work first, so the order below
@@ -53,7 +53,7 @@ applies only to what remains.
 | Expert lifecycle | Production | `qubivex-expert-stream`: leases, in-flight dedup, LRU, bounded prefetch, cancellation of unstarted loads, loom checks |
 | Memory planner | Production | `qubivex-memory::plan`, cgroup-aware, explainable through `qubivex plan` |
 | KV cache | Partial (job 6: prefix reuse done) | `KvCache` in `qubivex-arch` is per-conversation, bounded and reserved through the planner. Job 6 added retained KV with prefix reuse, a budget and eviction in `qubivex-kv-cache` (ADR-016). No paging |
-| Backends | Partial | CPU and Metal bit-identical. CUDA and Vulkan exist only as detection |
+| Backends | Partial | CPU, Metal and Vulkan bit-identical. CUDA exists only as detection |
 | Stable interfaces | Partial | Traits exist for `ComputeBackend`, `ExpertSource`, `DenseWeights`, `ExpertProvider`, `ArchitectureFactory`, `ResourceProbe`. `Engine::run_request` is the generation contract (ADR-013 amendment 1). There is no model handle yet |
 | Sampling | Production | Greedy, temperature, top-k, top-p, seed |
 
@@ -197,7 +197,7 @@ Owner rules for this plan (2026-11-06):
 | 10 | Observability (**done**) | S10 | 5 | The §8 metrics; structured logs with no prompt text |
 | 11 | Deployment (**done**) | S10 | 9, 10 | Docker, runbooks, the §14 docs |
 | Blocked | CUDA | S9 | B2 | Needs NVIDIA hardware; abstraction only until then |
-| Later | Vulkan | S9 | | Spec says "where practical" |
+| Started | Vulkan | S9 | | Spec says "where practical". ADR-019: a correct `DiscreteDevice`; fast kernels not built |
 
 ## 5. Owner decisions (2026-11-06)
 

@@ -99,7 +99,8 @@ to discover a gap by hitting it.
 
 **Hardware and platforms**
 
-- CUDA and Vulkan. The only GPU backend is Metal on macOS.
+- CUDA. Vulkan runs (ADR-019, Proposed) with the CPU's bits but slower than the CPU;
+  Metal is the fast GPU backend, on macOS.
 - Windows.
 - Multiple GPUs, and splitting a model across devices.
 - Hand-written x86-64 kernels. x86-64 runs the portable kernels built for AVX2 and FMA,

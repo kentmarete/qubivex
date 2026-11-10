@@ -753,7 +753,7 @@ These invariants are enforced by tests and CI
 | 5 | Memory planner: fits the model to RAM, VRAM and cgroup limits | Done |
 | 6 | Full expert streaming: tiered cache, I/O pool, packed expert files | Done |
 | 7 | Predictive expert prefetching | Router lookahead and the disk-saturation throttle done; off by default |
-| 8 | GPU backends: CUDA, Vulkan, Metal | Metal slices 1–6 done (bit-identical; 1.4× the CPU at decode, 2× at prefill); CUDA next |
+| 8 | GPU backends: CUDA, Vulkan, Metal | Metal slices 1–6 done (bit-identical; 1.4× the CPU at decode, 2× at prefill); Vulkan bit-identical but slower than the CPU (ADR-019); CUDA blocked on hardware |
 | 9 | OpenAI-compatible HTTP server and serving | Done: `qubivex serve` (ADR-013); the OpenAI SDK works against real models |
 | 10–11 | Hardening, packaging, documentation | Done: limits, metrics and logs on the gateway; a Docker image; deployment runbooks and the documentation set under [`docs/`](docs/README.md) |
 

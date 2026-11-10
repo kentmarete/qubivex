@@ -26,7 +26,7 @@ fn open(config: VulkanConfig) -> Option<VulkanDevice> {
             panic!("QUBIVEX_REQUIRE_VULKAN=1 but no device: {e}")
         }
         Err(e) => {
-            eprintln!("no Vulkan device, skipped: {e}");
+            eprintln!("Vulkan device unavailable, skipped: {e}");
             None
         }
     }
@@ -103,8 +103,23 @@ fn acts(n: usize, seed: usize) -> Vec<f32> {
         .collect()
 }
 
-fn bits(v: &[f32]) -> Vec<u32> {
-    v.iter().map(|f| f.to_bits()).collect()
+/// Asserts the same bits, naming how many outputs differ and the first few.
+#[track_caller]
+fn assert_bits(got: &[f32], want: &[f32], what: &str) {
+    assert_eq!(got.len(), want.len(), "{what}");
+    let bad: Vec<_> = (0..got.len())
+        .filter(|&i| got[i].to_bits() != want[i].to_bits())
+        .collect();
+    assert!(
+        bad.is_empty(),
+        "{what}: {} of {} outputs differ; first {:?}",
+        bad.len(),
+        got.len(),
+        bad.iter()
+            .take(4)
+            .map(|&i| (i, got[i], want[i]))
+            .collect::<Vec<_>>()
+    );
 }
 
 fn cpu(dtype: DType, rows: usize, cols: usize, host: &[u8], xs: &[f32], s: usize) -> Vec<f32> {
@@ -146,7 +161,7 @@ fn every_dtype_shape_and_batch_matches_the_cpu() {
                         ys: &mut got,
                     }])
                     .unwrap();
-                    assert_eq!(bits(&got), bits(&want), "{dtype} {rows} x {cols}, s = {s}");
+                    assert_bits(&got, &want, &format!("{dtype} {rows} x {cols}, s = {s}"));
                 }
             }
         }
@@ -185,7 +200,7 @@ fn many_matrices_at_offsets_in_one_buffer_and_one_submission() {
     drop(ops);
     for (p, (x, y)) in parts.iter().zip(xs.iter().zip(&ys)) {
         let want = cpu(p.0, p.1, p.2, &p.4, x, s);
-        assert_eq!(bits(y), bits(&want), "{} at {}", p.0, p.3);
+        assert_bits(y, &want, &format!("{} at {}", p.0, p.3));
     }
     let t = dev.transfers();
     assert_eq!(t.submissions, 1);
@@ -215,8 +230,8 @@ fn large_submissions_reuse_and_grow_their_buffers() {
         .collect();
     dev.matmul_many(&mut ops).unwrap();
     drop(ops);
-    for y in &ys {
-        assert_eq!(bits(y), bits(&want));
+    for (i, y) in ys.iter().enumerate() {
+        assert_bits(y, &want, &format!("op {i}"));
     }
 }
 

@@ -121,7 +121,7 @@ A server keeps nothing on disk. Stopping one loses only caches.
 | Linux arm64 | CPU (NEON) | Built and run in the Docker image. Not in CI |
 | macOS x86-64 | CPU | Builds. Not tested in CI |
 | CUDA | | Not built: needs NVIDIA hardware |
-| Vulkan | | Not built |
+| Vulkan | Every matmul (`--backend vulkan`) | Bit-identical on MoltenVK (local); lavapipe is refused (it splits fma); slower than the CPU; not in CI (ADR-019, Proposed) |
 | Windows | | Not supported |
 
 ## Further reading

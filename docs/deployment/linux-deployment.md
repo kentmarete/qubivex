@@ -4,7 +4,8 @@ How to run `qubivex serve` as a managed service on Linux x86-64 or arm64, either
 systemd or in a container. Day-to-day operation is in
 [Production operations](production-operations.md).
 
-On Linux QUBIVEX runs on the CPU. There is no CUDA or Vulkan backend yet (see
+On Linux QUBIVEX runs on the CPU. There is no CUDA backend, and the Vulkan one is
+slower than the CPU so far (see
 [Not supported](#not-supported)).
 
 ## Before you start
@@ -284,7 +285,8 @@ curl -s http://127.0.0.1:8080/metrics | grep qubivex_generated_tokens_total
 ## Not supported
 
 - **GPUs on Linux.** There is no CUDA backend (it needs NVIDIA hardware to build and
-  measure on) and no Vulkan backend. `--backend metal` exists only on macOS.
+  measure on). `--backend vulkan` has not been measured on a Linux GPU. Mesa's lavapipe
+  (software Vulkan) is refused because it splits fma (ADR-019). `--backend metal` exists only on macOS.
 - **TLS.** Terminate it at a proxy.
 - **More than one API key.** One key serves every client, so clients cannot be told
   apart or limited separately.

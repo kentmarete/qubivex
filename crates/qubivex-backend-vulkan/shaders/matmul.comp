@@ -1,6 +1,6 @@
 // QUBIVEX Vulkan matmul (ADR-019): ys[t] = W · xs[t] with the CPU backend's bits.
 //
-// Compile with `shaders/build.sh` (glslc); the SPIR-V is checked in as `src/matmul.spv`
+// Compile with `shaders/build.sh`; the SPIR-V is checked in as `src/matmul.spv`
 // so building the crate needs no shader compiler.
 //
 // Every output reproduces what `qubivex-backend-cpu` computes:
@@ -13,7 +13,8 @@
 //   then (a0 + a1) + (a2 + a3).
 //
 // `precise` stops the compiler fusing or reassociating: only the explicit `fma` calls
-// are fused, and they are single operations with one rounding.
+// are fused. glslang does not mark `fma` itself NoContraction, so `build.sh` does:
+// without it a driver may split an fma into two roundings (lavapipe does).
 //
 // One group of 32 invocations computes one output: invocation `lane` holds lanes `lane`
 // and `lane + 32`, so the w = 32 step is a per-invocation add. The rest of the tree goes

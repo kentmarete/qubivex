@@ -27,7 +27,8 @@ use qubivex_core::{DType, GgmlType};
 
 use crate::{BACKEND, VulkanConfig};
 
-/// The matmul shader (`shaders/matmul.comp`, compiled by `shaders/build.sh`).
+/// The matmul shader (`shaders/matmul.comp`, compiled by `shaders/build.sh`, which also
+/// marks every `fma` NoContraction).
 pub(crate) const MATMUL_SPV: &[u8] = include_bytes!("matmul.spv");
 
 /// Output rows per workgroup. Must equal `ROWS` in the shader.
