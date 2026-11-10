@@ -178,7 +178,8 @@ pub struct RamBudget {
     pub expert_cache_full_context: Quantity,
 }
 
-/// One device's VRAM budget. None exist until a GPU backend is built (Phase 8).
+/// One device's VRAM budget. None exist until a discrete-GPU backend (CUDA or Vulkan)
+/// is built; Metal shares host memory and is planned as RAM.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct VramBudget {
     /// Device index.
@@ -537,7 +538,10 @@ pub fn plan(
             });
         }
     }
-    reasons.push("No VRAM budget: no GPU backend is built yet (Phase 8).".to_owned());
+    reasons.push(
+        "No VRAM budget: Metal shares host memory, so its buffers count against the RAM budget. Discrete GPUs (CUDA, Vulkan) are not supported yet."
+            .to_owned(),
+    );
 
     Ok(MemoryPlan {
         profile: req.profile,

@@ -12,7 +12,7 @@ Last updated: 2026-11-09
 - The payloads in `docs/serving/` were captured from the server (the Qwen3-0.6B run in the image and the fixtures locally), and the documented OpenAI Python SDK calls were run against it, including the refusals. The systemd unit passes `systemd-analyze verify`, the launchd plist `plutil -lint`, the Compose file `docker compose config`, and the config example the binary's own parser. Every relative link and anchor in `docs/` and the README resolves.
 - CI gains a `docker` job: it builds the image, serves the fixture model, calls it, and checks that `docker stop` exits 0.
 - Not done: nothing was run on Linux x86-64 hardware beyond CI, on Kubernetes, or as a launchd agent across a reboot; the runbooks say which steps are untested. No image or package is published. The alert thresholds in the operations runbook are starting points, not measurements.
-- Noticed, not changed: `qubivex plan` still prints "No VRAM budget: no GPU backend is built yet (Phase 8)", which predates Metal.
+- Fixed after the job (2026-11-10): `qubivex plan` printed "No VRAM budget: no GPU backend is built yet (Phase 8)", which predated Metal. It now says Metal shares host memory and is counted in the RAM budget, and that discrete GPUs (CUDA, Vulkan) are not supported yet.
 - Tests: 502 passed, 0 failed, 1 ignored (one new: SIGTERM through the binary).
 - **Next:** the platform plan is complete. Open: CUDA (blocked on NVIDIA hardware), Vulkan, the owner decisions under "Pending review decisions", and ADR-005, 008, 011 and 014, which are still Proposed.
 
