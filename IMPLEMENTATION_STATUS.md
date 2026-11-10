@@ -1,6 +1,6 @@
 # QUBIVEX Implementation Status
 
-Last updated: 2026-11-09
+Last updated: 2026-11-10
 
 ## Current phase
 **Deployment done (2026-11-10; job 11, ADR-013 amendment 6).** The last job of the platform plan (`PLATFORM_AUDIT` §4): Docker, runbooks and the spec §14 documents.
@@ -14,7 +14,7 @@ Last updated: 2026-11-09
 - Not done: nothing was run on Linux x86-64 hardware beyond CI, on Kubernetes, or as a launchd agent across a reboot; the runbooks say which steps are untested. No image or package is published. The alert thresholds in the operations runbook are starting points, not measurements.
 - Fixed after the job (2026-11-10): `qubivex plan` printed "No VRAM budget: no GPU backend is built yet (Phase 8)", which predated Metal. It now says Metal shares host memory and is counted in the RAM budget, and that discrete GPUs (CUDA, Vulkan) are not supported yet.
 - Tests: 502 passed, 0 failed, 1 ignored (one new: SIGTERM through the binary).
-- **Next:** the platform plan is complete. Open: CUDA (blocked on NVIDIA hardware), Vulkan, the owner decisions under "Pending review decisions", and ADR-005, 008, 011 and 014, which are still Proposed.
+- **Next:** the platform plan is complete. Open: CUDA (blocked on NVIDIA hardware), Vulkan, and the owner decisions under "Pending review decisions". ADR-005, 008, 011 and 014 were accepted on 2026-11-10 (the CPU stays the default backend), so no ADR is Proposed.
 
 **Observability done (2026-11-10; job 10, ADR-013 amendment 5).** The spec §8 metrics and structured logs on the gateway, still hand-written (the owner chose that over Kerniq Observe: no new dependency).
 - `/metrics` gains per-model histograms: `qubivex_time_to_first_token_seconds`, `qubivex_generation_duration_seconds` and `qubivex_queue_wait_seconds` (all from the request's arrival), `qubivex_inter_token_seconds`, `qubivex_prompt_tokens_per_second`, `qubivex_generation_tokens_per_second`, `qubivex_model_load_seconds`; and `qubivex_http_request_duration_seconds` per endpoint.
@@ -212,7 +212,7 @@ Last updated: 2026-11-09
   - CLI: `--metal-ops layers`.
 - Tests: 240 pass (Rust 1.99.1; 1.85 checks). New: `ops_parity.rs` (every op bit-identical, including exp over −110..110), gather/scatter, misaligned Q4_K is declined, `metal_layers_match_the_cpu_in_waves_and_across_kv_growth` (one-slot pools, 300 decode steps past 256 positions, three fixtures). Env-gated: whole layers on real OLMoE give bit-identical prompt logits and 48 identical tokens; all 130 tensors stay bit-identical with the new kernels. GPU tests now fail (not skip) on a shader compile error.
 - Measured (M3 Pro, OLMoE Q4_K_M, ADR-011 amendment 2; records `2026-11-03-m3pro-phase8s3-*.json`): all resident, decode 26.41 → 44.47 tok/s (median step 37.86 → 22.49 ms, P95 47.80 → 23.36 ms), prefill 33 → 77 tok/s. At `--ram-budget 1GiB`, Metal is slower (14.66 vs 20.31 tok/s): the pools hold 2–3 experts, so each layer runs about three waves that each wait for all their loads. Kernel throughput (`metal_stream`): Q4_K 23 → 38 GiB/s, Q6_K 38 → 64 GiB/s.
-- Decision (pending owner review): the CPU stays the default backend; `--backend metal` means whole layers.
+- Decision (accepted with ADR-011 on 2026-11-10): the CPU stays the default backend; `--backend metal` meant whole layers here, and whole tokens since slice 5.
 - Slice 4 (above) handled small expert caches.
 
 **Phase 8 slice 2 done (2026-11-03): Metal in the engine (batching, zero-copy weights, placement, token parity).**
@@ -234,7 +234,7 @@ Last updated: 2026-11-09
   - `MetalBackend` implements `ComputeBackend` (it copies weights per call: a correctness path); `MetalBackend::upload` and `matmul_resident` keep weights on the device. `dequant_row` stays on the CPU.
   - `ComputeError::Device`. Dependency rule: a GPU backend may dev-depend on `qubivex-backend-cpu` as its parity reference (`xtask` test added).
 - Tests: synthetic parity (all six dtypes, tails of 32–37 lanes, s = 1, 3, 8, typical and wide-range values) is bit-identical; resident and copying paths agree; errors are reported. The env-gated `qubivex-runtime/tests/metal_parity.rs` is bit-identical on all 130 real OLMoE tensors (3.92 GiB, about 11M outputs).
-- Finding: Apple GPUs flush f32 subnormals to zero (safe mode too). That is the only divergence; `subnormals_are_the_only_divergence` documents it. Parity contract: ADR-011 (Proposed).
+- Finding: Apple GPUs flush f32 subnormals to zero (safe mode too). That is the only divergence; `subnormals_are_the_only_divergence` documents it. Parity contract: ADR-011 (accepted 2026-11-10).
 - Kernel benches (`cargo bench -p qubivex-backend-metal --bench kernels`), resident weights, against the CPU baseline at 5 threads: expert Q4_K 1024 × 2048 decode 176 µs vs 63 µs; Q6_K head 1.78 ms vs 2.77 ms; Q4_K prefill s = 128 4.84 ms vs 3.44 ms; a 64 × 64 matmul costs 120 µs, which is per-call synchronisation.
 - Slice 2 (above) built the batching, zero-copy weights, placement, `--backend` and token parity.
 
@@ -591,4 +591,5 @@ ADR-002 spike, M3 Pro: [`docs/performance/ADR-002-SPIKE.md`](docs/performance/AD
 Register and proposed status changes: `docs/engineering/ARCHITECTURE_DECISIONS.md` §1.
 - Accepted: ADR-001 (workspace, phase-gated crates; 2026-11-06), ADR-003 (architecture registry; 2026-11-08), ADR-004 (versioned manifest; 2026-11-08), ADR-006 (synchronous lease-based expert store, io_uring deferred; 2026-11-08), ADR-015 (scheduler and concurrency model; 2026-11-08), ADR-016 (KV subsystem: retained KV and prefix reuse; 2026-11-07), ADR-002 (hybrid, no Candle; amendment 1: own register-blocked prefill instead of `gemm`, spinning pool deferred), ADR-009 (tensor descriptors), ADR-010 (numerical precision).
 - Amended: ADR-007 (Metal first; device assignment fixed per execution plan).
-- Proposed: ADR-005 and ADR-008 are not built yet. ADR-014 is Proposed.
+- Accepted 2026-11-10: ADR-005 (memory planner; no VRAM budget yet), ADR-008 (expert cache; hot set, pins and tier promotion not built), ADR-011 (device execution and GPU parity; the CPU stays the default backend), ADR-014 (model downloads and threat review).
+- Proposed: none.

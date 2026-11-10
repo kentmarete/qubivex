@@ -4,7 +4,8 @@
 - Status: **Owner decisions taken 2026-11-03** on §2.1 (named opt-ins only, ADR-010),
   §2.6 (Metal first, ADR-007 amendment), §3 (keep `MIGRATION_PLAN.md`, fold the EIP in)
   and the tensor scope (ADR-009, implemented). The ADR status changes proposed in §1
-  for ADR-003, 004 and 006 were accepted on 2026-11-08; ADR-001 was accepted on 2026-11-06.
+  for ADR-003, 004 and 006 were accepted on 2026-11-08; ADR-001 was accepted on 2026-11-06;
+  ADR-005, 008, 011 and 014 were accepted on 2026-11-10.
 - Inputs: ADR-001 to ADR-008 (`docs/decisions/`), `QUBIVEX_DESIGN.md`,
   `MIGRATION_PLAN.md`, `IMPROVEMENTS_EVALUATION.md`, and the Engineering Improvement Plan
   (EIP).
@@ -21,11 +22,13 @@ recorded in the ADR it affects, or in a new ADR numbered from 009.
 | 002 | Hybrid compute, own kernels, no Candle | Accepted | Own kernels built, including the register-blocked prefill (amendment 1, instead of `gemm`, which breaks batch invariance) and a faster lossless Q4_K decode kernel with the same bits (amendment 2). Spinning pool **deferred** with measurements | Accepted, plus an "Implementation status" note listing the two unbuilt parts |
 | 003 | Architecture registry by manifest id | Proposed | Implemented; OLMoE and a Qwen3-MoE fixture load through one factory; a second architecture, `transformer_dense`, runs a real SafeTensors checkpoint (amendment 1) | **Accepted** |
 | 004 | Versioned manifest, cross-validated | Proposed | Implemented (schema v1, import, cross-checks) | **Accepted** |
-| 005 | One measured, role-driven memory planner | Proposed | Not built (Phase 5) | Proposed; extended by §2.3 |
+| 005 | One measured, role-driven memory planner | Accepted (2026-11-10) | Built in Phase 5 (amendments 1–3), extended by §2.3; no VRAM budget, `rebalance` or `recommend` | **Accepted** |
 | 006 | Synchronous lease-based expert store | Proposed | Leases, dedup, the priority I/O queue, I/O threads and `acquire_many` built (Phase 6 slice 2, amendment 1); direct I/O built, off by default (slice 3, amendment 2); io_uring deferred to a Linux host | **Accepted** for the lease and sync model; io_uring waits for a Linux measurement |
 | 007 | Backends behind one trait | Proposed | Trait exists in host-only form | Proposed; amended by §2.4 and §2.6 (backend order) |
 | 013 | Serving gateway (Phase 9) | Accepted | Built: `qubivex-api`, `qubivex serve`; one forward pass per engine at a time (FIFO), KV reservations against the plan, cancellation per chunk and token | **Accepted** |
-| 008 | Expert cache: slabs, LFRU, hysteresis | Proposed | Per-layer pools, slab reuse and LFRU built (Phase 6 slice 1, amendment 1); pins and the persisted hot set not built | Proposed |
+| 008 | Expert cache: slabs, LFRU, hysteresis | Accepted (2026-11-10) | Per-layer pools, slab reuse and LFRU (amendment 1), prefetch guard (amendment 2), saturation throttle (amendment 3); pins, the persisted hot set and tier promotion not built | **Accepted**; unbuilt parts stay open |
+| 011 | Device execution, buffer lifetimes, GPU parity | Accepted (2026-11-10) | Metal built (amendments 1–6): bit-identical except f32 subnormals, whole-token pass, CPU pass below top-k or half a pool | **Accepted**; the CPU stays the default backend |
+| 014 | Model downloads and their threat review | Accepted (2026-11-10) | Built: `qubivex-model-download`, `models pull` and `search`; every threat has a test | **Accepted** |
 
 The EIP proposes `docs/adr/ADR-003-TENSOR-STORAGE.md` through `ADR-008-ASYNC-EXECUTION.md`.
 Those numbers are taken. **Proposal:** keep `docs/decisions/`, and map the EIP's ADRs as

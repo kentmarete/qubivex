@@ -1,6 +1,8 @@
 # ADR-005: One measured, role-driven memory planner
 
-- Status: Proposed (Phase 0); built in Phase 5 (amendments 1–3), awaiting acceptance
+- Status: **Accepted (2026-11-10)** by owner decision, for amendments 1 to 3 as built in
+  Phase 5. Not built: a VRAM budget (Metal shares host memory and is counted in the RAM
+  budget; it waits for a discrete GPU backend, CUDA or Vulkan), `rebalance` and `recommend`.
 - Date: 2026-11-01
 
 ## Context
