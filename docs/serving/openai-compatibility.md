@@ -79,7 +79,7 @@ clients work to the extent that they send only what the tables below accept.
 | `seed` | Supported | Deterministic: the same request gives the same text |
 | `stop` | Supported | Up to 4 strings |
 | `stream`, `stream_options.include_usage` | Supported | See [Streaming](streaming.md) |
-| `user` | Supported | Used for fairness and to separate prefix caches |
+| `user` | Supported | Used for fairness and to separate prefix caches; under a named key, within that key's client |
 | `n` | Only 1 | Any other value is a 400 |
 | `tools`, `tool_choice` (other than `"none"`) | Refused | 400: "tool calls are not supported" |
 | `response_format` | Only `{"type":"text"}` | `json_object` and `json_schema` are a 400 |

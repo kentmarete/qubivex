@@ -445,8 +445,7 @@ impl AppState {
 
     /// Sets who `params` counts as, from the caller and its `user`.
     fn identify(&self, caller: Caller, params: &mut Params) {
-        let (client, scope) =
-            keys::identity(&self.cfg.client_keys, caller, params.user.as_deref());
+        let (client, scope) = keys::identity(&self.cfg.client_keys, caller, params.user.as_deref());
         params.client = client;
         params.cache_scope = scope;
         params.client_name = match caller {

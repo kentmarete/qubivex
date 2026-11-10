@@ -5,12 +5,16 @@
 //! default. Each key in the file is the flag's name with `_` for `-`; repeatable flags
 //! (`--model`, `--dir`, `--cors-origin`) are lists named `models`, `dirs` and
 //! `cors_origins`, and flags given on the command line replace the file's list.
+//!
+//! Named client keys (ADR-013 amendment 7) are only in the file, as
+//! `[[serve.client_keys]]` tables (`qubivex keys new` prints one), so no key hash or
+//! client list shows in `ps` or the environment.
 
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use qubivex_api::{Gateway, LogFormat, MemoryPolicy, RateLimit, ServerConfig};
+use qubivex_api::{ClientKey, Gateway, LogFormat, MemoryPolicy, RateLimit, ServerConfig};
 use qubivex_model::{ArchitectureRegistry, find};
 use qubivex_runtime::Engine;
 use serde::Deserialize;
@@ -38,7 +42,9 @@ pub(crate) struct ServeFlags {
     /// API key, or --allow-unauthenticated.
     #[arg(long)]
     listen: Option<SocketAddr>,
-    /// Require `Authorization: Bearer <key>` on /v1 (default: $QUBIVEX_API_KEY).
+    /// A key shared by every client, required as `Authorization: Bearer <key>` on /v1
+    /// (default: $QUBIVEX_API_KEY). Named per-client keys go in the config file
+    /// (`qubivex keys new`).
     #[arg(long, env = "QUBIVEX_API_KEY", hide_env_values = true)]
     api_key: Option<String>,
     /// Enable the admin endpoints with this bearer token (default:
@@ -95,8 +101,8 @@ pub(crate) struct ServeFlags {
     #[arg(long)]
     shutdown_grace: Option<u64>,
     /// MiB per model of finished KV to keep, so a prompt that repeats a prefix skips
-    /// it. Counts against the memory plan. Requests with different `user` values
-    /// never share it (default: 0, none).
+    /// it. Counts against the memory plan. Requests with different `user` values or
+    /// named keys never share it (default: 0, none).
     #[arg(long)]
     prefix_cache_mb: Option<u64>,
     /// A fixed expert cache in MiB per model, bypassing the memory planner.
@@ -144,10 +150,40 @@ struct ConfigFile {
     serve: FileServe,
 }
 
-/// The `[serve]` table: the flags, by the same names.
+/// One `[[serve.client_keys]]` table.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct FileKey {
+    client: String,
+    key_sha256: String,
+    rate_limit: Option<u32>,
+    rate_limit_burst: Option<u32>,
+}
+
+impl FileKey {
+    fn key(self) -> Result<ClientKey, String> {
+        let rate_limit = match (self.rate_limit, self.rate_limit_burst) {
+            (Some(per_minute), burst) => Some(RateLimit {
+                per_minute,
+                burst: burst.unwrap_or(per_minute),
+            }),
+            (None, Some(_)) => {
+                return Err(format!(
+                    "client {:?}: rate_limit_burst needs rate_limit",
+                    self.client
+                ));
+            }
+            (None, None) => None,
+        };
+        ClientKey::from_hex(self.client, &self.key_sha256, rate_limit)
+    }
+}
+
+/// The `[serve]` table: the flags, by the same names, plus the client keys.
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct FileServe {
+    client_keys: Option<Vec<FileKey>>,
     models: Option<Vec<String>>,
     dirs: Option<Vec<PathBuf>>,
     listen: Option<SocketAddr>,
@@ -189,7 +225,7 @@ fn check_private(path: &Path, meta: &std::fs::Metadata) -> Result<(), String> {
     let mode = meta.permissions().mode() & 0o777;
     if mode & 0o077 != 0 {
         return Err(format!(
-            "{} holds an API key or admin token but other users can read it (mode {mode:o}); run chmod 600 on it",
+            "{} holds API keys or an admin token but other users can read it (mode {mode:o}); run chmod 600 on it",
             path.display()
         ));
     }
@@ -206,7 +242,10 @@ fn read_config(path: &Path) -> Result<FileServe, String> {
         .map_err(|e| format!("cannot read config file {}: {e}", path.display()))?;
     let file: ConfigFile =
         toml::from_str(&text).map_err(|e| format!("config file {}: {e}", path.display()))?;
-    if file.serve.api_key.is_some() || file.serve.admin_token.is_some() {
+    if file.serve.api_key.is_some()
+        || file.serve.admin_token.is_some()
+        || file.serve.client_keys.is_some()
+    {
         let meta = std::fs::metadata(path)
             .map_err(|e| format!("cannot read config file {}: {e}", path.display()))?;
         check_private(path, &meta)?;
@@ -289,8 +328,15 @@ impl ServeFlags {
             .unwrap_or(0)
             .saturating_mul(1 << 20);
         let dirs = roots(&list(self.dirs, file.dirs));
+        let client_keys = file
+            .client_keys
+            .unwrap_or_default()
+            .into_iter()
+            .map(FileKey::key)
+            .collect::<Result<Vec<_>, _>>()?;
         let cfg = ServerConfig {
             api_key: self.api_key.or(file.api_key),
+            client_keys,
             admin_token: self.admin_token.or(file.admin_token),
             allow_unauthenticated_remote: self.allow_unauthenticated
                 || file.allow_unauthenticated.unwrap_or(false),
@@ -339,8 +385,9 @@ impl ServeFlags {
             .listen
             .or(file.listen)
             .unwrap_or_else(|| SocketAddr::from(([127, 0, 0, 1], 8080)));
-        cfg.check_listen(addr)
-            .map_err(|e| format!("{e} (--api-key, --listen or --allow-unauthenticated)"))?;
+        cfg.check_listen(addr).map_err(|e| {
+            format!("{e} (--api-key, client_keys in --config, --listen or --allow-unauthenticated)")
+        })?;
         let models = list(self.models, file.models);
         if cfg.admin_token.is_none() && models.is_empty() {
             return Err("no model to serve and no admin token to load one later".into());
@@ -362,7 +409,7 @@ pub(crate) fn serve(p: Plan) -> Result<(), String> {
     let Plan { models, addr, cfg } = p;
     let dirs = cfg.model_dirs.clone();
     let opts = cfg.engine;
-    let open = cfg.api_key.is_none() && !addr.ip().is_loopback();
+    let open = !cfg.needs_key() && !addr.ip().is_loopback();
     // The human-readable lines below belong to the text log; in the other formats the
     // gateway's own events say the same (`model_added`, `server_started`, ...).
     let text = cfg.log_format == LogFormat::Text;
@@ -558,6 +605,58 @@ mod tests {
         assert!(ok.is_ok());
         let allowed = file("[serve]\nallow_unauthenticated = true\nlisten = \"0.0.0.0:8080\"\n");
         assert!(flags(&["--model", "m"]).plan(allowed).is_ok());
+    }
+
+    #[test]
+    fn client_keys_come_from_the_file_and_count_as_keys() {
+        let h = qubivex_api::hash_key("secret");
+        let f = file(&format!(
+            "[serve]\nlisten = \"0.0.0.0:8080\"\n\
+             [[serve.client_keys]]\nclient = \"a\"\nkey_sha256 = \"{h}\"\nrate_limit = 10\n\
+             [[serve.client_keys]]\nclient = \"b\"\nkey_sha256 = \"{}\"\n",
+            qubivex_api::hash_key("other")
+        ));
+        let p = flags(&["--model", "m"]).plan(f).unwrap();
+        assert_eq!(p.cfg.client_keys.len(), 2);
+        assert_eq!(
+            p.cfg.client_keys[0],
+            qubivex_api::ClientKey::new(
+                "a",
+                "secret",
+                Some(RateLimit {
+                    per_minute: 10,
+                    burst: 10
+                })
+            )
+        );
+        assert_eq!(p.cfg.client_keys[1].rate_limit, None);
+        assert!(
+            p.cfg.needs_key(),
+            "a remote listener with named keys only is allowed"
+        );
+
+        let bad = |t: &str| {
+            flags(&["--model", "m"])
+                .plan(file(&format!("[serve]\n{t}")))
+                .unwrap_err()
+        };
+        let e = bad("[[serve.client_keys]]\nclient = \"a\"\nkey_sha256 = \"nothex\"\n");
+        assert!(e.contains("64 hex"), "{e}");
+        let e = bad(&format!(
+            "[[serve.client_keys]]\nclient = \"a b\"\nkey_sha256 = \"{h}\"\n"
+        ));
+        assert!(e.contains("client name"), "{e}");
+        let e = bad(&format!(
+            "[[serve.client_keys]]\nclient = \"a\"\nkey_sha256 = \"{h}\"\nrate_limit_burst = 2\n"
+        ));
+        assert!(e.contains("rate_limit_burst"), "{e}");
+        assert!(
+            toml::from_str::<ConfigFile>(&format!(
+                "[[serve.client_keys]]\nclient = \"a\"\nkey = \"{h}\"\n"
+            ))
+            .is_err(),
+            "a plain key is an unknown field"
+        );
     }
 
     #[test]

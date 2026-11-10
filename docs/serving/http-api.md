@@ -38,6 +38,12 @@ x-request-id: req-6af2c353-6
 {"error":{"code":"invalid_api_key","message":"missing or invalid bearer token","param":null,"type":"authentication_error"}}
 ```
 
+**Named keys** (`[[serve.client_keys]]` in the config file, made with `qubivex keys new`)
+are accepted the same way, alongside the shared key or instead of it. A named key makes the
+request its client's: the rate limit counts that key, fairness counts that client whatever
+`user` says, and the prefix-cache scope is the client plus `user`. A bearer that is no key
+counts against its address's allowance.
+
 With no API key set, `/v1` is open, which the server allows only on loopback unless
 started with `--allow-unauthenticated`.
 
@@ -141,7 +147,7 @@ answer.
 | `stop` | string or array | none | Up to 4 non-empty strings. Generation ends before the first one that appears, and it is not returned |
 | `stream` | boolean | false | Server-sent events. See [Streaming](streaming.md) |
 | `stream_options.include_usage` | boolean | false | Add a final chunk with `usage` to a stream |
-| `user` | string | none | The client this request is for. Used for fairness and as the prefix-cache scope |
+| `user` | string | none | The client this request is for. Used for fairness and as the prefix-cache scope; with a named key, fairness counts the key's client and `user` only separates scopes within it |
 | `priority` | string | `normal` | `low`, `normal` or `high`. Not an OpenAI field. See [Scheduler](scheduler.md) |
 | `timeout` | number | none | Seconds this request may take, queue included. Not an OpenAI field |
 

@@ -51,8 +51,8 @@ Among waiting requests, the next to start is chosen by, in order:
 
 1. **Priority.** The request field `priority`: `high`, `normal` (the default) or `low`.
 2. **Fairness.** Within a priority, the client with the fewest running requests goes
-   first. The client is the request's `user` field; requests with no `user` count as
-   one client.
+   first. With a named key the client is the key's; otherwise it is the request's `user`
+   field, and requests with no `user` count as one client.
 3. **Age.** Then the oldest.
 
 A waiting request gains one priority level for every 10 s it waits, so a low priority
@@ -148,8 +148,8 @@ ended.
 
 ## Not supported
 
-- **Per-client limits and quotas.** One API key serves everyone, `user` is whatever the
-  client sends, and `priority: "high"` is open to any client with the key.
+- **Per-client quotas and priority caps.** Named keys get their own request rate, but
+  not a token quota, and `priority: "high"` is open to any client with a key.
 - **Arbitration between models.** Each model has its own scheduler, limits and compute
   threads. Two busy models oversubscribe the cores and can together exceed what either
   planned for.

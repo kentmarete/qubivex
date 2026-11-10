@@ -119,7 +119,7 @@ to discover a gap by hitting it.
 - Tool calls, JSON mode and JSON schema, logprobs, logit bias, penalties, `n > 1`.
 - Embeddings, the Responses, Assistants and Batch APIs, images, audio, files.
 - A separate reasoning field.
-- TLS, more than one API key, per-key limits and quotas.
+- TLS, token quotas per key, and changing keys without a restart.
 - Loading a model on first request, and unloading idle ones.
 
 **Serving**

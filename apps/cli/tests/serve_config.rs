@@ -122,3 +122,89 @@ fn sigterm_drains_and_exits_zero() {
     assert!(status.success(), "{status:?}: {seen}");
     assert!(seen.contains("shutting down"), "{seen}");
 }
+
+/// `keys new` prints a key once and a table for the config file; `serve` with that file
+/// accepts the key, refuses others, and `keys hash` gives the same hash.
+#[cfg(unix)]
+#[test]
+fn a_key_from_keys_new_works_with_serve() {
+    use std::io::{BufRead, BufReader, Read, Write};
+    use std::os::unix::fs::PermissionsExt;
+    use std::process::Stdio;
+
+    let o = qubivex(&["keys", "new", "app-1", "--rate-limit", "100"]);
+    assert!(o.status.success(), "{}", stderr(&o));
+    let out = String::from_utf8(o.stdout).unwrap();
+    let key = out
+        .lines()
+        .map(str::trim)
+        .find(|l| l.starts_with("qvx_"))
+        .unwrap()
+        .to_owned();
+    let table = &out[out.find("[[serve.client_keys]]").unwrap()..];
+    assert!(!table.contains(&key), "only the hash goes in the file");
+
+    let mut hash = Command::new(env!("CARGO_BIN_EXE_qubivex"))
+        .args(["keys", "hash"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    writeln!(hash.stdin.take().unwrap(), "{key}").unwrap();
+    let hashed = hash.wait_with_output().unwrap();
+    assert!(hashed.status.success());
+    let hashed = String::from_utf8(hashed.stdout).unwrap();
+    assert!(table.contains(hashed.trim()), "{table} / {hashed}");
+
+    let f = scratch("client-keys.toml");
+    fs::write(&f, format!("[serve]\nmodels = [\"olmoe-tiny\"]\n{table}")).unwrap();
+    fs::set_permissions(&f, fs::Permissions::from_mode(0o600)).unwrap();
+    let models = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/models");
+    let mut child = Command::new(env!("CARGO_BIN_EXE_qubivex"))
+        .args(["serve", "--listen", "127.0.0.1:0", "--config"])
+        .arg(&f)
+        .arg("--dir")
+        .arg(&models)
+        .env_remove("QUBIVEX_API_KEY")
+        .env_remove("QUBIVEX_ADMIN_TOKEN")
+        .env_remove("QUBIVEX_CONFIG")
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut err = BufReader::new(child.stderr.take().unwrap());
+    let mut seen = String::new();
+    let addr = loop {
+        let mut line = String::new();
+        if err.read_line(&mut line).unwrap() == 0 {
+            let _ = child.kill();
+            panic!("the server ended before listening: {seen}");
+        }
+        seen.push_str(&line);
+        if let Some(rest) = line.split("http://").nth(1) {
+            break rest.split_whitespace().next().unwrap().to_owned();
+        }
+    };
+    let status = |auth: Option<&str>| {
+        let mut s = std::net::TcpStream::connect(&addr).unwrap();
+        let header = auth.map_or(String::new(), |k| format!("authorization: Bearer {k}\r\n"));
+        write!(
+            s,
+            "GET /v1/models HTTP/1.1\r\nhost: {addr}\r\n{header}connection: close\r\n\r\n"
+        )
+        .unwrap();
+        let mut r = String::new();
+        s.read_to_string(&mut r).unwrap();
+        r.split(' ').nth(1).unwrap().to_owned()
+    };
+    let with_key = status(Some(&key));
+    let wrong = status(Some("qvx_wrong"));
+    let none = status(None);
+    let _ = child.kill();
+    let _ = child.wait();
+    assert_eq!(
+        (with_key.as_str(), wrong.as_str(), none.as_str()),
+        ("200", "401", "401"),
+        "{seen}"
+    );
+}

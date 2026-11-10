@@ -198,7 +198,8 @@ counts addresses, so behind a proxy every client shares one allowance.
     and a client can still keep its own users apart. Unnamed requests (shared key or no
     key) keep `user` as their scope, now in a separate namespace, so no `user` value can
     name a client's scope.
-  - Request log lines gain `client`.
+  - The `generation_started` log line gains `client` (the name, never the key or its
+    hash).
 - **Rate limit by key.** The limiter counts a named key's requests under that key, with
   the key's own `rate_limit` if it has one, else the server's. Other requests still count
   by address. An invalid bearer counts by address, so made-up keys cannot buy

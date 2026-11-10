@@ -73,10 +73,12 @@ fn digest(key: &str) -> [u8; 32] {
 #[must_use]
 pub fn hash_key(key: &str) -> String {
     use std::fmt::Write;
-    digest(key).iter().fold(String::with_capacity(64), |mut s, b| {
-        let _ = write!(s, "{b:02x}");
-        s
-    })
+    digest(key)
+        .iter()
+        .fold(String::with_capacity(64), |mut s, b| {
+            let _ = write!(s, "{b:02x}");
+            s
+        })
 }
 
 /// Whose key `bearer` is: an index into `keys`. Every digest is compared in full, in
@@ -195,7 +197,13 @@ mod tests {
             ClientKey::from_hex("c", &h.to_uppercase(), None).unwrap(),
             ClientKey::new("c", "x", None)
         );
-        for bad in ["", "ab", &h[..63], &format!("{}zz", &h[..62]), "é".repeat(32).as_str()] {
+        for bad in [
+            "",
+            "ab",
+            &h[..63],
+            &format!("{}zz", &h[..62]),
+            "é".repeat(32).as_str(),
+        ] {
             assert!(ClientKey::from_hex("c", bad, None).is_err(), "{bad:?}");
         }
     }
@@ -204,22 +212,34 @@ mod tests {
     fn names_limits_and_duplicates_are_validated() {
         assert!(validate(&[ClientKey::new("app-1.prod_x", "k", None)]).is_ok());
         for name in ["", "has space", "a/b", "line\nbreak", &"x".repeat(65)] {
-            assert!(validate(&[ClientKey::new(name, "k", None)]).is_err(), "{name:?}");
+            assert!(
+                validate(&[ClientKey::new(name, "k", None)]).is_err(),
+                "{name:?}"
+            );
         }
         let zero = Some(RateLimit {
             per_minute: 0,
             burst: 1,
         });
         assert!(validate(&[ClientKey::new("a", "k", zero)]).is_err());
-        let same_name = [ClientKey::new("a", "k1", None), ClientKey::new("a", "k2", None)];
+        let same_name = [
+            ClientKey::new("a", "k1", None),
+            ClientKey::new("a", "k2", None),
+        ];
         assert!(validate(&same_name).unwrap_err().contains("twice"));
-        let same_key = [ClientKey::new("a", "k", None), ClientKey::new("b", "k", None)];
+        let same_key = [
+            ClientKey::new("a", "k", None),
+            ClientKey::new("b", "k", None),
+        ];
         assert!(validate(&same_key).unwrap_err().contains("same key"));
     }
 
     #[test]
     fn named_clients_own_their_scope_and_fairness() {
-        let keys = vec![ClientKey::new("a", "ka", None), ClientKey::new("b", "kb", None)];
+        let keys = vec![
+            ClientKey::new("a", "ka", None),
+            ClientKey::new("b", "kb", None),
+        ];
         let (fa, sa) = identity(&keys, Caller::Client(0), Some("u1"));
         let (fa2, sa2) = identity(&keys, Caller::Client(0), Some("u2"));
         // Fairness ignores `user`; the scope keeps users apart.

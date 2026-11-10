@@ -363,8 +363,8 @@ r = client.chat.completions.create(model="qwen3-0.6b",
 | Option | Default | |
 |---|---|---|
 | `--config FILE` | `$QUBIVEX_CONFIG` | A TOML file with a `[serve]` table of these settings (below) |
-| `--listen ADDR` | `127.0.0.1:8080` | Anything but loopback is refused without `--api-key` or `--allow-unauthenticated` |
-| `--api-key KEY` | `$QUBIVEX_API_KEY` | Required as a bearer token on `/v1` when set |
+| `--listen ADDR` | `127.0.0.1:8080` | Anything but loopback is refused without an API key (`--api-key` or named keys) or `--allow-unauthenticated` |
+| `--api-key KEY` | `$QUBIVEX_API_KEY` | A key shared by every client, required as a bearer token on `/v1` when set. Named keys (below) tell clients apart |
 | `--admin-token T` | `$QUBIVEX_ADMIN_TOKEN` | Enables the admin endpoints |
 | `--allow-unauthenticated` | off | Serve beyond loopback with no API key |
 | `--rate-limit N` | unlimited | Requests per minute each client address may make to `/v1`; more get a 429 with `retry-after`. `/health` and `/metrics` are never limited |
@@ -439,7 +439,7 @@ Settings come from, highest first: a flag, its environment variable, the config 
 the default. In the file each key is the flag's name with `_` for `-`, and the repeatable
 flags are lists named `models`, `dirs` and `cors_origins`; flags given on the command line
 replace the file's list. Unknown keys are errors, everything is checked before a model
-loads, and a file holding `api_key` or `admin_token` must not be readable by other users
+loads, and a file holding `api_key`, `admin_token` or `client_keys` must not be readable by other users
 (`chmod 600`).
 
 ```toml
@@ -454,7 +454,22 @@ queue_timeout = 30
 ```
 
 The rate limit counts by peer address (an IPv6 client by its /64), so behind a reverse
-proxy every client shares one allowance: limit at the proxy there instead.
+proxy every client shares one allowance, unless clients have named keys.
+
+**Named keys** give each client its own key (ADR-013 amendment 7). `qubivex keys new
+CLIENT [--rate-limit N]` prints a key once, and a table to add to the config file; the
+server keeps only the key's SHA-256. A request with a named key is rate-limited under that
+key (its own `rate_limit`, else the server's), counts as that client for fairness whatever
+`user` it sends, and never shares retained KV with another client. The log's
+`generation_started` line names the client. `qubivex keys hash` hashes a key made
+elsewhere, read from standard input. Keys change with a restart.
+
+```toml
+[[serve.client_keys]]
+client = "billing-app"
+key_sha256 = "…"   # from qubivex keys new
+rate_limit = 600   # optional, with rate_limit_burst
+```
 
 With `--prefix-cache-mb`, a finished conversation's KV is kept, and the next request from
 the same `user` that starts with the same tokens copies it instead of running them again. On

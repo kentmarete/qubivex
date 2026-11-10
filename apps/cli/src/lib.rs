@@ -7,6 +7,7 @@
 mod analyse;
 mod bench;
 mod doctor;
+mod keys;
 mod models;
 mod plan;
 mod pull;
@@ -246,6 +247,31 @@ enum Command {
         #[command(subcommand)]
         command: ModelsCommand,
     },
+    /// Make named API keys for `serve`: each key belongs to a client, which then has its
+    /// own rate limit and prefix cache.
+    Keys {
+        #[command(subcommand)]
+        command: KeysCommand,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum KeysCommand {
+    /// Print a new key for CLIENT once, and the [[serve.client_keys]] table holding its
+    /// hash for the serve config file.
+    New {
+        /// The client's name: letters, digits, '.', '_' or '-' (shown in the log).
+        client: String,
+        /// Requests per minute this client may make (default: the server's --rate-limit).
+        #[arg(long)]
+        rate_limit: Option<u32>,
+        /// Requests this client may make at once after being idle (default: its
+        /// --rate-limit).
+        #[arg(long)]
+        rate_limit_burst: Option<u32>,
+    },
+    /// Print the SHA-256 of a key read from standard input, for key_sha256.
+    Hash,
 }
 
 #[derive(Debug, Subcommand)]
@@ -1027,6 +1053,14 @@ fn execute(cmd: &Command) -> Result<(), String> {
             })?,
             ModelsCommand::Remove { model, dirs, yes } => models::remove(model, dirs, *yes)?,
             ModelsCommand::Architectures => models::architectures(),
+        }),
+        Command::Keys { command } => emit(&match command {
+            KeysCommand::New {
+                client,
+                rate_limit,
+                rate_limit_burst,
+            } => keys::new(client, *rate_limit, *rate_limit_burst)?,
+            KeysCommand::Hash => keys::hash()?,
         }),
     }
 }

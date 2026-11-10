@@ -84,6 +84,11 @@ EOF
 TOML file instead, the file must be `chmod 600` and owned by the `qubivex` user, or the
 server refuses to start.
 
+To tell clients apart, give each a named key instead of sharing one: `qubivex keys new
+CLIENT` prints the key once and a `[[serve.client_keys]]` table for the TOML file (the same
+`chmod 600` rule applies). Each client then has its own rate limit, fairness and prefix
+cache, also behind a proxy. See the README's `qubivex serve` section.
+
 ### The unit
 
 `/etc/systemd/system/qubivex.service`:
