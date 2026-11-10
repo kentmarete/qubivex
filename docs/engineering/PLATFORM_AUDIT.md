@@ -91,8 +91,8 @@ applies only to what remains.
 | Request limits | Production (job 9) | Body bytes (413), prompt tokens after the template and `max_tokens` (400), all configurable |
 | CORS | Production (job 9) | Configured origins or `*`; preflights answered, other origins refused; no credentials |
 | Graceful shutdown | Production | Waiters end at once, running requests get `--shutdown-grace`, then stop with an error. Tested over HTTP |
-| Metrics | Partial | Requests, tokens, active, cancelled, failed, KV, cache bytes, slots, queue depth, rejections. No TTFT, tokens/s, latency histograms, hit rate, evictions or disk throughput |
-| Structured logs | **Missing** | `eprintln!` with a request id. No model or sequence ids, levels or format |
+| Metrics | Production (job 10) | The §8 list on `/metrics`: histograms per model for time to first token, latency, scheduler wait, inter-token gap, prompt and generation tokens/s and load time; expert cache hits, loads, evictions, bytes read and load wait; ledger and process memory; queue, slots, rejections, cancellations. Not measured: peak VRAM, fragmentation |
+| Structured logs | Production (job 10) | Text or JSON lines (`--log-format`) with levels and request, model and sequence ids; no prompt or generated text, tested over HTTP |
 | Config files | Production (job 9) | `serve --config` TOML `[serve]` table; flag > environment > file > default; unknown keys refused; a file holding secrets must be private |
 
 ### CLI
@@ -188,7 +188,7 @@ Owner rules for this plan (2026-11-06):
 | 7 | Batching design (**done**) | S8 | 5 (gate), 6 | ADR with a measured prototype |
 | 8 | Batching, stages 2 and 3 (**done**) | S8 | 7 | A 2-to-5-row CPU kernel first (ADR-017 measurements); then sequences share a pass; tokens bit-identical; measured on power |
 | 9 | Hardening (**done**) | S10 | 5 | Rate limits, request limits, CORS, non-localhost refusal, config files |
-| 10 | Observability | S10 | 5 | The §8 metrics; structured logs with no prompt text |
+| 10 | Observability (**done**) | S10 | 5 | The §8 metrics; structured logs with no prompt text |
 | 11 | Deployment | S10 | 9, 10 | Docker, runbooks, the §14 docs |
 | Blocked | CUDA | S9 | B2 | Needs NVIDIA hardware; abstraction only until then |
 | Later | Vulkan | S9 | | Spec says "where practical" |

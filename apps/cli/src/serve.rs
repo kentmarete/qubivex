@@ -10,7 +10,7 @@ use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use qubivex_api::{Gateway, MemoryPolicy, RateLimit, ServerConfig};
+use qubivex_api::{Gateway, LogFormat, MemoryPolicy, RateLimit, ServerConfig};
 use qubivex_model::{ArchitectureRegistry, find};
 use qubivex_runtime::Engine;
 use serde::Deserialize;
@@ -127,6 +127,13 @@ pub(crate) struct ServeFlags {
     /// Compute threads (default: the CPU's performance cores).
     #[arg(long)]
     threads: Option<usize>,
+    /// How the server logs to standard error: text, json (one object per line) or off
+    /// (default: text). No format logs prompts or generated text.
+    #[arg(long)]
+    log_format: Option<String>,
+    /// Do not serve GET /metrics.
+    #[arg(long)]
+    no_metrics: bool,
 }
 
 /// The config file. Unknown keys are errors, so a misspelt setting is not ignored.
@@ -171,6 +178,8 @@ struct FileServe {
     metal_ops: Option<String>,
     context: Option<usize>,
     threads: Option<usize>,
+    log_format: Option<String>,
+    no_metrics: Option<bool>,
 }
 
 /// Refuses a config file holding a secret that other users can read (Unix).
@@ -211,6 +220,10 @@ fn memory_policy(s: &str) -> Result<MemoryPolicy, String> {
         "refuse" => Ok(MemoryPolicy::Refuse),
         _ => Err(format!("memory_policy takes queue or refuse, not {s:?}")),
     }
+}
+
+fn log_format(s: &str) -> Result<LogFormat, String> {
+    LogFormat::parse(s).ok_or_else(|| format!("log_format takes text, json or off, not {s:?}"))
 }
 
 /// Everything `serve` needs, with flags, environment, file and defaults merged.
@@ -313,6 +326,12 @@ impl ServeFlags {
                 .unwrap_or(d.default_max_tokens),
             model_dirs: dirs,
             engine,
+            log_format: self
+                .log_format
+                .or(file.log_format)
+                .as_deref()
+                .map_or(Ok(d.log_format), log_format)?,
+            metrics_enabled: !(self.no_metrics || file.no_metrics.unwrap_or(false)),
             ..d
         };
         cfg.validate()?;
@@ -344,20 +363,25 @@ pub(crate) fn serve(p: Plan) -> Result<(), String> {
     let dirs = cfg.model_dirs.clone();
     let opts = cfg.engine;
     let open = cfg.api_key.is_none() && !addr.ip().is_loopback();
+    // The human-readable lines below belong to the text log; in the other formats the
+    // gateway's own events say the same (`model_added`, `server_started`, ...).
+    let text = cfg.log_format == LogFormat::Text;
     let gw = Gateway::new(cfg);
     let reg = ArchitectureRegistry::with_builtins();
     for m in &models {
         let meta = find(m, &dirs, &reg).map_err(|e| chain(&e))?;
         let id = meta.manifest.model.id.clone();
         let engine = Engine::load(meta, opts).map_err(|e| chain(&e))?;
-        eprintln!(
-            "qubivex: loaded {id} ({}; context {})",
-            engine.metadata().manifest.architecture.id,
-            engine.max_context()
-        );
+        if text {
+            eprintln!(
+                "qubivex: loaded {id} ({}; context {})",
+                engine.metadata().manifest.architecture.id,
+                engine.max_context()
+            );
+        }
         gw.add_model(&id, engine).map_err(|e| e.message)?;
     }
-    if open {
+    if open && text {
         eprintln!(
             "qubivex: warning: serving on {addr} without an API key, as allowed; anyone who can reach it can use it"
         );
@@ -373,13 +397,17 @@ pub(crate) fn serve(p: Plan) -> Result<(), String> {
             .await
             .map_err(|e| format!("cannot listen on {addr}: {e}"))?;
         let local = listener.local_addr().map_err(|e| e.to_string())?;
-        eprintln!(
-            "qubivex: serving {:?} on http://{local} (OpenAI API under /v1)",
-            gw.model_ids()
-        );
-        gw.serve(listener, async {
+        if text {
+            eprintln!(
+                "qubivex: serving {:?} on http://{local} (OpenAI API under /v1)",
+                gw.model_ids()
+            );
+        }
+        gw.serve(listener, async move {
             let _ = tokio::signal::ctrl_c().await;
-            eprintln!("qubivex: shutting down; letting open requests finish");
+            if text {
+                eprintln!("qubivex: shutting down; letting open requests finish");
+            }
         })
         .await
         .map_err(|e| format!("server error: {e}"))
@@ -393,7 +421,7 @@ mod tests {
     use std::time::Duration;
 
     use clap::Parser;
-    use qubivex_api::{MemoryPolicy, RateLimit};
+    use qubivex_api::{LogFormat, MemoryPolicy, RateLimit};
 
     use super::{ConfigFile, FileServe, ServeFlags};
 
@@ -460,6 +488,28 @@ mod tests {
         assert_eq!(p.cfg.max_prompt_tokens, Some(1000));
         assert_eq!(p.cfg.stall_timeout, Duration::from_secs(30), "the default");
         assert_eq!(p.cfg.default_max_tokens, 512, "the default");
+        assert_eq!(p.cfg.log_format, LogFormat::Text, "the default");
+        assert!(p.cfg.metrics_enabled, "the default");
+    }
+
+    #[test]
+    fn the_log_format_and_metrics_follow_the_same_precedence() {
+        let f = || file("[serve]\nlog_format = \"json\"\nno_metrics = true\n");
+        let p = flags(&["--model", "m"]).plan(f()).unwrap();
+        assert_eq!(p.cfg.log_format, LogFormat::Json, "the file");
+        assert!(!p.cfg.metrics_enabled, "the file");
+        let p = flags(&["--model", "m", "--log-format", "off"])
+            .plan(f())
+            .unwrap();
+        assert_eq!(p.cfg.log_format, LogFormat::Off, "the flag");
+        let p = flags(&["--model", "m", "--no-metrics"])
+            .plan(FileServe::default())
+            .unwrap();
+        assert!(!p.cfg.metrics_enabled);
+        assert_eq!(
+            p.cfg.prefill_chunk, 256,
+            "untouched settings keep their defaults"
+        );
     }
 
     #[test]
@@ -506,6 +556,10 @@ mod tests {
             .plan(FileServe::default())
             .unwrap_err();
         assert!(e.contains("memory_policy"), "{e}");
+        let e = flags(&["--model", "m", "--log-format", "xml"])
+            .plan(FileServe::default())
+            .unwrap_err();
+        assert!(e.contains("log_format"), "{e}");
         let e = flags(&[]).plan(FileServe::default()).unwrap_err();
         assert!(e.contains("no model"), "{e}");
     }
