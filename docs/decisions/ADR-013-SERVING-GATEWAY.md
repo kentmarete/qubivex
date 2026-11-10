@@ -181,7 +181,9 @@ and structured logs with request, model and sequence ids and no private text.
 - **Not built:** published images or packages, a system-wide launchd daemon, and
   Kubernetes manifests. `docs/deployment/` says so.
 
-## Amendment 7 (2026-11-10): per-client API keys (Proposed)
+## Amendment 7 (2026-11-10): per-client API keys
+
+Accepted by the owner on 2026-11-11.
 Amendment 3 left two gaps, both because one key serves every client: `user`, which
 scopes the prefix cache and fairness, comes from the client unchecked, and the rate limit
 counts addresses, so behind a proxy every client shares one allowance.
