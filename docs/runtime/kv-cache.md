@@ -105,9 +105,11 @@ one scope.
 
 - Chat clients should send a stable `user` per end user, to get reuse and stay apart
   from others.
-- `user` is whatever the client sends. A client that sends another's `user` reaches
-  that scope. Among callers holding the same API key that is the current trust model.
-  **If you cannot trust clients to send their own `user`, leave the prefix cache off.**
+- With a named key (`qubivex keys new`), the scope is the key's client plus `user`, so
+  clients never reach each other's KV, whatever `user` they send.
+- Without one, `user` is whatever the client sends. A client that sends another's `user`
+  reaches that scope. **Give clients you cannot trust their own named keys, or leave the
+  prefix cache off.**
 
 ### Observing it
 
@@ -132,6 +134,5 @@ unaffected.
 - **Reuse of anything but a prefix:** no reuse of a matching middle or suffix.
 - **KV on disk,** and KV that survives a restart or moves between servers.
 - **Reduced-precision KV** (`f16` or quantised).
-- **Per-API-key scopes.** There is one key, so the scope is the `user` field.
 - **Sliding the context.** When the context is full the generation ends with
   `finish_reason: "length"`; old tokens are not dropped to make room.

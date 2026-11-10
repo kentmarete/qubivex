@@ -372,15 +372,17 @@ the balancer, stop it, start the new version, wait for `/health`, put it back.
 
 ## Known limits
 
-- **One API key.** Every client holds the same key. The `user` field is whatever the
-  client sends, so fairness and prefix-cache separation hold only among clients that do
-  not lie about it. `priority: "high"` is open to anyone with the key.
-- **No per-key rate limits or quotas.** The rate limit counts peer addresses.
+- **Clients without a named key are told apart only by `user`.** With the shared key or
+  none, `user` is whatever the client sends, so fairness and prefix-cache separation hold
+  only among clients that do not lie about it. Give each client a named key (`qubivex keys
+  new`) to tie them to the key. `priority: "high"` is open to anyone with a key.
+- **Rate limits count requests, not tokens.** Named keys have their own allowance; there
+  are no token quotas.
 - **Models share nothing and arbitrate nothing.** Two loaded models can together exceed
   what either planned for.
 - **Cancellation lands between tokens or prefill chunks,** not inside a forward pass.
 - **No tracing.** There are metrics and logs, and no OpenTelemetry export.
 - **Not measured:** peak GPU memory and memory fragmentation. On macOS the peak resident
   size is the highest value a scrape has read.
-- **No hot reload of settings.** Changing any flag, including the API key, needs a
+- **No hot reload of settings.** Changing any flag, an API key, or a named key needs a
   restart.

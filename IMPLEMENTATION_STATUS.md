@@ -1,8 +1,16 @@
 # QUBIVEX Implementation Status
 
-Last updated: 2026-11-10
+Last updated: 2026-11-11
 
 ## Current phase
+**Per-client API keys done (2026-11-10; ADR-013 amendment 7, accepted 2026-11-11).** Closes job 9's two gaps: `user` was unauthenticated, and behind a proxy every client shared one rate limit.
+- Named keys: `ServerConfig::client_keys` (`ClientKey { client, key_sha256, rate_limit }`), from `[[serve.client_keys]]` tables in the config file only (`chmod 600`), never flags or environment. Only the SHA-256 is stored; a bearer is hashed once and compared with every digest in constant time. The shared `api_key` still works alongside them; either counts as a key for the loopback check.
+- A named key makes the request its client's: the rate limit counts that key (its own `rate_limit`, else the server's); fairness counts the client whatever `user` says; the prefix-cache scope is the client plus `user`, and unnamed scopes are in a separate namespace, so no `user` value reaches a client's KV. A bearer that is no key counts against its address. `generation_started` logs `client`.
+- CLI: `qubivex keys new CLIENT [--rate-limit N] [--rate-limit-burst N]` prints a `qvx_` key (32 bytes from `/dev/urandom`) once and the table to paste; `qubivex keys hash` hashes a key from standard input. `sha2` joins `qubivex-api` (already in the workspace for downloads).
+- Tests: 4 over HTTP in `tests/client_keys.rs` (auth, separate allowances from one address, no KV reuse across clients whatever `user`, log names the client and never the key), 4 unit tests in `keys.rs`, 2 in the CLI, 1 config test, and one through the binary (`keys new`, config, `serve`, 200/401/401). Reverting the scope to `user` alone fails the KV test.
+- Not built: reloading keys without a restart, per-client model access, token quotas, a cap on `priority: "high"` per client, per-client metrics labels.
+- **Next:** open items: per-client quotas and priority caps (not started), CUDA (blocked on NVIDIA hardware), Vulkan, real-model metrics measurement (needs mains power).
+
 **Deployment done (2026-11-10; job 11, ADR-013 amendment 6).** The last job of the platform plan (`PLATFORM_AUDIT` §4): Docker, runbooks and the spec §14 documents.
 - `qubivex serve` now drains on SIGTERM as it does on Ctrl-C. Before, `docker stop` and systemd ended it mid-request (as process 1 in a container the signal was ignored until Docker killed it at 10 s). A test sends SIGTERM to the real binary and expects status 0.
 - `Dockerfile` and `.dockerignore`: `rust:1.88-bookworm` builds, `debian:bookworm-slim` runs, as uid 10001, with the fixture models under `/usr/share/qubivex/models`, `/models` as the volume, and a `HEALTHCHECK` on `/health` that needs no curl. The image is 156 MB on arm64. Its default command listens on `0.0.0.0`, so it refuses to start without `QUBIVEX_API_KEY` or `--allow-unauthenticated`.

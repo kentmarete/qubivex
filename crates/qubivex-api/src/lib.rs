@@ -22,9 +22,12 @@
 //!
 //! Spec §11: an optional per-client rate limit, limits on the body, the prompt and
 //! `max_tokens`, CORS for configured origins, and no listening beyond loopback without
-//! an API key unless that is asked for explicitly.
+//! an API key unless that is asked for explicitly. Named keys ([`ClientKey`]) tell
+//! clients apart: a named client's requests are rate-limited, scheduled fairly and
+//! scoped in the prefix cache as that client, whatever `user` they send.
 
 mod error;
+mod keys;
 mod limits;
 mod log;
 mod metrics;
@@ -50,6 +53,7 @@ use kerniq_server::axum::response::{IntoResponse, Response};
 use kerniq_server::axum::{Json, Router};
 use kerniq_server::config::ServerConfig as ServeConfig;
 use kerniq_server::routing::Router as Routes;
+pub use keys::{ClientKey, hash_key};
 pub use limits::RateLimit;
 pub use log::LogFormat;
 pub use metrics::Metrics;
@@ -60,6 +64,7 @@ use serde_json::{Value, json};
 use tokio::sync::{mpsc, oneshot, watch};
 use tokio_stream::wrappers::ReceiverStream;
 
+use crate::keys::Caller;
 use crate::limits::RateLimiter;
 use crate::log::{Log, millis};
 use crate::models::Entry;
@@ -73,14 +78,19 @@ const STOP_MARGIN: Duration = Duration::from_secs(5);
 /// Server settings.
 #[derive(Clone, Debug)]
 pub struct ServerConfig {
-    /// Required as `Authorization: Bearer <key>` on `/v1/*` when set.
+    /// A key shared by every client, accepted as `Authorization: Bearer <key>` on
+    /// `/v1/*`. With it or [`client_keys`](Self::client_keys) set, `/v1/*` needs one of
+    /// them.
     pub api_key: Option<String>,
+    /// Named keys, one per client (ADR-013 amendment 7).
+    pub client_keys: Vec<ClientKey>,
     /// Required on the admin endpoints, which are disabled without it.
     pub admin_token: Option<String>,
     /// Serve beyond loopback without `api_key`. Off: [`Gateway::serve`] refuses such a
     /// listener ([`ServerConfig::check_listen`]).
     pub allow_unauthenticated_remote: bool,
-    /// Requests per client (by peer address) on `/v1/*`. `None`: unlimited.
+    /// Requests per client on `/v1/*`: per named key, else per peer address. A named key
+    /// may set its own. `None`: unlimited.
     pub rate_limit: Option<RateLimit>,
     /// Origins browsers may call the API from (`scheme://host[:port]`, or `*`). Empty:
     /// no CORS headers.
@@ -129,6 +139,7 @@ impl Default for ServerConfig {
     fn default() -> Self {
         Self {
             api_key: None,
+            client_keys: Vec::new(),
             admin_token: None,
             allow_unauthenticated_remote: false,
             rate_limit: None,
@@ -196,7 +207,7 @@ fn same_secret(a: &str, b: &str) -> bool {
     a.len() == b.len() && a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
 }
 
-fn bearer(headers: &HeaderMap) -> Option<&str> {
+pub(crate) fn bearer(headers: &HeaderMap) -> Option<&str> {
     headers
         .get("authorization")?
         .to_str()
@@ -223,7 +234,10 @@ impl Gateway {
     fn with(cfg: ServerConfig, log: Log) -> Self {
         Self {
             state: Arc::new(AppState {
-                limiter: cfg.rate_limit.map(RateLimiter::new),
+                limiter: RateLimiter::with_keys(
+                    cfg.rate_limit,
+                    cfg.client_keys.iter().map(|k| k.rate_limit).collect(),
+                ),
                 cfg,
                 models: RwLock::new(BTreeMap::new()),
                 unloaded: Mutex::new(Vec::new()),
@@ -338,7 +352,7 @@ impl Gateway {
             .check_listen(listener.local_addr()?)
             .map_err(refuse)?;
         let grace = st.cfg.shutdown_grace;
-        if st.cfg.api_key.is_none() && !listener.local_addr()?.ip().is_loopback() {
+        if !st.cfg.needs_key() && !listener.local_addr()?.ip().is_loopback() {
             st.log.warn(
                 "serving_without_api_key",
                 &[("listen", listener.local_addr()?.to_string().into())],
@@ -412,13 +426,32 @@ impl AppState {
         }
     }
 
-    fn check_key(&self, headers: &HeaderMap) -> Result<(), ApiError> {
-        match &self.cfg.api_key {
-            Some(k) if !bearer(headers).is_some_and(|b| same_secret(b, k)) => {
-                Err(ApiError::unauthorized())
-            }
-            _ => Ok(()),
+    /// Checks the request's key, and says whose it is.
+    fn check_key(&self, headers: &HeaderMap) -> Result<Caller, ApiError> {
+        let given = bearer(headers);
+        if let Some(i) = keys::identify(&self.cfg.client_keys, given) {
+            return Ok(Caller::Client(i));
         }
+        let shared = self
+            .cfg
+            .api_key
+            .as_deref()
+            .is_some_and(|k| given.is_some_and(|b| same_secret(b, k)));
+        if self.cfg.needs_key() && !shared {
+            return Err(ApiError::unauthorized());
+        }
+        Ok(Caller::Unnamed)
+    }
+
+    /// Sets who `params` counts as, from the caller and its `user`.
+    fn identify(&self, caller: Caller, params: &mut Params) {
+        let (client, scope) = keys::identity(&self.cfg.client_keys, caller, params.user.as_deref());
+        params.client = client;
+        params.cache_scope = scope;
+        params.client_name = match caller {
+            Caller::Client(i) => Some(self.cfg.client_keys[i].client.clone()),
+            Caller::Unnamed => None,
+        };
     }
 
     fn check_admin(&self, headers: &HeaderMap) -> Result<(), ApiError> {
@@ -649,7 +682,7 @@ fn model_card(id: &str, created: u64) -> Value {
 async fn list_models(State(st): State<Arc<AppState>>, headers: HeaderMap) -> Response {
     let began = Instant::now();
     let rid = st.request_id(&headers);
-    let r = st.check_key(&headers).map(|()| {
+    let r = st.check_key(&headers).map(|_| {
         let data: Vec<Value> = st
             .ready()
             .iter()
@@ -669,7 +702,7 @@ async fn get_model(
     let rid = st.request_id(&headers);
     let r = st
         .check_key(&headers)
-        .and_then(|()| st.model(&id))
+        .and_then(|_| st.model(&id))
         .map(|l| Json(model_card(&id, l.created)).into_response());
     st.finish("models", &rid, began, r)
 }
@@ -699,11 +732,12 @@ async fn chat(
     let began = Instant::now();
     let rid = st.request_id(&headers);
     let r = async {
-        st.check_key(&headers)?;
+        let caller = st.check_key(&headers)?;
         let req = json_body(&st, body)?;
         let messages = req.messages()?;
         let max = req.max_completion_tokens.or(req.common.max_tokens);
-        let params = req.common.params(max)?;
+        let mut params = req.common.params(max)?;
+        st.identify(caller, &mut params);
         generate(
             &st,
             &rid,
@@ -726,11 +760,12 @@ async fn completions(
     let began = Instant::now();
     let rid = st.request_id(&headers);
     let r = async {
-        st.check_key(&headers)?;
+        let caller = st.check_key(&headers)?;
         let req = json_body(&st, body)?;
         let prompt = req.prompt()?;
         let max = req.common.max_tokens;
-        let params = req.common.params(max)?;
+        let mut params = req.common.params(max)?;
+        st.identify(caller, &mut params);
         generate(
             &st,
             &rid,
@@ -830,17 +865,18 @@ async fn generate(
     let waited = now - arrived;
     timings.queue_wait.observe_duration(waited);
     let sequence = st.next_sequence.fetch_add(1, Ordering::Relaxed);
-    st.log.info(
-        "generation_started",
-        &[
-            ("request_id", rid.into()),
-            ("model", model.into()),
-            ("sequence_id", sequence.into()),
-            ("prompt_tokens", prepared.prompt_tokens().into()),
-            ("stream", params.stream.into()),
-            ("queue_ms", millis(waited)),
-        ],
-    );
+    let mut fields = vec![
+        ("request_id", rid.into()),
+        ("model", model.into()),
+        ("sequence_id", sequence.into()),
+        ("prompt_tokens", prepared.prompt_tokens().into()),
+        ("stream", params.stream.into()),
+        ("queue_ms", millis(waited)),
+    ];
+    if let Some(c) = &params.client_name {
+        fields.push(("client", c.as_str().into()));
+    }
+    st.log.info("generation_started", &fields);
     let run_limit = now + st.cfg.request_timeout;
     request.deadline = Some(limit.map_or(run_limit, |l| l.min(run_limit)));
     let cancel = Arc::new(AtomicBool::new(false));

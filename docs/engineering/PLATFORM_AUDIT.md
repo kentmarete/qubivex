@@ -83,10 +83,10 @@ applies only to what remains.
 | Load dedup | Production | Concurrent loads join one load; one directory, one instance (ADR-015) |
 | Safe unload | Production | `Arc` holds the model for running requests; the queue closes at once; tested with a live stream |
 | Queue | Production | `qubivex-scheduler`: bounded by count, refused at once past the limit |
-| Priorities, deadlines, per-client fairness | Production | `priority` and `timeout` request fields, aging, fewest-running-first by `user`. `user` is not authenticated (job 9) |
+| Priorities, deadlines, per-client fairness | Production | `priority` and `timeout` request fields, aging, fewest-running-first by `user`, or by the named key's client. Without a named key `user` is not authenticated |
 | Memory admission | Production | Against the plan through the scheduler; queues or refuses by `--memory-policy` |
 | Batching | **Missing** | See §3 |
-| Auth | Partial | Optional API key and admin token, constant-time. Job 9: no key refuses a listener beyond loopback unless allowed explicitly (before, it only warned). One key for every client; no per-client keys |
+| Auth | Partial | Optional API key and admin token, constant-time. Job 9: no key refuses a listener beyond loopback unless allowed explicitly (before, it only warned). Named per-client keys (ADR-013 amendment 7): hashed, with their own rate limit, fairness and prefix-cache scope |
 | Rate limiting | Production (job 9) | Token bucket per peer address on `/v1`, 429 with `retry-after`; health and metrics exempt; bounded client table |
 | Request limits | Production (job 9) | Body bytes (413), prompt tokens after the template and `max_tokens` (400), all configurable |
 | CORS | Production (job 9) | Configured origins or `*`; preflights answered, other origins refused; no credentials |
