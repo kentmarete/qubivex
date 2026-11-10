@@ -1,7 +1,7 @@
 [workspace]
 resolver = "3"
-members = ["crates/qubivex-core", "crates/qubivex-hardware", "crates/qubivex-model", "crates/qubivex-model-registry", "crates/qubivex-model-download", "crates/qubivex-compute", "crates/qubivex-backend-cpu", "crates/qubivex-tokenizer", "crates/qubivex-scheduler", "crates/qubivex-kv-cache", "crates/qubivex-runtime", "crates/qubivex-expert-stream", "crates/qubivex-arch", "crates/qubivex-memory", "crates/qubivex-backend-metal", "crates/qubivex-api", "apps/cli", "xtask"]
-default-members = ["crates/qubivex-core", "crates/qubivex-hardware", "crates/qubivex-model", "crates/qubivex-model-registry", "crates/qubivex-model-download", "crates/qubivex-compute", "crates/qubivex-backend-cpu", "crates/qubivex-tokenizer", "crates/qubivex-scheduler", "crates/qubivex-kv-cache", "crates/qubivex-runtime", "crates/qubivex-expert-stream", "crates/qubivex-arch", "crates/qubivex-memory", "crates/qubivex-backend-metal", "crates/qubivex-api", "apps/cli", "xtask"]
+members = ["crates/qubivex-core", "crates/qubivex-hardware", "crates/qubivex-model", "crates/qubivex-model-registry", "crates/qubivex-model-download", "crates/qubivex-compute", "crates/qubivex-backend-cpu", "crates/qubivex-tokenizer", "crates/qubivex-scheduler", "crates/qubivex-kv-cache", "crates/qubivex-runtime", "crates/qubivex-expert-stream", "crates/qubivex-arch", "crates/qubivex-memory", "crates/qubivex-backend-metal", "crates/qubivex-backend-vulkan", "crates/qubivex-api", "apps/cli", "xtask"]
+default-members = ["crates/qubivex-core", "crates/qubivex-hardware", "crates/qubivex-model", "crates/qubivex-model-registry", "crates/qubivex-model-download", "crates/qubivex-compute", "crates/qubivex-backend-cpu", "crates/qubivex-tokenizer", "crates/qubivex-scheduler", "crates/qubivex-kv-cache", "crates/qubivex-runtime", "crates/qubivex-expert-stream", "crates/qubivex-arch", "crates/qubivex-memory", "crates/qubivex-backend-metal", "crates/qubivex-backend-vulkan", "crates/qubivex-api", "apps/cli", "xtask"]
 # Spikes are standalone packages with their own lock files (their dependencies are not
 # product dependencies until an ADR accepts them).
 exclude = ["spikes"]
@@ -40,6 +40,9 @@ qubivex-api = { path = "crates/qubivex-api", version = "0.1.0" }
 # Kerniq Server is a thin layer over Axum, Tower and Hyper; its `axum` re-export is
 # the gateway's Axum. Pinned exactly while the crate is new (first release 2026-11-07).
 kerniq-server = { version = "=0.1.3", default-features = false, features = ["json"] }
+# Vulkan bindings (qubivex-backend-vulkan, ADR-019). `loaded` opens the Vulkan loader at
+# run time, so building needs no Vulkan SDK and a machine without one gets an error.
+ash = { version = "0.38", default-features = false, features = ["loaded", "std"] }
 clap = { version = "4.5", features = ["derive"] }
 # Kernel benchmarks only (dev-dependency); no plotters, no HTML reports.
 criterion = { version = "0.7", default-features = false, features = ["cargo_bench_support"] }
