@@ -1,6 +1,6 @@
 # ADR-018: Discrete device memory, and a simulated device to build it on
 
-- Status: **Proposed**
+- Status: **Accepted (2026-11-11)** by owner decision
 - Date: 2026-11-11
 - Related: ADR-005 (memory planner), ADR-006 (expert store), ADR-007 (backends),
   ADR-008 (expert cache), ADR-011 (device execution and parity).

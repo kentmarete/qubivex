@@ -5,7 +5,7 @@
   §2.6 (Metal first, ADR-007 amendment), §3 (keep `MIGRATION_PLAN.md`, fold the EIP in)
   and the tensor scope (ADR-009, implemented). The ADR status changes proposed in §1
   for ADR-003, 004 and 006 were accepted on 2026-11-08; ADR-001 was accepted on 2026-11-06;
-  ADR-005, 008, 011 and 014 were accepted on 2026-11-10.
+  ADR-005, 008, 011 and 014 were accepted on 2026-11-10; ADR-018 on 2026-11-11.
 - Inputs: ADR-001 to ADR-008 (`docs/decisions/`), `QUBIVEX_DESIGN.md`,
   `MIGRATION_PLAN.md`, `IMPROVEMENTS_EVALUATION.md`, and the Engineering Improvement Plan
   (EIP).
@@ -29,7 +29,7 @@ recorded in the ADR it affects, or in a new ADR numbered from 009.
 | 008 | Expert cache: slabs, LFRU, hysteresis | Accepted (2026-11-10) | Per-layer pools, slab reuse and LFRU (amendment 1), prefetch guard (amendment 2), saturation throttle (amendment 3); pins, the persisted hot set and tier promotion not built | **Accepted**; unbuilt parts stay open |
 | 011 | Device execution, buffer lifetimes, GPU parity | Accepted (2026-11-10) | Metal built (amendments 1–6): bit-identical except f32 subnormals, whole-token pass, CPU pass below top-k or half a pool | **Accepted**; the CPU stays the default backend |
 | 014 | Model downloads and their threat review | Accepted (2026-11-10) | Built: `qubivex-model-download`, `models pull` and `search`; every threat has a test | **Accepted** |
-| 018 | Discrete device memory, simulated device | Proposed (2026-11-11) | Built: `DiscreteDevice`, `SimDevice`, VRAM planning, `--backend sim` with a device expert cache, VRAM metrics; bit-identical to the CPU on the fixtures and real OLMoE | Proposed |
+| 018 | Discrete device memory, simulated device | Accepted (2026-11-11) | Built: `DiscreteDevice`, `SimDevice`, VRAM planning, `--backend sim` with a device expert cache, VRAM metrics; bit-identical to the CPU on the fixtures and real OLMoE | **Accepted** |
 
 The EIP proposes `docs/adr/ADR-003-TENSOR-STORAGE.md` through `ADR-008-ASYNC-EXECUTION.md`.
 Those numbers are taken. **Proposal:** keep `docs/decisions/`, and map the EIP's ADRs as

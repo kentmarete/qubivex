@@ -3,7 +3,7 @@
 Last updated: 2026-11-11
 
 ## Current phase
-**Discrete device memory on a simulated GPU (2026-11-11; ADR-018, Proposed).** Groundwork for CUDA and Vulkan, built and tested without either.
+**Discrete device memory on a simulated GPU (2026-11-11; ADR-018, accepted 2026-11-11).** Groundwork for CUDA and Vulkan, built and tested without either.
 - `qubivex-compute::discrete`: a `DiscreteDevice` trait (`upload`, `matmul_many` over `DeviceWeights`, `usage`, `transfers`), an `Arc`-backed `DeviceBuffer` whose optional guard (the ledger charge) lives as long as the allocation, and `ComputeError::OutOfDeviceMemory`.
 - `qubivex-backend-cpu::sim::SimDevice`: its own allocations with a hard capacity, real copies, refusal of another device's buffers, copy time modelled from bandwidth and latency (PCIe 4.0 by default) and optionally slept. It runs the CPU kernels on its own bytes.
 - Planner: `PlanRequest::vram` (`VramRequest`) gives `MemoryPlan::vram` its first entries: budget, dense copy, a 256 MiB device reserve, and an expert cache capped at the RAM cache at full context; `Location::Vram(d)` and `VramCache(d)`. `qubivex plan --vram SIZE [--vram-budget SIZE]`.
@@ -12,7 +12,7 @@ Last updated: 2026-11-11
 - Measured, OLMoE Q4_K_M, 3 GiB RAM budget, 1.5 GiB device: the same text as the CPU. The 767 MiB device cache made 4572 copies against 2065 hits (16.5 GiB, 0.93 s modelled at PCIe 4.0), so a device cache below the working set churns.
 - Tests: 6 sim unit tests; a planner test; 5 fixture tests in `qubivex-runtime/tests/discrete.rs` (bits on all fixtures, a one-expert device cache, RAM-slab reuse, 4 concurrent requests, refusal of a too-small device) plus one env-gated OLMoE test (Colibri's tokens and the CPU's logits with a 64-expert device cache); one `/metrics` test. Removing the expert upload fails them with "no device copy".
 - Not built: whole layers or activations on the device, asynchronous copies, pinned host memory, prefetch into the device cache, several devices, and CUDA or Vulkan themselves.
-- **Next:** owner review of ADR-018. Then a Vulkan backend implementing `DiscreteDevice`, tested locally through MoltenVK (installed 2026-11-11) and lavapipe in a Linux container. CUDA is still blocked on NVIDIA hardware.
+- **Next:** a Vulkan backend implementing `DiscreteDevice`, tested locally through MoltenVK (installed 2026-11-11) and lavapipe in a Linux container. CUDA is still blocked on NVIDIA hardware.
 
 **Per-client API keys done (2026-11-10; ADR-013 amendment 7, accepted 2026-11-11).** Closes job 9's two gaps: `user` was unauthenticated, and behind a proxy every client shared one rate limit.
 - Named keys: `ServerConfig::client_keys` (`ClientKey { client, key_sha256, rate_limit }`), from `[[serve.client_keys]]` tables in the config file only (`chmod 600`), never flags or environment. Only the SHA-256 is stored; a bearer is hashed once and compared with every digest in constant time. The shared `api_key` still works alongside them; either counts as a key for the loopback check.
