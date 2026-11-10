@@ -121,7 +121,14 @@ pub(crate) struct Params {
     pub(crate) include_usage: bool,
     pub(crate) priority: Priority,
     pub(crate) timeout: Option<Duration>,
+    /// The request's `user`, as sent.
+    pub(crate) user: Option<String>,
+    /// Who the scheduler's fairness counts this request as.
     pub(crate) client: Option<String>,
+    /// Who may share this request's retained KV.
+    pub(crate) cache_scope: Option<String>,
+    /// The named key's client, for the log.
+    pub(crate) client_name: Option<String>,
 }
 
 fn zero_or_absent(v: Option<f32>) -> bool {
@@ -216,7 +223,10 @@ impl Common {
             include_usage: self.stream_options.is_some_and(|o| o.include_usage),
             priority,
             timeout,
-            client: self.user,
+            user: self.user,
+            client: None,
+            cache_scope: None,
+            client_name: None,
         })
     }
 }

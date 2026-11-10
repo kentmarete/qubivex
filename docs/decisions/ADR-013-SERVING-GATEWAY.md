@@ -181,6 +181,37 @@ and structured logs with request, model and sequence ids and no private text.
 - **Not built:** published images or packages, a system-wide launchd daemon, and
   Kubernetes manifests. `docs/deployment/` says so.
 
+## Amendment 7 (2026-11-10): per-client API keys (Proposed)
+Amendment 3 left two gaps, both because one key serves every client: `user`, which
+scopes the prefix cache and fairness, comes from the client unchecked, and the rate limit
+counts addresses, so behind a proxy every client shares one allowance.
+- **Named keys.** `ServerConfig::client_keys` lists `ClientKey { client, key_sha256,
+  rate_limit }`. `client` is a name (`[A-Za-z0-9._-]`, 1 to 64 bytes, unique) that
+  appears in the log; the key is stored only as its SHA-256, so a leaked config file
+  gives no key. A bearer is hashed once and compared with every digest in constant time.
+  Keys are random 256-bit values, so a plain hash needs no slow KDF. The single
+  `api_key` stays as before, as a shared key with no client name; both may be set.
+- **Who a request is.** A named key makes the request that client's:
+  - Fairness counts the client, not `user`: one client sending many `user` values gets
+    no larger share.
+  - The prefix-cache scope is the client plus `user`, so clients never share retained KV
+    and a client can still keep its own users apart. Unnamed requests (shared key or no
+    key) keep `user` as their scope, now in a separate namespace, so no `user` value can
+    name a client's scope.
+  - Request log lines gain `client`.
+- **Rate limit by key.** The limiter counts a named key's requests under that key, with
+  the key's own `rate_limit` if it has one, else the server's. Other requests still count
+  by address. An invalid bearer counts by address, so made-up keys cannot buy
+  allowances. The limiter runs before the handlers' 401, as before.
+- **Configuration.** Keys live only in the config file (`[[serve.client_keys]]`, the file
+  must be `chmod 600`), not on the command line or in the environment, where they would
+  show in `ps` or the process environment. `qubivex keys new <client>` prints a fresh key
+  once and the table to paste; `qubivex keys hash` hashes a key read from standard input.
+  A named key counts as a key for the loopback check.
+- **Not built:** reloading keys without a restart, per-client model access, per-client
+  quotas on tokens rather than requests, and per-client metrics labels (unbounded label
+  sets are what amendment 5 avoided).
+
 ## Consequences
 - The exit criteria are met: `crates/qubivex-api/tests/gateway.rs` (over HTTP, tiny
   fixtures: shapes, streaming equals non-streaming, concurrent equals sequential,

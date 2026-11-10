@@ -104,7 +104,7 @@ pub(crate) fn request(
         deadline: None,
         // Retained KV is shared within a client and never across clients, because a
         // reused prefix is faster and so shows that someone already sent it (ADR-016).
-        cache_scope: params.client.clone(),
+        cache_scope: params.cache_scope.clone(),
     }
 }
 

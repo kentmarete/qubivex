@@ -14,7 +14,8 @@ use kerniq_server::axum::middleware::Next;
 use kerniq_server::axum::response::{IntoResponse, Response};
 
 use crate::error::ApiError;
-use crate::{AppState, ServerConfig};
+use crate::keys::identify;
+use crate::{AppState, ServerConfig, bearer};
 
 /// Clients the rate limiter remembers at most. Past this, the client seen longest ago
 /// is forgotten (and starts again with a full allowance).
@@ -31,7 +32,7 @@ pub struct RateLimit {
 }
 
 impl RateLimit {
-    fn check(self) -> Result<(), String> {
+    pub(crate) fn check(self) -> Result<(), String> {
         if self.per_minute == 0 || self.burst == 0 {
             return Err(
                 "the rate limit needs at least 1 request per minute and a burst of at least 1"
@@ -46,13 +47,31 @@ impl RateLimit {
 struct Bucket {
     tokens: f64,
     seen: Instant,
+    limit: RateLimit,
 }
 
-/// Token buckets by client address.
+impl Bucket {
+    fn per_sec(&self) -> f64 {
+        f64::from(self.limit.per_minute) / 60.0
+    }
+}
+
+/// What a request's allowance is counted under: its named key, or else its address.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(crate) enum Who {
+    /// A named key: an index into [`ServerConfig::client_keys`].
+    Key(usize),
+    /// Anything else, by [`client_key`].
+    Addr(IpAddr),
+}
+
+/// Token buckets by client: the server's limit for addresses, and each named key's own
+/// limit or else the server's.
 #[derive(Debug)]
 pub(crate) struct RateLimiter {
-    limit: RateLimit,
-    buckets: Mutex<HashMap<IpAddr, Bucket>>,
+    limit: Option<RateLimit>,
+    per_key: Vec<Option<RateLimit>>,
+    buckets: Mutex<HashMap<Who, Bucket>>,
 }
 
 /// Who a request counts against: its peer address, with IPv6 cut to its /64 (one host
@@ -73,18 +92,41 @@ fn client_key(peer: Option<SocketAddr>) -> IpAddr {
 }
 
 impl RateLimiter {
+    #[cfg(test)]
     pub(crate) fn new(limit: RateLimit) -> Self {
         Self {
-            limit,
+            limit: Some(limit),
+            per_key: Vec::new(),
             buckets: Mutex::new(HashMap::new()),
         }
     }
 
+    /// A limiter for `limit` on addresses and `per_key` on the named keys, or `None`
+    /// when nothing is limited.
+    pub(crate) fn with_keys(
+        limit: Option<RateLimit>,
+        per_key: Vec<Option<RateLimit>>,
+    ) -> Option<Self> {
+        (limit.is_some() || per_key.iter().any(Option::is_some)).then(|| Self {
+            limit,
+            per_key,
+            buckets: Mutex::new(HashMap::new()),
+        })
+    }
+
     /// Takes one request from `client`'s allowance at `now`, or says how long until it
-    /// has one.
-    pub(crate) fn take(&self, client: IpAddr, now: Instant) -> Result<(), Duration> {
-        let per_sec = f64::from(self.limit.per_minute) / 60.0;
-        let cap = f64::from(self.limit.burst);
+    /// has one. A client with no limit always may.
+    pub(crate) fn take(&self, client: impl Into<Who>, now: Instant) -> Result<(), Duration> {
+        let client = client.into();
+        let limit = match client {
+            Who::Key(i) => self.per_key.get(i).copied().flatten().or(self.limit),
+            Who::Addr(_) => self.limit,
+        };
+        let Some(limit) = limit else {
+            return Ok(());
+        };
+        let per_sec = f64::from(limit.per_minute) / 60.0;
+        let cap = f64::from(limit.burst);
         // A poisoned lock means another request panicked mid-update; the counts are
         // still usable.
         let mut b = self
@@ -94,7 +136,8 @@ impl RateLimiter {
         if b.len() >= MAX_CLIENTS && !b.contains_key(&client) {
             // Full buckets carry no state worth keeping.
             b.retain(|_, k| {
-                k.tokens + now.saturating_duration_since(k.seen).as_secs_f64() * per_sec < cap
+                k.tokens + now.saturating_duration_since(k.seen).as_secs_f64() * k.per_sec()
+                    < f64::from(k.limit.burst)
             });
             if b.len() >= MAX_CLIENTS
                 && let Some(oldest) = b.iter().min_by_key(|(_, k)| k.seen).map(|(ip, _)| *ip)
@@ -105,6 +148,7 @@ impl RateLimiter {
         let k = b.entry(client).or_insert(Bucket {
             tokens: cap,
             seen: now,
+            limit,
         });
         let refilled = now.saturating_duration_since(k.seen).as_secs_f64() * per_sec;
         k.tokens = (k.tokens + refilled).min(cap);
@@ -123,8 +167,16 @@ impl RateLimiter {
     }
 }
 
+impl From<IpAddr> for Who {
+    fn from(ip: IpAddr) -> Self {
+        Self::Addr(ip)
+    }
+}
+
 /// Middleware: refuses `/v1/*` requests past the client's allowance with a 429 and a
-/// `retry-after`. Health and metrics stay open, so monitoring is never limited.
+/// `retry-after`. Health and metrics stay open, so monitoring is never limited. A named
+/// key counts under that key; anything else, including a key that is not one, counts
+/// under the address, so made-up keys buy no allowance.
 pub(crate) async fn rate_limit(
     State(st): State<Arc<AppState>>,
     req: Request,
@@ -140,7 +192,11 @@ pub(crate) async fn rate_limit(
         .extensions()
         .get::<ConnectInfo<SocketAddr>>()
         .map(|c| c.0);
-    match limiter.take(client_key(peer), Instant::now()) {
+    let who = match identify(&st.cfg.client_keys, bearer(req.headers())) {
+        Some(i) => Who::Key(i),
+        None => Who::Addr(client_key(peer)),
+    };
+    match limiter.take(who, Instant::now()) {
         Ok(()) => next.run(req).await,
         Err(wait) => {
             let rid = st.request_id(req.headers());
@@ -252,6 +308,7 @@ impl ServerConfig {
         if let Some(r) = self.rate_limit {
             r.check()?;
         }
+        crate::keys::validate(&self.client_keys)?;
         if self.max_body_bytes == 0 {
             return Err("the request body limit must be positive".into());
         }
@@ -271,6 +328,12 @@ impl ServerConfig {
         Ok(())
     }
 
+    /// Whether `/v1/*` needs a key: the shared one or a named one is set.
+    #[must_use]
+    pub fn needs_key(&self) -> bool {
+        self.api_key.is_some() || !self.client_keys.is_empty()
+    }
+
     /// Refuses to listen on `addr` beyond loopback without an API key, unless
     /// [`ServerConfig::allow_unauthenticated_remote`] says to (spec §11: no
     /// unauthenticated inference server on the network by default).
@@ -278,7 +341,7 @@ impl ServerConfig {
     /// # Errors
     /// A message saying what to set.
     pub fn check_listen(&self, addr: SocketAddr) -> Result<(), String> {
-        if addr.ip().is_loopback() || self.api_key.is_some() || self.allow_unauthenticated_remote {
+        if addr.ip().is_loopback() || self.needs_key() || self.allow_unauthenticated_remote {
             return Ok(());
         }
         Err(format!(
