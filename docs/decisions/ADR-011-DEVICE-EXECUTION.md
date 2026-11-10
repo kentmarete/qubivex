@@ -1,6 +1,7 @@
 # ADR-011: Device execution, buffer lifetimes and GPU parity
 
-- Status: Proposed (Phase 8 slice 1, 2026-11-03; amendments 1–5, slices 2–6; amendment 6, 2026-11-06). Owner review pending.
+- Status: **Accepted (2026-11-10)** by owner decision, for the parity contract and
+  amendments 1 to 6. The CPU stays the default backend; `--backend metal` is an opt-in.
 - Date: 2026-11-03
 - Related: ADR-007 (backends; amendment 2026-11-03), ADR-010 (lossless by default),
   `docs/engineering/ARCHITECTURE_DECISIONS.md` §2.4–2.5, TENSOR_ARCHITECTURE §6.

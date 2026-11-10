@@ -1,6 +1,7 @@
 # ADR-014: Model downloads and their threat review
 
-- Status: Proposed
+- Status: **Accepted (2026-11-10)** by owner decision, with the threat review and the limits
+  as written
 - Date: 2026-11-06
 
 ## Context

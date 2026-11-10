@@ -1,6 +1,9 @@
 # ADR-008: Expert cache: per-layer slab pools, LFRU with hysteresis, learned pins
 
-- Status: Proposed (Phase 0); pools, slabs and LFRU built in Phase 6 (amendment 1), awaiting acceptance
+- Status: **Accepted (2026-11-10)** by owner decision, for amendments 1 to 3: per-layer
+  pools, slabs, LFRU, the prefetch guard and the saturation throttle. Not built, and kept
+  open: the learned, persisted hot set and pins, and RAM↔VRAM promotion (no second tier
+  exists). Each must be measured against this baseline before it is built.
 - Date: 2026-11-01
 
 ## Decision
