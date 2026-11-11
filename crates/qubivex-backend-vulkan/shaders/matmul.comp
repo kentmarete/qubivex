@@ -128,6 +128,13 @@ uvec2 scale_min_k4(uint j, uint q) {
                  (byte_at(q + j + 4u) >> 4) | ((byte_at(q + j) >> 6) << 4));
 }
 
+// `v` itself, through an integer OR with a zero no compiler can prove is zero
+// (`n` < 2^31), so `v` is a rounded value: a multiply producing it cannot be fused into
+// what consumes it.
+float opaque(float v) {
+    return uintBitsToFloat(floatBitsToUint(v) | (p.n >> 31));
+}
+
 // `scale_min_k4` on the 12 scale bytes held in three words.
 uint sbyte(uvec3 sw, uint i) {
     return (sw[i >> 2] >> ((i & 3u) * 8u)) & 0xFFu;
@@ -232,10 +239,11 @@ void main() {
                     float d1 = d * float(s1.x);
                     float m1 = dmin * float(s1.y);
                     uint v = byte_at(blk + 16u + 32u * g + lane);
-                    float t0 = d0 * float(v & 0xFu);
-                    float y0 = t0 - m0;
-                    float t1 = d1 * float(v >> 4);
-                    float y1 = t1 - m1;
+                    // y = t - m as fma(t, 1, -m): the same single rounding, without the
+                    // call SPIRV-Cross makes for a NoContraction subtract. `opaque`
+                    // keeps the product rounded on its own.
+                    float y0 = fma(opaque(d0 * float(v & 0xFu)), 1.0, -m0);
+                    float y1 = fma(opaque(d1 * float(v >> 4)), 1.0, -m1);
                     uint j = x + c + 64u * g + lane;
                     a0 = fma(y0, xs[j], a0);
                     a1 = fma(y1, xs[j + 32u], a1);
