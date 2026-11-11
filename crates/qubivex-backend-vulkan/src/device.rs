@@ -42,6 +42,10 @@ pub(crate) const MATMUL_FUSED_SPV: &[u8] = include_bytes!("matmul_fused.spv");
 /// SwiGLU (`shaders/swiglu.comp`, built -O0).
 pub(crate) const SWIGLU_SPV: &[u8] = include_bytes!("swiglu.spv");
 
+/// The most experts a layer routed on the device may have (`route.comp`'s
+/// `MAX_EXPERTS`: its shared arrays).
+pub(crate) const ROUTED_EXPERTS: usize = 256;
+
 /// `shaders/route.comp`: routing on the device (Step 3b).
 pub(crate) const ROUTE_SPV: &[u8] = include_bytes!("route.spv");
 
@@ -2526,7 +2530,8 @@ impl Submitter {
             || sk as u64 * db > maxx
             || (gn as u64).div_ceil(u64::from(SWIGLU_GROUP)) > maxx
             || ((s * rows) as u64).div_ceil(256) > maxx
-            || s.div_ceil(64) as u64 > maxx
+            || s as u64 > maxx
+            || ne > ROUTED_EXPERTS
         {
             return Ok(false);
         }
@@ -2665,12 +2670,7 @@ impl Submitter {
         let (hdr32, ent32) = (n32(hdr, "table")?, n32(ent, "table")?);
         let steps: [Step; 6] = [
             (fused.matmul[rdt], sets[0], [rb, 1, 0, 0], (rb, s32)),
-            (
-                routed.route,
-                sets[1],
-                [s32, ne32, k32, hdr32],
-                (s32.div_ceil(64), 1),
-            ),
+            (routed.route, sets[1], [s32, ne32, k32, hdr32], (s32, 1)),
             (
                 fused.matmul[g.dtype],
                 sets[2],
@@ -2785,7 +2785,13 @@ impl Submitter {
             return Err(err("route", "no routing pipelines"));
         };
         let ne = logits.len().checked_div(s).unwrap_or(0);
-        if s == 0 || k == 0 || k > ne || ids.len() != s * k || weights.len() != s * k {
+        if s == 0
+            || k == 0
+            || k > ne
+            || ne > ROUTED_EXPERTS
+            || ids.len() != s * k
+            || weights.len() != s * k
+        {
             return Err(ComputeError::Shape {
                 op: "route",
                 detail: format!("{} logits, {s} tokens, top {k}", logits.len()),
@@ -2836,7 +2842,7 @@ impl Submitter {
             u32_of(k, "top k")?,
             u32_of(hdr, "table")?,
         ];
-        let groups = u32_of(s.div_ceil(64), "groups")?;
+        let groups = u32_of(s, "groups")?;
         self.run(|d, cmd| {
             let mut push = [0u8; 16];
             for (i, w) in words4.iter().enumerate() {

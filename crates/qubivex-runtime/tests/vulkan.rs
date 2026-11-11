@@ -264,7 +264,10 @@ fn routed_on_vulkan_matches_the_cpu_bits() {
         });
         assert_eq!(got, want, "{id}: prompt logits");
         assert_eq!(run(&e), want_run, "{id}");
-        assert!(e.placement().device.as_deref().unwrap().contains("routed"), "{id}");
+        assert!(
+            e.placement().device.as_deref().unwrap().contains("routed"),
+            "{id}"
+        );
 
         let prompts: [&[u32]; 4] = [&[72, 101], &[108, 108, 111], &[44, 32, 101], &[120]];
         let c = cpu(id, Some(1 << 30));

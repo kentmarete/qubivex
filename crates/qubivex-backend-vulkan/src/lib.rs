@@ -346,7 +346,7 @@ impl DiscreteDevice for VulkanDevice {
     }
 
     fn routes_moe(&self, experts: usize, k: usize, s: usize) -> bool {
-        k > 0 && k <= experts && s > 0 && s <= self.route_rows
+        k > 0 && k <= experts && experts <= device::ROUTED_EXPERTS && s > 0 && s <= self.route_rows
     }
 
     /// One submission when the layer's experts sit in one buffer per matrix kind (the

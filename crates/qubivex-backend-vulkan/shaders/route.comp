@@ -1,28 +1,41 @@
 // QUBIVEX Vulkan MoE routing (audit §17, Step 3b): `qubivex_compute::math::route` per
 // token, on the device, then the routed experts' entries of the fused dispatch table.
 //
-// One invocation per token runs the CPU's operations in its order:
-// - softmax: the maximum by Rust's `f32::max` (a NaN loses), `exp(v - max)` with
-//   `math::exp` (exp.glsl), a sequential sum from +0, and one division per value;
-// - the top k in `f32::total_cmp` order, highest first, ties to the lower id: the
-//   order the CPU's stable sort defines, found by selection;
+// One workgroup per token, its logits in shared memory. The CPU's operations, in its
+// order where order matters:
+// - softmax: the maximum by Rust's `f32::max` (a NaN loses; one invocation, in id
+//   order), `exp(v - max)` with `math::exp` (exp.glsl; in parallel, each value on its
+//   own), their sequential sum from +0 (one invocation, in id order), and one division
+//   per value (in parallel);
+// - the top k in `f32::total_cmp` order, highest first, ties to the lower id, which is
+//   the order the CPU's stable sort defines: each expert's rank is the number of experts
+//   before it in that order (in parallel), and ranks below k are chosen;
 // - optionally, the weights renormalised by their sequential sum from -0 (Rust's
-//   `Iterator::sum` for f32) and one division each.
-// Then, for each (token, rank) entry j, it copies the chosen expert's three table
-// templates (gate, up, down: n, k, row bytes, weight offset; written by the host) into
-// the entries the fused dispatches read, with their input and output offsets: gate and
-// up read the token's activation row and write rows j of the gate and up intermediates;
+//   `Iterator::sum` for f32; one invocation, in rank order) and one division each.
+// Then, for each (token, rank) entry j, the chosen expert's three table templates (gate,
+// up, down: n, k, row bytes, weight offset; written by the host) are copied into the
+// entries the fused dispatches read, with their input and output offsets: gate and up
+// read the token's activation row and write rows j of the gate and up intermediates;
 // down reads intermediate row j and writes output row j of `contrib`.
 //
 // Built -O0 (it contains exp's rounding idiom; build.sh), then every add, subtract and
 // fma NoContraction, as the other shaders. The divisions must be correctly rounded: the
-// routing parity tests check them on the device.
+// routing parity tests check them on the device. At most MAX_EXPERTS experts.
 #version 450
 
 layout(local_size_x = 64) in;
 
-// Router logits, s × ne; rewritten in place as the probabilities.
-layout(std430, set = 0, binding = 1) buffer Logits {
+const uint LOCAL = 64u;
+const uint MAX_EXPERTS = 256u;
+
+shared float sp[MAX_EXPERTS];
+shared int skey[MAX_EXPERTS];
+shared uint chosen[MAX_EXPERTS];
+shared float smax;
+shared float ssum;
+
+// Router logits, s × ne.
+layout(std430, set = 0, binding = 1) readonly buffer Logits {
     float lg[];
 };
 
@@ -63,7 +76,8 @@ int total_key(float v) {
 }
 
 void main() {
-    uint t = gl_GlobalInvocationID.x;
+    uint t = gl_WorkGroupID.x;
+    uint l = gl_LocalInvocationID.x;
     if (t >= p.s) {
         return;
     }
@@ -79,45 +93,60 @@ void main() {
     uint base = t * p.ne;
 
     // Softmax (math::softmax).
-    float m = uintBitsToFloat(0xff800000u);
-    for (uint e = 0u; e < p.ne; e++) {
-        m = rust_max(m, lg[base + e]);
+    for (uint e = l; e < p.ne; e += LOCAL) {
+        sp[e] = lg[base + e];
     }
-    float sum = 0.0;
-    for (uint e = 0u; e < p.ne; e++) {
-        float v = qexp(lg[base + e] - m);
-        lg[base + e] = v;
-        sum = sum + v;
-    }
-    for (uint e = 0u; e < p.ne; e++) {
-        lg[base + e] = lg[base + e] / sum;
-    }
-
-    // Top k, highest first, ties to the lower id.
-    int pk = 0;
-    uint pid = 0u;
-    float wsum = uintBitsToFloat(0x80000000u);
-    for (uint r = 0u; r < p.k; r++) {
-        uint best = p.ne;
-        int bk = 0;
+    barrier();
+    if (l == 0u) {
+        float m = uintBitsToFloat(0xff800000u);
         for (uint e = 0u; e < p.ne; e++) {
-            int ke = total_key(lg[base + e]);
-            bool after = r == 0u || ke < pk || (ke == pk && e > pid);
-            if (after && (best == p.ne || ke > bk)) {
-                best = e;
-                bk = ke;
+            m = rust_max(m, sp[e]);
+        }
+        smax = m;
+    }
+    barrier();
+    for (uint e = l; e < p.ne; e += LOCAL) {
+        sp[e] = qexp(sp[e] - smax);
+    }
+    barrier();
+    if (l == 0u) {
+        float sum = 0.0;
+        for (uint e = 0u; e < p.ne; e++) {
+            sum = sum + sp[e];
+        }
+        ssum = sum;
+    }
+    barrier();
+    for (uint e = l; e < p.ne; e += LOCAL) {
+        float v = sp[e] / ssum;
+        sp[e] = v;
+        skey[e] = total_key(v);
+    }
+    barrier();
+
+    // Top k: an expert's rank is the number of experts before it (higher key, or an
+    // equal key and a lower id).
+    for (uint e = l; e < p.ne; e += LOCAL) {
+        int ke = skey[e];
+        uint rank = 0u;
+        for (uint f = 0u; f < p.ne; f++) {
+            int kf = skey[f];
+            if (kf > ke || (kf == ke && f < e)) {
+                rank++;
             }
         }
-        pk = bk;
-        pid = best;
-        uint j = t * p.k + r;
-        float w = lg[base + best];
-        rt[j] = uintBitsToFloat(best);
-        rt[sk + j] = w;
-        wsum = wsum + w;
+        if (rank < p.k) {
+            chosen[rank] = e;
+        }
+    }
+    barrier();
 
-        // The entry's three matrices: gate at ent + 16j, up at ent + 16j + 8, down at
-        // ent + 16·sk + 8j.
+    // The routed entries: gate at ent + 16j, up at ent + 16j + 8, down at
+    // ent + 16·sk + 8j.
+    for (uint r = l; r < p.k; r += LOCAL) {
+        uint best = chosen[r];
+        uint j = t * p.k + r;
+        rt[j] = uintBitsToFloat(best);
         uint src = tpl + 24u * best;
         uint g = ent + 16u * j;
         uint u = g + 8u;
@@ -140,10 +169,16 @@ void main() {
         tab[d + 6u] = 1u;
         tab[d + 7u] = 0u;
     }
-    if (renorm != 0u) {
+
+    // The weights, in rank order, renormalised by their sequential sum from -0.
+    if (l == 0u) {
+        float wsum = uintBitsToFloat(0x80000000u);
         for (uint r = 0u; r < p.k; r++) {
-            uint j = sk + t * p.k + r;
-            rt[j] = rt[j] / wsum;
+            wsum = wsum + sp[chosen[r]];
+        }
+        for (uint r = 0u; r < p.k; r++) {
+            float w = sp[chosen[r]];
+            rt[sk + t * p.k + r] = renorm != 0u ? w / wsum : w;
         }
     }
 }
