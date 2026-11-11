@@ -521,6 +521,11 @@ pub(crate) struct DeviceArgs {
     /// queries (for `bench`'s device timings; adds two timestamps per submission).
     #[arg(long)]
     vulkan_timestamps: bool,
+    /// With --backend vulkan: run a layer's experts as one fused submission when no
+    /// expert computes more than N rows (default 4; 0: never, each expert's matmuls
+    /// submitted on their own as before).
+    #[arg(long, value_name = "N")]
+    vulkan_fuse_rows: Option<usize>,
     /// With a discrete device: an explicit VRAM budget, for example 6GiB; replaces the
     /// profile's fraction of the device's memory.
     #[arg(long)]
@@ -551,10 +556,12 @@ impl DeviceArgs {
         if !vulkan
             && (self.vulkan_device.is_some()
                 || self.vulkan_vram.is_some()
-                || self.vulkan_timestamps)
+                || self.vulkan_timestamps
+                || self.vulkan_fuse_rows.is_some())
         {
             return Err(
-                "--vulkan-device, --vulkan-vram and --vulkan-timestamps need --backend vulkan"
+                "--vulkan-device, --vulkan-vram, --vulkan-timestamps and --vulkan-fuse-rows \
+                 need --backend vulkan"
                     .to_owned(),
             );
         }
@@ -567,6 +574,7 @@ impl DeviceArgs {
                 .transpose()?
                 .map(|b| b.0),
             timestamps: self.vulkan_timestamps,
+            fuse_rows: self.vulkan_fuse_rows,
         };
         let sim = backend == qubivex_runtime::BackendKind::Sim;
         if !sim && (self.sim_vram.is_some() || self.sim_bandwidth.is_some() || self.sim_delay) {
