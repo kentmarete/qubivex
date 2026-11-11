@@ -17,8 +17,17 @@ spikes/vulkan-step2-metal-timing/run.sh shapes    # every shape at 1/4/8 experts
 spikes/vulkan-step2-metal-timing/run.sh dispatch  # per-dispatch intervals inside one command buffer
 spikes/vulkan-step2-metal-timing/run.sh scale     # one dispatch of 128 … 16384 rows
 TS=1 THREADS=1 spikes/vulkan-step2-metal-timing/run.sh focus
+spikes/vulkan-step2-metal-timing/run.sh fused     # + the fused multi-matrix dispatch (audit §14)
+spikes/vulkan-step2-metal-timing/run.sh check     # fused vs unfused vs the CPU, bit for bit
+SEARCH=1 spikes/vulkan-step2-metal-timing/run.sh fused   # the table-search lookup instead of O(1)
 ```
+
+The fused prototype (audit §14) is in two parts:
+- `fuse.py` derives `fused0` from MoltenVK's kernel: the same body, with the push constants
+  taken from a per-matrix table.
+- `cpucheck/` is a standalone crate, outside the workspace. It compares the `check` dump
+  with `CpuBackend::matmul`.
 
 Needs only the Command Line Tools: clang, plus the Metal runtime compiler for the MSL. The CLT
 Swift toolchain on this machine does not match its SDK, hence Objective-C. Shapes are fixed to
-OLMoE: hidden 2048, ffn 1024, 8 experts. Weights are random quants with plausible f16 scales.
+OLMoE: hidden 2048, ffn 1024, 8 experts. Weights and activations follow the parity tests (random bytes with every odd byte & 0x3b; `acts`).

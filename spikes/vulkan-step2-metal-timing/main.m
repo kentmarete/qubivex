@@ -16,12 +16,13 @@ typedef struct { uint32_t n, k, rowBytes, wBase, xBase, yBase; } Params;
 typedef struct { double a, b; } Iv;
 
 static id<MTLDevice> dev;
-static id<MTLComputePipelineState> pso;
+static id<MTLComputePipelineState> pso, psoF;
 static id<MTLBuffer> wbuf, xbuf, ybuf;
 static id<MTLCommandQueue> q0;
 static NSArray<id<MTLCommandQueue>> *queues;
 static Mat mats[MAXE][3];
 static int reps = 200;
+static uint8_t *hostWeights; static int hostWeightBytes;
 static int threads = 5;
 
 static void encodeOp(id<MTLComputeCommandEncoder> enc, Op op, int s) {
@@ -34,19 +35,41 @@ static void encodeOp(id<MTLComputeCommandEncoder> enc, Op op, int s) {
     [enc dispatchThreadgroups:MTLSizeMake((op.m.n + 7) / 8, s, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
 }
 
+// One dispatch over several independent matrices (fused.metal): the grid's x axis is
+// every matrix's row blocks in order; the table gives each matrix's push constants and
+// its first row block.
+typedef struct { Params p; uint32_t first, pad; } FusedEntry;
+static void encodeFused(id<MTLComputeCommandEncoder> enc, const Op *ops, int n, int s) {
+    FusedEntry tab[2 * MAXE]; uint32_t first = 0;
+    for (int i = 0; i < n; i++) {
+        tab[i] = (FusedEntry){{ops[i].m.n, ops[i].m.k, rowBytes(ops[i].m.k), ops[i].m.off, ops[i].xBase, ops[i].yBase}, first, 0};
+        first += (ops[i].m.n + 7) / 8;
+    }
+    // For the O(1) lookup variant (equal-size matrices): row blocks per matrix.
+    tab[0].pad = (ops[0].m.n + 7) / 8;
+    uint32_t count = n;
+    [enc setComputePipelineState:psoF];
+    [enc setBuffer:wbuf offset:0 atIndex:0];
+    [enc setBuffer:xbuf offset:0 atIndex:1];
+    [enc setBuffer:ybuf offset:0 atIndex:2];
+    [enc setBytes:tab length:sizeof(FusedEntry) * n atIndex:8];
+    [enc setBytes:&count length:4 atIndex:9];
+    [enc dispatchThreadgroups:MTLSizeMake(first, s, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+}
+
 // gu[2e], gu[2e+1]: gate, up of expert e; down[e].
 static void makeOps(int experts, int s, Op *gu, Op *down) {
     int y = 0;
     for (int e = 0; e < experts; e++) {
         gu[2 * e] = (Op){mats[e][0], 0, y}; y += s * F;
         gu[2 * e + 1] = (Op){mats[e][1], 0, y}; y += s * F;
-        down[e] = (Op){mats[e][2], MAXT * H, y}; y += s * H;
+        down[e] = (Op){mats[e][2], MAXT * H + e * MAXT * F, y}; y += s * H;
     }
 }
 
-typedef enum { PER_EXPERT, GROUPED_SERIAL, GROUPED_SERIAL_ENC, GROUPED_CONC, MULTI_CB, MULTI_QUEUE } Shape;
+typedef enum { PER_EXPERT, GROUPED_SERIAL, GROUPED_SERIAL_ENC, GROUPED_CONC, MULTI_CB, MULTI_QUEUE, FUSED } Shape;
 static const char *shapeName[] = {"A per-expert (5 thr)", "B serial, 1 encoder", "B serial, enc/dispatch",
-                                  "B concurrent, 1 enc", "B multi-cb, 1 queue", "B multi-queue"};
+                                  "B concurrent, 1 enc", "B multi-cb, 1 queue", "B multi-queue", "F fused, 1 dispatch/stage"};
 
 typedef struct { Iv iv[64]; int n; Iv ts[64]; int nts; } Rec;
 // MoltenVK-style timestamps (TS=1): what vkCmdWriteTimestamp(TOP) ... (BOTTOM) becomes on an
@@ -131,6 +154,17 @@ static void run(Shape shape, int experts, int s, Rec *rec) {
         }
         break;
     }
+    case FUSED:
+        // Two command buffers as on the grouped path (the host's SwiGLU sits between
+        // them), each a single dispatch over the stage's matrices.
+        for (int st = 0; st < 2; st++) {
+            Op *ops = st ? down : gu; int n = st ? experts : 2 * experts;
+            id<MTLCommandBuffer> cb = [q0 commandBuffer];
+            id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoderWithDispatchType:MTLDispatchTypeSerial];
+            encodeFused(enc, ops, n, s); [enc endEncoding];
+            [cb commit]; [cb waitUntilCompleted]; add(rec, cb, -1);
+        }
+        break;
     case MULTI_CB: case MULTI_QUEUE:
         // One command buffer per expert, committed back to back; one wait per stage.
         for (int st = 0; st < 2; st++) {
@@ -172,7 +206,7 @@ static double med(double *v, int n) { qsort(v, n, sizeof(double), cmpD); return 
 static void measure(Shape shape, int experts, int s) {
     for (int i = 0; i < 10; i++) { Rec r = {0}; tsNext = 0; run(shape, experts, s, &r); }
     double *wall = calloc(reps, 8), *sum = calloc(reps, 8), *uni = calloc(reps, 8), *span = calloc(reps, 8), *pairs = calloc(reps, 8);
-    double *tsum = calloc(reps, 8), *tuni = calloc(reps, 8);
+    double *tsum = calloc(reps, 8), *tuni = calloc(reps, 8), *st0 = calloc(reps, 8), *st1 = calloc(reps, 8);
     int ncb = 0;
     for (int k = 0; k < reps; k++) {
         Rec r = {0}; tsNext = 0;
@@ -183,11 +217,14 @@ static void measure(Shape shape, int experts, int s) {
         for (int i = 0; i < r.n; i++) { sm += r.iv[i].b - r.iv[i].a; if (r.iv[i].a < lo) lo = r.iv[i].a; if (r.iv[i].b > hi) hi = r.iv[i].b; }
         double tsm = 0; for (int i = 0; i < r.nts; i++) tsm += r.ts[i].b - r.ts[i].a;
         tsum[k] = tsm; tuni[k] = unionIv(r.ts, r.nts);
+        st0[k] = r.iv[0].b - r.iv[0].a; st1[k] = r.n > 1 ? r.iv[1].b - r.iv[1].a : 0;
         sum[k] = sm; uni[k] = unionIv(r.iv, r.n); span[k] = hi - lo; pairs[k] = overlapping(&r); ncb = r.n;
     }
     printf("%-24s e%d s%-2d | cbs %2d | wall %.3f | GPU sum %.3f | GPU union %.3f | first->last %.3f | overlapping pairs %.0f",
            shapeName[shape], experts, s, ncb, med(wall, reps) * 1e3, med(sum, reps) * 1e3, med(uni, reps) * 1e3,
            med(span, reps) * 1e3, med(pairs, reps));
+    if (shape == GROUPED_SERIAL || shape == FUSED || shape == GROUPED_CONC)
+        printf(" | gate+up %.3f down %.3f", med(st0, reps) * 1e3, med(st1, reps) * 1e3);
     if (tsMode && (shape == PER_EXPERT || shape == GROUPED_SERIAL))
         printf(" | MVK-style ts sum %.3f union %.3f", med(tsum, reps) * 1e3, med(tuni, reps) * 1e3);
     printf("\n");
@@ -270,6 +307,14 @@ int main(int argc, char **argv) {
         uint32_t dt = 4; [fc setConstantValue:&dt type:MTLDataTypeUInt atIndex:0];
         id<MTLFunction> fn = [lib newFunctionWithName:@"main0" constantValues:fc error:&err];
         pso = [dev newComputePipelineStateWithFunction:fn error:&err];
+        {
+            NSString *fsrc = [NSString stringWithContentsOfFile:@(getenv("FUSED_SRC") ? getenv("FUSED_SRC") : "fused.metal") encoding:NSUTF8StringEncoding error:&err];
+            id<MTLLibrary> flib = fsrc ? [dev newLibraryWithSource:fsrc options:opts error:&err] : nil;
+            if (!flib) { printf("fused compile: %s\n", err.description.UTF8String); return 1; }
+            id<MTLFunction> ffn = [flib newFunctionWithName:@"fused0" constantValues:fc error:&err];
+            psoF = [dev newComputePipelineStateWithFunction:ffn error:&err];
+            printf("fused pipeline: maxThreadsPerTG %lu\n", (unsigned long)psoF.maxTotalThreadsPerThreadgroup);
+        }
         printf("device %s  cores? | pipeline maxThreadsPerTG %lu  simd width %lu  static TG mem %lu B | untracked %d\n",
                dev.name.UTF8String, (unsigned long)pso.maxTotalThreadsPerThreadgroup, (unsigned long)pso.threadExecutionWidth,
                (unsigned long)pso.staticThreadgroupMemoryLength, untracked);
@@ -293,8 +338,10 @@ int main(int argc, char **argv) {
         uint64_t r = 0x9E3779B97F4A7C15ull;
         #define NEXT() (r ^= r << 13, r ^= r >> 7, r ^= r << 17, r)
         for (int i = 0; i < off; i++) host[i] = (uint8_t)NEXT();
-        for (int b = 0; b < off; b += 144)
-            for (int h = 0; h < 2; h++) { uint16_t v = 0x1800 + (uint16_t)(NEXT() % 0x1000); host[b + 2 * h] = v & 0xFF; host[b + 2 * h + 1] = v >> 8; }
+        // The parity tests' rule for block formats: every odd byte & 0x3b, so the f16
+        // scales (and everything else) stay finite and small.
+        for (int i = 1; i < off; i += 2) host[i] &= 0x3b;
+        hostWeights = host; hostWeightBytes = off;
         MTLResourceOptions priv = MTLResourceStorageModePrivate | (untracked ? MTLResourceHazardTrackingModeUntracked : 0);
         MTLResourceOptions shared = MTLResourceStorageModeShared | (untracked ? MTLResourceHazardTrackingModeUntracked : 0);
         id<MTLBuffer> staging = [dev newBufferWithBytes:host length:off options:MTLResourceStorageModeShared];
@@ -317,9 +364,10 @@ int main(int argc, char **argv) {
         { MTLTimestamp c0, g0, c1, g1; [dev sampleTimestamps:&c0 gpuTimestamp:&g0]; usleep(200000);
           [dev sampleTimestamps:&c1 gpuTimestamp:&g1]; nsPerTick = (double)(c1 - c0) / (double)(g1 - g0);
           printf("GPU timestamp: %.4f ns per tick\n", nsPerTick); }
-        xbuf = [dev newBufferWithLength:4 * MAXT * (H + F) options:shared];
+        xbuf = [dev newBufferWithLength:4 * MAXT * (H + MAXE * F) options:shared];
         float *xp = xbuf.contents;
-        for (int i = 0; i < MAXT * (H + F); i++) xp[i] = (float)((int)(NEXT() % 2001) - 1000) / 1000.0f;
+        // The parity tests' activations: acts(n, seed) = ((i + seed) * 37 % 101 - 50) / 25.
+        for (int i = 0; i < MAXT * (H + MAXE * F); i++) xp[i] = (float)((int)(((i + 5) * 37) % 101) - 50) / 25.0f;
         ybuf = [dev newBufferWithLength:4 * MAXE * MAXT * (2 * F + H) options:shared];
         printf("expert weight bytes %d (gate/up %d each, down %d)\n\n", off / MAXE, mats[0][1].off - mats[0][0].off, off / MAXE - 2 * (mats[0][1].off - mats[0][0].off));
 
@@ -350,12 +398,42 @@ int main(int argc, char **argv) {
                 free(t);
             }
         }
-        if (!strcmp(which, "focus")) {
-            int cfg[][2] = {{8, 1}, {8, 4}};
-            for (int c = 0; c < 2; c++) {
+        if (!strcmp(which, "focus") || !strcmp(which, "fused")) {
+            int cfg[][2] = {{8, 1}, {8, 4}, {1, 1}, {4, 1}, {8, 10}};
+            int nc = !strcmp(which, "focus") ? 2 : 5;
+            for (int c = 0; c < nc; c++) {
                 measure(PER_EXPERT, cfg[c][0], cfg[c][1]); measure(GROUPED_SERIAL, cfg[c][0], cfg[c][1]);
-                measure(GROUPED_CONC, cfg[c][0], cfg[c][1]);
+                measure(GROUPED_CONC, cfg[c][0], cfg[c][1]); measure(FUSED, cfg[c][0], cfg[c][1]);
             }
+        }
+        if (!strcmp(which, "check")) {
+            // Fused against unfused on the GPU, bit for bit, and a dump for the CPU check
+            // (cpucheck/): weights, activations, and every output, per token count.
+            const char *dir = argc > 3 ? argv[3] : ".";
+            NSString *d = @(dir);
+            [[NSData dataWithBytes:hostWeights length:hostWeightBytes] writeToFile:[d stringByAppendingPathComponent:@"weights.bin"] atomically:NO];
+            [[NSData dataWithBytes:xbuf.contents length:xbuf.length] writeToFile:[d stringByAppendingPathComponent:@"x.bin"] atomically:NO];
+            int ss[] = {1, 2, 4, 10, 32};
+            int es[] = {1, 3, 8};
+            int fails = 0, total = 0;
+            for (int ei = 0; ei < 3; ei++) for (int si = 0; si < 5; si++) {
+                int e = es[ei], s = ss[si];
+                size_t ylen = (size_t)e * s * (2 * F + H) * 4;
+                Rec r = {0};
+                memset(ybuf.contents, 0xFF, ybuf.length);
+                run(GROUPED_SERIAL, e, s, &r);
+                NSData *ref = [NSData dataWithBytes:ybuf.contents length:ylen];
+                memset(ybuf.contents, 0xFF, ybuf.length);
+                run(FUSED, e, s, &r);
+                NSData *fus = [NSData dataWithBytes:ybuf.contents length:ylen];
+                const uint32_t *a = ref.bytes, *b = fus.bytes; size_t bad = 0, nan = 0;
+                for (size_t i = 0; i < ylen / 4; i++) { if (a[i] != b[i]) bad++; if ((b[i] & 0x7F800000) == 0x7F800000) nan++; }
+                printf("check e%d s%-2d: %zu outputs, fused vs unfused bits differ in %zu, non-finite %zu\n", e, s, ylen / 4, bad, nan);
+                fails += bad != 0; total++;
+                [fus writeToFile:[d stringByAppendingPathComponent:[NSString stringWithFormat:@"y-fused-e%d-s%d.bin", e, s]] atomically:NO];
+                [ref writeToFile:[d stringByAppendingPathComponent:[NSString stringWithFormat:@"y-unfused-e%d-s%d.bin", e, s]] atomically:NO];
+            }
+            printf("check: %d of %d configurations differ\n", fails, total);
         }
         if (!strcmp(which, "all") || !strcmp(which, "dispatch")) {
             perDispatch(1, 1, MTLDispatchTypeSerial);

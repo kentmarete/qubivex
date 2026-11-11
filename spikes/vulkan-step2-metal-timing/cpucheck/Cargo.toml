@@ -1,0 +1,15 @@
+[package]
+name = "metal-timing-cpucheck"
+version = "0.0.0"
+edition = "2024"
+publish = false
+license = "Apache-2.0"
+description = "Checks the Metal harness's outputs against the CPU backend, bit for bit (not a workspace crate)"
+
+# Standalone: a spike, outside the product workspace.
+[workspace]
+
+[dependencies]
+qubivex-backend-cpu = { path = "../../../crates/qubivex-backend-cpu" }
+qubivex-compute = { path = "../../../crates/qubivex-compute" }
+qubivex-core = { path = "../../../crates/qubivex-core" }
