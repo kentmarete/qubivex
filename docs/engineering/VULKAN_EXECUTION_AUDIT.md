@@ -1684,3 +1684,89 @@ separately switched step, after 3b is measured.
 - Report: decode ms/token, tok/s, submissions per token (expect 65 → 49), routed layers
   per token, prefill, concurrent tok/s; accept only beyond the run-to-run spread
   (~0.7 ms).
+
+### 17.11 What was built (separate commits, each compiling alone)
+
+| Commit | What |
+|---|---|
+| Compute | `RoutedMoe`, `ComputeBackend::{routes_moe, routed_moe}` and `DiscreteDevice`'s pair, declined by default; reference steps (`routed_moe_steps`, `route_tokens`, `combine_ranks`). `softmax` and `route` move into `qubivex-compute::math` unchanged. |
+| Arch | `ExpertProvider::with_layer_held` (default: not held). The MoE stage offers the layer to the backend when it routes the shape and no trace is taken; otherwise Step 3a, unchanged. |
+| Sim | `SimConfig::route_rows`: an opt-in routed layer in one submission, entry-major, for the runtime tests. |
+| Runtime | `StoreProvider::with_layer_held`: quiet `hold_layer` leases and device pins (`OnDevice::hold`, no hit, no recency); missing experts prefetched (loaded now without I/O threads); after the pass `record_uses`, `after_demand` and the device-cache hit for the used experts only, so the counts equal Step 3a's (tested). Routing on the device only with a **fully provisioned** device cache (an arena slot for every expert of every layer). `DeviceReport::routed_layers`. |
+| Shaders | `route.comp`, `combine.comp` (both `-O0`); `exp` moved into `exp.glsl`. **`swiglu.spv`, `matmul.spv` and `matmul_fused.spv` byte-identical.** |
+| Vulkan | `routed_moe`: 6 dispatches, 5 barriers, one command buffer (§17.5), on Step 3a's fused layout; declined (Step 3a runs) when a matrix kind spans buffers, dtypes or shapes, or past the limits. `VulkanConfig::route`, `--vulkan-route on\|off` (**default off**), up to `--vulkan-fuse-rows` tokens, at most 256 experts. `VulkanDevice::route` (the shader alone, for conformance tests). |
+| Route kernel | One workgroup per token, logits in shared memory, `exp` and ranks in parallel; the max and both sums stay sequential in one invocation. The first version (one invocation per token) added 1.4 ms of GPU time per token; this one adds 0.3. |
+| CLI, bench | `--vulkan-route`; the batch example and `scripts/bench-vulkan-baseline` pass it on. |
+
+### 17.12 Correctness
+
+- **Route alone** (`tests/routed.rs`, against `math::route`): ids and weights bit for bit
+  at 8, 60, 64 and 128 experts × k = 1, 2, 8 × renormalise on/off, over adversarial
+  logits (ties, pairs of ties, all equal, ±0, ±∞, a spread past `exp`'s underflow,
+  ×10³⁰ and ×10⁻³⁰) and 8192 random tokens each, plus 4 × 2¹⁸ tokens at OLMoE's shape.
+  Tokens with a NaN logit: every weight NaN on both; ids not compared (`total_cmp`
+  orders NaNs by payload, which is outside the contract, ADR-011 amendment 7).
+- **Whole layer** (against `routed_moe_steps` on the CPU): outputs, ids and weights bit
+  for bit for Q4_K/Q4_K, Q4_K/Q6_K (Q8_0 router), Q6_K/Q6_K (f16 router), Q8_0, and
+  f32/f16 (bf16 router), 1, 2, 4 and 8 tokens, with and without a router tie; OLMoE's
+  shape (64 × 2048 × 1024, top 8, Q4_K and Q6_K down) at 1 and 4 tokens; one submission
+  each. Declined for separate buffers, past the token limit, and when off.
+- **Positive controls** (each restored after): ties to the higher id fails 3 tests;
+  `x · (1/sum)` instead of `x / sum` fails 4; the combine in reverse rank order fails 2;
+  in the runtime, a wrong id-to-expert mapping fails the sim tests (the concurrent test
+  was strengthened to compare logits after it first passed the mutation). Starting the
+  softmax sum at −0 instead of +0 cannot differ (the maximum contributes `exp(0) = 1`).
+- **Runtime:** sim (fixtures): the CPU's bits, 3 submissions per layer + 1, the same
+  store and device-cache hits as Step 3a, nothing routed with a device cache short of the
+  model, concurrent requests. Vulkan: the fixtures' logits and tokens with routing on,
+  alone and 4 concurrent; **real OLMoE: the CPU's prompt logits and Colibri's 12 tokens,
+  every layer routed** (1024 experts, 4.21 GB on the device). Step 3a's tests unchanged
+  and passing.
+
+### 17.13 Measured: battery diagnostic only (not an acceptance record)
+
+The machine was on battery for the whole session, so `scripts/bench-vulkan-baseline`
+refused to run and **nothing here is a mains record**. Same binary, Step 3a
+(`--vulkan-route off`) alternated with Step 3b (`on`), OLMoE Q4_K_M, 5 threads, 10-token
+prompt, 128 generated, 1 + 3 runs, every run's tokens equal to the Step 1a reference:
+
+| Round | Step 3a ms/token | Step 3b ms/token | Step 3a tok/s | Step 3b tok/s |
+|---|---|---|---|---|
+| 1 | 33.08 | **31.14** | 30.23 | **32.11** |
+| 2 | 32.85 | **31.25** | 30.44 | **32.00** |
+| 3 | 32.95 | **31.23** | 30.35 | **32.02** |
+
+- −1.6 to −1.9 ms per token (−5.5%), more than twice the run-to-run spread; submissions
+  per decode token 65 → 49; prefill 197.4–198.7 against 198.0–199.8 ms (the 10-token
+  prompt is not routed: unchanged).
+- Timed (`--vulkan-timestamps`): GPU idle 14.39 → 11.86 ms per token (−2.5 ms, the
+  estimate in §17.8), GPU busy 20.52 → 20.82 (+0.3 ms: the route and combine dispatches
+  and two more encoder boundaries).
+- Concurrent (batch example, 32 tokens per sequence, median of 3, 2 rounds, tokens
+  identical in every mode):
+
+  | N | Step 3a concurrent tok/s | Step 3b concurrent tok/s | Gain |
+  |---|---|---|---|
+  | 1 | 30.45–30.56 | 32.22–32.34 | +5.6% |
+  | 2 | 37.57 | 39.23–39.29 | +4.5% |
+  | 4 | 42.78–42.96 | 44.59–44.64 | +4.0% |
+  | 8 | 45.99–46.04 | 47.90–47.91 | +4.1% |
+
+- **Against the 35 tok/s target:** 32.0 tok/s on battery. Not reached. The remaining
+  per-layer round trips are QKV and O; §17.9 (the O projection, residual and FFN norm
+  joining the routed submission) removes another 16 per token, and needs `sqrt` and
+  division proven on the device first.
+
+### 17.14 Not done; for the owner
+
+1. **Mains records.** Run on mains power:
+   `scripts/bench-vulkan-baseline --tag step3b --variant step3a= --variant routed='--vulkan-route on'`
+   (Step 1a baseline, Step 3a and Step 3b alternated, single-stream and concurrent).
+   Acceptance and any default change wait for them.
+2. **Default.** `--vulkan-route` stays off until accepted.
+3. **ADR-019 amendment 4** (routing on the device: residency rule, the route kernel's
+   order argument, the 256-expert limit) is not written; it follows acceptance, as
+   amendment 3 did for Step 3a.
+4. **A device-open division probe** for drivers other than MoltenVK (§17.6) is not
+   built.
+5. **Next:** §17.9.
