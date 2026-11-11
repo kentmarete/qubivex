@@ -313,4 +313,14 @@ pub trait DiscreteDevice: Send + Sync {
 
     /// Copies so far.
     fn transfers(&self) -> TransferStats;
+
+    /// Whether callers should group a layer's independent matmuls into one
+    /// [`DiscreteDevice::matmul_many`] ([`crate::ComputeBackend::groups_matmuls`]).
+    /// The default is `false`: grouping saves host submission work but leaves only
+    /// one submission in flight, which exposes every round trip that concurrent
+    /// submissions hid. On MoltenVK that is slower end to end
+    /// (docs/engineering/VULKAN_EXECUTION_AUDIT.md §13). Grouping never changes bits.
+    fn groups_matmuls(&self) -> bool {
+        false
+    }
 }

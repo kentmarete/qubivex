@@ -245,9 +245,9 @@ pub trait ComputeBackend: Send + Sync {
 
     /// Whether callers should put independent matmuls into one
     /// [`ComputeBackend::matmul_many`] wherever they can, rather than issuing them
-    /// from several threads at once: `true` for a backend where every call is a
-    /// device submission with a fixed round-trip cost (a discrete device, ADR-019).
-    /// Grouping never changes bits.
+    /// from several threads at once: `true` when the backend's discrete device asks
+    /// for it ([`discrete::DiscreteDevice::groups_matmuls`]). Grouping never changes
+    /// bits.
     fn groups_matmuls(&self) -> bool {
         false
     }

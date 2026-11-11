@@ -356,9 +356,9 @@ impl ComputeBackend for Placed {
         }
     }
 
-    /// A discrete device: each call is a submission and a fence wait.
+    /// Whether the discrete device asks for grouping (Vulkan does not: audit §13).
     fn groups_matmuls(&self) -> bool {
-        self.device.is_some()
+        self.device.as_ref().is_some_and(|d| d.groups_matmuls())
     }
 
     fn dequant_row(
