@@ -8,11 +8,12 @@
 //! ```text
 //! cargo run --release -p qubivex-runtime --example batch -- \
 //!     <MODEL_DIR> <TOKENIZER_JSON> [--cache-mb N] [--steps N] [--runs N] [--sizes 1,2,4,8] \
-//!     [--metal layers|token]
+//!     [--metal layers|token] [--vulkan on] [--threads N]
 //! ```
 //!
 //! `--metal` runs whole layers on Metal, routed on the host (`layers`) or on the GPU
-//! (`token`).
+//! (`token`). `--vulkan on` runs on the default Vulkan device, with the device expert
+//! cache sized like `qubivex bench`'s (every expert resident when the RAM cache is).
 
 use std::error::Error;
 use std::path::PathBuf;
@@ -22,6 +23,7 @@ use qubivex_expert_stream::predict::LookaheadConfig;
 use qubivex_model::{ArchitectureRegistry, ModelMetadata};
 use qubivex_runtime::{
     BackendKind, Engine, EngineOptions, KvCache, Logits, MetalOps, PrefetchOptions, Segment,
+    VulkanConfig,
 };
 use qubivex_tokenizer::Tokenizer;
 
@@ -158,13 +160,16 @@ fn median(mut v: Vec<Duration>) -> Duration {
 }
 
 fn main() -> Result<(), Box<dyn Error>> {
-    let usage = "usage: batch <MODEL_DIR> <TOKENIZER_JSON> [--cache-mb N] [--steps N] [--runs N] [--sizes 1,2,4,8] [--metal layers|token] [--prefetch on|off]";
+    let usage = "usage: batch <MODEL_DIR> <TOKENIZER_JSON> [--cache-mb N] [--steps N] [--runs N] [--sizes 1,2,4,8] [--metal layers|token] [--vulkan on] [--threads N] [--prefetch on|off]";
     let mut args = std::env::args().skip(1);
     let dir = PathBuf::from(args.next().ok_or(usage)?);
     let tok = Tokenizer::from_hf_dir(&PathBuf::from(args.next().ok_or(usage)?))?;
     let (mut cache_mb, mut steps, mut runs) = (None, 32usize, 3usize);
     let mut sizes = vec![1usize, 2, 4, 8];
     let mut metal = None;
+    let vulkan = VulkanConfig::default();
+    let mut on_vulkan = false;
+    let mut threads = None;
     let mut prefetch = None;
     while let Some(flag) = args.next() {
         let value = args.next().ok_or(usage)?;
@@ -172,6 +177,14 @@ fn main() -> Result<(), Box<dyn Error>> {
             "--cache-mb" => cache_mb = Some(value.parse::<u64>()?),
             "--steps" => steps = value.parse()?,
             "--runs" => runs = value.parse()?,
+            "--threads" => threads = Some(value.parse()?),
+            "--vulkan" => {
+                on_vulkan = match value.as_str() {
+                    "on" => true,
+                    "off" => false,
+                    _ => return Err(usage.into()),
+                };
+            }
             "--prefetch" => {
                 prefetch = match value.as_str() {
                     "on" => Some(PrefetchOptions {
@@ -208,9 +221,13 @@ fn main() -> Result<(), Box<dyn Error>> {
             max_context: Some(512),
             backend: if metal.is_some() {
                 BackendKind::Metal
+            } else if on_vulkan {
+                BackendKind::Vulkan
             } else {
                 BackendKind::Cpu
             },
+            vulkan,
+            threads,
             metal_ops: metal.unwrap_or_default(),
             prefetch,
             ..EngineOptions::default()
@@ -226,7 +243,11 @@ fn main() -> Result<(), Box<dyn Error>> {
         .collect::<Result<_, _>>()?;
     println!(
         "{}; prefetch {}; expert cache: {}; {steps} tokens per sequence, median of {runs} runs",
-        metal.map_or("CPU".into(), |o| format!("Metal {}", o.describe())),
+        match (metal, &p.device) {
+            (Some(o), _) => format!("Metal {}", o.describe()),
+            (None, Some(d)) if on_vulkan => d.clone(),
+            _ => "CPU".into(),
+        },
         if prefetch.is_some() { "on" } else { "off" },
         cache_mb.map_or("all resident".into(), |m| format!("{m} MiB"))
     );
