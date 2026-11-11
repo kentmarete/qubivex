@@ -240,6 +240,43 @@ pub struct TransferStats {
     /// The time the copies took, in nanoseconds: measured on a real device, modelled
     /// from the configured bandwidth on a simulated one.
     pub transfer_ns: u64,
+    /// Waits for a submission to complete (fence waits), counted for matmul
+    /// submissions that reached the device. 0 on a device without them.
+    pub fence_waits: u64,
+    /// Host time preparing and making those submissions (descriptors, recording, the
+    /// submit call), in nanoseconds; activation copies are in `transfer_ns`.
+    pub submit_ns: u64,
+    /// Host time blocked waiting for them to complete, in nanoseconds.
+    pub wait_ns: u64,
+    /// Submissions whose GPU time was measured (timestamp queries, when enabled).
+    pub timed: u64,
+    /// GPU time of the timed submissions, summed, in nanoseconds. Concurrent
+    /// submissions overlap, so this can exceed wall time.
+    pub gpu_ns: u64,
+    /// The union of the timed submissions' GPU intervals, in nanoseconds: the time the
+    /// GPU was busy with at least one of them.
+    pub gpu_busy_ns: u64,
+}
+
+impl TransferStats {
+    /// What happened between `before` and `self` (counters only grow).
+    #[must_use]
+    pub const fn since(&self, before: &Self) -> Self {
+        Self {
+            uploads: self.uploads.saturating_sub(before.uploads),
+            upload_bytes: self.upload_bytes.saturating_sub(before.upload_bytes),
+            activations_in: self.activations_in.saturating_sub(before.activations_in),
+            activations_out: self.activations_out.saturating_sub(before.activations_out),
+            submissions: self.submissions.saturating_sub(before.submissions),
+            transfer_ns: self.transfer_ns.saturating_sub(before.transfer_ns),
+            fence_waits: self.fence_waits.saturating_sub(before.fence_waits),
+            submit_ns: self.submit_ns.saturating_sub(before.submit_ns),
+            wait_ns: self.wait_ns.saturating_sub(before.wait_ns),
+            timed: self.timed.saturating_sub(before.timed),
+            gpu_ns: self.gpu_ns.saturating_sub(before.gpu_ns),
+            gpu_busy_ns: self.gpu_busy_ns.saturating_sub(before.gpu_busy_ns),
+        }
+    }
 }
 
 /// A device with its own memory (ADR-018).
@@ -276,4 +313,14 @@ pub trait DiscreteDevice: Send + Sync {
 
     /// Copies so far.
     fn transfers(&self) -> TransferStats;
+
+    /// Whether callers should group a layer's independent matmuls into one
+    /// [`DiscreteDevice::matmul_many`] ([`crate::ComputeBackend::groups_matmuls`]).
+    /// The default is `false`: grouping saves host submission work but leaves only
+    /// one submission in flight, which exposes every round trip that concurrent
+    /// submissions hid. On MoltenVK that is slower end to end
+    /// (docs/engineering/VULKAN_EXECUTION_AUDIT.md §13). Grouping never changes bits.
+    fn groups_matmuls(&self) -> bool {
+        false
+    }
 }

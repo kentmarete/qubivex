@@ -84,8 +84,8 @@ fn vulkan(id: &str, ram_cache: Option<u64>, device_cache: Option<u64>) -> Option
         EngineOptions {
             backend: BackendKind::Vulkan,
             vulkan: VulkanConfig {
-                device: None,
                 capacity: Some(1 << 30),
+                ..VulkanConfig::default()
             },
             vram_budget,
             expert_cache_bytes: ram_cache,

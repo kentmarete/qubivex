@@ -28,6 +28,10 @@
 //! Up to 8 submissions are in flight at once, one per concurrent caller; each still
 //! completes before its call returns.
 //!
+//! [`TransferStats`] counts each matmul submission's host time (preparing and
+//! submitting, then blocked on its fence) and, with [`VulkanConfig::timestamps`], its
+//! GPU time from timestamp queries: summed, and as the union of busy intervals.
+//!
 //! Not built: activations kept on the device across submissions (whole layers on the
 //! device), several queues, asynchronous copies, and token tiles (each activation row
 //! reads the weights again).
@@ -62,6 +66,10 @@ pub struct VulkanConfig {
     pub device: Option<usize>,
     /// Bytes of device memory to allow. `None`: the largest device-local heap.
     pub capacity: Option<u64>,
+    /// Measure each matmul submission's GPU time with timestamp queries (into
+    /// [`TransferStats`]). Off by default: it adds a query reset and two timestamps to
+    /// every command buffer. Ignored on a queue without timestamps.
+    pub timestamps: bool,
 }
 
 /// A Vulkan GPU as a discrete device. See the crate documentation.
@@ -93,11 +101,15 @@ impl VulkanDevice {
     /// driver fails to create the device or its pipelines.
     pub fn new(config: VulkanConfig) -> Result<Self, ComputeError> {
         let opened = device::Shared::open(&config)?;
-        let mut submitter = device::Submitter::new(&opened.shared)?;
+        let timestamps = config.timestamps;
+        let mut submitter = device::Submitter::new(&opened.shared, timestamps)?;
         fused_fma(&mut submitter, &opened.info)?;
         let mut submitters = vec![Mutex::new(submitter)];
         for _ in 1..SUBMITTERS {
-            submitters.push(Mutex::new(device::Submitter::new(&opened.shared)?));
+            submitters.push(Mutex::new(device::Submitter::new(
+                &opened.shared,
+                timestamps,
+            )?));
         }
         let heap = opened.info.device_local;
         let capacity = config.capacity.unwrap_or(heap);
@@ -128,6 +140,12 @@ impl VulkanDevice {
     #[must_use]
     pub const fn info(&self) -> &PhysicalInfo {
         &self.info
+    }
+
+    /// Whether submissions are timed on the GPU (asked for, and the queue supports it).
+    #[must_use]
+    pub fn timestamps(&self) -> bool {
+        device::lock(&self.submitters[0]).timed()
     }
 }
 

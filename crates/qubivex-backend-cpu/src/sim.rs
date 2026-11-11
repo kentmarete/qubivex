@@ -189,6 +189,11 @@ impl DiscreteDevice for SimDevice {
         "sim"
     }
 
+    /// The simulator groups, so the grouped expert path stays exercised and tested.
+    fn groups_matmuls(&self) -> bool {
+        true
+    }
+
     fn describe(&self) -> String {
         #[allow(clippy::cast_precision_loss)]
         let gb = |b: u64| b as f64 / 1e9;
@@ -273,6 +278,7 @@ impl DiscreteDevice for SimDevice {
             activations_out: c.activations_out.load(Ordering::Relaxed),
             submissions: c.submissions.load(Ordering::Relaxed),
             transfer_ns: c.transfer_ns.load(Ordering::Relaxed),
+            ..TransferStats::default()
         }
     }
 }

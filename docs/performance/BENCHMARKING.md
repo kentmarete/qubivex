@@ -140,6 +140,29 @@ pools are smaller than top-k, or any holds fewer than half its layer's experts,
 `--backend metal` runs the CPU pass, and the record's
 `config.device.fallback` says so. Measure prefill at several prompt lengths (`--prompt-tokens`): the token-tiled and grouped kernels switch on at 4 tokens and at 2 routed entries per expert. Results: ADR-011 amendments 1–6.
 
+### Discrete-device timings (`device` in the record)
+
+With `--backend vulkan` or `sim`, the record has a `device` block: per prefill pass and
+per decode token, averaged over the measured runs. It holds:
+- wall time
+- submissions and fence waits
+- host time preparing and submitting, and blocked on fences, summed over the threads
+  that submit, so these can exceed wall
+- activation copy time and bytes in and out
+- weight uploads (device-cache misses)
+
+`--vulkan-timestamps` adds GPU time from timestamp queries:
+- `gpu_ms`: summed per submission
+- `gpu_busy_ms`: the union of the submissions' intervals
+- `gpu_idle_ms`: wall minus busy
+
+Summed and busy are equal when submissions never overlap on the GPU.
+
+Timestamps are not free on MoltenVK: on mains power, decode went from 35.5–35.9 to
+39.0–39.8 ms per token with them on (the step 0 records). So take tok/s from a run without
+`--vulkan-timestamps`, and GPU attribution from a run with it, back to back. Quote
+both records.
+
 ### How to read the numbers
 
 - **Report the median, and the P95 next to it.** A P95 far above the median means jitter
@@ -309,6 +332,25 @@ cargo test --release -p qubivex-backend-vulkan --test parity -- --ignored --noca
 It prints the per-submission overhead (about 0.16 ms), one large Q4_K matrix (22.5 GB/s
 after, 14.7 before) and a layer's 24 expert matmuls in one submission (Q4_K 1.26 ms after,
 4.97 before). Treat it as a guide: one change it favoured was slower end to end.
+
+## 2026-11-11: Vulkan step 0, device timings (docs/engineering/VULKAN_EXECUTION_AUDIT.md §10)
+
+OLMoE-1B-7B-0125-Instruct Q4_K_M, MoltenVK 1.4.2 (M3 Pro, mains power): 10-token
+prompt, 64 generated, 1 warm-up and 3 runs. Every record's tokens equal the
+`…-vulkan-after.json` record's.
+
+| Record | Decode tok/s (median step) | GPU busy per token | GPU idle per token |
+|---|---|---|---|
+| `2026-11-11-m3pro-vulkan-step0-untimed-5t.json` | 27.89 (35.86 ms) | | |
+| `…-step0-untimed-5t-repeat.json` | 28.16 (35.51 ms) | | |
+| `…-step0-timed-5t.json` | 25.64 (39.00 ms) | 19.52 ms | 19.39 ms |
+| `…-step0-timed-5t-repeat.json` | 25.14 (39.78 ms) | 19.74 ms | 19.90 ms |
+| `…-step0-untimed-8t.json` | 28.77 (34.76 ms) | | |
+| `…-step0-timed-8t.json` | 27.15 (36.83 ms) | 17.15 ms | 19.69 ms |
+| `…-step0-cpu-5t.json` (CPU) | 43.28 (23.11 ms) | | |
+
+Submissions never overlap on the GPU: summed GPU time equals busy time in every timed
+run.
 
 ## Saturated disks
 

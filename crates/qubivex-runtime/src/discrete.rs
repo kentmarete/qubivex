@@ -145,6 +145,11 @@ fn not_on_device(what: &str) -> ComputeError {
 }
 
 impl OnDevice {
+    /// Whether the device asks callers to group matmuls.
+    pub(crate) fn groups_matmuls(&self) -> bool {
+        self.device.groups_matmuls()
+    }
+
     /// Copies `arena` (the dense weights) to `device`, charged to the ledger's
     /// `Vram(0)` tier, with an expert cache of `budget` bytes.
     pub(crate) fn new(

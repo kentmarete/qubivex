@@ -417,6 +417,36 @@ impl<'p> Wave<'p, '_, '_> {
             .take()
     }
 
+    /// Computes `held` (leases already taken from the batch) and then every other
+    /// expert of the batch as it becomes ready.
+    fn run(&self, held: Vec<Lease<'p>>) -> Result<(), ArchError> {
+        if !held.is_empty() {
+            rayon::scope(|sc| {
+                for lease in held {
+                    self.spawn(sc, lease);
+                }
+                self.start_ready(sc);
+            });
+            if let Some(e) = self.take_error() {
+                return Err(e);
+            }
+        }
+        loop {
+            // Holding nothing: wait for the next expert (or fail as `next` does).
+            let lease = match self.lock_batch().next() {
+                None => return Ok(()),
+                Some(lease) => lease.map_err(|e| self.lease_err(e))?,
+            };
+            rayon::scope(|sc| {
+                self.spawn(sc, lease);
+                self.start_ready(sc);
+            });
+            if let Some(e) = self.take_error() {
+                return Err(e);
+            }
+        }
+    }
+
     /// Computes `lease`'s expert on the pool, releases it, then starts whatever has
     /// become ready.
     fn spawn<'scope>(&'scope self, sc: &rayon::Scope<'scope>, lease: Lease<'p>) {
@@ -488,28 +518,74 @@ impl ExpertProvider for StoreProvider<'_> {
             .acquire_many(&keys)
             .map_err(|e| store_err(layer, first, &e))?;
         self.after_demand(layer, experts);
-        let wave = Wave {
+        Wave {
             provider: self,
             layer,
             first,
             f,
             batch: Mutex::new(batch),
             error: Mutex::new(None),
-        };
-        loop {
-            // Holding nothing: wait for the next expert (or fail as `next` does).
-            let lease = match wave.lock_batch().next() {
-                None => return Ok(()),
-                Some(lease) => lease.map_err(|e| wave.lease_err(e))?,
-            };
-            rayon::scope(|sc| {
-                wave.spawn(sc, lease);
-                wave.start_ready(sc);
-            });
-            if let Some(e) = wave.take_error() {
-                return Err(e);
-            }
         }
+        .run(Vec::new())
+    }
+
+    /// Takes every lease that is ready now; when that is all of `experts`, pins them
+    /// and calls `group` once. Otherwise computes the leases already taken and the
+    /// rest one by one, exactly as [`StoreProvider::with_experts`]. The store counts
+    /// hits, heat and recency at `acquire_many` either way.
+    fn with_experts_grouped(
+        &self,
+        layer: LayerIdx,
+        experts: &[ExpertIdx],
+        group: &mut dyn FnMut(&[ExpertWeights<'_>]) -> Result<(), ArchError>,
+        each: &(dyn Fn(ExpertIdx, &ExpertWeights<'_>) -> Result<(), ArchError> + Sync),
+    ) -> Result<(), ArchError> {
+        let keys: Vec<_> = experts.iter().map(|&e| (layer, e)).collect();
+        let first = experts.first().copied().unwrap_or(ExpertIdx(0));
+        let mut batch = self
+            .store
+            .acquire_many(&keys)
+            .map_err(|e| store_err(layer, first, &e))?;
+        self.after_demand(layer, experts);
+        let mut held = Vec::with_capacity(experts.len());
+        let complete = loop {
+            match batch.try_next() {
+                Next::Lease(Ok(lease)) => held.push(lease),
+                Next::Lease(Err(e)) => {
+                    let at = match &e {
+                        StoreError::Load { key, .. } | StoreError::Full { key, .. } => key.1,
+                        _ => first,
+                    };
+                    return Err(store_err(layer, at, &e));
+                }
+                Next::Done => break true,
+                Next::Later => break false,
+            }
+        };
+        if complete && held.len() == experts.len() {
+            drop(batch);
+            held.sort_by_key(|l| experts.iter().position(|&e| e == l.key().1));
+            let pins = held
+                .iter()
+                .map(|l| self.pin(l))
+                .collect::<Result<Vec<_>, _>>()?;
+            let ws = held
+                .iter()
+                .map(|l| self.weights(layer, l.key().1, l.bytes()))
+                .collect::<Result<Vec<_>, _>>()?;
+            let r = group(&ws);
+            drop(pins);
+            return r;
+        }
+        Wave {
+            provider: self,
+            layer,
+            first,
+            f: each,
+            batch: Mutex::new(batch),
+            error: Mutex::new(None),
+        }
+        .run(held)
     }
 
     fn wants_lookahead(&self) -> bool {

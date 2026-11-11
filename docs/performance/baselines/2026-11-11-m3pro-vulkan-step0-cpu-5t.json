@@ -1,0 +1,278 @@
+{
+  "schema": 1,
+  "label": "cpu-5t",
+  "started": "2026-11-11T11:22:25Z",
+  "build": {
+    "version": "0.1.0",
+    "git": "835e7615027c-dirty",
+    "rustc": "rustc 1.99.1 (58cf8f9c3 2026-10-13)",
+    "profile": "release",
+    "opt_level": "3",
+    "debug_assertions": false,
+    "target": "aarch64-apple-darwin",
+    "target_features": "aes,crc,dit,dotprod,dpb,dpb2,fcma,fhm,flagm,fp16,frintts,jsconv,lor,lse,neon,paca,pacg,pan,pmuv3,ras,rcpc,rcpc2,rdm,sb,sha2,sha3,ssbs,vh",
+    "rustflags": ""
+  },
+  "hardware": {
+    "cpu": {
+      "arch": "aarch64",
+      "vendor": {
+        "known": "Apple"
+      },
+      "model": {
+        "known": "Apple M3 Pro"
+      },
+      "logical_cores": {
+        "known": 11
+      },
+      "physical_cores": {
+        "known": 11
+      },
+      "tiers": {
+        "known": [
+          {
+            "name": "Performance",
+            "physical": 5,
+            "logical": 5
+          },
+          {
+            "name": "Efficiency",
+            "physical": 6,
+            "logical": 6
+          }
+        ]
+      },
+      "simd": [
+        "neon",
+        "fp16",
+        "dotprod",
+        "i8mm",
+        "bf16"
+      ],
+      "numa_nodes": {
+        "known": 1
+      }
+    },
+    "memory": {
+      "total": {
+        "known": 19327352832
+      },
+      "cgroup_limit": {
+        "known": "none"
+      }
+    },
+    "os": {
+      "family": "macos",
+      "name": {
+        "known": "macOS 27.2 (26B123)"
+      },
+      "kernel": {
+        "known": "27.2.0"
+      }
+    }
+  },
+  "model": {
+    "id": "olmoe-1b-7b-0125-instruct",
+    "name": "OLMoE-1B-7B-0125-Instruct Q4_K_M",
+    "architecture": "transformer_moe",
+    "dir": "~/.qubivex/models/olmoe-1b-7b-0125-instruct"
+  },
+  "config": {
+    "threads": 5,
+    "expert_cache": 3900702720,
+    "expert_slots": [
+      64,
+      64,
+      64,
+      64,
+      64,
+      64,
+      64,
+      64,
+      64,
+      64,
+      64,
+      64,
+      64,
+      64,
+      64,
+      64
+    ],
+    "cache_policy": "Lfru { decay_window: 256 }",
+    "io_threads": 4,
+    "expert_io": "buffered",
+    "verification": "verified",
+    "context": 4096,
+    "prompt": "Write a long story about a lighthouse keeper.",
+    "prompt_tokens": 10,
+    "generated_tokens": 64,
+    "warmup_runs": 1,
+    "measured_runs": 3
+  },
+  "prefill": {
+    "ms": {
+      "n": 3,
+      "min": 128.817917,
+      "median": 130.080583,
+      "p95": 153.113458,
+      "max": 153.113458,
+      "mean": 137.33731933333334
+    },
+    "tok_s_at_median": 76.87542421300495
+  },
+  "decode": {
+    "step_ms": {
+      "n": 189,
+      "min": 22.496667000000002,
+      "median": 23.105375000000002,
+      "p95": 24.94075,
+      "max": 43.929584,
+      "mean": 23.59898415343915
+    },
+    "tok_s_at_median": 43.27997273361717,
+    "run_tok_s": [
+      40.99066286052963,
+      43.05856988042252,
+      43.146274200193886
+    ]
+  },
+  "memory": {
+    "rss_after_load": {
+      "known": 348930048
+    },
+    "peak_rss": {
+      "known": 4058677248
+    },
+    "peak_source": "sampled",
+    "plan_budget": 9270755737,
+    "ledger": {
+      "dense": 311027712,
+      "expert_cache": 3606822912,
+      "kv": 67108864,
+      "total": 3984959488
+    }
+  },
+  "experts": {
+    "hits": 26049,
+    "loads": 0,
+    "bytes_read": 0,
+    "evictions": 0,
+    "hit_rate": 1.0,
+    "bytes_per_token": 0,
+    "slab_allocs": 0,
+    "wait_ms_per_token": 0.0,
+    "read_retries": 0,
+    "read_timeouts": 0
+  },
+  "check": {
+    "deterministic": true,
+    "first_divergence": null,
+    "reference": "docs/performance/baselines/2026-11-11-m3pro-vulkan-after.json",
+    "reference_match": true,
+    "reference_divergence": null
+  },
+  "runs": [
+    {
+      "prefill_ms": 153.113458,
+      "decode_step_ms": {
+        "n": 63,
+        "min": 22.573542,
+        "median": 23.208333,
+        "p95": 28.760667,
+        "max": 43.929584,
+        "mean": 24.395799682539682
+      },
+      "decode_tok_s": 40.99066286052963
+    },
+    {
+      "prefill_ms": 128.817917,
+      "decode_step_ms": {
+        "n": 63,
+        "min": 22.547,
+        "median": 23.010208000000002,
+        "p95": 24.017542,
+        "max": 25.6775,
+        "mean": 23.224180523809526
+      },
+      "decode_tok_s": 43.05856988042252
+    },
+    {
+      "prefill_ms": 130.080583,
+      "decode_step_ms": {
+        "n": 63,
+        "min": 22.496667000000002,
+        "median": 23.10825,
+        "p95": 23.895833,
+        "max": 24.802708,
+        "mean": 23.17697225396826
+      },
+      "decode_tok_s": 43.146274200193886
+    }
+  ],
+  "tokens": [
+    187,
+    187,
+    510,
+    1708,
+    5967,
+    6225,
+    10086,
+    285,
+    9979,
+    327,
+    247,
+    33848,
+    28900,
+    37159,
+    253,
+    3034,
+    503,
+    3472,
+    6150,
+    15,
+    7850,
+    8325,
+    273,
+    1708,
+    18753,
+    758,
+    253,
+    13862,
+    13,
+    26766,
+    35089,
+    15792,
+    949,
+    43286,
+    528,
+    12685,
+    15,
+    380,
+    43775,
+    13,
+    247,
+    637,
+    4907,
+    7195,
+    13,
+    574,
+    5262,
+    253,
+    2469,
+    10488,
+    1107,
+    275,
+    436,
+    29437,
+    3698,
+    13,
+    43981,
+    281,
+    253,
+    1708,
+    285,
+    253,
+    1708,
+    5967
+  ]
+}

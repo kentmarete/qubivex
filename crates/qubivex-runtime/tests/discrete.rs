@@ -160,6 +160,40 @@ fn ram_cache_reuse_drops_device_copies() {
     }
 }
 
+/// With every routed expert resident, a layer's experts are two submissions (every
+/// gate and up, then every down): a pass is 5 per layer (q/k/v, output, router, two
+/// for the experts) plus the head. With a RAM cache too small to hold a layer's
+/// routed set, the experts go one by one, and the bits are the same either way.
+#[test]
+fn resident_experts_are_grouped_into_two_submissions() {
+    for id in MOE {
+        let logits = |e: &Engine| {
+            let mut c = e.new_cache();
+            bits(&e.forward(PROMPT, &mut c, Logits::All, None).unwrap())
+        };
+        let submissions = |e: &Engine| e.device_report().unwrap().transfers.submissions;
+        let pass = |e: &Engine| {
+            let before = submissions(e);
+            let l = logits(e);
+            (l, submissions(e) - before)
+        };
+        let want = logits(&cpu(id, Some(1 << 30)));
+
+        let e = sim(id, Some(1 << 30), Some(1 << 28));
+        let _ = pass(&e); // Loads every expert the prompt routes to.
+        let (got, n) = pass(&e);
+        assert_eq!(got, want, "{id}");
+        assert_eq!(n, 5 * layers(id) + 1, "{id}: grouped");
+
+        let small = largest_expert(id) * 4 * layers(id);
+        let e = sim(id, Some(small), Some(1 << 28));
+        let _ = pass(&e);
+        let (got, n) = pass(&e);
+        assert_eq!(got, want, "{id}");
+        assert!(n > 5 * layers(id) + 1, "{id}: per expert: {n}");
+    }
+}
+
 /// Concurrent requests share the device and its cache; each gets the CPU's tokens.
 #[test]
 fn concurrent_requests_on_one_device() {

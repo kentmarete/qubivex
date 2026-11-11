@@ -3,7 +3,21 @@
 Last updated: 2026-11-11
 
 ## Current phase
-**Vulkan kernel speed (2026-11-11; ADR-019 amendment 1, Proposed).** Decode on MoltenVK 4.2x faster with the same bits.
+**Vulkan submission plan, Step 0: measurement (2026-11-11, done, branch `vulkan-submission-audit`).** See docs/engineering/VULKAN_EXECUTION_AUDIT.md (§8 sequence, §9 decisions, §10 results).
+- Built: device counters and opt-in GPU timestamps (`--vulkan-timestamps`), and a per-phase `device` block in `qubivex bench` records. Behaviour is unchanged without the flag; the tests pass, timed runs included.
+- Measured on mains power (`baselines/2026-11-11-m3pro-vulkan-step0-*.json`, tokens identical to the reference):
+  - Vulkan: 27.9–28.2 tok/s untimed at 5 threads, 28.8 at 8. CPU: 43.3.
+  - GPU busy is 19.5–19.7 ms per token, idle about the same.
+  - Submissions never overlap on the GPU.
+  - Wall minus GPU busy leaves about 16 ms of GPU idle per token over about 113 serial hand-offs, ≈ 140 µs each. (A first reading of "220 µs fixed latency per submission" double-counted overlapping waits; corrected in the audit §10.)
+  - Host submit work is about 18 µs per submission.
+  - So the round trips bind, not the kernels.
+- Step 1a (bulk copies) committed: neutral end to end. 1b and the other per-call clean-ups skipped (owner, 2026-11-11).
+- Step 2 (grouped experts) built (`c2a114a`, experiment `6c8b691`): 81 submissions per decode step instead of 305, same tokens, all tests pass. Battery diagnostic only: **slower** (35.9 → 37.3–38.3 ms), because grouping adds 3.2–3.5 ms of GPU time (dispatches in one command buffer serialise, while separate threads' command buffers overlap) and the expert hand-offs were already mostly hidden. Not accepted; owner to choose revert / keep off / investigate (audit §12). **Investigated (audit §13):** the GPU penalty is a MoltenVK timestamp artefact (the TOP sample lands late; it under-counts per-expert submissions by 3–19 µs each). By Metal's own clock grouped = per-expert GPU time, and command buffers never overlap. Grouping is still 2–4 ms/token slower end to end (mains, untimed, alternated) because it gives up the 5 in-flight submissions that hid each round trip. Recommendation: keep it off for Vulkan; next, a multi-matrix dispatch prototyped in `spikes/vulkan-step2-metal-timing`.
+- Step 2 option (b) (`825b84b`, revert `f4dd9c3`): Vulkan no longer groups, because the device decides and the simulator still groups. Mains records equal Step 1a (35.6–36.0 against 35.1–35.7 ms/token). Fused expert dispatch prototyped in the Metal harness (audit §14): bit-exact against the CPU (2.29 M outputs). It takes 0.783 ms per layer at 8 × 1, against 0.926 for Step 1a (−15%), missing the 0.76 target. On its own it would only about break even end to end, because it needs grouping. Next (for review): the SwiGLU parity and weight-binding harness checks, then Vulkan Step 3a (experts in one submission per layer).
+- Step 3a harness checks (audit §15). SwiGLU: exhaustive over 2 × 2³² inputs, the `-O0`/`precise` builds equal the CPU except for subnormals (ADR-011) and NaN payloads, while `glslc -O` breaks `exp`'s rounding (1-ulp errors). Binding: arena ≤ bda (+0.3%) ≤ array (+1%) in GPU time, and bda through MoltenVK costs +0.1–0.2 ms per call in residency. The one-submission expert block (fused + GPU SwiGLU) is bit-exact against the CPU, 0.98 ms wall per layer against 1.37 for Step 1a's shape at 8 × 1. Projected 31.6–33.9 ms/token. Recommendation: two slot-class arenas. Awaiting review before Vulkan Step 3a.
+
+**Vulkan kernel speed (2026-11-11; ADR-019 amendment 1, accepted 2026-11-11).** Decode on MoltenVK 4.2x faster with the same bits.
 - Shader: Q4_K, Q6_K and Q8_0 decode a block at a time (scales once per block, each byte once for all the weights it holds); a Q4_K header is read as four words. No `precise`: `shaders/build.sh` marks every add, subtract and `fma` `NoContraction`, because SPIRV-Cross turned every `precise` multiply into an unoptimised helper call. Q4_K's `t - m` is `fma(t, 1, -m)` with `t` kept rounded by an integer OR.
 - Device: 8 submitters (own command buffer, fence and host buffers), the queue locked only around `vkQueueSubmit`, so a layer's experts overlap their round trips.
 - Measured, OLMoE Q4_K_M, mains power: decode 153.3 -> 36.55 ms per token (6.52 -> 27.36 tok/s), prefill 8.2 -> 48.9 tok/s, tokens identical. The CPU in the same session: 43.50 tok/s, prefill 77.0. Records `docs/performance/baselines/2026-11-11-m3pro-vulkan-*.json`; steps in ADR-019 amendment 1 and BENCHMARKING.md.

@@ -1,0 +1,69 @@
+// Candidate Vulkan SwiGLU (audit §15, harness only): g[i] = silu(g[i]) * u[i], with
+// silu(a) = a / (1 + exp(-a)) exactly as `qubivex_arch::ops::swiglu`, and exp the port of
+// `qubivex_compute::math::exp` (basic operations and fma only, same order).
+// Compiled like matmul.comp: build.sh decorates every add, subtract and fma
+// NoContraction; multiplies and the division are left undecorated.
+#version 450
+
+layout(local_size_x = 256) in;
+
+layout(std430, set = 0, binding = 0) buffer G {
+    float g[];
+};
+layout(std430, set = 0, binding = 1) readonly buffer U {
+    float u[];
+};
+
+layout(push_constant) uniform Params {
+    uint n;
+} p;
+
+// `qubivex_compute::math` constants, as bit patterns.
+const float LOG2E = uintBitsToFloat(0x3fb8aa3bu);
+const float LN2_HI = uintBitsToFloat(0x3f317200u);
+const float LN2_LO = uintBitsToFloat(0x35bfbe8eu);
+const float SHIFT = uintBitsToFloat(0x4b400000u);
+const float OVERFLOW = uintBitsToFloat(0x42b17218u);
+const float UNDERFLOW = uintBitsToFloat(0xc2aeac50u);
+const float MIN_POSITIVE = uintBitsToFloat(0x00800000u);
+const float INF = uintBitsToFloat(0x7f800000u);
+
+float pow2(int k) {
+    return intBitsToFloat((k + 127) << 23);
+}
+
+float qexp(float x) {
+    if (isnan(x)) {
+        return x;
+    }
+    if (x > OVERFLOW) {
+        return INF;
+    }
+    if (x < UNDERFLOW) {
+        return 0.0;
+    }
+    float kf = (x * LOG2E + SHIFT) - SHIFT;
+    float r = fma(-kf, LN2_HI, x);
+    r = fma(-kf, LN2_LO, r);
+    float q = uintBitsToFloat(0x39506967u);
+    q = fma(q, r, uintBitsToFloat(0x3ab743ceu));
+    q = fma(q, r, uintBitsToFloat(0x3c088908u));
+    q = fma(q, r, uintBitsToFloat(0x3d2aa9c1u));
+    q = fma(q, r, uintBitsToFloat(0x3e2aaaaau));
+    q = fma(q, r, uintBitsToFloat(0x3f000000u));
+    float y = fma(q, r * r, r) + 1.0;
+    int k = int(kf);
+    int k1 = k >> 1;
+    float v = (y * pow2(k1)) * pow2(k - k1);
+    return v < MIN_POSITIVE ? 0.0 : v;
+}
+
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    if (i >= p.n) {
+        return;
+    }
+    float a = g[i];
+    float s = a / (1.0 + qexp(-a));
+    g[i] = s * u[i];
+}

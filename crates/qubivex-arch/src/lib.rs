@@ -120,6 +120,26 @@ pub trait ExpertProvider: Sync {
         Ok(())
     }
 
+    /// As [`ExpertProvider::with_experts`], except that when every one of `experts`
+    /// is ready now (resident, nothing to load or wait for), the provider may hold
+    /// them all at once and call `group` a single time with their weights, in the
+    /// order of `experts`, instead of calling `each` per expert. Callers use it when
+    /// the backend groups matmuls ([`ComputeBackend::groups_matmuls`]): one
+    /// submission per stage for the whole layer. The default always calls `each`.
+    ///
+    /// # Errors
+    /// As [`ExpertProvider::with_experts`], or whatever `group` returns.
+    fn with_experts_grouped(
+        &self,
+        layer: LayerIdx,
+        experts: &[ExpertIdx],
+        group: &mut dyn FnMut(&[ExpertWeights<'_>]) -> Result<(), ArchError>,
+        each: &(dyn Fn(ExpertIdx, &ExpertWeights<'_>) -> Result<(), ArchError> + Sync),
+    ) -> Result<(), ArchError> {
+        let _ = group;
+        self.with_experts(layer, experts, each)
+    }
+
     /// Whether the provider wants [`ExpertProvider::lookahead`] calls. When `false`
     /// (the default) the forward pass skips the lookahead router entirely.
     fn wants_lookahead(&self) -> bool {
@@ -1141,48 +1161,131 @@ impl Transformer {
                         .map(|(e, _)| ExpertIdx(u32::try_from(e).unwrap_or(u32::MAX)))
                         .collect();
                     let slots = std::sync::Mutex::new(&mut contrib);
-                    experts.with_experts(
-                        LayerIdx(li),
-                        &used,
-                        &|ei: ExpertIdx, w: &ExpertWeights<'_>| {
-                            let users = &by_expert[ei.0 as usize];
-                            let n_t = users.len();
-                            let mut xe = vec![0f32; n_t * h];
-                            for (j, &(t, _)) in users.iter().enumerate() {
-                                xe[j * h..(j + 1) * h].copy_from_slice(&x[t * h..(t + 1) * h]);
+                    // Writes an expert's outputs `y` (one row per user) into its users'
+                    // rank slots. A poisoned lock means another expert panicked
+                    // mid-copy; its slots are not ours, so ours are still written
+                    // correctly.
+                    let store = |users: &[(usize, usize)], y: &[f32]| {
+                        let mut contrib = slots
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner);
+                        for (j, &(t, r)) in users.iter().enumerate() {
+                            let dst = (t * k_top + r) * h;
+                            contrib[dst..dst + h].copy_from_slice(&y[j * h..(j + 1) * h]);
+                        }
+                    };
+                    // An expert's input rows: its users' rows of `x`.
+                    let gather = |users: &[(usize, usize)]| {
+                        let mut xe = vec![0f32; users.len() * h];
+                        for (j, &(t, _)) in users.iter().enumerate() {
+                            xe[j * h..(j + 1) * h].copy_from_slice(&x[t * h..(t + 1) * h]);
+                        }
+                        xe
+                    };
+                    let each = |ei: ExpertIdx, w: &ExpertWeights<'_>| {
+                        let users = &by_expert[ei.0 as usize];
+                        let n_t = users.len();
+                        let xe = gather(users);
+                        let ffn = w.gate.rows();
+                        let mut g = vec![0f32; n_t * ffn];
+                        let mut u = vec![0f32; n_t * ffn];
+                        be.matmul_many(&mut [
+                            MatMul {
+                                w: w.gate,
+                                xs: &xe,
+                                s: n_t,
+                                ys: &mut g,
+                            },
+                            MatMul {
+                                w: w.up,
+                                xs: &xe,
+                                s: n_t,
+                                ys: &mut u,
+                            },
+                        ])?;
+                        swiglu(&mut g, &u);
+                        let mut y = vec![0f32; n_t * h];
+                        be.matmul(&w.down, &g, n_t, &mut y)?;
+                        store(users, &y);
+                        Ok(())
+                    };
+                    if be.groups_matmuls() {
+                        // Every expert at once: one call for every gate and up, then one
+                        // for every down. Each matmul has the same weight, input and
+                        // kernel as on the per-expert path, so the same bits.
+                        let mut group = |ws: &[ExpertWeights<'_>]| -> Result<(), ArchError> {
+                            let users: Vec<&[(usize, usize)]> = used
+                                .iter()
+                                .map(|ei| by_expert[ei.0 as usize].as_slice())
+                                .collect();
+                            // An expert used by every token in order reads `x` itself, so
+                            // the backend sees one shared input.
+                            let xes: Vec<Option<Vec<f32>>> = users
+                                .iter()
+                                .map(|u| {
+                                    let all = u.len() == s
+                                        && u.iter().enumerate().all(|(j, &(t, _))| j == t);
+                                    (!all).then(|| gather(u))
+                                })
+                                .collect();
+                            let mut gs: Vec<Vec<f32>> = Vec::with_capacity(ws.len());
+                            let mut us: Vec<Vec<f32>> = Vec::with_capacity(ws.len());
+                            for (w, u) in ws.iter().zip(&users) {
+                                gs.push(vec![0f32; u.len() * w.gate.rows()]);
+                                us.push(vec![0f32; u.len() * w.up.rows()]);
                             }
-                            let ffn = w.gate.rows();
-                            let mut g = vec![0f32; n_t * ffn];
-                            let mut u = vec![0f32; n_t * ffn];
-                            be.matmul_many(&mut [
-                                MatMul {
+                            let mut ops = Vec::with_capacity(2 * ws.len());
+                            for ((((w, u), xe), g), up) in ws
+                                .iter()
+                                .zip(&users)
+                                .zip(&xes)
+                                .zip(gs.iter_mut())
+                                .zip(us.iter_mut())
+                            {
+                                let xs = xe.as_deref().unwrap_or(&x);
+                                ops.push(MatMul {
                                     w: w.gate,
-                                    xs: &xe,
-                                    s: n_t,
-                                    ys: &mut g,
-                                },
-                                MatMul {
+                                    xs,
+                                    s: u.len(),
+                                    ys: g,
+                                });
+                                ops.push(MatMul {
                                     w: w.up,
-                                    xs: &xe,
-                                    s: n_t,
-                                    ys: &mut u,
-                                },
-                            ])?;
-                            swiglu(&mut g, &u);
-                            let mut y = vec![0f32; n_t * h];
-                            be.matmul(&w.down, &g, n_t, &mut y)?;
-                            // A poisoned lock means another expert panicked mid-copy; its slots
-                            // are not ours, so ours are still written correctly.
-                            let mut contrib = slots
-                                .lock()
-                                .unwrap_or_else(std::sync::PoisonError::into_inner);
-                            for (j, &(t, r)) in users.iter().enumerate() {
-                                let dst = (t * k_top + r) * h;
-                                contrib[dst..dst + h].copy_from_slice(&y[j * h..(j + 1) * h]);
+                                    xs,
+                                    s: u.len(),
+                                    ys: up,
+                                });
+                            }
+                            be.matmul_many(&mut ops)?;
+                            drop(ops);
+                            for (g, u) in gs.iter_mut().zip(&us) {
+                                swiglu(g, u);
+                            }
+                            let mut ys: Vec<Vec<f32>> =
+                                users.iter().map(|u| vec![0f32; u.len() * h]).collect();
+                            let mut ops: Vec<MatMul<'_>> = ws
+                                .iter()
+                                .zip(&users)
+                                .zip(&gs)
+                                .zip(ys.iter_mut())
+                                .map(|(((w, u), g), y)| MatMul {
+                                    w: w.down,
+                                    xs: g,
+                                    s: u.len(),
+                                    ys: y,
+                                })
+                                .collect();
+                            be.matmul_many(&mut ops)?;
+                            drop(ops);
+                            for (u, y) in users.iter().zip(&ys) {
+                                store(u, y);
                             }
                             Ok(())
-                        },
-                    )?;
+                        };
+                        experts.with_experts_grouped(LayerIdx(li), &used, &mut group, &each)?;
+                    } else {
+                        experts.with_experts(LayerIdx(li), &used, &each)?;
+                    }
                     for (t, (_, w)) in picks.iter().enumerate() {
                         let out = &mut o[t * h..(t + 1) * h];
                         out.fill(0.0);

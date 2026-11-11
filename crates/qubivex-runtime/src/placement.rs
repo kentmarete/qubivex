@@ -356,6 +356,11 @@ impl ComputeBackend for Placed {
         }
     }
 
+    /// Whether the discrete device asks for grouping (Vulkan does not: audit §13).
+    fn groups_matmuls(&self) -> bool {
+        self.device.as_ref().is_some_and(|d| d.groups_matmuls())
+    }
+
     fn dequant_row(
         &self,
         w: &WeightView<'_>,
