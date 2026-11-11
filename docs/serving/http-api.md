@@ -286,7 +286,7 @@ unless noted. `--no-metrics` turns the endpoint into a 404.
 | Model load time | `qubivex_model_load_seconds` (histogram; loads through the admin endpoint), `qubivex_model_loads_total` (server-wide) |
 | Memory | `qubivex_memory_{dense,expert_cache,kv,activations}_bytes`, `qubivex_memory_budget_bytes`, `qubivex_kv_reserved_positions`; for the process, `qubivex_process_resident_bytes` and `qubivex_process_peak_resident_bytes` |
 | Expert cache | `qubivex_expert_cache_{hits,loads,evictions}_total`, `qubivex_expert_cache_bytes` |
-| Discrete GPU (ADR-018; only with one, today `--backend sim`) | `qubivex_vram_{dense,expert_cache,used,peak,capacity,budget}_bytes`, `qubivex_device_expert_{hits,copies,evictions}_total`, `qubivex_device_{upload,activation}_bytes_total`, `qubivex_device_transfer_seconds_total` |
+| Discrete GPU (ADR-018; only with one, `--backend vulkan` or `sim`) | `qubivex_vram_{dense,expert_cache,used,peak,capacity,budget}_bytes`, `qubivex_device_expert_{hits,copies,evictions}_total`, `qubivex_device_{upload,activation}_bytes_total`, `qubivex_device_transfer_seconds_total` |
 | Disk | `qubivex_expert_read_bytes_total`, `qubivex_expert_load_wait_seconds_total`, `qubivex_expert_read_{retries,timeouts}_total` |
 | Serving | `qubivex_generations_active` (server-wide), `qubivex_queue_depth`, `qubivex_generation_slots_free`, `qubivex_queue_{granted,rejected}_total`, `qubivex_batch_{passes,steps}_total` |
 | Outcomes, server-wide | `qubivex_generations_{cancelled,timed_out,failed}_total` |

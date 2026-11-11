@@ -12,6 +12,7 @@ publish.workspace = true
 qubivex-arch = { workspace = true }
 qubivex-backend-cpu = { workspace = true }
 qubivex-backend-metal = { workspace = true }
+qubivex-backend-vulkan = { workspace = true }
 qubivex-compute = { workspace = true }
 qubivex-core = { workspace = true }
 qubivex-expert-stream = { workspace = true }

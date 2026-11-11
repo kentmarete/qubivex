@@ -43,6 +43,8 @@ use crate::metal_forward::MetalForward;
 use crate::placement::{BackendKind, MetalOps, Placed, PlacementReport};
 use crate::{ExpertIo, IoPath, ModelExpertSource, RuntimeError, load_tokenizer};
 use qubivex_backend_metal::MetalBackend;
+use qubivex_backend_vulkan::{VulkanConfig, VulkanDevice};
+use qubivex_compute::discrete::DiscreteDevice;
 
 /// How to load a model.
 #[derive(Clone, Copy, Debug, Default)]
@@ -97,6 +99,9 @@ pub struct EngineOptions {
     /// The simulated device for [`BackendKind::Sim`]. `None`: [`DEFAULT_SIM_VRAM`]
     /// with PCIe 4.0 transfer costs, counted but not slept.
     pub sim: Option<SimConfig>,
+    /// The Vulkan device for [`BackendKind::Vulkan`] (ADR-019): which one, and how
+    /// much of its memory to allow.
+    pub vulkan: VulkanConfig,
     /// An explicit VRAM budget in bytes for a discrete device, replacing the
     /// profile's fraction of its memory (ADR-018).
     pub vram_budget: Option<u64>,
@@ -764,7 +769,8 @@ impl Drop for Watcher {
 
 /// A model ready to generate.
 pub struct Engine {
-    /// A discrete device running every matmul ([`BackendKind::Sim`], ADR-018).
+    /// A discrete device running every matmul ([`BackendKind::Sim`] and
+    /// [`BackendKind::Vulkan`], ADR-018).
     device: Option<Arc<OnDevice>>,
     verification: Verification,
     memory: Memory,
@@ -999,7 +1005,7 @@ impl Engine {
         let mut layers_on = None;
         let backend = match opts.backend {
             // Placed once the ledger exists (below).
-            BackendKind::Cpu | BackendKind::Sim => Placed::cpu(),
+            BackendKind::Cpu | BackendKind::Sim | BackendKind::Vulkan => Placed::cpu(),
             // Whole layers exist for routed experts only; a dense model places its
             // matmuls one by one instead (below), with the same bits.
             BackendKind::Metal if opts.metal_ops.layers && model.is_moe() => {
@@ -1030,10 +1036,21 @@ impl Engine {
             .and_then(|c| usize::try_from(c).ok())
             .unwrap_or(4096);
         let wanted_ctx = opts.max_context.map(|c| c.min(model_ctx));
+        // A discrete device is opened before planning: the plan needs its memory.
+        let discrete: Option<Arc<dyn DiscreteDevice>> = match opts.backend {
+            BackendKind::Sim => Some(Arc::new(SimDevice::new(
+                opts.sim.unwrap_or_else(|| SimConfig::new(DEFAULT_SIM_VRAM)),
+            ))),
+            BackendKind::Vulkan => Some(Arc::new(VulkanDevice::new(opts.vulkan).map_err(|e| {
+                RuntimeError::Model(format!("cannot open the Vulkan device: {e}"))
+            })?)),
+            BackendKind::Cpu | BackendKind::Metal => None,
+        };
+        let vram = discrete.as_ref().map(|d| d.usage().capacity);
         let (plan, capacity, max_context) = match opts.expert_cache_bytes {
             Some(c) => (None, c, wanted_ctx.unwrap_or(model_ctx)),
             None => {
-                let plan = plan_at_load(&footprint, &opts, wanted_ctx)?;
+                let plan = plan_at_load(&footprint, &opts, wanted_ctx, vram)?;
                 let capacity = plan
                     .expert_cache_for(0)
                     .map_err(|r| RuntimeError::Memory(r.to_string()))?
@@ -1075,13 +1092,8 @@ impl Engine {
             .set_read_timeout(opts.read_timeout.unwrap_or(ReadTimeout::DEFAULT))
             .map_err(|e| RuntimeError::Model(e.to_string()))?;
         store.set_read_retries(opts.read_retries.unwrap_or(DEFAULT_READ_RETRIES));
-        let sim = (opts.backend == BackendKind::Sim).then(|| {
-            Arc::new(SimDevice::new(
-                opts.sim.unwrap_or_else(|| SimConfig::new(DEFAULT_SIM_VRAM)),
-            ))
-        });
-        let ledger = MemoryLedger::new(u32::from(sim.is_some()));
-        let device = match sim {
+        let ledger = MemoryLedger::new(u32::from(discrete.is_some()));
+        let device = match discrete {
             None => None,
             Some(dev) => {
                 let budget = match plan.as_ref().and_then(|p| p.vram.first()) {
@@ -1089,7 +1101,7 @@ impl Engine {
                     // A fixed RAM cache: the device's room after the dense copy.
                     None => opts
                         .vram_budget
-                        .unwrap_or(dev.config().capacity)
+                        .unwrap_or(dev.usage().capacity)
                         .saturating_sub(dense.arena.len() as u64)
                         .saturating_sub(VRAM_ACTIVATION_RESERVE.0),
                 };
@@ -1099,7 +1111,7 @@ impl Engine {
             }
         };
         let backend = match &device {
-            Some(d) => Placed::discrete(Arc::clone(d), model.dense_matmuls().len()),
+            Some(d) => Placed::discrete(Arc::clone(d), opts.backend, model.dense_matmuls().len()),
             None => backend,
         };
         let charges = Charges {
@@ -1186,7 +1198,7 @@ impl Engine {
     }
 
     /// The discrete device's memory, copies and expert cache, with
-    /// [`BackendKind::Sim`].
+    /// [`BackendKind::Sim`] or [`BackendKind::Vulkan`].
     #[must_use]
     pub fn device_report(&self) -> Option<DeviceReport> {
         self.device.as_ref().map(|d| d.report())
@@ -1970,6 +1982,7 @@ fn plan_at_load(
     fp: &ModelFootprint,
     opts: &EngineOptions,
     context: Option<usize>,
+    vram: Option<u64>,
 ) -> Result<MemoryPlan, RuntimeError> {
     let host = Host::live();
     let memory = qubivex_hardware::probe_memory(&host);
@@ -1987,9 +2000,9 @@ fn plan_at_load(
         context: context.map(|c| c as u64),
         sequences: 1,
         layer_weights: None,
-        vram: (opts.backend == BackendKind::Sim).then(|| VramRequest {
+        vram: vram.map(|available| VramRequest {
             device: 0,
-            available: Bytes(opts.sim.map_or(DEFAULT_SIM_VRAM, |c| c.capacity)),
+            available: Bytes(available),
             budget: opts.vram_budget.map(Bytes),
         }),
     };

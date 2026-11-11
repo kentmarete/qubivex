@@ -168,6 +168,7 @@ Errors fail the request, not the process.
 - **Repetition, presence and frequency penalties, logit bias, logprobs, beam search and
   grammar-constrained sampling.**
 - **Multimodal input, embeddings output and LoRA adapters.**
-- **CUDA and Vulkan backends.**
+- **A CUDA backend, and a fast Vulkan one.** `--backend vulkan` has the CPU's bits but
+  decodes slower than the CPU (ADR-019).
 - **Cancellation inside a forward pass.** It lands between tokens or prefill chunks.
 - **Saving a conversation's KV to disk.**

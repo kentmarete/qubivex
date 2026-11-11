@@ -1,0 +1,20 @@
+[package]
+name = "qubivex-backend-vulkan"
+description = "Vulkan compute backend for QUBIVEX: a discrete device with the CPU's bits"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+ash = { workspace = true }
+qubivex-compute = { workspace = true }
+qubivex-core = { workspace = true }
+
+[dev-dependencies]
+qubivex-backend-cpu = { workspace = true }
+
+[lints]
+workspace = true

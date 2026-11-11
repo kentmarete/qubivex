@@ -143,7 +143,7 @@ pub(crate) fn device_line(engine: &Engine) -> Option<String> {
     #[allow(clippy::cast_precision_loss)]
     let ms = t.transfer_ns as f64 / 1e6;
     Some(format!(
-        "[backend: {} on {} | VRAM {} used, peak {} of {} | device experts: cache {} of {}, {} hits, {} copies, {} evictions, {} dropped with the RAM cache{} | copies: {} weights ({}), {} activations in, {} out, {} submissions, {ms:.1} ms modelled]",
+        "[backend: {} on {} | VRAM {} used, peak {} of {} | device experts: cache {} of {}, {} hits, {} copies, {} evictions, {} dropped with the RAM cache{} | copies: {} weights ({}), {} activations in, {} out, {} submissions, {ms:.1} ms {}]",
         engine.placement().backend.name(),
         r.device,
         Bytes(u.used),
@@ -165,6 +165,11 @@ pub(crate) fn device_line(engine: &Engine) -> Option<String> {
         Bytes(t.activations_in),
         Bytes(t.activations_out),
         t.submissions,
+        if engine.placement().backend == qubivex_runtime::BackendKind::Sim {
+            "modelled"
+        } else {
+            "copying"
+        },
     ))
 }
 

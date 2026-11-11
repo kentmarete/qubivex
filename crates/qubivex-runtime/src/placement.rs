@@ -28,6 +28,9 @@ pub enum BackendKind {
     /// Every matmul on a simulated discrete GPU with its own memory (ADR-018); the
     /// rest (norms, attention, routing, sampling) on the CPU.
     Sim,
+    /// Every matmul on a Vulkan GPU as a discrete device (ADR-019); the rest on the
+    /// CPU, as with [`BackendKind::Sim`].
+    Vulkan,
 }
 
 impl BackendKind {
@@ -38,6 +41,7 @@ impl BackendKind {
             Self::Cpu => "cpu",
             Self::Metal => "metal",
             Self::Sim => "sim",
+            Self::Vulkan => "vulkan",
         }
     }
 }
@@ -258,9 +262,9 @@ impl Placed {
 
     /// Every matmul on the discrete device `on`, whose copy of the dense weights holds
     /// `tensors` matrices.
-    pub(crate) fn discrete(on: Arc<OnDevice>, tensors: usize) -> Self {
+    pub(crate) fn discrete(on: Arc<OnDevice>, backend: BackendKind, tensors: usize) -> Self {
         let report = PlacementReport {
-            backend: BackendKind::Sim,
+            backend,
             device: Some(on.describe()),
             ops: None,
             tensors,

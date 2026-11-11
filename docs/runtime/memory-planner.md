@@ -199,15 +199,19 @@ the device's memory. From the budget, the planner takes:
 - a device expert cache from the rest, never larger than the RAM expert cache at full
   context, because the device only holds copies of experts the RAM cache holds.
 
-No CUDA or Vulkan backend exists yet. `qubivex run --backend sim --sim-vram SIZE`
+`qubivex run --backend vulkan` runs on a Vulkan GPU (ADR-019): `--vulkan-vram SIZE`
+caps the memory it may use, which matters on an integrated GPU whose device memory is
+host RAM. No CUDA backend exists yet. `qubivex run --backend sim --sim-vram SIZE`
 runs on a simulated device that copies weights into its own memory with a hard
 capacity, so the plan, the ledger's VRAM tier and the device expert cache can be
 checked on any machine. The output bits are the CPU's.
 
 ## Not supported
 
-- **A real discrete GPU.** The VRAM budget is planned and simulated (`--backend sim`);
-  CUDA and Vulkan are not built.
+- **CUDA.** The VRAM budget is planned, simulated (`--backend sim`) and run on Vulkan
+  (`--backend vulkan`), which has only been measured on an integrated GPU (MoltenVK).
+- **Integrated GPUs planned as RAM under Vulkan.** Their device memory is host memory,
+  so cap it with `--vulkan-vram`.
 - **A shared budget across models** in one server, or across servers on one machine.
 - **Per-layer slot counts from measured demand.** Slots are spread evenly.
 - **Swap-aware planning.** The planner budgets RAM and treats swapping as a failure of

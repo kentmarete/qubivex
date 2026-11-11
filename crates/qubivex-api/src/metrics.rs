@@ -352,7 +352,7 @@ pub(crate) const MODEL_VALUES: &[(&str, &str, &str)] = &[
     (
         "qubivex_device_transfer_seconds_total",
         "counter",
-        "Time host-device copies took (modelled on a simulated device).",
+        "Time host-device copies took (measured on a real device, modelled on a simulated one).",
     ),
 ];
 
