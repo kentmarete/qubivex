@@ -74,6 +74,17 @@ pub fn exp(x: f32) -> f32 {
     if v < f32::MIN_POSITIVE { 0.0 } else { v }
 }
 
+/// `silu(g) · u`, in place into `g`: `silu(a) = a / (1 + exp(−a))`, then one multiply.
+///
+/// A device kernel gives the same bits if it evaluates the same operations in the same
+/// order, with this module's [`exp`], a correctly rounded division and contraction off.
+pub fn swiglu(g: &mut [f32], u: &[f32]) {
+    for (a, b) in g.iter_mut().zip(u) {
+        let s = *a / (1.0 + exp(-*a));
+        *a = s * b;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

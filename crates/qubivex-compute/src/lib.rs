@@ -205,6 +205,114 @@ pub struct MatMul<'a> {
     pub ys: &'a mut [f32],
 }
 
+/// One gated feed-forward block (SwiGLU), as a mixture-of-experts layer runs per
+/// expert: `ys = down · swiglu(gate · xs, up · xs)` for `s` activation rows.
+///
+/// Every output has the bits of the three matmuls and [`math::swiglu`] run in that
+/// order: fusing changes where the intermediates live, never the arithmetic.
+#[derive(Debug)]
+pub struct GatedFfn<'a> {
+    /// `ffn × cols` gate projection.
+    pub gate: WeightView<'a>,
+    /// `ffn × cols` up projection.
+    pub up: WeightView<'a>,
+    /// `rows × ffn` down projection.
+    pub down: WeightView<'a>,
+    /// `s × cols` activations.
+    pub xs: &'a [f32],
+    /// Activation rows.
+    pub s: usize,
+    /// `s × rows` outputs.
+    pub ys: &'a mut [f32],
+}
+
+impl GatedFfn<'_> {
+    /// Checks that the three matrices and both buffers fit together.
+    ///
+    /// # Errors
+    /// [`ComputeError::Shape`] when they do not.
+    pub fn check(&self) -> Result<(), ComputeError> {
+        let (g, u, d) = (&self.gate, &self.up, &self.down);
+        if g.rows() != u.rows()
+            || g.cols() != u.cols()
+            || d.cols() != g.rows()
+            || self.xs.len() != self.s * g.cols()
+            || self.ys.len() != self.s * d.rows()
+        {
+            return Err(ComputeError::Shape {
+                op: "gated ffn",
+                detail: format!(
+                    "gate {} x {}, up {} x {}, down {} x {}, {} rows: {} inputs, {} outputs",
+                    g.rows(),
+                    g.cols(),
+                    u.rows(),
+                    u.cols(),
+                    d.rows(),
+                    d.cols(),
+                    self.s,
+                    self.xs.len(),
+                    self.ys.len()
+                ),
+            });
+        }
+        Ok(())
+    }
+}
+
+/// [`ComputeBackend::gated_ffn_many`] as the separate steps: one
+/// [`ComputeBackend::matmul_many`] for every gate and up, [`math::swiglu`] on the host,
+/// then one for every down. Backends without a fused block use this.
+///
+/// # Errors
+/// As [`ComputeBackend::matmul_many`].
+pub fn gated_ffn_steps(
+    be: &(impl ComputeBackend + ?Sized),
+    ops: &mut [GatedFfn<'_>],
+) -> Result<(), ComputeError> {
+    for op in ops.iter() {
+        op.check()?;
+    }
+    let mut gs: Vec<Vec<f32>> = ops
+        .iter()
+        .map(|op| vec![0f32; op.s * op.gate.rows()])
+        .collect();
+    let mut us: Vec<Vec<f32>> = ops
+        .iter()
+        .map(|op| vec![0f32; op.s * op.up.rows()])
+        .collect();
+    let mut first = Vec::with_capacity(2 * ops.len());
+    for ((op, g), u) in ops.iter().zip(gs.iter_mut()).zip(us.iter_mut()) {
+        first.push(MatMul {
+            w: op.gate,
+            xs: op.xs,
+            s: op.s,
+            ys: g,
+        });
+        first.push(MatMul {
+            w: op.up,
+            xs: op.xs,
+            s: op.s,
+            ys: u,
+        });
+    }
+    be.matmul_many(&mut first)?;
+    drop(first);
+    for (g, u) in gs.iter_mut().zip(&us) {
+        math::swiglu(g, u);
+    }
+    let mut second: Vec<MatMul<'_>> = ops
+        .iter_mut()
+        .zip(&gs)
+        .map(|(op, g)| MatMul {
+            w: op.down,
+            xs: g,
+            s: op.s,
+            ys: &mut *op.ys,
+        })
+        .collect();
+    be.matmul_many(&mut second)
+}
+
 /// A compute backend.
 pub trait ComputeBackend: Send + Sync {
     /// Short name (`cpu`).
@@ -250,6 +358,24 @@ pub trait ComputeBackend: Send + Sync {
     /// bits.
     fn groups_matmuls(&self) -> bool {
         false
+    }
+
+    /// Whether callers should run `blocks` gated feed-forward blocks of at most `rows`
+    /// activation rows each as one [`ComputeBackend::gated_ffn_many`] (a fused expert
+    /// block), rather than as separate matmuls. The answer may depend on the shape: a
+    /// fused block can win at decode and lose at prefill. The default is `false`.
+    fn fuses_gated_ffn(&self, blocks: usize, rows: usize) -> bool {
+        let _ = (blocks, rows);
+        false
+    }
+
+    /// Independent gated feed-forward blocks ([`GatedFfn`]). Each output has the bits
+    /// of the separate steps ([`gated_ffn_steps`], the default).
+    ///
+    /// # Errors
+    /// As [`ComputeBackend::matmul`]; on an error, outputs may be partly written.
+    fn gated_ffn_many(&self, ops: &mut [GatedFfn<'_>]) -> Result<(), ComputeError> {
+        gated_ffn_steps(self, ops)
     }
 
     /// Writes the exact f32 values of row `r` (embedding lookup).

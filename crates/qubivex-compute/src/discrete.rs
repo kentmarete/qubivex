@@ -211,6 +211,24 @@ pub struct DeviceMatMul<'a> {
     pub ys: &'a mut [f32],
 }
 
+/// One gated feed-forward block of a submission, as [`crate::GatedFfn`] with the
+/// weights in device memory: `ys = down · swiglu(gate · xs, up · xs)`.
+#[derive(Debug)]
+pub struct DeviceGatedFfn<'a> {
+    /// `ffn × cols` gate projection.
+    pub gate: &'a DeviceWeights,
+    /// `ffn × cols` up projection.
+    pub up: &'a DeviceWeights,
+    /// `rows × ffn` down projection.
+    pub down: &'a DeviceWeights,
+    /// `s × cols` activations.
+    pub xs: &'a [f32],
+    /// Activation rows.
+    pub s: usize,
+    /// `s × rows` outputs.
+    pub ys: &'a mut [f32],
+}
+
 /// A device's memory.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct DeviceUsage {
@@ -323,4 +341,112 @@ pub trait DiscreteDevice: Send + Sync {
     fn groups_matmuls(&self) -> bool {
         false
     }
+
+    /// Whether callers should run `blocks` gated feed-forward blocks of at most `rows`
+    /// activation rows each as one [`DiscreteDevice::gated_ffn_many`]
+    /// ([`crate::ComputeBackend::fuses_gated_ffn`]). The default is `false`.
+    fn fuses_gated_ffn(&self, blocks: usize, rows: usize) -> bool {
+        let _ = (blocks, rows);
+        false
+    }
+
+    /// Independent gated feed-forward blocks. Each output has the bits of the separate
+    /// steps: the default runs them as two [`DiscreteDevice::matmul_many`] submissions
+    /// with [`crate::math::swiglu`] on the host between them. A device with a fused
+    /// block runs them as one submission, the intermediates staying on the device.
+    ///
+    /// # Errors
+    /// As [`DiscreteDevice::matmul_many`].
+    fn gated_ffn_many(&self, ops: &mut [DeviceGatedFfn<'_>]) -> Result<(), ComputeError> {
+        gated_ffn_steps(self, ops)
+    }
+
+    /// New device memory of `len` bytes, contents unspecified, filled later with
+    /// [`DiscreteDevice::write`]: an arena that holds many copies at fixed offsets.
+    /// `guard` lives as long as the allocation. The default refuses
+    /// ([`ComputeError::Device`]); callers then upload each copy on its own.
+    ///
+    /// # Errors
+    /// [`ComputeError::OutOfDeviceMemory`] when the device cannot hold `len` more
+    /// bytes; [`ComputeError::Device`] when the device has no arenas or the driver
+    /// fails.
+    fn alloc(&self, len: usize, guard: Option<Guard>) -> Result<DeviceBuffer, ComputeError> {
+        let _ = (len, guard);
+        Err(ComputeError::Device {
+            backend: self.name(),
+            detail: "this device has no writable arenas".into(),
+        })
+    }
+
+    /// Copies `host` into `buffer` at byte `offset` (an arena from
+    /// [`DiscreteDevice::alloc`]), counted as an upload. The caller makes sure no
+    /// submission reads those bytes meanwhile.
+    ///
+    /// # Errors
+    /// [`ComputeError::Device`] for a buffer of another device, a range outside it, or
+    /// a driver failure.
+    fn write(&self, buffer: &DeviceBuffer, offset: usize, host: &[u8]) -> Result<(), ComputeError> {
+        let _ = (buffer, offset, host);
+        Err(ComputeError::Device {
+            backend: self.name(),
+            detail: "this device has no writable arenas".into(),
+        })
+    }
+
+    /// The largest buffer one submission can address as a whole, in bytes: an arena
+    /// should not be larger, so a fused block can read every copy in it.
+    fn max_arena(&self) -> u64 {
+        u64::MAX
+    }
+}
+
+/// [`DiscreteDevice::gated_ffn_many`] as separate steps (the default): one
+/// [`DiscreteDevice::matmul_many`] for every gate and up, [`crate::math::swiglu`] on the
+/// host, then one for every down.
+///
+/// # Errors
+/// As [`DiscreteDevice::matmul_many`].
+pub fn gated_ffn_steps(
+    dev: &(impl DiscreteDevice + ?Sized),
+    ops: &mut [DeviceGatedFfn<'_>],
+) -> Result<(), ComputeError> {
+    let mut gs: Vec<Vec<f32>> = ops
+        .iter()
+        .map(|op| vec![0f32; op.s * op.gate.rows()])
+        .collect();
+    let mut us: Vec<Vec<f32>> = ops
+        .iter()
+        .map(|op| vec![0f32; op.s * op.up.rows()])
+        .collect();
+    let mut first = Vec::with_capacity(2 * ops.len());
+    for ((op, g), u) in ops.iter().zip(gs.iter_mut()).zip(us.iter_mut()) {
+        first.push(DeviceMatMul {
+            w: op.gate,
+            xs: op.xs,
+            s: op.s,
+            ys: g,
+        });
+        first.push(DeviceMatMul {
+            w: op.up,
+            xs: op.xs,
+            s: op.s,
+            ys: u,
+        });
+    }
+    dev.matmul_many(&mut first)?;
+    drop(first);
+    for (g, u) in gs.iter_mut().zip(&us) {
+        crate::math::swiglu(g, u);
+    }
+    let mut second: Vec<DeviceMatMul<'_>> = ops
+        .iter_mut()
+        .zip(&gs)
+        .map(|(op, g)| DeviceMatMul {
+            w: op.down,
+            xs: g,
+            s: op.s,
+            ys: &mut *op.ys,
+        })
+        .collect();
+    dev.matmul_many(&mut second)
 }
