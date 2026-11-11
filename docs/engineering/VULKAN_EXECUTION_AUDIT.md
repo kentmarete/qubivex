@@ -974,3 +974,190 @@ Corrections to §10:
 5. **If the owner installs Xcode**, one Metal capture of a decode step each way should
    confirm findings 1–4. It would also give the cache, occupancy and bandwidth counters that
    the public API does not expose.
+
+## 14. Option (b) and the fused-dispatch prototype (2026-11-11)
+
+The owner chose (b), then a harness prototype of a fused expert dispatch.
+- No production shader changed.
+- Nothing was pushed.
+- c2a114a and Step 1a are unchanged.
+
+### 14.1 Option (b), as built
+
+- `825b84b`: `DiscreteDevice::groups_matmuls()`, default `false`, decides whether to group.
+  - The simulator answers `true`, so the grouped expert path and its test
+    (`resident_experts_are_grouped_into_two_submissions`) stay exercised.
+  - Vulkan inherits `false`. Reverting this one commit turns grouping back on for Vulkan.
+- `f4dd9c3`: `git revert` of the `QUBIVEX_VK_PARTS` experiment (6c8b691). The history is
+  kept; the experiment is no longer in the code.
+- Records: `baselines/2026-11-11-m3pro-vulkan-optb-{base,optb}-{1,2,3}.json`, untimed,
+  alternated, mains. The tokens match the PR #55 reference in all six, at 305 submissions
+  per token.
+
+  | Round | Step 1a (5e0ca13), ms/token | (b) (f4dd9c3), ms/token |
+  |---|---|---|
+  | 1 | 35.10 | 35.95 |
+  | 2 | 35.70 | 35.76 |
+  | 3 | 35.68 | 35.63 |
+
+  Equal within the run-to-run spread: (b) gives back Step 1a's behaviour.
+
+### 14.2 The fused dispatch: design
+
+`spikes/vulkan-step2-metal-timing`: `fuse.py`, the `FUSED` shape and `check` mode in
+`main.m`, and `cpucheck/`.
+
+- **One dispatch per stage covers every matrix of the stage.**
+  - Gate/up: 16 matrices × 128 row blocks = 2048 threadgroups.
+  - Down: 8 × 256.
+  - The grid's x axis concatenates the matrices' row blocks, and y is the token, as before.
+- **A table replaces the push constants.** One entry per matrix: the six push-constant
+  fields (`n`, `k`, `row_bytes`, `w_base`, `x_base`, `y_base`) and the matrix's first row
+  block.
+- Each threadgroup:
+  - finds its matrix `m`;
+  - copies that entry into the local that the body reads as its push constants;
+  - sets its row block to `wg.x − first[m]`;
+  - then runs **MoltenVK's generated body unchanged**. `fuse.py` changes only the entry
+    signature and adds 7 lines.
+- Two lookups, both measured:
+  - a search of the table;
+  - `m = wg.x / blocks_per_matrix`, which is valid because every matrix of a stage has the
+    same shape: `--equal`, the default.
+- `m` is uniform within a threadgroup, so the body's barriers stay uniform.
+
+### 14.3 Mathematical and execution approach
+
+- Each output is still one row's dot product, computed by one 32-lane group, with the same:
+  - weights (`w_base` is the matrix's byte offset in the bound range);
+  - input row (`x_base`);
+  - dequantisation;
+  - 64-lane FMA accumulation;
+  - reduction tree.
+- So every output is computed by the same instruction sequence on the same operands as in
+  its own dispatch, and has the same bits. Fusing only changes the mapping of threadgroups
+  to work, not the arithmetic.
+- **Why it is faster.** In a serial encoder each dispatch pays about 7.5 µs to ramp up and
+  drain (§13, finding 4). One dispatch per stage pays it twice per layer instead of 24 times,
+  and keeps the GPU at the kernel's large-dispatch rate (about 37 GB/s) across matrix
+  boundaries. It recovers what a concurrent encoder would, without needing one. MoltenVK
+  cannot use a concurrent encoder.
+
+### 14.4 Correctness
+
+`run.sh check`, for 1, 3 and 8 experts × 1, 2, 4, 10 and 32 tokens: every gate, up and down
+output, 2 286 592 in all.
+- Weights use the parity tests' rule for block formats; activations use their `acts`.
+- Each down has its own input.
+
+| Check | Result |
+|---|---|
+| fused vs unfused, on the GPU, bit for bit (both lookups) | **0 of 15 configurations differ** |
+| fused and unfused vs `CpuBackend::matmul`, bit for bit (both lookups) | **0 of 30 differ** |
+| positive control: one output bit flipped | detected (1 of 30) |
+| non-finite outputs | none |
+
+The unfused harness kernel also matches the CPU bit for bit. That confirms the harness runs
+the same arithmetic as the Vulkan backend.
+
+### 14.5 Benchmarks
+
+Metal GPU time per layer (ms). Two command buffers, as on the grouped path, with no timestamp
+queries. Mains; 5 interleaved repeats, 200 samples each, medians. The range is over repeats.
+
+| Experts × tokens | A: Step 1a shape (16 cbs, 5 threads) | B: grouped, serial | B: concurrent encoder (reference only) | **F: fused, search** | **F: fused, O(1)** |
+|---|---|---|---|---|---|
+| 8 × 1 | 0.924–0.927 | 0.932–0.937 | 0.765–0.767 | 0.789–0.793 | **0.783** |
+| — of which gate+up / down | — | 0.633 / 0.302 | 0.504 / 0.261 | 0.518 / 0.272 | 0.513 / 0.270 |
+| 8 × 4 | 3.169–3.175 | 3.161–3.163 | 3.014–3.015 | 3.098–3.099 | 3.085 |
+| 8 × 10 | 7.689–7.691 | 7.666–7.667 | 7.520 | 7.721 | — |
+| 4 × 1 | 0.461–0.462 | 0.469–0.470 | 0.390–0.391 | 0.397–0.401 | — |
+| 1 × 1 | 0.116–0.118 | 0.117–0.118 | 0.107–0.111 | 0.108–0.113 | — |
+
+The O(1) column comes from 3 alternations against the search. Every repeat agrees to within
+0.004 ms.
+
+- **The target (≤ 0.76 ms at 8 × 1) is not met:**
+  - fused: 0.783 ms, **−15.4% against Step 1a's shape** (0.926);
+  - the concurrent encoder: 0.766 ms.
+  - About 9 µs per stage remains between them, inside the dispatch. The lookup accounted for
+    7 µs of the gap, which the O(1) lookup removed. Neither a table search nor the stage
+    structure explains the rest.
+- **At 10 tokens fused is 0.4% slower** (7.72 against 7.69). There the dispatches are long
+  and the ramp cost is negligible. A fused path should apply at small token counts (decode)
+  only, or be checked again for prefill.
+
+### 14.6 Against Step 1a, end to end: what the prototype does and does not buy
+
+Per token (16 layers), fused saves 16 × (0.926 − 0.783) ≈ **2.3 ms of GPU time**. But
+fusing requires grouping (one submission per stage), and §13 measured grouping at 2–4 ms per
+token slower end to end, because only one submission is in flight. So:
+
+- **Fused + grouped as today (two submissions per layer, host SwiGLU between): about even
+  with Step 1a.** Estimate: grouped's 37–38.7 ms − 2.3 ≈ 35–36 ms, against 34.3–35.7. Not
+  worth building on its own.
+- **Fused + SwiGLU on the device, one submission per layer for the experts**:
+  - This removes one exposed round trip per layer, about 0.1–0.2 ms × 16 = 1.6–3.2 ms.
+  - Estimate: about 32–34 ms per token (29–31 tok/s), a gain of about 1–3 ms over Step 1a.
+  - This is an estimate built from §13's gap measurements, not a measurement.
+
+### 14.7 Step 3, rescoped: removing host round trips inside a layer
+
+Today a decode layer has these round trips on its critical path:
+- QKV;
+- O;
+- router;
+- the expert stages: 4, partly hidden by the 5 in-flight submissions.
+
+What each host operation needs in order to move to the device:
+
+| Host operation | Round trip it forces | What moving it needs | Parity risk (§5) |
+|---|---|---|---|
+| SwiGLU, `g·silu(g)` with `silu(x) = x/(1+exp(−x))` | gate/up → down (per layer) | a small elementwise kernel between the fused stages in one command buffer, with a barrier | `exp`: port `qubivex_compute::math::exp` (basic ops and `fma` only), then **division**: Vulkan allows 2.5 ULP. Needs the probe and/or an fma correction. Medium |
+| Combine (rank order, `fma`) | none by itself: it follows the last wait | needed only when a whole layer is one submission | `fma` is already probed at open. Low |
+| Router matmul + softmax + top-8 | router → experts | top-k on the device; the experts' device addresses from a table | `exp`, division, **tie order** in top-k. Leases and residency are host decisions: valid only when every expert of the layer is resident (the grouped path's condition), with the host reading the choice back afterwards for statistics. Medium–high |
+| RMS norms (attention, FFN, final), QK norm | part of QKV → attention → O | reduction via `reduce`'s shape, then `1/sqrt` | **`sqrt` and division**: about 3 ULP allowed. Metal's non-fast mode is probably correct, but must be proven by probe. Medium |
+| Clip, residual adds | — | elementwise | exact. Low |
+| RoPE | QKV → attention | upload the host's f64-rounded table, as on Metal | low |
+| KV store + attention (scores, softmax, values) | QKV → attention → O | **a device-resident KV cache**: today `qubivex-kv-cache` owns it on the host. This is an architecture change (ADR-level) | dot via `reduce::dot`'s shape, `exp`, division. High |
+
+Proposed order, each step gated on untimed, alternated mains wall-clock:
+
+1. **3a, experts in one submission per layer:** fused gate/up → SwiGLU → fused down. The
+   first step that should beat Step 1a: about 1–3 ms per token, estimated.
+2. **3b, router and routing join that submission:** for fully resident layers only.
+   2 round trips per layer remain: QKV and O+router+experts.
+3. **3c, norms, RoPE and attention on the device, with a device KV cache:** one submission
+   per layer, then per token. The wall clock then approaches GPU busy: about 21–23 ms with
+   fused experts, about 43–47 tok/s. This is the only route to the 43.5 tok/s target found so
+   far.
+
+### 14.8 Recommendation for the next Vulkan step (not started; for review)
+
+Two harness checks come before any production shader change:
+
+1. **SwiGLU parity in the harness.** A Metal kernel built from MoltenVK's translation of a
+   GLSL SwiGLU (`exp` port, NoContraction), checked bit for bit against
+   `CpuBackend`'s `swiglu` by `cpucheck`, over the full float range seen in decode plus edge
+   cases (overflow of `exp`, subnormals). If division is not exact on MoltenVK, add the fma
+   correction step and prove it there.
+2. **How the fused dispatch reaches eight experts' weights.** Each expert's device copy is
+   its own `VkBuffer` today (tied to its RAM slab), while the harness used one buffer with
+   offsets. Measure in the harness, against the 0.783 ms result:
+   - (a) the expert copies sub-allocated from one device arena (what the harness shows today);
+   - (b) a descriptor array indexed by matrix (Metal argument buffer);
+   - (c) buffer device addresses (`VK_KHR_buffer_device_address`, a GPU address in the table).
+
+Then the Vulkan Step 3a would be:
+- `matmul.comp` gains the fused entry: same body, table in a storage buffer, chosen by
+  specialisation constant, so the unfused pipeline is unchanged;
+- a SwiGLU shader;
+- the grouped provider path, re-enabled for Vulkan only in this combined form: a device
+  capability, not the old `groups_matmuls`;
+- isolated commits, each revertible: fused entry, SwiGLU shader, binding change, enabling
+  switch;
+- parity tests per shader against the CPU, `tests/vulkan.rs` with OLMoE, and alternated
+  mains records against Step 1a.
+
+It is accepted only if the wall clock beats Step 1a beyond the run-to-run spread (about
+0.7 ms).
