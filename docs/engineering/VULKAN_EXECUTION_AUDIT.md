@@ -515,12 +515,11 @@ The host Σ columns sum over the threads that submit, so they exceed wall time.
    - About 762 MB in 19.6 ms is about 39 GB/s while busy.
    - The 34 ms kernel floor feared in §1.3 is refuted. With every round trip removed,
      the GPU work alone would allow about 50 tok/s.
-3. **The cost of a round trip.**
-   - GPU time per submission: 19.6 ms / 305 ≈ 64 µs.
-   - Host wait per submission: 86 ms / 305 ≈ 280 µs. So about 220 µs per submission is
-     fixed latency (submit to fence signalled), not GPU work.
-   - The critical path is about 113 round trips × ~316 µs ≈ 35.7 ms, which matches the
-     untimed median (35.5–35.9 ms).
+3. **The cost of a round trip.** The first version of this item reconciled 113 × ~316 µs
+   with 35.7 ms. That fit was a coincidence: it mixed two different intervals and
+   counted GPU time twice. See "Reconciling the per-token time" below for the corrected
+   accounting: about 16 ms of idle time per token, spread over about 113 gaps, ≈ 140 µs
+   per gap.
 4. **Host submission work is small.** Preparing and submitting takes 5.6 ms per token
    summed over threads, about 18 µs per submission, and copies take 0.9 ms. On the
    critical path that is at most about 113 × 18 µs ≈ 2 ms plus part of the copies.
@@ -535,12 +534,66 @@ The host Σ columns sum over the threads that submit, so they exceed wall time.
 
 Consequences for the sequence:
 - Step 2's value depends on the grouped dispatch, not on submission concurrency.
-  Two submissions per layer for the experts take the critical path from 7 round trips
-  to 5 per layer, about 81 per token. At ~316 µs each that is about 26 ms, roughly
-  37 tok/s, provided the grouped dispatch's GPU time is no worse than the serial
-  dispatches it replaces. The kernel test's 24 matrices in one submission (1.26 ms)
-  against ~16 × 64 µs ≈ 1.0 ms today says to measure that before building on it.
+  Two expert submissions per layer instead of four critical round trips remove about
+  2 gaps per layer, 32 per token. At ≈ 140 µs per gap that is about 4.5 ms: about
+  31 ms per token, **≈ 32 tok/s**, if the grouped submissions' GPU time is no worse than
+  the serial dispatches they replace. The earlier "≈ 37 tok/s" came from the
+  double-counted 316 µs per round trip and is withdrawn as an estimate; 37 tok/s stays
+  a target, not an expected result. The kernel test's 24 matrices in one submission
+  (1.26 ms) against ~16 × 64 µs ≈ 1.0 ms today says to measure GPU time before
+  building on it.
 - Steps 3–4 target the ~16–19 ms of idle time directly.
+
+### Reconciling the per-token time (added 2026-11-11, at the owner's request)
+
+The four figures measure different intervals, and some of them overlap:
+
+| Figure | Interval measured | Summed over | Overlaps with |
+|---|---|---|---|
+| 35.7 ms/token | wall clock, one decode step | one step | — (the quantity to explain) |
+| 305 submissions | each `vkQueueSubmit` | all submitting threads | 49 are serial (3 dense per layer + head); 256 are expert submissions issued by 5 threads at once |
+| 280 µs "wait per submission" | fence wait: return of `vkQueueSubmit` to return of `vkWaitForFences` | **every thread**, 86 ms Σ per token | each other: up to 5 expert waits run at once, and each includes the GPU time of the command buffers queued ahead of it from other threads. Σ wait (86 ms) exceeds wall (35.7 ms) for this reason |
+| 18 µs "host submit" | descriptor sets, record, `vkQueueSubmit` | every thread, 5.6 ms Σ | other threads' waits; only the part on the critical thread adds to wall |
+| 19.6 ms GPU busy | union of TOP_OF_PIPE → BOTTOM_OF_PIPE timestamp intervals | the GPU queue | nothing: Σ GPU = busy, so no two command buffers ran at once |
+| "220 µs non-GPU" | 280 µs − 64 µs average GPU | — | **invalid**: 280 µs is an average over overlapping waits that include other submissions' GPU time, so subtracting one submission's GPU time does not isolate fixed latency |
+
+What does reconcile:
+- The GPU runs one command buffer at a time and every token waits for all of its GPU
+  work. So all 19.6 ms of GPU busy time lies on the critical path.
+- Wall minus busy is the time the GPU sits idle while the token is in progress:
+  35.7 − 19.6 ≈ **16.1 ms**.
+  - The timed runs show 19.4–19.9 ms idle. That includes the ~3.5–4 ms the timestamp
+    queries add on the host.
+  - The GPU figure is taken from the timed runs on the assumption that timestamps do
+    not change GPU time. Their busy time matches across the two runs (19.52, 19.74).
+- Idle time is what each serial hand-off costs:
+  - host work between submissions: CPU attention, norms, routing, SwiGLU and combine,
+    copies, descriptor writes and recording;
+  - MoltenVK's submit-to-start latency;
+  - completion-to-wake latency.
+- About 113 hand-offs per token:
+  - 3 dense per layer;
+  - about 4 expert stages per layer, in two waves;
+  - plus the head.
+- That is ≈ 16.1 / 113 ≈ **140 µs idle per hand-off**.
+  - It is an average. The expert waves are pipelined across 5 threads rather than strict
+    waves, so the expert stages' share of the gaps is not measured separately.
+  - Per-stage timestamps are not recorded.
+- The earlier "113 × 316 µs ≈ 35.7 ms" added the 280 µs average wait (which already
+  contains GPU time, partly other submissions') to the critical-path count. GPU time was
+  then also counted in the wall. Its agreement with the median was a coincidence.
+
+Consequences:
+- Step 1's ceiling still holds: host prep (≈ 18 µs per submission) plus copies is a
+  small part of the ≈ 140 µs gap. Step 1a's neutral result agrees.
+- Each removed hand-off saves about one gap, ≈ 140 µs, not 316 µs. Step 2's estimate
+  above is corrected to ≈ 32 tok/s on that basis.
+- Step 2's measurements report the following, each separately:
+  - host submit time (Σ `submit_ms`, and per submission);
+  - fence wait (Σ);
+  - GPU execution (Σ and busy);
+  - GPU idle.
+  Throughput comes only from untimed, alternated runs.
 
 ## 11. Step 1a: bulk copies, one copy per shared input (2026-11-11)
 
@@ -573,3 +626,51 @@ This confirms Step 0's bound for the rest of Step 1. The remaining host submissi
 is about 18 µs per submission. Push descriptors would remove only part of that, at most
 about 0.5 ms per token on the critical path, which is below the noise floor of a 3-run
 bench, and they would add a second descriptor path to maintain.
+
+## 12. Step 2: grouped experts (plan, 2026-11-11)
+
+The owner approved Step 2 and set these conditions:
+- skip 1b and keep 1a;
+- parity with PR #55 on every run;
+- expert dispatches per layer go from 7 to 5;
+- host submit time measured apart from GPU execution;
+- register pressure, occupancy, memory traffic and grouped shader time monitored;
+- no throughput claim from timestamped runs;
+- alternated baseline and candidate runs on mains power;
+- isolated and reversible;
+- the existing tests run;
+- 37 tok/s is a target only;
+- report and stop for review before anything further.
+
+Design (variant B of §4.3; same shader, same pipeline):
+- `ComputeBackend::groups_matmuls()` (default `false`): the backend asks callers to put
+  independent matmuls into one `matmul_many`, because each call is a submission.
+  `Placed` answers `true` for a discrete device.
+- `ExpertProvider::with_experts_grouped(layer, experts, group, each)`:
+  - The provider calls `group` once with every routed expert held, when all of them are
+    ready now (resident, and pinned on the device).
+  - Otherwise it calls `each` per expert, exactly as `with_experts` does.
+  - The default always takes the per-expert path.
+  - `StoreProvider` takes the leases from `acquire_many` with `try_next`, so hits,
+    heat and recency are counted exactly as today. If any expert is not ready, it hands
+    the leases it already holds to the per-expert path.
+- The MoE block, with a grouping backend, does three things:
+  - one `matmul_many` over every expert's gate and up;
+  - host SwiGLU per expert;
+  - one `matmul_many` over every down.
+- Each op has the same weight, the same inputs and the same kernel as before. So each
+  output has the same bits, and the combine is unchanged, in rank order.
+
+What can and cannot be monitored on this device:
+- MoltenVK reports `pipelineStatisticsQuery = false` and lists neither
+  `VK_KHR_pipeline_executable_properties` nor `VK_KHR_performance_query`. Register
+  counts and occupancy cannot be read through Vulkan here.
+- Variant B does not change the shader, the specialization constants or the workgroup
+  size. Register pressure and occupancy are therefore unchanged by construction.
+- A new shader (variant C) would need Xcode's Metal capture to inspect them. It is
+  built only if B shows a GPU-time penalty.
+- GPU execution time comes from timestamps:
+  - per submission;
+  - Σ and busy per token;
+  - per stage in the kernel test.
+- Memory traffic is computed: weight bytes per stage divided by GPU time.

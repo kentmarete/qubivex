@@ -9,10 +9,11 @@ Last updated: 2026-11-11
   - Vulkan: 27.9–28.2 tok/s untimed at 5 threads, 28.8 at 8. CPU: 43.3.
   - GPU busy is 19.5–19.7 ms per token, idle about the same.
   - Submissions never overlap on the GPU.
-  - About 220 µs of each submission's ~280 µs wait is fixed latency.
+  - Wall minus GPU busy leaves about 16 ms of GPU idle per token over about 113 serial hand-offs, ≈ 140 µs each. (A first reading of "220 µs fixed latency per submission" double-counted overlapping waits; corrected in the audit §10.)
   - Host submit work is about 18 µs per submission.
   - So the round trips bind, not the kernels.
-- Next: Step 1 (host submission cost, at most about 2–3 ms), then Step 2 (grouped experts).
+- Step 1a (bulk copies) committed: neutral end to end. 1b and the other per-call clean-ups skipped (owner, 2026-11-11).
+- Next: Step 2 (grouped experts), estimate ≈ 32 tok/s; 37 is a target, not an expectation.
 
 **Vulkan kernel speed (2026-11-11; ADR-019 amendment 1, accepted 2026-11-11).** Decode on MoltenVK 4.2x faster with the same bits.
 - Shader: Q4_K, Q6_K and Q8_0 decode a block at a time (scales once per block, each byte once for all the weights it holds); a Q4_K header is read as four words. No `precise`: `shaders/build.sh` marks every add, subtract and `fma` `NoContraction`, because SPIRV-Cross turned every `precise` multiply into an unoptimised helper call. Q4_K's `t - m` is `fma(t, 1, -m)` with `t` kept rounded by an integer OR.
