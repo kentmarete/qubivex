@@ -6,7 +6,6 @@
 //! [`qubivex_compute::math::exp`] are used, so the bits are the same on every
 //! platform and on a GPU that evaluates them in the same order.
 
-
 /// RMSNorm in place and its factor (defined in `qubivex-compute`, so a device backend
 /// can give the same bits without depending on this crate).
 pub use qubivex_compute::math::{rms_norm, rms_scale};

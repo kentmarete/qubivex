@@ -310,6 +310,7 @@ fn cpu_layer(
             ys: &mut ys,
             ids: &mut ids,
             weights: &mut ws,
+            prelude: None,
         },
     )
     .unwrap();
@@ -388,6 +389,7 @@ fn gpu_layer(
             ys: &mut ys,
             ids: &mut ids,
             weights: &mut ws,
+            prelude: None,
         })
         .unwrap();
     ran.then_some((ys, ids, ws))

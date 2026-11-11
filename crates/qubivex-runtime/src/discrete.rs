@@ -34,8 +34,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, PoisonError, Weak};
 
 use qubivex_compute::discrete::{
-    DeviceBuffer, DeviceGatedFfn, DeviceMatMul, DeviceRoutedMoe, DeviceUsage, DeviceWeights,
-    DiscreteDevice, TransferStats,
+    DeviceBuffer, DeviceGatedFfn, DeviceMatMul, DeviceMoePrelude, DeviceRoutedMoe, DeviceUsage,
+    DeviceWeights, DiscreteDevice, TransferStats,
 };
 use qubivex_compute::host::PageAligned;
 use qubivex_compute::{ComputeError, GatedFfn, MatMul, RoutedMoe, WeightView};
@@ -347,6 +347,12 @@ impl OnDevice {
     /// every layer, so holding a layer evicts nothing.
     pub(crate) fn routes_moe(&self, experts: usize, k: usize, s: usize) -> bool {
         self.provisioned && self.device.routes_moe(experts, k, s)
+    }
+
+    /// Whether such a layer should be routed with its prelude (the O projection,
+    /// residual and norm) in the same submission (Step 3c); as [`Self::routes_moe`].
+    pub(crate) fn routes_moe_prelude(&self, experts: usize, k: usize, s: usize) -> bool {
+        self.provisioned && self.device.routes_moe_prelude(experts, k, s)
     }
 
     pub(crate) fn describe(&self) -> String {
@@ -683,6 +689,20 @@ impl OnDevice {
             .iter()
             .map(|[g, u, d]| Ok([self.weights(g)?, self.weights(u)?, self.weights(d)?]))
             .collect::<Result<Vec<_>, ComputeError>>()?;
+        let o = match &op.prelude {
+            Some(p) => Some(self.weights(&p.o)?),
+            None => None,
+        };
+        let prelude = match (op.prelude.as_mut(), o.as_ref()) {
+            (Some(p), Some(o)) => Some(DeviceMoePrelude {
+                o,
+                att: p.att,
+                hs: &mut *p.hs,
+                norm: p.norm,
+                eps: p.eps,
+            }),
+            _ => None,
+        };
         let ran = self.device.routed_moe(&mut DeviceRoutedMoe {
             router: &router,
             experts: &experts,
@@ -693,6 +713,7 @@ impl OnDevice {
             ys: &mut *op.ys,
             ids: &mut *op.ids,
             weights: &mut *op.weights,
+            prelude,
         })?;
         if ran {
             self.routed.fetch_add(1, Ordering::Relaxed);

@@ -275,9 +275,21 @@ fn fused_expert_blocks_are_one_submission() {
 /// As [`sim_fused`], with MoE layers of up to `route_rows` tokens also routed on the
 /// device (Step 3b); `device_cache` limits the device expert cache.
 fn sim_routed(id: &str, route_rows: usize, device_cache: Option<u64>) -> Engine {
+    sim_routed_with(id, route_rows, false, device_cache)
+}
+
+/// As [`sim_routed`], with each routed layer's prelude (the O projection, residual and
+/// norm) in the same submission when `prelude` (Step 3c).
+fn sim_routed_with(
+    id: &str,
+    route_rows: usize,
+    prelude: bool,
+    device_cache: Option<u64>,
+) -> Engine {
     let mut config = SimConfig::new(1 << 30);
     config.fuse_rows = 64;
     config.route_rows = route_rows;
+    config.route_prelude = prelude;
     Engine::load(
         meta(id),
         EngineOptions {
@@ -367,6 +379,93 @@ fn routed_layers_are_one_submission_with_the_cpu_bits() {
         assert_eq!(run(&off), want_run, "{id}");
         assert_eq!(off.device_report().unwrap().routed_layers, 0, "{id}");
     }
+}
+
+/// Step 3c on the sim: the O projection, residual and FFN norm join the routed
+/// submission, two submissions per layer, with the CPU's bits and the same store and
+/// device-cache uses as Step 3b.
+#[test]
+fn routed_layers_with_their_prelude_are_two_submissions_per_layer() {
+    for id in MOE {
+        let cpu_e = cpu(id, Some(1 << 30));
+        let want = {
+            let mut c = cpu_e.new_cache();
+            bits(&cpu_e.forward(PROMPT, &mut c, Logits::All, None).unwrap())
+        };
+        let want_run = run(&cpu_e);
+        let e = sim_routed_with(id, 64, true, None);
+        assert_eq!(routed_logits(&e, id), want, "{id}");
+        let submissions = |e: &Engine| e.device_report().unwrap().transfers.submissions;
+        let before = submissions(&e);
+        let mut c = e.new_cache();
+        assert_eq!(
+            bits(&e.forward(PROMPT, &mut c, Logits::All, None).unwrap()),
+            want,
+            "{id}"
+        );
+        assert_eq!(
+            submissions(&e) - before,
+            2 * layers(id) + 1,
+            "{id}: QKV and the routed layer with its prelude per layer, then the head"
+        );
+        assert_eq!(run(&e), want_run, "{id}");
+
+        // The same uses as Step 3b, once both are warm.
+        let b = sim_routed(id, 64, None);
+        let _ = routed_logits(&b, id);
+        let uses = |e: &Engine| {
+            let (h, d) = (
+                e.store_stats().hits,
+                e.device_report().unwrap().experts.hits,
+            );
+            let _ = run(e);
+            (
+                e.store_stats().hits - h,
+                e.device_report().unwrap().experts.hits - d,
+            )
+        };
+        assert_eq!(uses(&e), uses(&b), "{id}: store and device-cache hits");
+
+        // A device cache short of the model routes on the host, prelude or not.
+        let short = sim_routed_with(id, 64, true, Some(2 * largest_expert(id)));
+        assert_eq!(run(&short), want_run, "{id}");
+        assert_eq!(short.device_report().unwrap().routed_layers, 0, "{id}");
+    }
+}
+
+/// Concurrent requests routed with their prelude: each gets the CPU's prompt logits and
+/// tokens.
+#[test]
+fn concurrent_requests_routed_with_their_prelude() {
+    let id = "olmoe-tiny";
+    let prompts: Vec<Vec<u32>> = (0..4)
+        .map(|i| PROMPT.iter().map(|&t| t + i).collect())
+        .collect();
+    let both = |e: &Engine, p: &[u32]| {
+        let mut c = e.new_cache();
+        let logits = bits(&e.forward(p, &mut c, Logits::All, None).unwrap());
+        (
+            logits,
+            e.generate(p, 8, Sampling::default(), |_| true).unwrap(),
+        )
+    };
+    let c = cpu(id, Some(1 << 30));
+    let want: Vec<_> = prompts.iter().map(|p| both(&c, p)).collect();
+    let e = sim_routed_with(id, 64, true, None);
+    let _ = routed_logits(&e, id);
+    let before = e.device_report().unwrap().routed_layers;
+    let got: Vec<_> = std::thread::scope(|s| {
+        let hs: Vec<_> = prompts
+            .iter()
+            .map(|p| {
+                let e = &e;
+                s.spawn(move || both(e, p))
+            })
+            .collect();
+        hs.into_iter().map(|h| h.join().unwrap()).collect()
+    });
+    assert_eq!(got, want);
+    assert!(e.device_report().unwrap().routed_layers > before);
 }
 
 /// A device cache that cannot hold every expert never routes on the device (holding a

@@ -313,6 +313,54 @@ pub fn gated_ffn_steps(
     be.matmul_many(&mut second)
 }
 
+/// What comes before a mixture-of-experts layer, run at the head of a [`RoutedMoe`]
+/// (Step 3c): the attention output projection, the residual and the layer's norm.
+/// `hs += O · att`, then the layer's activations are `rms_norm(hs, norm, eps)` per token
+/// ([`prelude_steps`]).
+#[derive(Debug)]
+pub struct MoePrelude<'a> {
+    /// `cols × att_cols` output projection (`cols`: the router's input width).
+    pub o: WeightView<'a>,
+    /// `s × att_cols` attention outputs.
+    pub att: &'a [f32],
+    /// `s × cols` residual stream: read, and written back with the projection added.
+    pub hs: &'a mut [f32],
+    /// `cols` norm weights.
+    pub norm: &'a [f32],
+    /// The norm's epsilon.
+    pub eps: f64,
+}
+
+/// The residual and norm of a prelude given the projection's outputs `o` (`s × cols`):
+/// `hs += o`, then each token's row of `hs` through [`math::rms_norm`]. Returns the
+/// normed activations.
+#[must_use]
+pub fn residual_norm(o: &[f32], hs: &mut [f32], norm: &[f32], eps: f64) -> Vec<f32> {
+    for (a, b) in hs.iter_mut().zip(o) {
+        *a += b;
+    }
+    let mut x = hs.to_vec();
+    for row in x.chunks_exact_mut(norm.len().max(1)) {
+        math::rms_norm(row, norm, eps);
+    }
+    x
+}
+
+/// [`MoePrelude`] as separate steps on `be`: the O matmul, then [`residual_norm`].
+/// Returns the normed activations.
+///
+/// # Errors
+/// As [`ComputeBackend::matmul`].
+pub fn prelude_steps(
+    be: &(impl ComputeBackend + ?Sized),
+    p: &mut MoePrelude<'_>,
+    s: usize,
+) -> Result<Vec<f32>, ComputeError> {
+    let mut o = vec![0f32; s * p.o.rows()];
+    be.matmul(&p.o, p.att, s, &mut o)?;
+    Ok(residual_norm(&o, p.hs, p.norm, p.eps))
+}
+
 /// A mixture-of-experts layer after its norm, as one operation: the router, softmax
 /// top-k routing ([`math::route`]), every routed expert's gated feed-forward block, and
 /// the rank-order combine. A backend that runs it on a device lets the device choose the
@@ -333,7 +381,7 @@ pub struct RoutedMoe<'a> {
     pub k: usize,
     /// Whether the chosen probabilities are renormalised to sum to 1.
     pub renormalise: bool,
-    /// `s × cols` activations (normed).
+    /// `s × cols` activations (normed); empty with a prelude, which computes them.
     pub xs: &'a [f32],
     /// Activation rows (tokens).
     pub s: usize,
@@ -343,6 +391,9 @@ pub struct RoutedMoe<'a> {
     pub ids: &'a mut [u32],
     /// `s × k` their routing weights.
     pub weights: &'a mut [f32],
+    /// The O projection, residual and norm before the layer, in the same operation
+    /// (Step 3c); `None`: `xs` holds the activations.
+    pub prelude: Option<MoePrelude<'a>>,
 }
 
 impl RoutedMoe<'_> {
@@ -383,7 +434,29 @@ impl RoutedMoe<'_> {
                 )));
             }
         }
-        if self.xs.len() != self.s * cols
+        let xs = match &self.prelude {
+            None => self.s * cols,
+            Some(p) => {
+                if p.o.rows() != cols
+                    || p.att.len() != self.s * p.o.cols()
+                    || p.hs.len() != self.s * cols
+                    || p.norm.len() != cols
+                {
+                    return Err(bad(format!(
+                        "prelude: O {} x {}, {} attention outputs, {} residuals, {} norm \
+                         weights, for {} tokens of {cols}",
+                        p.o.rows(),
+                        p.o.cols(),
+                        p.att.len(),
+                        p.hs.len(),
+                        p.norm.len(),
+                        self.s
+                    )));
+                }
+                0
+            }
+        };
+        if self.xs.len() != xs
             || self.ys.len() != self.s * rows
             || self.ids.len() != self.s * self.k
             || self.weights.len() != self.s * self.k
@@ -461,15 +534,20 @@ pub fn routed_moe_steps(
     op.check()?;
     let (ne, cols, s, k) = (op.router.rows(), op.router.cols(), op.s, op.k);
     let rows = op.ys.len().checked_div(s).unwrap_or(0);
+    let normed = match op.prelude.as_mut() {
+        Some(p) => Some(prelude_steps(be, p, s)?),
+        None => None,
+    };
+    let xs: &[f32] = normed.as_deref().unwrap_or(op.xs);
     let mut logits = vec![0f32; s * ne];
-    be.matmul(&op.router, op.xs, s, &mut logits)?;
+    be.matmul(&op.router, xs, s, &mut logits)?;
     route_tokens(&logits, s, k, op.renormalise, op.ids, op.weights);
     let users = users_by_expert(op.ids, k);
     let xes: Vec<Vec<f32>> = users
         .iter()
         .map(|(_, u)| {
             u.iter()
-                .flat_map(|&(t, _)| op.xs[t * cols..(t + 1) * cols].iter().copied())
+                .flat_map(|&(t, _)| xs[t * cols..(t + 1) * cols].iter().copied())
                 .collect()
         })
         .collect();
@@ -575,6 +653,14 @@ pub trait ComputeBackend: Send + Sync {
     /// top `k`, over `s` tokens as one [`ComputeBackend::routed_moe`] (routing on the
     /// device). The default is `false`.
     fn routes_moe(&self, experts: usize, k: usize, s: usize) -> bool {
+        let _ = (experts, k, s);
+        false
+    }
+
+    /// Whether callers should offer such a layer with its [`MoePrelude`] (the O
+    /// projection, residual and norm, Step 3c) as one [`ComputeBackend::routed_moe`].
+    /// Implies [`ComputeBackend::routes_moe`]. The default is `false`.
+    fn routes_moe_prelude(&self, experts: usize, k: usize, s: usize) -> bool {
         let _ = (experts, k, s);
         false
     }
