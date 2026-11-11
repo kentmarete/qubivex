@@ -365,6 +365,27 @@ fn speed() {
         200,
     );
     eprintln!("tiny submission: {ms:.3} ms");
+    // One large Q4_K matrix: the kernel's rate without per-dispatch costs.
+    let q4k = DType::Ggml(GgmlType::Q4_K);
+    let (r, c) = (24 * 1024, 2048);
+    let host = weights(q4k, r, c, 3);
+    let wv = WeightView::new(q4k, r, c, &host).unwrap();
+    let big = DeviceWeights::like(dev.upload(&host, None).unwrap(), 0, &wv).unwrap();
+    let xs = acts(c, 1);
+    let mut ys = vec![0f32; r];
+    let ms = time(
+        &mut [DeviceMatMul {
+            w: &big,
+            xs: &xs,
+            s: 1,
+            ys: &mut ys,
+        }],
+        20,
+    );
+    eprintln!(
+        "q4_k one {r} x {c}: {ms:.3} ms ({:.1} GB/s)",
+        host.len() as f64 / ms / 1e6
+    );
     for dtype in [
         DType::Ggml(GgmlType::Q4_K),
         DType::Ggml(GgmlType::Q6_K),
