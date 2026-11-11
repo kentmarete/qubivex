@@ -1757,12 +1757,41 @@ prompt, 128 generated, 1 + 3 runs, every run's tokens equal to the Step 1a refer
   joining the routed submission) removes another 16 per token, and needs `sqrt` and
   division proven on the device first.
 
-### 17.14 Not done; for the owner
+### 17.14 Measured on mains (the acceptance records)
 
-1. **Mains records.** Run on mains power:
-   `scripts/bench-vulkan-baseline --tag step3b --variant step3a= --variant routed='--vulkan-route on'`
-   (Step 1a baseline, Step 3a and Step 3b alternated, single-stream and concurrent).
-   Acceptance and any default change wait for them.
+`scripts/bench-vulkan-baseline --tag step3b --variant step3a= --variant routed='--vulkan-route on'`,
+AC power, untimed, 3 alternated rounds (records `2026-11-11-m3pro-vulkan-step3b-{base,step3a,routed}-{1,2,3}.json`,
+log `…-step3b-mains.txt`). Every record's tokens equal the Step 1a reference.
+
+| Round | Step 1a ms/token | Step 3a | **Step 3b** | Step 1a prefill ms | Step 3a | Step 3b |
+|---|---|---|---|---|---|---|
+| 1 | 35.60 | 33.06 | **30.82** | 199.8 | 195.1 | 195.0 |
+| 2 | 35.40 | 33.15 | **31.28** | 199.7 | 195.5 | 195.4 |
+| 3 | 36.21 | 33.14 | **31.16** | 200.5 | 195.6 | 195.3 |
+| tok/s | 27.6–28.3 | 30.2–30.3 | **32.0–32.5** | | | |
+| submissions/token | 305 | 65 | **49** | | | |
+
+- Against Step 3a: **−1.8 to −2.3 ms per token (−6.4%)**, about three times the run-to-run
+  spread. Against the permanent Step 1a baseline: −4.6 ms (−13%).
+- Prefill: unchanged against Step 3a (195.0–195.4 against 195.1–195.6 ms).
+
+Concurrent tok/s (batch example, 32 tokens per sequence, median of 3, per round; tokens
+identical in every mode):
+
+| N | Step 1a | Step 3a | **Step 3b** | Gain over 3a |
+|---|---|---|---|---|
+| 1 | 27.93–28.05 | 30.33–30.47 | **32.26–32.49** | +6.3% |
+| 2 | 34.17–34.41 | 37.65–37.83 | **39.47–39.61** | +4.7% |
+| 4 | 40.15–40.19 | 43.04–43.21 | **44.92–44.98** | +4.2% |
+| 8 | 44.48–44.52 | 46.34–46.44 | **48.32–48.34** | +4.2% |
+
+**Gates:** identical tokens (yes, every record and mode); numerical correctness (§17.12);
+no prefill regression (yes); no concurrent regression (a gain at every N); a measured
+single-stream gain over Step 3a (yes, −6.4%). **35 tok/s: not reached (32.0–32.5).**
+
+### 17.15 Not done; for the owner
+
+1. **Acceptance**, and whether `--vulkan-route` becomes the default (it is off).
 2. **Default.** `--vulkan-route` stays off until accepted.
 3. **ADR-019 amendment 4** (routing on the device: residency rule, the route kernel's
    order argument, the 256-expert limit) is not written; it follows acceptance, as
