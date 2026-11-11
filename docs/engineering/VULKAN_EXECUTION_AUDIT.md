@@ -765,3 +765,212 @@ Options (owner to choose; nothing further is built until then):
     overlap and the per-dispatch tail.
 - The formal mains-power, alternated records are still owed for whichever option
   ships. They were not run because the machine was on battery.
+
+## 13. Step 2 investigation, option (c): what the GPU actually does (2026-11-11)
+
+The owner chose (c): explain the grouped penalty before anything else. No optimisation was
+built. `c2a114a`, `6c8b691` and Step 1a are unchanged.
+
+### 13.1 Method, and why not Xcode
+
+- This Mac has only the Command Line Tools: no Xcode, so no Metal GPU capture, no
+  Instruments, no `xctrace`. The same capture would need Xcode installed; the owner can do
+  that, and the questions below can then be rechecked in a capture.
+- Instead:
+  - `spikes/vulkan-step2-metal-timing` runs **MoltenVK's own MSL** for `matmul.comp`
+    (Q4_K, taken from MoltenVK's debug log) in the layer's expert shapes.
+  - It times them with Metal's clocks, which do not go through Vulkan:
+    - `GPUStartTime`/`GPUEndTime` per command buffer;
+    - stage-boundary counter samples per encoder.
+- The MoltenVK 1.4.2 source was read for how it encodes dispatches, barriers and
+  timestamps.
+- End to end: untimed bench, alternated, mains power. Step 1a (5e0ca13) against grouped
+  (7636c43), 3 rounds. Records: `baselines/2026-11-11-m3pro-vulkan-step2-{base,grouped}-{1,2,3}.json`.
+  The tokens match the PR #55 reference in all six.
+
+### 13.2 How MoltenVK maps our submissions onto Metal (source, v1.4.2)
+
+- **Every compute dispatch goes into a serial encoder.** `getDispatchType()` returns
+  `MTLDispatchTypeSerial` for everything except occlusion-query accumulation, and there is no
+  setting to change it.
+  - All dispatches recorded in one `VkCommandBuffer` share one serial
+    `MTLComputeCommandEncoder`.
+  - Metal runs them one after another, although our recording has no barrier between them.
+- **Command buffers are chained by device-wide fences** when Metal residency sets exist
+  (they do on this OS):
+  - `syncFences` makes each command buffer wait on and update device-level barrier fences.
+- **Timestamps.** On Apple GPUs (stage-boundary sampling only), `vkCmdWriteTimestamp` is
+  deferred to the end of the current Metal encoder:
+  - Each query becomes its own one-byte blit pass (`fillBuffer` on a shared dummy buffer)
+    that samples at its start.
+  - The BOTTOM sample's blit waits on a fence that the compute encoder updates. The TOP
+    sample's blit has **no dependency on the compute encoder**: the compute work may start
+    before it.
+
+### 13.3 Findings
+
+**1. Command buffers never overlap on this GPU: the GPU-overlap hypothesis is rejected.**
+- By Metal's own times, with no timestamp queries, overlapping command-buffer pairs = 0 in
+  every shape and size:
+  - 5 submitting threads on one queue;
+  - 8–16 command buffers committed back to back;
+  - one command buffer per queue on 8 queues.
+- Inside one command buffer, consecutive dispatches never overlap either, in a serial
+  encoder or in separate encoders. Dispatch *n+1* starts 0.3–3 µs after dispatch *n* ends.
+- §12's "command buffers from separate threads evidently overlap on the GPU" is withdrawn.
+  §10 item 1's conclusion (the GPU runs one submission at a time) stands, now on a measurement
+  that does not depend on timestamps.
+
+**2. The grouped "+20–25% GPU time" is a timestamp artefact, not GPU work.** 8 experts × 1
+token, one layer, ms:
+
+| Shape | Metal GPU time (5 runs) | MoltenVK-style timestamps (`TS=1`) |
+|---|---|---|
+| A per-expert, 5 threads (16 command buffers) | 0.920–0.922 | 0.718–0.760 |
+| A per-expert, 1 thread | 1.20 | 1.03 |
+| B grouped, serial encoder (2 command buffers) | 0.907–0.920 | 0.918–0.921 |
+| B grouped, concurrent encoder (not reachable through MoltenVK) | 0.762–0.763 | — |
+
+- The MoltenVK-style A figure, 0.72–0.76 ms, is below what is physically possible: the 24
+  dispatches alone take 16 × 39 + 8 × 37 µs ≈ 0.92 ms by stage counters.
+- The timestamps under-count each command buffer by:
+  - about 19 µs when other command buffers are queued behind it (5 threads);
+  - about 10 µs with one thread;
+  - about 3 µs for the grouped shape.
+- Why: the TOP sample's blit lands after the compute encoder has started (13.2).
+- The harness reproduces the Vulkan kernel test closely:
+
+  | | A timestamps | B timestamps |
+  |---|---|---|
+  | Vulkan kernel test (§12) | 0.78–0.83 | 0.98–1.00 |
+  | harness, `TS=1` | 0.72–0.76 | 0.92 |
+
+- The same holds at 8 × 4 (ms):
+
+  | | A | B |
+  |---|---|---|
+  | timestamps (Vulkan test) | 2.87 | 3.21 |
+  | Metal | 3.15–3.32 | 3.14–3.30 |
+
+- Grouping does not change any dispatch's duration. Inside the grouped command buffer:
+  - gate/up dispatches take 38.6–39.3 µs;
+  - down dispatches take 36.7–38.1 µs;
+  - 1 expert alone: 38.5–38.8 µs and 37.2 µs.
+
+**3. End to end, grouping is still slower, and the cost is host-side serialisation, not GPU
+execution.** Untimed, mains, ms/token (median):
+
+| Round | Step 1a | Grouped |
+|---|---|---|
+| 1 | 39.21 (disturbed: copies 10 ms, P95 51, the same first-run pattern as Step 0) | 38.71 |
+| 2 | 35.28 | 36.97 |
+| 3 | 34.28 | 38.45 |
+
+- Grouped is slower by about 2–4 ms per token: 26.0–27.1 against 28.4–29.2 tok/s.
+- It is not GPU time:
+  - (2) shows that per layer the GPU work is the same;
+  - Σ host submit time fell from 5.5–6.6 to 1.1 ms.
+- The difference is overlap:
+  - Step 1a keeps up to 5 expert submissions in flight. While one thread is in its round
+    trip (wake, SwiGLU, copies, record, submit), another thread's command buffer runs, so the
+    GPU queue rarely empties during the expert stage.
+  - Grouped has exactly one submission in flight. So both of its round trips per layer are
+    fully exposed: GPU idle from completion through wake, host work and submit, to the start
+    of the next command buffer.
+  - About 0.2 ms per layer × 16 ≈ 3 ms, which matches.
+- §12 reading 2 named this. It is the cause, not a side effect.
+
+**4. The kernel, not memory bandwidth, bounds GPU time, and serial dispatch adds about
+7.5 µs per dispatch.** One dispatch, k = 2048, alone in a command buffer:
+
+| Rows | Threadgroups | GPU µs | GB/s (weights) |
+|---|---|---|---|
+| 1024 | 128 | 57–67 | 18–21 |
+| 2048 | 256 | 69–80 | 29–34 |
+| 4096 | 512 | 130 | 36.3 |
+| 16384 | 2048 | 502 | 37.6 |
+
+- Steady state: 31.4 µs per 1024 rows, **37.6 GB/s**. That is about a quarter of this chip's
+  memory bandwidth.
+- Time scales with tokens × bytes: 8 × 4 costs 3.4 × 8 × 1, with the same weights. So the
+  kernel is bound by its dequantisation and reduction instructions (byte extraction, the
+  `optnone` `spvFAdd` helpers from NoContraction), not by memory traffic.
+- A 1024-row expert dispatch in a serial encoder costs 39 µs, against 31.4 µs at steady
+  state: about 7.5 µs of ramp and drain per dispatch. 24 dispatches per layer ≈ 0.18 ms,
+  which is exactly what the concurrent encoder recovers (0.92 → 0.76 ms).
+- §12's "single 24 576-row dispatch was slower still (1.67 ms)" does not reproduce under Metal
+  timing, which predicts about 0.77 ms. It was measured with the biased timestamps and is not
+  in the tree; treat it as unreconciled, not as evidence against large dispatches.
+- What can and cannot be read:
+  - The device exposes only the `timestamp` counter set through the public API. There are
+    no bandwidth, cache, occupancy or utilisation counters; those need Xcode or Instruments.
+  - The pipeline reports `maxTotalThreadsPerThreadgroup` 1024 for a 256-wide kernel. So
+    register use does not limit the threadgroup size; occupancy beyond that cannot be read.
+
+### 13.4 Wall, GPU busy and GPU idle: what each measures
+
+| Figure | Measures | Bias on MoltenVK/M3 |
+|---|---|---|
+| wall (ms/token) | host clock, one decode step | none: the only throughput figure |
+| GPU Σ / busy (`--vulkan-timestamps`) | per submission: TOP blit sample → BOTTOM blit sample; busy = union | **low**, by about 3–19 µs per submission. The bias grows with the number of submissions and with how many are in flight. Use it only between runs with the same submission shape |
+| GPU idle | wall − busy | **high** by the same amount. It is not an independent measurement, so busy + idle = wall by construction |
+| host submit Σ, wait Σ | summed over threads | they overlap each other and the GPU, so they are not additive with wall |
+| Metal `GPUStart/EndTime` (harness) | command buffer on the GPU | when timed, it includes MoltenVK's timestamp blits |
+
+Corrections to §10:
+- Step 0's 19.6 ms of GPU busy per token is an under-count. 256 expert submissions ×
+  10–19 µs plus 49 × 3–10 µs ≈ 2.7–5.4 ms is missing, so **true busy is about 22–25 ms**.
+  Grouped: 23.1 ms + 81 × 3–10 µs ≈ 23.3–23.9 ms.
+- Idle in Step 1a is therefore about 10–13 ms, not 16–19 ms, and the gap per hand-off is
+  about 90–115 µs, not about 140 µs.
+- §10's "≈ 50 tok/s with every round trip removed" becomes **about 40–45 tok/s** at today's
+  kernel speed and serial dispatch.
+
+### 13.5 Implications for Step 3 (a layer in one command buffer)
+
+- **No inherent GPU penalty.** Putting dispatches into one command buffer costs the same GPU
+  time as separate command buffers, because the GPU runs command buffers one at a time
+  anyway (findings 1 and 2). The "same scheduling penalty" does not exist.
+- **The real penalty, lost overlap, would hit Step 3 harder** if any host work stays between
+  stages:
+  - Step 3 removes every in-flight submission but one.
+  - Each remaining host hand-off is then fully exposed, with nothing to hide it.
+  - Step 3 pays off only if the layer has **no intermediate host round trip**: attention,
+    norms, routing, SwiGLU and the combine must run on the GPU, under the §5 parity rules.
+    Fewer submissions with the same number of host round trips on the critical path is what
+    Step 2 measured: slower.
+- **Serial dispatch remains a cost of about 0.18 ms per layer for the experts** (≈ 2.9 ms
+  per token). One command buffer does not remove it; MoltenVK cannot use a concurrent encoder.
+- **Measurement:** Vulkan timestamps cannot compare Step 3 with Step 1a, because the
+  submission counts differ. Decide on untimed wall, alternated, and attribute GPU time with
+  the Metal harness.
+
+### 13.6 Recommendation for the next experiment
+
+1. **Step 2 as built: option (b), keep it off for Vulkan.**
+   - Keep the grouped provider path and its tests; Step 3 needs them.
+   - `groups_matmuls()` → `false`.
+   - Remove the `QUBIVEX_VK_PARTS` experiment (`6c8b691`): it measured nothing that the
+     harness does not show more directly.
+   - This leaves Step 1a's behaviour on Vulkan.
+2. **Next experiment: a multi-matrix dispatch, prototyped in the harness first.** This
+   needs no Vulkan shader change until it is reviewed.
+   - One dispatch whose grid covers (matrix, row block) for all of a layer's gate and up
+     matrices, from a small table of per-matrix offsets, then one for the downs.
+   - It aims at the 31.4 µs/1024-row steady state from inside one dispatch, which is what
+     the concurrent encoder shows is available. That is about 0.92 → 0.76 ms per layer, with
+     each output's arithmetic unchanged (the same per-row reduction), so the same bits.
+   - Accept it only if the harness shows Metal GPU time ≤ 0.78 ms at 8 × 1 and no
+     regression at 8 × 4.
+3. **Step 3, re-scoped:** one command buffer per layer *with the host work between matmuls
+   moved to the GPU*, or not at all.
+   - The budget is about 10–13 ms of real idle per token.
+   - Together with (2), about 3 ms of expert GPU time.
+   - Gate it on the same untimed, alternated mains records.
+4. **Instrumentation:**
+   - Note the timestamp bias in `BENCHMARKING.md`.
+   - Optionally, record the TOP timestamp *after* a first, empty dispatch, so that MoltenVK
+     closes an encoder before it. Check that against the harness before trusting it.
+5. **If the owner installs Xcode**, one Metal capture of a decode step each way should
+   confirm findings 1–4. It would also give the cache, occupancy and bandwidth counters that
+   the public API does not expose.
