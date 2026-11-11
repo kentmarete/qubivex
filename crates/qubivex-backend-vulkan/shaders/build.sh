@@ -5,9 +5,10 @@
 # a temporary directory and fails when the checked-in SPIR-V differs, if the tools are
 # installed.
 #
-# glslang decorates `precise` arithmetic with NoContraction but not the GLSL.std.450
-# Fma instructions, and without that decoration a driver may split fma into a
-# multiply and an add (lavapipe does). So every Fma result is decorated here.
+# The shader does not use `precise` (see matmul.comp): every OpFAdd, OpFSub and
+# GLSL.std.450 Fma result is decorated NoContraction here instead, so no driver fuses
+# a multiply into an add or subtract, and none may split an fma into a multiply and
+# an add (lavapipe does). Multiplies stay undecorated.
 set -eu
 here="$(cd "$(dirname "$0")" && pwd)"
 out="${1:-$here/../src}"
@@ -16,7 +17,7 @@ trap 'rm -rf "$tmp"' EXIT
 glslc --target-env=vulkan1.1 -O -o "$tmp/matmul.spv" "$here/matmul.comp"
 spirv-dis --raw-id "$tmp/matmul.spv" > "$tmp/matmul.spvasm"
 awk '
-    / = OpExtInst .* Fma / { fma[n++] = $1 }
+    / = OpExtInst .* Fma / || / = OpF(Add|Sub) / { fma[n++] = $1 }
     { line[m++] = $0 }
     END {
         done = 0

@@ -7,8 +7,10 @@
 //!   an `Arc<Shared>`, so the device outlives its memory.
 //! - [`Allocation`] owns one buffer and its memory.
 //! - [`Submitter`] owns the command pool, the fence, the descriptor pool and the
-//!   staging and activation buffers. It sits behind the device's mutex, which is also
-//!   what externally synchronises the queue.
+//!   staging and activation buffers. The device keeps several, each behind its own
+//!   mutex, so concurrent callers record, submit and wait at the same time. The queue
+//!   is externally synchronised by [`Shared`]'s queue lock, held only around
+//!   `vkQueueSubmit`.
 //!
 //! Every submission waits for its fence before returning, so no GPU work is in flight
 //! when control returns to safe code: an allocation can only be dropped when no
@@ -151,6 +153,8 @@ pub(crate) struct Shared {
     instance: ash::Instance,
     pub(crate) device: ash::Device,
     queue: vk::Queue,
+    /// Held around every `vkQueueSubmit` (the queue needs external synchronisation).
+    queue_lock: Mutex<()>,
     queue_family: u32,
     memory: vk::PhysicalDeviceMemoryProperties,
     pub(crate) limits: vk::PhysicalDeviceLimits,
@@ -449,6 +453,7 @@ impl Shared {
             instance: instance.clone(),
             device,
             queue,
+            queue_lock: Mutex::new(()),
             queue_family: family,
             memory,
             limits: props.limits,
@@ -891,7 +896,7 @@ impl Submitter {
         let cmds = [self.cmd];
         // SAFETY: the command buffer is not in flight (the last submission was waited
         // for), its pool allows reset, and the queue is externally synchronised by the
-        // device mutex that guards `self`.
+        // queue lock.
         unsafe {
             d.reset_command_buffer(self.cmd, vk::CommandBufferResetFlags::empty())
                 .map_err(|e| err("reset", e))?;
@@ -904,8 +909,15 @@ impl Submitter {
             record(d, self.cmd);
             d.end_command_buffer(self.cmd).map_err(|e| err("end", e))?;
             let submit = [vk::SubmitInfo::default().command_buffers(&cmds)];
-            d.queue_submit(self.shared.queue, &submit, self.fence)
-                .map_err(|e| err("submit", e))?;
+            {
+                let _queue = self
+                    .shared
+                    .queue_lock
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                d.queue_submit(self.shared.queue, &submit, self.fence)
+                    .map_err(|e| err("submit", e))?;
+            }
             let waited = d.wait_for_fences(&[self.fence], true, u64::MAX);
             d.reset_fences(&[self.fence])
                 .map_err(|e| err("fence reset", e))?;

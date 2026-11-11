@@ -1,6 +1,7 @@
 # ADR-019: The Vulkan backend, a discrete device with the CPU's bits
 
-- Status: **Accepted (2026-11-11)** by owner decision
+- Status: **Accepted (2026-11-11)** by owner decision; amendment 1 (2026-11-11, kernel
+  speed) Proposed
 - Date: 2026-11-11
 - Related: ADR-007 (backends), ADR-010 (lossless by default), ADR-011 (device execution
   and parity), ADR-018 (discrete device memory).
@@ -127,10 +128,10 @@ bookworm) and Mesa 25.0.7 (trixie):
   on any discrete GPU. A driver that does not is refused, not trusted.
 
 ## Not decided here
-- Faster kernels with the same bits: block-wise K-quant dequantisation, token tiles and
-  several rows per group, as Metal's slices 3 to 5 did.
-- Whole layers and activations on the device, asynchronous copies, overlapped
-  submissions and more than one queue.
+- Faster kernels with the same bits: block-wise K-quant dequantisation is done
+  (amendment 1); token tiles remain, and several rows per group was measured slower.
+- Whole layers and activations on the device, asynchronous copies and more than one
+  queue (overlapped submissions: amendment 1).
 - Whether integrated GPUs should default to a smaller capacity, or be planned as RAM as
   ADR-011 §4 plans Metal.
 - Measuring a discrete Vulkan GPU.
@@ -140,3 +141,78 @@ bookworm) and Mesa 25.0.7 (trixie):
     is correctly rounded. Lavapipe has `shaderFloat64`; Apple GPUs do not, and do not
     need it;
   - or a documented tolerance for such devices, as a lossy opt-in under ADR-010.
+
+## Amendment 1 (2026-11-11): kernel speed with the same bits
+
+### What changed
+- **Block-wise K-quants.** The shader decodes Q4_K, Q6_K and Q8_0 a block at a time:
+  the scales once per block, and each quant byte once for every weight it holds (in
+  Q4_K, lanes `l` and `l + 32` of a chunk are the low and high nibbles of one byte). A
+  Q4_K block's 16-byte header is read as four words. Each lane gets the same weights,
+  from the same operations, in the same order as before; the per-element `weight`
+  function remains for f32, f16, bf16 and tails.
+- **How contraction is forbidden (replaces "every intermediate is `precise`" in §5).**
+  SPIRV-Cross, inside MoltenVK, turns each `NoContraction` operation into a call to a
+  `[[clang::optnone]]` helper (a multiply becomes `fma(l, r, 0)` in an unoptimised
+  function), and `precise` marked every multiply. The shader now uses no `precise`.
+  `shaders/build.sh` decorates every `OpFAdd`, `OpFSub` and `Fma` with
+  `NoContraction`: that alone forbids fusing a multiply into the add or subtract that
+  consumes it. Multiplies compile to plain `*`.
+- **Q4_K's subtract is an `fma`.** `y = t - m` is written `fma(t, 1, -m)`: `t · 1` is
+  exact, so it is the same single rounding, and an `fma` compiles to one instruction
+  where a decorated subtract became a helper call. `t` passes through an integer OR
+  with `n >> 31` (zero, since n < 2^31, but not provably so), so the multiply producing
+  it is rounded on its own and cannot be folded into the `fma` by any compiler.
+- **Concurrent submissions.** The device keeps 8 submitters, each with its own command
+  buffer, fence, descriptor pool and host buffers. A caller takes a free one, so a
+  layer's experts, computed on several threads, record, submit and wait at the same
+  time. The queue is locked only around `vkQueueSubmit`. Every submission still
+  completes before its call returns (§3 unchanged).
+
+### Measured (M3 Pro, MoltenVK 1.4.2, mains power)
+- **Bits.** All parity tests, the fixtures and the OLMoE test (the CPU's prompt logits,
+  Colibri's tokens) pass after each step; `bench` tokens match the starting record.
+- **Positive controls.**
+  - Fast math forced on (layer setting removed, `MVK_CONFIG_FAST_MATH_ENABLED=1`,
+    "MathMode Fast" logged): the tests pass. The decorations hold the bits, as
+    `precise` did; turning fast math off stays a second guard.
+  - Fast math on and only `Fma` decorated: 3 tests fail (254 of 1024 outputs differ in
+    one). So the add and subtract decorations are what holds the bits there.
+  - With fast math off, neither the add/subtract decorations nor the integer OR are
+    needed on Metal: both are guards for other compilers, not this one.
+- **End to end**, OLMoE-1B-7B-0125-Instruct Q4_K_M, 10-token prompt, 64 generated, 5
+  threads (records `docs/performance/baselines/2026-11-11-m3pro-vulkan-*.json`):
+
+  | Step | Decode ms/token | tok/s | Prefill tok/s |
+  |---|---|---|---|
+  | Start | 153.3 | 6.52 | 8.2 |
+  | Block-wise decoding | 100.3 | 9.97 | 16.7 |
+  | 8 submitters | 57.9 | 17.26 | 26.8 |
+  | Q4_K header as four words | 51.5 | 19.42 | 31.3 |
+  | No `precise`; adds and subtracts decorated | 41.9 | 23.89 | 42.7 |
+  | Q4_K subtract as `fma` | 36.6 | 27.36 | 48.9 |
+
+  The CPU in the same session: 23.0 ms (43.50 tok/s), prefill 77.0 tok/s.
+- **Where the time goes now.** About 297 submissions per token, not the 15 that
+  Consequences gives: each expert is two. Per submission the GPU is busy about 74 µs,
+  `vkQueueSubmit` takes about 34 µs on the host, and the caller waits about 320 µs.
+  The GPU is idle more than half the time: the cost is the chain of about 7 dependent
+  round trips per layer (attention, router, then experts in waves), not the kernels.
+- **Tried and not kept.**
+  - Four (or two) rows per invocation group, reusing each activation load: faster in the
+    kernel timing test, but 89 ms per token end to end against 51.5. One row per group.
+  - Polling the fence instead of `vkWaitForFences`: no change (MoltenVK signals the fence
+    from Metal's completion handler either way).
+  - 8 or 10 compute threads instead of 5: 35.0 and 35.6 ms against 36.5. The default is
+    unchanged.
+  - The shared-memory tree: a build without it was no faster, so it stays (no subgroup
+    operations).
+
+### Consequences
+- The kernel timing test (`cargo test --release -p qubivex-backend-vulkan --test parity
+  -- --ignored --nocapture speed`) is a guide only: one change it favoured was slower
+  end to end. Kernel changes are judged by `qubivex bench`.
+- Further speed on this path needs fewer dependent round trips: whole layers on the
+  device, as Metal amendment 2 did, with the CPU's bits for norms, attention, softmax,
+  routing and SwiGLU. That is its own decision. Token tiles for prefill and batched
+  decode remain open.

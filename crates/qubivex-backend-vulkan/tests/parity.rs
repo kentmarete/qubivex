@@ -332,3 +332,105 @@ fn wrong_activation_lengths_are_refused() {
     }]);
     assert!(matches!(e, Err(ComputeError::Shape { .. })), "{e:?}");
 }
+
+/// Timing, not a check: `cargo test --release -p qubivex-backend-vulkan --test parity
+/// -- --ignored --nocapture speed`. Prints the per-submission overhead and the time of
+/// OLMoE-shaped matmuls (a layer's eight experts, three matrices each, in one
+/// submission) for each K-quant.
+#[test]
+#[ignore = "timing; run by hand"]
+fn speed() {
+    let Some(dev) = device() else { return };
+    let time = |ops: &mut [DeviceMatMul<'_>], reps: u32| {
+        dev.matmul_many(ops).unwrap();
+        let t = std::time::Instant::now();
+        for _ in 0..reps {
+            dev.matmul_many(ops).unwrap();
+        }
+        t.elapsed().as_secs_f64() * 1e3 / f64::from(reps)
+    };
+    // Overhead: one tiny matmul.
+    let host = weights(DType::F32, 1, 64, 1);
+    let wv = WeightView::new(DType::F32, 1, 64, &host).unwrap();
+    let dw = DeviceWeights::like(dev.upload(&host, None).unwrap(), 0, &wv).unwrap();
+    let xs = acts(64, 1);
+    let mut y = [0f32];
+    let ms = time(
+        &mut [DeviceMatMul {
+            w: &dw,
+            xs: &xs,
+            s: 1,
+            ys: &mut y,
+        }],
+        200,
+    );
+    eprintln!("tiny submission: {ms:.3} ms");
+    // One large Q4_K matrix: the kernel's rate without per-dispatch costs.
+    let q4k = DType::Ggml(GgmlType::Q4_K);
+    let (r, c) = (24 * 1024, 2048);
+    let host = weights(q4k, r, c, 3);
+    let wv = WeightView::new(q4k, r, c, &host).unwrap();
+    let big = DeviceWeights::like(dev.upload(&host, None).unwrap(), 0, &wv).unwrap();
+    let xs = acts(c, 1);
+    let mut ys = vec![0f32; r];
+    let ms = time(
+        &mut [DeviceMatMul {
+            w: &big,
+            xs: &xs,
+            s: 1,
+            ys: &mut ys,
+        }],
+        20,
+    );
+    eprintln!(
+        "q4_k one {r} x {c}: {ms:.3} ms ({:.1} GB/s)",
+        host.len() as f64 / ms / 1e6
+    );
+    for dtype in [
+        DType::Ggml(GgmlType::Q4_K),
+        DType::Ggml(GgmlType::Q6_K),
+        DType::Ggml(GgmlType::Q8_0),
+    ] {
+        // gate and up: 1024 x 2048; down: 2048 x 1024.
+        let shapes = [(1024, 2048), (1024, 2048), (2048, 1024)];
+        let mut ws = Vec::new();
+        for (i, &(r, c)) in shapes.iter().enumerate() {
+            let host = weights(dtype, r, c, 7 + i as u32);
+            let wv = WeightView::new(dtype, r, c, &host).unwrap();
+            ws.push(DeviceWeights::like(dev.upload(&host, None).unwrap(), 0, &wv).unwrap());
+        }
+        for s in [1usize, 8] {
+            let xs: Vec<_> = shapes.iter().map(|&(_, c)| acts(s * c, 3)).collect();
+            let mut ys: Vec<_> = shapes.iter().map(|&(r, _)| vec![0f32; s * r]).collect();
+            let one = {
+                let mut op = [DeviceMatMul {
+                    w: &ws[0],
+                    xs: &xs[0],
+                    s,
+                    ys: &mut ys[0],
+                }];
+                time(&mut op, 20)
+            };
+            // 24 ops (8 experts x 3): each expert's outputs in their own vectors.
+            let mut outs: Vec<Vec<f32>> =
+                (0..24).map(|i| vec![0f32; s * shapes[i % 3].0]).collect();
+            let mut layer: Vec<_> = outs
+                .iter_mut()
+                .enumerate()
+                .map(|(i, y)| DeviceMatMul {
+                    w: &ws[i % 3],
+                    xs: &xs[i % 3],
+                    s,
+                    ys: y,
+                })
+                .collect();
+            let ms = time(&mut layer, 10);
+            let bytes: usize = ws.iter().map(DeviceWeights::len).sum::<usize>() * 8;
+            eprintln!(
+                "{dtype} s = {s}: one 1024 x 2048 {one:.3} ms; 24 expert matmuls {ms:.3} ms \
+                 ({:.1} GB/s of weights)",
+                bytes as f64 / ms / 1e6
+            );
+        }
+    }
+}

@@ -3,6 +3,15 @@
 Last updated: 2026-11-11
 
 ## Current phase
+**Vulkan kernel speed (2026-11-11; ADR-019 amendment 1, Proposed).** Decode on MoltenVK 4.2x faster with the same bits.
+- Shader: Q4_K, Q6_K and Q8_0 decode a block at a time (scales once per block, each byte once for all the weights it holds); a Q4_K header is read as four words. No `precise`: `shaders/build.sh` marks every add, subtract and `fma` `NoContraction`, because SPIRV-Cross turned every `precise` multiply into an unoptimised helper call. Q4_K's `t - m` is `fma(t, 1, -m)` with `t` kept rounded by an integer OR.
+- Device: 8 submitters (own command buffer, fence and host buffers), the queue locked only around `vkQueueSubmit`, so a layer's experts overlap their round trips.
+- Measured, OLMoE Q4_K_M, mains power: decode 153.3 -> 36.55 ms per token (6.52 -> 27.36 tok/s), prefill 8.2 -> 48.9 tok/s, tokens identical. The CPU in the same session: 43.50 tok/s, prefill 77.0. Records `docs/performance/baselines/2026-11-11-m3pro-vulkan-*.json`; steps in ADR-019 amendment 1 and BENCHMARKING.md.
+- Positive controls: fast math forced on, the parity tests pass; fast math on with only `Fma` decorated, 3 fail. Four rows per group, fence polling and more threads were measured and not kept.
+- Now bounded by round trips, not kernels: about 297 submissions per token, the GPU busy about 74 µs of a 320 µs wait each, about 7 dependent round trips per layer.
+- Tests: the 8 parity tests and the 4 runtime Vulkan tests (OLMoE included) pass; a new ignored timing test (`parity.rs`, `speed`).
+- **Next:** whole layers on the Vulkan device (one submission per token, as Metal's token mode), or token tiles for prefill and batched decode; CUDA once hardware exists.
+
 **Vulkan backend (2026-11-11; ADR-019, accepted 2026-11-11).** A real GPU behind ADR-018's `DiscreteDevice`, bit-identical through MoltenVK on the M3 Pro; lavapipe in a Linux container is detected and refused.
 - `qubivex-backend-vulkan`: `VulkanDevice` on `ash` 0.38 (the loader is opened at run time, so the crate builds everywhere). It needs Vulkan 1.1 and no optional features. Weights go through a staging buffer into device-local memory with a counted capacity; each `matmul_many` is one command buffer waited on a fence. One shader (`shaders/matmul.comp`, SPIR-V checked in, dtype as a specialization constant) covers f32, f16, bf16, Q8_0, Q4_K and Q6_K.
 - Bits: the CPU's 64-lane shape with the tree in shared memory (not subgroups), integer f16 conversion, `precise` everywhere. On MoltenVK, fast math is also turned off through `VK_EXT_layer_settings`.
@@ -12,7 +21,7 @@ Last updated: 2026-11-11
 - Lavapipe (Mesa 22.3 and 25.0, Linux container) splits every `fma` into a multiply and an add, even with `NoContraction`, which `shaders/build.sh` now adds because glslang omits it. A diagnostic matched its outputs exactly to an unfused-fma CPU reference (99 of 99 f32, 16 of 16 Q4_K). Everything else passed there. `VulkanDevice::new` now probes one fma and refuses such a device with the reason, so lavapipe is refused rather than trusted, and the tests skip on it.
 - Tests: 1 unit test (SPIR-V freshness, needs glslc and SPIRV-Tools) and 8 parity tests in the crate; 4 in `qubivex-runtime/tests/vulkan.rs` (fixtures with ledger = device memory, a one-expert device cache, 4 concurrent requests, and the env-gated OLMoE test). All skip without a device unless `QUBIVEX_REQUIRE_VULKAN=1`, so CI (no Vulkan) skips them.
 - Not built: fast kernels (block-wise K-quants, token tiles), layers or activations on the device, asynchronous submission, an integrated-GPU default (MoltenVK reports all RAM as device memory; cap it with `--vulkan-vram`), and lavapipe as a parity target (an emulated exact fma, or a lossy tolerance; ADR-019 lists both).
-- **Next:** Vulkan kernel speed, or CUDA once hardware exists.
+- **Next was** Vulkan kernel speed (done, above).
 
 **Discrete device memory on a simulated GPU done (2026-11-11; ADR-018, accepted 2026-11-11).** Groundwork for CUDA and Vulkan, built and tested without either.
 - `qubivex-compute::discrete`: a `DiscreteDevice` trait (`upload`, `matmul_many` over `DeviceWeights`, `usage`, `transfers`), an `Arc`-backed `DeviceBuffer` whose optional guard (the ledger charge) lives as long as the allocation, and `ComputeError::OutOfDeviceMemory`.

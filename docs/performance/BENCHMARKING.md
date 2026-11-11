@@ -287,6 +287,29 @@ tok/s is about 77 GiB/s, close to the 80 GiB/s bf16 streams in the kernel benchm
 On Metal a dense model's matmuls are placed one by one (about 196 synchronisations per
 token), which is why it is slower than the CPU; a dense whole-layer pass is future work.
 
+## 2026-11-11: Vulkan kernel speed (ADR-019 amendment 1)
+
+OLMoE-1B-7B-0125-Instruct Q4_K_M, `--backend vulkan` on MoltenVK 1.4.2 (M3 Pro, mains
+power), 10-token prompt, 64 generated, 5 threads, 1 warm-up and 3 runs. Tokens are
+identical in every record.
+
+| Record | Build | Prefill tok/s | Decode tok/s (median step) |
+|---|---|---|---|
+| `2026-11-11-m3pro-vulkan-before.json` | `d68f6a6` | 8.2 | 6.52 (153.3 ms) |
+| `2026-11-11-m3pro-vulkan-after.json` | `5bf7ecb` | 48.9 | 27.36 (36.55 ms) |
+| `2026-11-11-m3pro-vulkan-cpu.json` (CPU, same session) | `5bf7ecb` | 77.0 | 43.50 (22.99 ms) |
+
+The steps between them are in ADR-019 amendment 1. Kernel timings for the Vulkan device
+come from an ignored test, not Criterion:
+
+```sh
+cargo test --release -p qubivex-backend-vulkan --test parity -- --ignored --nocapture speed
+```
+
+It prints the per-submission overhead (about 0.16 ms), one large Q4_K matrix (22.5 GB/s
+after, 14.7 before) and a layer's 24 expert matmuls in one submission (Q4_K 1.26 ms after,
+4.97 before). Treat it as a guide: one change it favoured was slower end to end.
+
 ## Saturated disks
 
 Warm reads never saturate here, so `bench --disk-mbps N` (with `--disk-latency-us`) puts
