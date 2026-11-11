@@ -1,0 +1,138 @@
+#!/bin/zsh
+# Measures the working tree's Vulkan decode against the permanent Step 1a baseline
+# (tag bench/vulkan-step1a; docs/performance/BENCHMARKING.md, "Vulkan baseline").
+#
+#   scripts/bench-vulkan-baseline [--rounds N] [--tag NAME] [--out DIR] [--no-concurrent]
+#                                 [--variant NAME='ARGS'] ...
+#
+# Builds the baseline once (a worktree and target directory under the scratch area) and
+# the working tree, both release. Then, round by round, alternates the baseline with
+# each variant (default: one variant `head` with no extra arguments; ARGS are extra
+# `qubivex bench` flags, such as --vulkan-fuse-rows 0):
+#   - single stream: `qubivex bench`, identical configuration for every run; each
+#     record is written to OUT/<date>-m3pro-vulkan-<tag>-<name>-<round>.json, and every
+#     record's tokens are checked against --reference FILE (default: the 2026-11-11
+#     Step 1a record, whose tokens match PR #55's reference; else the first baseline
+#     record of this session);
+#   - concurrent (unless --no-concurrent): the batch example at 1, 2, 4 and 8
+#     sequences, sequential, batched and concurrent, tokens checked identical.
+# Refuses to run on battery. Prints a median table at the end.
+#
+# Env: QUBIVEX_MODELS (default ~/.qubivex/models), QUBIVEX_OLMOE_TOKENIZER_DIR (default
+# ~/.qubivex/tokenizers/olmoe-0125-instruct).
+set -eu
+setopt pipe_fail
+
+ROOT=$(git -C "${0:A:h}" rev-parse --show-toplevel)
+TAG=bench/vulkan-step1a
+ENCODED=${ROOT//[^a-zA-Z0-9]/-}
+SCRATCH=/private/tmp/claude-$(id -u)/$ENCODED/vulkan-baseline
+MODELS=${QUBIVEX_MODELS:-$HOME/.qubivex/models}
+TOKENIZER=${QUBIVEX_OLMOE_TOKENIZER_DIR:-$HOME/.qubivex/tokenizers/olmoe-0125-instruct}
+MODEL=olmoe-1b-7b-0125-instruct
+
+rounds=3
+name=step
+out=$ROOT/docs/performance/baselines
+concurrent=1
+variants=()
+reference=$ROOT/docs/performance/baselines/2026-11-11-m3pro-vulkan-optb-base-1.json
+[[ -f $reference ]] || reference=""
+while (( $# )); do
+  case $1 in
+    --rounds) rounds=$2; shift 2 ;;
+    --tag) name=$2; shift 2 ;;
+    --out) out=$2; shift 2 ;;
+    --no-concurrent) concurrent=0; shift ;;
+    --variant) variants+=("$2"); shift 2 ;;
+    --reference) reference=$2; shift 2 ;;
+    *) print -r -- "unknown argument $1" >&2; exit 2 ;;
+  esac
+done
+(( ${#variants} )) || variants=("head=")
+
+if ! pmset -g batt | grep -q "AC Power"; then
+  print -r -- "on battery: benchmarks need mains power" >&2
+  exit 1
+fi
+
+# The baseline, built once.
+base_tree=$SCRATCH/tree
+base_target=$SCRATCH/target
+if [[ ! -d $base_tree ]]; then
+  mkdir -p $SCRATCH
+  git -C $ROOT worktree add -q --detach $base_tree $TAG
+fi
+if [[ $(git -C $base_tree rev-parse HEAD) != $(git -C $ROOT rev-parse "$TAG^{commit}") ]]; then
+  git -C $base_tree checkout -q --detach $TAG
+fi
+print -r -- "building the baseline ($TAG) ..."
+(cd $base_tree && CARGO_TARGET_DIR=$base_target cargo build -q --release -p qubivex-cli -p qubivex-runtime --example batch)
+print -r -- "building the working tree ..."
+(cd $ROOT && cargo build -q --release -p qubivex-cli -p qubivex-runtime --example batch)
+
+base_bin=$base_target/release/qubivex
+head_bin=$ROOT/target/release/qubivex
+base_batch=$base_target/release/examples/batch
+head_batch=$ROOT/target/release/examples/batch
+date=$(date +%Y-%m-%d)
+mkdir -p $out
+
+common=(bench --model $MODEL --backend vulkan --threads 5 --prompt-tokens 10
+  --decode-tokens 128 --warmup 1 --runs 5 --expert-cache-mb 3720)
+records=()
+
+bench() { # label binary record extra...
+  local label=$1 bin=$2 record=$3; shift 3
+  local ref=()
+  [[ -n $reference ]] && ref=(--reference $reference)
+  $bin $common --label $label --out $record $ref "$@" > /dev/null
+  [[ -z $reference ]] && reference=$record
+  records+=($record)
+  print -r -- "  $label: $record"
+}
+
+for r in $(seq 1 $rounds); do
+  print -r -- "round $r of $rounds"
+  bench base $base_bin $out/$date-m3pro-vulkan-$name-base-$r.json
+  for v in $variants; do
+    vname=${v%%=*}
+    vargs=(${(z)${v#*=}})
+    bench $vname $head_bin $out/$date-m3pro-vulkan-$name-$vname-$r.json $vargs
+  done
+done
+
+print
+print -r -- "| record | decode ms/token (median) | tok/s | prefill ms | submissions/token | tokens = baseline |"
+print -r -- "|---|---:|---:|---:|---:|---|"
+for f in $records; do
+  python3 -I - $f <<'EOF'
+import json, sys
+r = json.load(open(sys.argv[1]))
+d = r.get("device") or {}
+dec = d.get("decode", {})
+ok = r["check"].get("reference_match")
+print(f"| {sys.argv[1].rsplit('/', 1)[-1]} | {r['decode']['step_ms']['median']:.2f} | "
+      f"{r['decode']['tok_s_at_median']:.2f} | {r['prefill']['ms']['median']:.1f} | "
+      f"{dec.get('submissions', float('nan')):.0f} | {ok} |")
+EOF
+done
+
+if (( concurrent )); then
+  batch_args=($MODELS/$MODEL $TOKENIZER --vulkan on --threads 5 --cache-mb 3720
+    --steps 32 --runs 3 --sizes 1,2,4,8)
+  for r in $(seq 1 $rounds); do
+    print
+    print -r -- "concurrent, round $r: baseline"
+    $base_batch $batch_args
+    for v in $variants; do
+      vname=${v%%=*}
+      vargs=(${(z)${v#*=}})
+      # The batch example takes --vulkan-fuse-rows; other bench flags do not apply.
+      bargs=()
+      (( ${vargs[(I)--vulkan-fuse-rows]} )) && bargs=(--vulkan-fuse-rows ${vargs[${vargs[(I)--vulkan-fuse-rows]}+1]})
+      print -r -- "concurrent, round $r: $vname"
+      $head_batch $batch_args $bargs
+    done
+  done
+fi

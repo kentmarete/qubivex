@@ -352,6 +352,29 @@ prompt, 64 generated, 1 warm-up and 3 runs. Every record's tokens equal the
 Submissions never overlap on the GPU: summed GPU time equals busy time in every timed
 run.
 
+## Vulkan baseline: Step 1a (permanent)
+
+The tag `bench/vulkan-step1a` is the fixed reference for every Vulkan optimisation
+(owner, 2026-11-11). It is `main` at 2fedcb3 (Step 1a: one copy per shared input; no
+grouping, no fusion) plus the batch example's `--vulkan on`, so single-stream and
+concurrent runs use the same measuring code on both sides. The tag is never moved; a
+later step that becomes the default is compared against it, not against its
+predecessor only.
+
+```sh
+# Mains power. Alternates the baseline with each variant, 3 rounds by default.
+scripts/bench-vulkan-baseline --tag step3a \
+    --variant fused= --variant unfused='--vulkan-fuse-rows 0'
+```
+
+The driver builds the baseline once (a worktree and target directory under the
+scratch area), builds the working tree, then per round runs `qubivex bench` (OLMoE
+Q4_K_M, `--backend vulkan`, 5 threads, 10-token prompt, 128 generated, 1 warm-up + 5
+runs, 3720 MiB expert cache, all resident) for the baseline and each variant, with every
+record's tokens checked against the Step 1a record, then the batch example at 1, 2, 4
+and 8 sequences (sequential, batched, concurrent). A change is accepted only if it
+beats the baseline beyond the run-to-run spread, single-stream and concurrent.
+
 ## Saturated disks
 
 Warm reads never saturate here, so `bench --disk-mbps N` (with `--disk-latency-us`) puts
