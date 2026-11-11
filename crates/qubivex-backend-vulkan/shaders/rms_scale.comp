@@ -1,0 +1,32 @@
+// QUBIVEX Vulkan RMS scale probe (audit §18): y[i] = 1 / sqrt(a[i] / n + eps) with
+// rms.glsl, for the conformance tests only, which compare every f32 input against
+// `qubivex_compute::math::rms_scale`'s arithmetic on the CPU. resnorm.comp uses the same
+// include, built the same way (-O0, NoContraction on the add).
+#version 450
+
+layout(local_size_x = 256) in;
+
+layout(std430, set = 0, binding = 1) readonly buffer In {
+    float a[];
+};
+
+layout(std430, set = 0, binding = 2) writeonly buffer Out {
+    float y[];
+};
+
+layout(push_constant) uniform Params {
+    uint count;
+    uint n_bits;
+    uint eps_bits;
+    uint unused;
+} p;
+
+#include "rms.glsl"
+
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    if (i >= p.count) {
+        return;
+    }
+    y[i] = rms_scale_of(a[i], uintBitsToFloat(p.n_bits), uintBitsToFloat(p.eps_bits));
+}

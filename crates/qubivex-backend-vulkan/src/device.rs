@@ -52,6 +52,13 @@ pub(crate) const ROUTE_SPV: &[u8] = include_bytes!("route.spv");
 /// `shaders/combine.comp`: the rank-order combine on the device (Step 3b).
 pub(crate) const COMBINE_SPV: &[u8] = include_bytes!("combine.spv");
 
+/// `shaders/resnorm.comp`: the attention residual and the FFN RMSNorm on the device
+/// (audit §18).
+pub(crate) const RESNORM_SPV: &[u8] = include_bytes!("resnorm.spv");
+
+/// `shaders/rms_scale.comp`: the RMSNorm scale alone, for the conformance tests.
+pub(crate) const RMS_SCALE_SPV: &[u8] = include_bytes!("rms_scale.spv");
+
 /// Invocations per SwiGLU workgroup. Must equal `local_size_x` in the shader.
 const SWIGLU_GROUP: u32 = 256;
 
@@ -197,6 +204,9 @@ pub(crate) struct Shared {
 pub(crate) struct Routed {
     route: vk::Pipeline,
     combine: vk::Pipeline,
+    /// The residual and RMSNorm (audit §18) and the scale probe.
+    resnorm: vk::Pipeline,
+    rms_scale: vk::Pipeline,
 }
 
 /// The fused matmul (one pipeline per dtype) and SwiGLU, on one layout: binding 0 the
@@ -235,6 +245,8 @@ impl Drop for Shared {
             if let Some(r) = &self.routed {
                 self.device.destroy_pipeline(r.route, None);
                 self.device.destroy_pipeline(r.combine, None);
+                self.device.destroy_pipeline(r.resnorm, None);
+                self.device.destroy_pipeline(r.rms_scale, None);
             }
             if let Some(f) = &self.fused {
                 f.destroy(&self.device);
@@ -789,16 +801,21 @@ fn create_fused(device: &ash::Device) -> Result<Fused, ComputeError> {
     }
 }
 
-/// The route and combine pipelines on the fused `layout`.
+/// The route, combine, residual-norm and scale-probe pipelines on the fused `layout`.
 fn create_routed(device: &ash::Device, layout: vk::PipelineLayout) -> Result<Routed, ComputeError> {
     let spv = |b: &[u8]| {
         ash::util::read_spv(&mut std::io::Cursor::new(b)).map_err(|e| err("bad SPIR-V", e))
     };
-    let codes = [spv(ROUTE_SPV)?, spv(COMBINE_SPV)?];
+    let codes = [
+        spv(ROUTE_SPV)?,
+        spv(COMBINE_SPV)?,
+        spv(RESNORM_SPV)?,
+        spv(RMS_SCALE_SPV)?,
+    ];
     // SAFETY: each create-info and what it points to live until its call returns;
     // modules are destroyed after pipeline creation, pipelines on failure.
     unsafe {
-        let mut modules = Vec::with_capacity(2);
+        let mut modules = Vec::with_capacity(codes.len());
         for code in &codes {
             match device
                 .create_shader_module(&vk::ShaderModuleCreateInfo::default().code(code), None)
@@ -830,9 +847,11 @@ fn create_routed(device: &ash::Device, layout: vk::PipelineLayout) -> Result<Rou
             device.destroy_shader_module(m, None);
         }
         match made {
-            Ok(p) if p.len() == 2 => Ok(Routed {
+            Ok(p) if p.len() == 4 => Ok(Routed {
                 route: p[0],
                 combine: p[1],
+                resnorm: p[2],
+                rms_scale: p[3],
             }),
             Ok(p) | Err((p, _)) => {
                 for p in p.into_iter().filter(|p| *p != vk::Pipeline::null()) {
@@ -2884,6 +2903,87 @@ impl Submitter {
             *id = v.to_bits();
         }
         weights.copy_from_slice(&rt[sk..2 * sk]);
+        Ok(())
+    }
+}
+
+impl Submitter {
+    /// The RMSNorm scale shader alone: `y[i] = 1 / sqrt(a[i] / n + eps)` (`rms.glsl`),
+    /// for the conformance tests, which check every f32 input against the CPU.
+    pub(crate) fn rms_scale(
+        &mut self,
+        a: &[f32],
+        n: f32,
+        eps: f32,
+        y: &mut [f32],
+    ) -> Result<(), ComputeError> {
+        let shared = Arc::clone(&self.shared);
+        let (Some(fused), Some(routed)) = (shared.fused.as_ref(), shared.routed.as_ref()) else {
+            return Err(err("rms scale", "no routing pipelines"));
+        };
+        if a.len() != y.len() || a.is_empty() {
+            return Err(ComputeError::Shape {
+                op: "rms scale",
+                detail: format!("{} inputs, {} outputs", a.len(), y.len()),
+            });
+        }
+        let bytes = 4 * a.len() as u64;
+        let storage = vk::BufferUsageFlags::STORAGE_BUFFER;
+        let abuf = {
+            let x = Self::host_buffer(&shared, &mut self.xs, bytes, storage)?;
+            x.floats_mut()[..a.len()].copy_from_slice(a);
+            x.buffer
+        };
+        let ybuf = Self::host_buffer(&shared, &mut self.ys, bytes, storage)?.buffer;
+        let sets = self.fused_sets(1)?;
+        let set = sets[0];
+        self.write_set(
+            set,
+            [
+                (abuf, 0, None),
+                (abuf, 0, None),
+                (ybuf, 0, None),
+                (abuf, 0, None),
+            ],
+        );
+        let (layout, pipeline) = (fused.layout, routed.rms_scale);
+        let count = u32_of(a.len(), "inputs")?;
+        let words4 = [count, n.to_bits(), eps.to_bits(), 0];
+        let groups = count.div_ceil(256);
+        self.run(|d, cmd| {
+            let mut push = [0u8; 16];
+            for (i, w) in words4.iter().enumerate() {
+                push[4 * i..4 * i + 4].copy_from_slice(&w.to_ne_bytes());
+            }
+            let to_host = [vk::MemoryBarrier::default()
+                .src_access_mask(vk::AccessFlags::SHADER_WRITE)
+                .dst_access_mask(vk::AccessFlags::HOST_READ)];
+            // SAFETY: as in `gated_ffn_many`.
+            unsafe {
+                d.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, pipeline);
+                d.cmd_bind_descriptor_sets(
+                    cmd,
+                    vk::PipelineBindPoint::COMPUTE,
+                    layout,
+                    0,
+                    &[set],
+                    &[],
+                );
+                d.cmd_push_constants(cmd, layout, vk::ShaderStageFlags::COMPUTE, 0, &push);
+                d.cmd_dispatch(cmd, groups, 1, 1);
+                d.cmd_pipeline_barrier(
+                    cmd,
+                    vk::PipelineStageFlags::COMPUTE_SHADER,
+                    vk::PipelineStageFlags::HOST,
+                    vk::DependencyFlags::empty(),
+                    &to_host,
+                    &[],
+                    &[],
+                );
+            }
+        })?;
+        let out = self.ys.as_mut().ok_or_else(|| err("outputs", "missing"))?;
+        y.copy_from_slice(&out.floats_mut()[..a.len()]);
         Ok(())
     }
 }

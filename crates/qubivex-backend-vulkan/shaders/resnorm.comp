@@ -1,0 +1,89 @@
+// QUBIVEX Vulkan residual and RMSNorm (audit §18): for each token t,
+//   hs[t] = hs[t] + o[t]                       (the attention residual, in place)
+//   x[t]  = (hs[t] · r) · w,  r = 1 / sqrt(Σ hs[t]² / n + eps)
+// with the CPU's bits: `hs += o` element by element, then `qubivex_compute::math::rms_norm`
+// on the result. The sum of squares is the shared 64-lane reduction
+// (`qubivex_compute::reduce::dot`): lane l takes elements l, l + 64, l + 128, … in order,
+// one fma each, then the fixed halving tree `a[i] += a[i + w]` for w = 32, 16, 8, 4 and
+// `(a0 + a1) + (a2 + a3)`. The scale is rms.glsl; each output is two multiplies in the
+// CPU's order.
+//
+// One workgroup of 64 invocations per token, one invocation per lane. Built -O0 (the
+// scale's division and square root; rms.glsl), then every add and fma NoContraction
+// (build.sh).
+//
+// Bindings (the fused layout): 0 the residual stream (s × n, read and written), 1 the
+// O projection's outputs (s × n), 2 the normed activations (s × n), 3 the table, whose
+// words from `w_base` hold the norm weight's n f32 values as bits.
+#version 450
+
+layout(local_size_x = 64) in;
+
+const uint LANES = 64u;
+
+layout(std430, set = 0, binding = 0) buffer Hs {
+    float hs[];
+};
+
+layout(std430, set = 0, binding = 1) readonly buffer O {
+    float o[];
+};
+
+layout(std430, set = 0, binding = 2) writeonly buffer X {
+    float x[];
+};
+
+layout(std430, set = 0, binding = 3) readonly buffer Table {
+    uint tab[];
+};
+
+layout(push_constant) uniform Params {
+    uint n;
+    uint w_base;
+    uint eps_bits;
+    uint unused;
+} p;
+
+shared float red[LANES];
+shared float scale;
+
+#include "rms.glsl"
+
+void main() {
+    uint l = gl_LocalInvocationID.x;
+    uint row = gl_WorkGroupID.x * p.n;
+
+    float acc = 0.0;
+    for (uint i = l; i < p.n; i += LANES) {
+        float v = hs[row + i] + o[row + i];
+        hs[row + i] = v;
+        acc = fma(v, v, acc);
+    }
+    red[l] = acc;
+    memoryBarrierShared();
+    barrier();
+    for (uint w = 32u; w >= 4u; w /= 2u) {
+        float v = 0.0;
+        if (l < w) {
+            v = red[l] + red[l + w];
+        }
+        memoryBarrierShared();
+        barrier();
+        if (l < w) {
+            red[l] = v;
+        }
+        memoryBarrierShared();
+        barrier();
+    }
+    if (l == 0u) {
+        float ss = (red[0] + red[1]) + (red[2] + red[3]);
+        scale = rms_scale_of(ss, float(p.n), uintBitsToFloat(p.eps_bits));
+    }
+    memoryBarrierShared();
+    barrier();
+    float r = scale;
+    for (uint i = l; i < p.n; i += LANES) {
+        float v = hs[row + i];
+        x[row + i] = (v * r) * uintBitsToFloat(tab[p.w_base + i]);
+    }
+}

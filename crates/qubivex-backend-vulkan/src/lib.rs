@@ -235,6 +235,18 @@ impl VulkanDevice {
             .route(logits, s, k, renormalise, ids, weights)
     }
 
+    /// The RMSNorm scale shader alone: `y[i] = 1 / sqrt(a[i] / n + eps)`, for the
+    /// numerical conformance tests, which check it against the CPU's arithmetic
+    /// ([`qubivex_compute::math::rms_scale_of`]).
+    ///
+    /// # Errors
+    /// [`ComputeError::Shape`] when the lengths differ or are zero;
+    /// [`ComputeError::Device`] when the device has no routing pipelines or the driver
+    /// fails.
+    pub fn rms_scale(&self, a: &[f32], n: f32, eps: f32, y: &mut [f32]) -> Result<(), ComputeError> {
+        self.submitter().rms_scale(a, n, eps, y)
+    }
+
     /// Whether submissions are timed on the GPU (asked for, and the queue supports it).
     #[must_use]
     pub fn timestamps(&self) -> bool {
@@ -410,6 +422,16 @@ mod tests {
                 "combine.spv",
                 built("combine.spv"),
                 crate::device::COMBINE_SPV,
+            ),
+            (
+                "resnorm.spv",
+                built("resnorm.spv"),
+                crate::device::RESNORM_SPV,
+            ),
+            (
+                "rms_scale.spv",
+                built("rms_scale.spv"),
+                crate::device::RMS_SCALE_SPV,
             ),
         ];
         let _ = std::fs::remove_dir_all(&out);
