@@ -14,7 +14,6 @@ use qubivex_arch::{
 };
 use qubivex_backend_cpu::sim::{SimConfig, SimDevice};
 use qubivex_compute::WeightView;
-use qubivex_compute::discrete::DeviceBuffer;
 use qubivex_compute::host::PageAligned;
 use qubivex_compute::tensor::TensorView;
 use qubivex_core::{Bytes, ExpertIdx, LayerIdx, Shape, TensorDesc};
@@ -38,7 +37,7 @@ use qubivex_tokenizer::Tokenizer;
 
 use crate::checksums::{ExpertSums, SUMS_FILE, SumsState};
 use crate::combine::{BatchStats, Combiner, Outcome, Step};
-use crate::discrete::{DeviceReport, OnDevice};
+use crate::discrete::{DeviceReport, OnDevice, Pin};
 use crate::metal_forward::MetalForward;
 use crate::placement::{BackendKind, MetalOps, Placed, PlacementReport};
 use crate::{ExpertIo, IoPath, ModelExpertSource, RuntimeError, load_tokenizer};
@@ -314,7 +313,7 @@ impl StoreProvider<'_> {
     }
 
     /// The expert's device copy, if there is a device: hold it while computing.
-    fn pin(&self, lease: &Lease<'_>) -> Result<Option<DeviceBuffer>, ArchError> {
+    fn pin(&self, lease: &Lease<'_>) -> Result<Option<Pin>, ArchError> {
         self.device
             .map(|d| d.ensure(lease.key(), lease.slab()))
             .transpose()
@@ -1157,9 +1156,10 @@ impl Engine {
         let kv_position_bytes = footprint.kv_bytes_per_token.0;
         let layers = footprint.layers;
         let io_threads = opts.io_threads.unwrap_or(DEFAULT_IO_THREADS);
+        let pools = pools_for(&layers, capacity);
         let store = ExpertStore::with_io_threads(
             wrap(Arc::clone(&source)),
-            &pools_for(&layers, capacity),
+            &pools,
             opts.cache_policy,
             io_threads,
         )
@@ -1181,8 +1181,16 @@ impl Engine {
                         .saturating_sub(dense.arena.len() as u64)
                         .saturating_sub(VRAM_ACTIVATION_RESERVE.0),
                 };
-                let on = OnDevice::new(dev, Arc::clone(&ledger), &dense.arena, budget)
-                    .map_err(|e| RuntimeError::Model(format!("cannot place on the device: {e}")))?;
+                let ram_slots: Vec<u32> = pools.iter().map(|p| p.slots).collect();
+                let on = OnDevice::new(
+                    dev,
+                    Arc::clone(&ledger),
+                    &dense.arena,
+                    budget,
+                    &layers,
+                    &ram_slots,
+                )
+                .map_err(|e| RuntimeError::Model(format!("cannot place on the device: {e}")))?;
                 Some(Arc::new(on))
             }
         };

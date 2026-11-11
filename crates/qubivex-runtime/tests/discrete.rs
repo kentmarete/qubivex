@@ -58,6 +58,24 @@ fn cpu(id: &str, cache: Option<u64>) -> Engine {
     .unwrap()
 }
 
+/// As [`sim`], with the device fusing expert blocks of up to `fuse_rows` rows.
+fn sim_fused(id: &str, fuse_rows: usize) -> Engine {
+    let mut config = SimConfig::new(1 << 30);
+    config.fuse_rows = fuse_rows;
+    Engine::load(
+        meta(id),
+        EngineOptions {
+            backend: BackendKind::Sim,
+            sim: Some(config),
+            vram_budget: Some(1 << 29),
+            expert_cache_bytes: Some(1 << 30),
+            max_context: Some(256),
+            ..EngineOptions::default()
+        },
+    )
+    .unwrap()
+}
+
 /// A sim engine. `ram_cache`: a fixed RAM expert cache (no plan); `device_cache`: the
 /// device expert cache's bytes, with a fixed RAM cache only.
 fn sim(id: &str, ram_cache: Option<u64>, device_cache: Option<u64>) -> Engine {
@@ -113,6 +131,9 @@ fn sim_matches_the_cpu_bits() {
             assert!(r.experts.hits > 0, "{id}: and reused");
             assert_eq!(v.expert_cache.0, r.experts.used, "{id}");
             assert_eq!(r.transfers.uploads, 1 + r.experts.misses, "{id}");
+            // The budget holds every expert: copies go into fixed-slot arenas.
+            assert!(r.experts.arena_slots > 0, "{id}: {r:?}");
+            assert!(r.experts.held <= r.experts.used, "{id}: {r:?}");
         } else {
             assert_eq!(r.transfers.uploads, 1, "{id}: only the dense copy");
         }
@@ -156,7 +177,7 @@ fn ram_cache_reuse_drops_device_copies() {
         assert_eq!(run(&e), want, "{id}");
         let r = e.device_report().unwrap();
         assert!(r.experts.detached > 0, "{id}: {r:?}");
-        assert!(r.experts.used <= small, "{id}: inclusive: {r:?}");
+        assert!(r.experts.held <= small, "{id}: inclusive: {r:?}");
     }
 }
 
@@ -192,6 +213,63 @@ fn resident_experts_are_grouped_into_two_submissions() {
         assert_eq!(got, want, "{id}");
         assert!(n > 5 * layers(id) + 1, "{id}: per expert: {n}");
     }
+}
+
+/// A device that fuses the expert block: with every routed expert resident, a layer's
+/// experts are one submission (4 per layer plus the head), and the bits are the CPU's.
+/// Selection is by shape: with blocks of at most 1 row fused, the prompt (several rows
+/// per expert) runs unfused and decode fused, and the tokens are the same; so are
+/// concurrent sequences, whose decode passes combine into blocks of several rows.
+#[test]
+fn fused_expert_blocks_are_one_submission() {
+    for id in MOE {
+        let logits = |e: &Engine| {
+            let mut c = e.new_cache();
+            bits(&e.forward(PROMPT, &mut c, Logits::All, None).unwrap())
+        };
+        let submissions = |e: &Engine| e.device_report().unwrap().transfers.submissions;
+        let want = logits(&cpu(id, Some(1 << 30)));
+        let want_run = run(&cpu(id, Some(1 << 30)));
+
+        let e = sim_fused(id, 64);
+        let _ = logits(&e); // Loads every expert the prompt routes to.
+        let before = submissions(&e);
+        assert_eq!(logits(&e), want, "{id}");
+        assert_eq!(submissions(&e) - before, 4 * layers(id) + 1, "{id}: fused");
+        assert_eq!(run(&e), want_run, "{id}");
+
+        let e = sim_fused(id, 1);
+        let _ = logits(&e);
+        let before = submissions(&e);
+        assert_eq!(logits(&e), want, "{id}");
+        assert!(
+            submissions(&e) - before > 4 * layers(id) + 1,
+            "{id}: the prompt's blocks have more than 1 row, so they are not fused"
+        );
+        assert_eq!(run(&e), want_run, "{id}");
+    }
+
+    let id = "olmoe-tiny";
+    let prompts: Vec<Vec<u32>> = (0..4)
+        .map(|i| PROMPT.iter().map(|&t| t + i).collect())
+        .collect();
+    let c = cpu(id, None);
+    let want: Vec<_> = prompts
+        .iter()
+        .map(|p| c.generate(p, 8, Sampling::default(), |_| true).unwrap())
+        .collect();
+    let e = sim_fused(id, 4);
+    let got: Vec<_> = std::thread::scope(|s| {
+        let hs: Vec<_> = prompts
+            .iter()
+            .map(|p| {
+                let e = &e;
+                s.spawn(move || e.generate(p, 8, Sampling::default(), |_| true).unwrap())
+            })
+            .collect();
+        hs.into_iter().map(|h| h.join().unwrap()).collect()
+    });
+    assert_eq!(got, want);
 }
 
 /// Concurrent requests share the device and its cache; each gets the CPU's tokens.

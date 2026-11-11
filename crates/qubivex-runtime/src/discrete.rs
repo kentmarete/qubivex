@@ -3,40 +3,60 @@
 //!
 //! The dense arena is copied to the device once, at load. A routed expert is copied the
 //! first time a forward pass uses it while it sits in the RAM cache, and the copy is
-//! kept in the device expert cache, evicted least recently used when the cache is over
-//! its budget. Copies are tied to the RAM cache's slabs: when the RAM cache reuses a
-//! slab for another expert, the device copy of the old one is dropped first, so the
-//! device cache only ever holds experts the RAM cache holds (an inclusive cache).
+//! kept in the device expert cache, evicted least recently used when the cache is full.
+//! Copies are tied to the RAM cache's slabs: when the RAM cache reuses a slab for
+//! another expert, the device copy of the old one is dropped first, so the device cache
+//! only ever holds experts the RAM cache holds (an inclusive cache).
+//!
+//! **Fixed-slot arenas** (audit §15.5). Experts of one layer all have the same size,
+//! and a model has few distinct sizes (OLMoE Q4_K_M: two, from its Q4_K and Q6_K down
+//! projections). The cache keeps one device arena per size class, divided into equal
+//! slots: a copy is a write into a free slot, never an allocation, there is no
+//! fragmentation, and every expert of a layer sits in one buffer, so a fused expert
+//! block can read all of them in one dispatch. The slot counts follow the budget's
+//! distribution over layers (the RAM cache's rule), capped by the RAM cache (the device
+//! cache is inclusive, so it can never use more) and by the largest arena the device
+//! can address at once. An arena is allocated on its class's first copy and charged to
+//! the ledger whole. On a device without arenas, or a budget too small for one slot per
+//! layer, each copy is its own allocation, as before.
 //!
 //! Every matmul weight is found on the device by its host address. A weight with no
 //! device copy is an error, not a silent CPU fallback: on the simulated device that is
 //! how a missing upload is caught.
 //!
-//! While a forward pass computes an expert it holds a clone of the expert's buffer (a
-//! pin), so eviction never frees memory in use (ADR-011 §3). If every cached expert is
-//! pinned, a new copy goes over the budget rather than failing; the device's capacity
-//! is the hard limit.
+//! While a forward pass computes an expert it holds a [`Pin`] on its copy, so eviction
+//! never frees or overwrites memory in use (ADR-011 §3). If every slot of a class is
+//! pinned, a new copy gets its own allocation over the budget rather than failing; the
+//! device's capacity is the hard limit.
 
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, PoisonError, Weak};
+use std::sync::{Arc, Mutex, OnceLock, PoisonError, Weak};
 
 use qubivex_compute::discrete::{
-    DeviceBuffer, DeviceMatMul, DeviceUsage, DeviceWeights, DiscreteDevice, TransferStats,
+    DeviceBuffer, DeviceGatedFfn, DeviceMatMul, DeviceUsage, DeviceWeights, DiscreteDevice,
+    TransferStats,
 };
 use qubivex_compute::host::PageAligned;
-use qubivex_compute::{ComputeError, MatMul, WeightView};
+use qubivex_compute::{ComputeError, GatedFfn, MatMul, WeightView};
 use qubivex_core::Bytes;
 use qubivex_expert_stream::{ExpertKey, Slab};
-use qubivex_memory::{MemoryLedger, Owner, Tier};
+use qubivex_memory::{LayerExperts, MemoryLedger, Owner, Tier};
 
 /// The device expert cache's counters.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct DeviceCacheStats {
     /// The cache's budget in bytes.
     pub budget: u64,
-    /// Bytes of expert copies held now.
+    /// Device bytes the cache occupies: its arenas, whole once allocated, and any
+    /// copies with their own allocation. The ledger's VRAM expert cache charge.
     pub used: u64,
+    /// Bytes of the expert copies it holds now.
+    pub held: u64,
+    /// Bytes of its arenas (allocated or not), and their slots.
+    pub arena_bytes: u64,
+    /// Slots in all arenas.
+    pub arena_slots: u64,
     /// Experts found on the device.
     pub hits: u64,
     /// Experts copied to the device.
@@ -45,7 +65,7 @@ pub struct DeviceCacheStats {
     pub evictions: u64,
     /// Copies dropped because the RAM cache dropped the expert.
     pub detached: u64,
-    /// Copies made while every cached expert was in use, over the budget.
+    /// Copies made while every slot or cached expert was in use, over the budget.
     pub over_budget: u64,
 }
 
@@ -62,19 +82,48 @@ pub struct DeviceReport {
     pub experts: DeviceCacheStats,
 }
 
+/// Arena slots start at multiples of this many bytes (any storage-buffer offset
+/// alignment a driver asks for divides it).
+const SLOT_ALIGN: usize = 256;
+
+/// Where a copy lives.
+enum Home {
+    /// Slot `slot` of arena `class`.
+    Slot { class: usize, slot: usize },
+    /// Its own allocation, and the pin count for it.
+    Own { buffer: DeviceBuffer, pin: Arc<()> },
+}
+
 struct Entry {
     key: ExpertKey,
     len: usize,
-    buffer: DeviceBuffer,
+    home: Home,
     last_use: u64,
+}
+
+/// One size class: an arena of equal slots.
+struct Arena {
+    /// Bytes of one slot (the class's expert size, aligned).
+    stride: usize,
+    slots: usize,
+    /// Allocated on first use; `None` inside when the device refused it.
+    buffer: OnceLock<Option<DeviceBuffer>>,
+    /// One pin count per slot: held by the cache's entry users and by a copy in
+    /// progress, so a slot is reused only when nothing reads or writes it.
+    pins: Vec<Arc<()>>,
 }
 
 #[derive(Default)]
 struct Cache {
     /// By the host address of the expert's slab.
     entries: BTreeMap<usize, Entry>,
-    used: u64,
+    /// Bytes of copies held.
+    held: u64,
+    /// Bytes of copies with their own allocation.
+    own: u64,
     clock: u64,
+    /// Per class: slots without a copy.
+    free: Vec<Vec<usize>>,
 }
 
 struct Shared {
@@ -84,7 +133,7 @@ struct Shared {
 
 impl Shared {
     fn lock(&self) -> std::sync::MutexGuard<'_, Cache> {
-        // Every update leaves the map and the byte count consistent.
+        // Every update leaves the map, the free lists and the byte counts consistent.
         self.cache.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
@@ -92,8 +141,19 @@ impl Shared {
         let mut c = self.lock();
         if c.entries.get(&addr).is_some_and(|e| e.key == key) {
             let e = c.entries.remove(&addr).expect("present");
-            c.used -= e.len as u64;
+            c.forget(&e);
             self.detached.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+}
+
+impl Cache {
+    /// Gives back what a removed entry held.
+    fn forget(&mut self, e: &Entry) {
+        self.held -= e.len as u64;
+        match e.home {
+            Home::Slot { class, slot } => self.free[class].push(slot),
+            Home::Own { .. } => self.own -= e.len as u64,
         }
     }
 }
@@ -113,6 +173,14 @@ impl Drop for Detach {
     }
 }
 
+/// A forward pass's hold on an expert's device copy: while it lives, the copy is
+/// neither evicted nor overwritten, and its memory is not freed.
+#[must_use]
+pub(crate) struct Pin {
+    _buffer: DeviceBuffer,
+    _pin: Arc<()>,
+}
+
 /// The dense weights on a discrete device, and its expert cache.
 pub(crate) struct OnDevice {
     device: Arc<dyn DiscreteDevice>,
@@ -121,6 +189,9 @@ pub(crate) struct OnDevice {
     dense: DeviceBuffer,
     arena: std::ops::Range<usize>,
     budget: u64,
+    /// The expert arenas, one per size class, and each layer's class.
+    arenas: Vec<Arena>,
+    class_of: Vec<Option<usize>>,
     shared: Arc<Shared>,
     hits: AtomicU64,
     misses: AtomicU64,
@@ -144,32 +215,104 @@ fn not_on_device(what: &str) -> ComputeError {
     }
 }
 
+/// The arenas for a device expert cache of `budget` bytes over `layers`, whose RAM
+/// cache holds `ram_slots[i]` experts of layer `i`, on a device that addresses at most
+/// `max_arena` bytes at once; and each layer's class. No arenas when the budget cannot
+/// give every layer a slot.
+fn plan_arenas(
+    layers: &[LayerExperts],
+    ram_slots: &[u32],
+    budget: u64,
+    max_arena: u64,
+) -> (Vec<Arena>, Vec<Option<usize>>) {
+    let slots = qubivex_memory::distribute(layers, Bytes(budget), None);
+    let need: u64 = layers
+        .iter()
+        .zip(&slots)
+        .map(|(l, &s)| u64::from(s) * l.expert_bytes.0)
+        .sum();
+    let mut class_of = vec![None; layers.len()];
+    if layers.is_empty() || need > budget || slots.contains(&0) {
+        return (Vec::new(), class_of);
+    }
+    // Size classes by expert bytes, in first-seen order.
+    let mut sizes: Vec<(u64, u64)> = Vec::new();
+    for (i, (l, &s)) in layers.iter().zip(&slots).enumerate() {
+        let s = u64::from(s.min(ram_slots.get(i).copied().unwrap_or(u32::MAX)));
+        let c = match sizes.iter().position(|&(b, _)| b == l.expert_bytes.0) {
+            Some(c) => c,
+            None => {
+                sizes.push((l.expert_bytes.0, 0));
+                sizes.len() - 1
+            }
+        };
+        sizes[c].1 += s;
+        class_of[i] = Some(c);
+    }
+    let arenas = sizes
+        .into_iter()
+        .map(|(bytes, n)| {
+            let stride = usize::try_from(bytes)
+                .unwrap_or(usize::MAX)
+                .max(1)
+                .next_multiple_of(SLOT_ALIGN);
+            let fit = max_arena / stride as u64;
+            let n = usize::try_from(n.min(fit)).unwrap_or(0);
+            Arena {
+                stride,
+                slots: n,
+                buffer: OnceLock::new(),
+                pins: (0..n).map(|_| Arc::new(())).collect(),
+            }
+        })
+        .collect();
+    (arenas, class_of)
+}
+
 impl OnDevice {
     /// Whether the device asks callers to group matmuls.
     pub(crate) fn groups_matmuls(&self) -> bool {
         self.device.groups_matmuls()
     }
 
+    /// Whether the device fuses this many expert blocks of this many rows.
+    pub(crate) fn fuses_gated_ffn(&self, blocks: usize, rows: usize) -> bool {
+        self.device.fuses_gated_ffn(blocks, rows)
+    }
+
     /// Copies `arena` (the dense weights) to `device`, charged to the ledger's
-    /// `Vram(0)` tier, with an expert cache of `budget` bytes.
+    /// `Vram(0)` tier, with an expert cache of `budget` bytes for `layers`, whose RAM
+    /// cache holds `ram_slots` experts per layer.
     pub(crate) fn new(
         device: Arc<dyn DiscreteDevice>,
         ledger: Arc<MemoryLedger>,
         arena: &PageAligned,
         budget: u64,
+        layers: &[LayerExperts],
+        ram_slots: &[u32],
     ) -> Result<Self, ComputeError> {
         let host = arena.as_slice();
         let charge = ledger.charge(Tier::Vram(0), Owner::Dense, Bytes(host.len() as u64));
         let dense = device.upload(host, Some(Box::new(charge)))?;
         let start = host.as_ptr() as usize;
+        let (arenas, class_of) = plan_arenas(layers, ram_slots, budget, device.max_arena());
+        let free = arenas
+            .iter()
+            .map(|a| (0..a.slots).rev().collect())
+            .collect();
         Ok(Self {
             device,
             ledger,
             dense,
             arena: start..start + host.len(),
             budget,
+            arenas,
+            class_of,
             shared: Arc::new(Shared {
-                cache: Mutex::default(),
+                cache: Mutex::new(Cache {
+                    free,
+                    ..Cache::default()
+                }),
                 detached: AtomicU64::new(0),
             }),
             hits: AtomicU64::new(0),
@@ -192,37 +335,156 @@ impl OnDevice {
         self.device.supports(dtype)
     }
 
+    /// Arena `class`'s buffer, allocated now if this is its first use; `None` if the
+    /// device has no arenas or refused the memory.
+    fn arena(&self, class: usize) -> Option<&DeviceBuffer> {
+        let a = &self.arenas[class];
+        a.buffer
+            .get_or_init(|| {
+                let len = a.stride.checked_mul(a.slots)?;
+                let charge =
+                    self.ledger
+                        .charge(Tier::Vram(0), Owner::ExpertCache, Bytes(len as u64));
+                self.device.alloc(len, Some(Box::new(charge))).ok()
+            })
+            .as_ref()
+    }
+
+    /// The pin of `home`, for a caller.
+    fn pin_of(&self, home: &Home) -> Pin {
+        match home {
+            Home::Slot { class, slot } => Pin {
+                _buffer: self.arenas[*class]
+                    .buffer
+                    .get()
+                    .and_then(Option::as_ref)
+                    .expect("a slot's arena is allocated")
+                    .clone(),
+                _pin: Arc::clone(&self.arenas[*class].pins[*slot]),
+            },
+            Home::Own { buffer, pin } => Pin {
+                _buffer: buffer.clone(),
+                _pin: Arc::clone(pin),
+            },
+        }
+    }
+
+    fn pinned(&self, home: &Home) -> bool {
+        // A pin is only taken under the cache lock, so a stale count can only overstate.
+        match home {
+            Home::Slot { class, slot } => Arc::strong_count(&self.arenas[*class].pins[*slot]) > 1,
+            Home::Own { pin, .. } => Arc::strong_count(pin) > 1,
+        }
+    }
+
+    /// A free slot of `class`, evicting the least recently used unpinned copy of the
+    /// class if none is free. The slot's pin is taken for the caller's copy.
+    fn take_slot(&self, c: &mut Cache, class: usize) -> Option<(usize, Arc<()>)> {
+        let pins = &self.arenas[class].pins;
+        // A slot freed while still read (dropped with the RAM cache mid-use) waits.
+        if let Some(i) = c.free[class]
+            .iter()
+            .rposition(|&s| Arc::strong_count(&pins[s]) == 1)
+        {
+            let slot = c.free[class].swap_remove(i);
+            return Some((slot, Arc::clone(&pins[slot])));
+        }
+        let victim = c
+            .entries
+            .iter()
+            .filter(|(_, e)| matches!(e.home, Home::Slot { class: k, .. } if k == class))
+            .filter(|(_, e)| !self.pinned(&e.home))
+            .min_by_key(|(_, e)| e.last_use)
+            .map(|(&a, _)| a)?;
+        let e = c.entries.remove(&victim).expect("present");
+        c.forget(&e);
+        self.evictions.fetch_add(1, Ordering::Relaxed);
+        let slot = c.free[class].pop().expect("the victim's slot");
+        Some((slot, Arc::clone(&pins[slot])))
+    }
+
     /// The device copy of the expert `key` held in `slab`, copied now if the device has
-    /// none. The returned buffer pins the copy: hold it while computing the expert.
-    pub(crate) fn ensure(&self, key: ExpertKey, slab: &Slab) -> Result<DeviceBuffer, ComputeError> {
+    /// none. Hold the returned pin while computing the expert.
+    pub(crate) fn ensure(&self, key: ExpertKey, slab: &Slab) -> Result<Pin, ComputeError> {
         let host = slab.bytes();
         let addr = host.as_ptr() as usize;
-        {
-            let mut c = self.shared.lock();
-            c.clock += 1;
-            let now = c.clock;
-            if let Some(e) = c.entries.get_mut(&addr)
-                && e.key == key
-                && e.len == host.len()
-            {
-                e.last_use = now;
-                self.hits.fetch_add(1, Ordering::Relaxed);
-                return Ok(e.buffer.clone());
-            }
-            self.make_room(&mut c, host.len() as u64);
-            // Reserved now, so concurrent copies cannot all fit into the same room.
-            c.used += host.len() as u64;
-        }
-        // Copy outside the lock, so other experts are found while this one moves.
-        let charge =
-            self.ledger
-                .charge(Tier::Vram(0), Owner::ExpertCache, Bytes(host.len() as u64));
-        let uploaded = self.device.upload(host, Some(Box::new(charge)));
+        let class = self
+            .class_of
+            .get(key.0.0 as usize)
+            .copied()
+            .flatten()
+            .filter(|&k| self.arenas[k].slots > 0 && host.len() <= self.arenas[k].stride);
+        // The arena first, outside the cache lock: its allocation can take a while.
+        let arena = class.and_then(|k| self.arena(k).cloned());
         let mut c = self.shared.lock();
-        let buffer = match uploaded {
-            Ok(b) => b,
+        c.clock += 1;
+        let now = c.clock;
+        if let Some(e) = c.entries.get_mut(&addr)
+            && e.key == key
+            && e.len == host.len()
+        {
+            e.last_use = now;
+            self.hits.fetch_add(1, Ordering::Relaxed);
+            return Ok(self.pin_of(&e.home));
+        }
+        let slot = match (class, &arena) {
+            (Some(k), Some(_)) => {
+                // Copies made over the budget while every slot was pinned go first.
+                self.make_room(&mut c, 0);
+                let s = self.take_slot(&mut c, k);
+                if s.is_none() {
+                    self.over_budget.fetch_add(1, Ordering::Relaxed);
+                }
+                s.map(|(s, pin)| (k, s, pin))
+            }
+            _ => {
+                self.make_room(&mut c, host.len() as u64);
+                None
+            }
+        };
+        if slot.is_none() {
+            // Reserved now, so concurrent copies cannot all fit into the same room.
+            c.own += host.len() as u64;
+        }
+        drop(c);
+        // Copy outside the lock, so other experts are found while this one moves. A
+        // slot being written is in no entry and pinned, so nothing reads or takes it.
+        let home = match (&slot, &arena) {
+            (Some((k, s, pin)), Some(buffer)) => self
+                .device
+                .write(buffer, s * self.arenas[*k].stride, host)
+                .map(|()| Home::Slot {
+                    class: *k,
+                    slot: *s,
+                })
+                .map(|h| (h, Arc::clone(pin))),
+            _ => {
+                let charge =
+                    self.ledger
+                        .charge(Tier::Vram(0), Owner::ExpertCache, Bytes(host.len() as u64));
+                self.device
+                    .upload(host, Some(Box::new(charge)))
+                    .map(|buffer| {
+                        let pin = Arc::new(());
+                        (
+                            Home::Own {
+                                buffer,
+                                pin: Arc::clone(&pin),
+                            },
+                            pin,
+                        )
+                    })
+            }
+        };
+        let mut c = self.shared.lock();
+        let give_back = |c: &mut Cache| match &slot {
+            Some((k, s, _)) => c.free[*k].push(*s),
+            None => c.own -= host.len() as u64,
+        };
+        let (home, _copying) = match home {
+            Ok(h) => h,
             Err(e) => {
-                c.used -= host.len() as u64;
+                give_back(&mut c);
                 return Err(e);
             }
         };
@@ -234,19 +496,21 @@ impl OnDevice {
         {
             // Another thread copied it first; keep theirs and give back the room.
             e.last_use = now;
-            let b = e.buffer.clone();
-            c.used -= host.len() as u64;
-            return Ok(b);
+            let pin = self.pin_of(&e.home);
+            give_back(&mut c);
+            return Ok(pin);
         }
         if let Some(old) = c.entries.remove(&addr) {
-            c.used -= old.len as u64;
+            c.forget(&old);
         }
+        let pin = self.pin_of(&home);
+        c.held += host.len() as u64;
         c.entries.insert(
             addr,
             Entry {
                 key,
                 len: host.len(),
-                buffer: buffer.clone(),
+                home,
                 last_use: now,
             },
         );
@@ -260,19 +524,19 @@ impl OnDevice {
                 shared: Arc::downgrade(&self.shared),
             })
         });
-        Ok(buffer)
+        Ok(pin)
     }
 
-    /// Evicts unpinned copies, least recently used first, until `len` more bytes fit
-    /// the budget or nothing more can go.
+    /// Evicts unpinned copies with their own allocation, least recently used first,
+    /// until `len` more bytes of them fit the budget left beside the arenas, or
+    /// nothing more can go.
     fn make_room(&self, c: &mut Cache, len: u64) {
-        while c.used + len > self.budget {
-            // A copy is pinned while anyone besides the cache holds its buffer. Pins
-            // are only taken under this lock, so a stale count can only overstate them.
+        let room = self.budget.saturating_sub(self.arena_bytes());
+        while c.own + len > room {
             let victim = c
                 .entries
                 .iter()
-                .filter(|(_, e)| !e.buffer.shared())
+                .filter(|(_, e)| matches!(e.home, Home::Own { .. }) && !self.pinned(&e.home))
                 .min_by_key(|(_, e)| e.last_use)
                 .map(|(&a, _)| a);
             let Some(a) = victim else {
@@ -280,9 +544,17 @@ impl OnDevice {
                 return;
             };
             let e = c.entries.remove(&a).expect("present");
-            c.used -= e.len as u64;
+            c.forget(&e);
             self.evictions.fetch_add(1, Ordering::Relaxed);
         }
+    }
+
+    /// Bytes of every arena, allocated or not.
+    fn arena_bytes(&self) -> u64 {
+        self.arenas
+            .iter()
+            .map(|a| (a.stride * a.slots) as u64)
+            .sum()
     }
 
     /// The device copy of `w`, found by its host address.
@@ -301,7 +573,18 @@ impl OnDevice {
         if p + len > base + e.len {
             return Err(not_on_device("a weight"));
         }
-        DeviceWeights::like(e.buffer.clone(), p - base, w)
+        match &e.home {
+            Home::Own { buffer, .. } => DeviceWeights::like(buffer.clone(), p - base, w),
+            Home::Slot { class, slot } => {
+                let a = &self.arenas[*class];
+                let buffer = a
+                    .buffer
+                    .get()
+                    .and_then(Option::as_ref)
+                    .ok_or_else(|| not_on_device("a weight"))?;
+                DeviceWeights::like(buffer.clone(), slot * a.stride + (p - base), w)
+            }
+        }
     }
 
     /// The matmuls as one device submission.
@@ -323,14 +606,53 @@ impl OnDevice {
         self.device.matmul_many(&mut batch)
     }
 
+    /// The gated feed-forward blocks, as the device runs them.
+    pub(crate) fn gated_ffn_many(&self, ops: &mut [GatedFfn<'_>]) -> Result<(), ComputeError> {
+        let mut ws = Vec::with_capacity(ops.len());
+        for op in ops.iter() {
+            op.check()?;
+            ws.push([
+                self.weights(&op.gate)?,
+                self.weights(&op.up)?,
+                self.weights(&op.down)?,
+            ]);
+        }
+        let mut batch: Vec<DeviceGatedFfn<'_>> = ops
+            .iter_mut()
+            .zip(&ws)
+            .map(|(op, [g, u, d])| DeviceGatedFfn {
+                gate: g,
+                up: u,
+                down: d,
+                xs: op.xs,
+                s: op.s,
+                ys: &mut *op.ys,
+            })
+            .collect();
+        self.device.gated_ffn_many(&mut batch)
+    }
+
     pub(crate) fn report(&self) -> DeviceReport {
+        let (held, own) = {
+            let c = self.shared.lock();
+            (c.held, c.own)
+        };
+        let allocated: u64 = self
+            .arenas
+            .iter()
+            .filter(|a| a.buffer.get().is_some_and(Option::is_some))
+            .map(|a| (a.stride * a.slots) as u64)
+            .sum();
         DeviceReport {
             device: self.device.describe(),
             usage: self.device.usage(),
             transfers: self.device.transfers(),
             experts: DeviceCacheStats {
                 budget: self.budget,
-                used: self.shared.lock().used,
+                used: allocated + own,
+                held,
+                arena_bytes: self.arena_bytes(),
+                arena_slots: self.arenas.iter().map(|a| a.slots as u64).sum(),
                 hits: self.hits.load(Ordering::Relaxed),
                 misses: self.misses.load(Ordering::Relaxed),
                 evictions: self.evictions.load(Ordering::Relaxed),
