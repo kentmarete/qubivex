@@ -1,6 +1,6 @@
 # ADR-019: The Vulkan backend, a discrete device with the CPU's bits
 
-- Status: **Proposed (2026-11-11)**
+- Status: **Accepted (2026-11-11)** by owner decision
 - Date: 2026-11-11
 - Related: ADR-007 (backends), ADR-010 (lossless by default), ADR-011 (device execution
   and parity), ADR-018 (discrete device memory).

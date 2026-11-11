@@ -5,7 +5,7 @@
   §2.6 (Metal first, ADR-007 amendment), §3 (keep `MIGRATION_PLAN.md`, fold the EIP in)
   and the tensor scope (ADR-009, implemented). The ADR status changes proposed in §1
   for ADR-003, 004 and 006 were accepted on 2026-11-08; ADR-001 was accepted on 2026-11-06;
-  ADR-005, 008, 011 and 014 were accepted on 2026-11-10; ADR-018 on 2026-11-11. ADR-019 (Vulkan) is Proposed.
+  ADR-005, 008, 011 and 014 were accepted on 2026-11-10; ADR-018 and ADR-019 on 2026-11-11.
 - Inputs: ADR-001 to ADR-008 (`docs/decisions/`), `QUBIVEX_DESIGN.md`,
   `MIGRATION_PLAN.md`, `IMPROVEMENTS_EVALUATION.md`, and the Engineering Improvement Plan
   (EIP).
@@ -30,6 +30,7 @@ recorded in the ADR it affects, or in a new ADR numbered from 009.
 | 011 | Device execution, buffer lifetimes, GPU parity | Accepted (2026-11-10) | Metal built (amendments 1–6): bit-identical except f32 subnormals, whole-token pass, CPU pass below top-k or half a pool | **Accepted**; the CPU stays the default backend |
 | 014 | Model downloads and their threat review | Accepted (2026-11-10) | Built: `qubivex-model-download`, `models pull` and `search`; every threat has a test | **Accepted** |
 | 018 | Discrete device memory, simulated device | Accepted (2026-11-11) | Built: `DiscreteDevice`, `SimDevice`, VRAM planning, `--backend sim` with a device expert cache, VRAM metrics; bit-identical to the CPU on the fixtures and real OLMoE | **Accepted** |
+| 019 | Vulkan backend, the CPU's bits | Accepted (2026-11-11) | Built: `qubivex-backend-vulkan` (`VulkanDevice` on `ash`), `--backend vulkan`; bit-identical through MoltenVK on the fixtures and real OLMoE, 5.5× slower than the CPU at decode; lavapipe refused (splits fma) | **Accepted**; fast kernels and lavapipe parity stay open |
 
 The EIP proposes `docs/adr/ADR-003-TENSOR-STORAGE.md` through `ADR-008-ASYNC-EXECUTION.md`.
 Those numbers are taken. **Proposal:** keep `docs/decisions/`, and map the EIP's ADRs as
