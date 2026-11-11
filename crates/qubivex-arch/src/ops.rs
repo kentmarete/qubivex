@@ -103,13 +103,9 @@ impl Rope {
     }
 }
 
-/// `silu(g) · u`, in place into `g`.
-pub fn swiglu(g: &mut [f32], u: &[f32]) {
-    for (a, b) in g.iter_mut().zip(u) {
-        let s = *a / (1.0 + exp(-*a));
-        *a = s * b;
-    }
-}
+/// `silu(g) · u`, in place into `g` (defined in `qubivex-compute`, so a device backend
+/// can give the same bits without depending on this crate).
+pub use qubivex_compute::math::swiglu;
 
 /// Softmax in place (max-subtracted, sequential sum).
 pub fn softmax(x: &mut [f32]) {

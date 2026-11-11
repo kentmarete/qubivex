@@ -32,6 +32,18 @@
 //! submitting, then blocked on its fence) and, with [`VulkanConfig::timestamps`], its
 //! GPU time from timestamp queries: summed, and as the union of busy intervals.
 //!
+//! **The fused expert block** (audit §14–15, Step 3a). [`DiscreteDevice::gated_ffn_many`]
+//! runs a layer's experts as one submission: one dispatch for every gate and up matrix
+//! (`shaders/matmul_fused.comp`: `matmul.comp`'s body, each workgroup finding its
+//! matrix in a table), SwiGLU on the device (`shaders/swiglu.comp`, built -O0), then one
+//! dispatch for every down matrix, the intermediates staying in device memory. Fusing
+//! changes which workgroup computes what, never the arithmetic, so every output keeps
+//! the CPU's bits. A dispatch reads every matrix from one buffer, so the experts should
+//! sit in an arena ([`DiscreteDevice::alloc`]); matrices in different buffers or of
+//! different dtypes get separate dispatches in the same submission. Fusion pays when
+//! each expert has few rows (decode) and not at prefill sizes, so it is chosen by shape:
+//! [`VulkanConfig::fuse_rows`].
+//!
 //! Not built: activations kept on the device across submissions (whole layers on the
 //! device), several queues, asynchronous copies, and token tiles (each activation row
 //! reads the weights again).
@@ -48,7 +60,7 @@ use std::sync::{Arc, Mutex, MutexGuard, TryLockError};
 pub use device::{PhysicalInfo, list};
 use qubivex_compute::ComputeError;
 use qubivex_compute::discrete::{
-    DeviceBuffer, DeviceMatMul, DeviceUsage, DiscreteDevice, Guard, TransferStats,
+    DeviceBuffer, DeviceGatedFfn, DeviceMatMul, DeviceUsage, DiscreteDevice, Guard, TransferStats,
 };
 use qubivex_core::DType;
 
@@ -57,6 +69,12 @@ pub(crate) const BACKEND: &str = "vulkan";
 /// Submissions that can be in flight at once: one per concurrent caller, such as the
 /// compute threads running a layer's experts.
 const SUBMITTERS: usize = 8;
+
+/// [`VulkanConfig::fuse_rows`]'s default: fuse expert blocks of up to 8 rows. In the
+/// harness (audit §15.2) fusion saved 15% of GPU time at 1 row per expert and 3% at 4,
+/// and was neutral or slightly slower at 10. End to end (audit §16) 8 beat 4 by 1% with
+/// 8 concurrent sequences and equalled it below; above 8 nothing was measured to gain.
+pub const FUSE_ROWS: usize = 8;
 
 /// Which device a [`VulkanDevice`] opens, and how much of its memory it may use.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -70,6 +88,10 @@ pub struct VulkanConfig {
     /// [`TransferStats`]). Off by default: it adds a query reset and two timestamps to
     /// every command buffer. Ignored on a queue without timestamps.
     pub timestamps: bool,
+    /// Run a layer's expert blocks as one fused submission when no expert has more
+    /// than this many rows ([`DiscreteDevice::fuses_gated_ffn`]). `None`: [`FUSE_ROWS`];
+    /// `Some(0)`: never (each expert's matmuls are submitted on their own, as before).
+    pub fuse_rows: Option<usize>,
 }
 
 /// A Vulkan GPU as a discrete device. See the crate documentation.
@@ -82,6 +104,12 @@ pub struct VulkanDevice {
     counters: Arc<device::Counters>,
     capacity: u64,
     info: PhysicalInfo,
+    /// Whether the driver built the fused pipelines.
+    fused: bool,
+    /// Fuse expert blocks of up to this many rows; 0 when off or not available.
+    fuse_rows: usize,
+    /// The largest arena a fused dispatch can address.
+    max_arena: u64,
 }
 
 impl std::fmt::Debug for VulkanDevice {
@@ -113,12 +141,25 @@ impl VulkanDevice {
         }
         let heap = opened.info.device_local;
         let capacity = config.capacity.unwrap_or(heap);
+        let fused = opened.shared.fused.is_some();
+        let fuse_rows = if fused {
+            config.fuse_rows.unwrap_or(FUSE_ROWS)
+        } else {
+            0
+        };
+        // Offsets inside a bound range are 32-bit in the shaders.
+        let max_arena =
+            u64::from(opened.shared.limits.max_storage_buffer_range).min(u64::from(u32::MAX)) / 256
+                * 256;
         Ok(Self {
             submitters,
             next: AtomicUsize::new(0),
             counters: Arc::default(),
             capacity,
             info: opened.info,
+            fused,
+            fuse_rows,
+            max_arena,
         })
     }
 
@@ -140,6 +181,23 @@ impl VulkanDevice {
     #[must_use]
     pub const fn info(&self) -> &PhysicalInfo {
         &self.info
+    }
+
+    /// The most rows per expert the fused expert block is used for; 0 when it is off
+    /// or the driver could not build it.
+    #[must_use]
+    pub const fn fuse_rows(&self) -> usize {
+        self.fuse_rows
+    }
+
+    /// The SwiGLU shader alone, `g = silu(g) · u` in place: for the numerical
+    /// conformance tests, which check it against [`qubivex_compute::math::swiglu`].
+    ///
+    /// # Errors
+    /// [`ComputeError::Shape`] when the lengths differ; [`ComputeError::Device`] when
+    /// the device has no fused pipelines or the driver fails.
+    pub fn swiglu(&self, g: &mut [f32], u: &[f32]) -> Result<(), ComputeError> {
+        self.submitter().swiglu(g, u)
     }
 
     /// Whether submissions are timed on the GPU (asked for, and the queue supports it).
@@ -199,8 +257,12 @@ impl DiscreteDevice for VulkanDevice {
         } else {
             format!(", {}", i.driver)
         };
+        let experts = match self.fuse_rows {
+            0 => "experts unfused".to_owned(),
+            n => format!("experts fused up to {n} rows"),
+        };
         format!(
-            "Vulkan device {} ({}, {}{driver}), {} usable",
+            "Vulkan device {} ({}, {}{driver}), {} usable, {experts}",
             i.index,
             i.name,
             i.kind,
@@ -219,6 +281,32 @@ impl DiscreteDevice for VulkanDevice {
 
     fn matmul_many(&self, ops: &mut [DeviceMatMul<'_>]) -> Result<(), ComputeError> {
         self.submitter().matmul_many(ops, &self.counters)
+    }
+
+    fn fuses_gated_ffn(&self, blocks: usize, rows: usize) -> bool {
+        blocks > 0 && rows > 0 && rows <= self.fuse_rows
+    }
+
+    /// One submission when the driver built the fused pipelines (whatever
+    /// `fuse_rows` says: it only steers callers); otherwise the separate steps.
+    fn gated_ffn_many(&self, ops: &mut [DeviceGatedFfn<'_>]) -> Result<(), ComputeError> {
+        if !self.fused {
+            return qubivex_compute::discrete::gated_ffn_steps(self, ops);
+        }
+        self.submitter().gated_ffn_many(ops, &self.counters)
+    }
+
+    fn alloc(&self, len: usize, guard: Option<Guard>) -> Result<DeviceBuffer, ComputeError> {
+        self.submitter()
+            .alloc(len, &self.counters, self.capacity, guard)
+    }
+
+    fn write(&self, buffer: &DeviceBuffer, offset: usize, host: &[u8]) -> Result<(), ComputeError> {
+        self.submitter().write(buffer, offset, host, &self.counters)
+    }
+
+    fn max_arena(&self) -> u64 {
+        self.max_arena
     }
 
     fn usage(&self) -> DeviceUsage {
@@ -259,11 +347,22 @@ mod tests {
             .status()
             .unwrap();
         assert!(status.success(), "shaders/build.sh failed");
-        let built = std::fs::read(out.join("matmul.spv")).unwrap();
+        let built = |name: &str| std::fs::read(out.join(name)).unwrap();
+        let pairs = [
+            ("matmul.spv", built("matmul.spv"), crate::device::MATMUL_SPV),
+            (
+                "matmul_fused.spv",
+                built("matmul_fused.spv"),
+                crate::device::MATMUL_FUSED_SPV,
+            ),
+            ("swiglu.spv", built("swiglu.spv"), crate::device::SWIGLU_SPV),
+        ];
         let _ = std::fs::remove_dir_all(&out);
-        assert!(
-            built == crate::device::MATMUL_SPV,
-            "src/matmul.spv is stale: run crates/qubivex-backend-vulkan/shaders/build.sh"
-        );
+        for (name, built, checked_in) in pairs {
+            assert!(
+                built == checked_in,
+                "src/{name} is stale: run crates/qubivex-backend-vulkan/shaders/build.sh"
+            );
+        }
     }
 }

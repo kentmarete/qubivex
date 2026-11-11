@@ -14,7 +14,7 @@ use qubivex_arch::DenseMatmul;
 use qubivex_backend_cpu::CpuBackend;
 use qubivex_backend_metal::{MetalBackend, MetalWeights, ResidentMatMul};
 use qubivex_compute::host::PageAligned;
-use qubivex_compute::{ComputeBackend, ComputeError, MatMul, WeightView};
+use qubivex_compute::{ComputeBackend, ComputeError, GatedFfn, MatMul, WeightView};
 use qubivex_core::DType;
 
 /// The compute backend an engine uses.
@@ -359,6 +359,20 @@ impl ComputeBackend for Placed {
     /// Whether the discrete device asks for grouping (Vulkan does not: audit §13).
     fn groups_matmuls(&self) -> bool {
         self.device.as_ref().is_some_and(|d| d.groups_matmuls())
+    }
+
+    /// Whether the discrete device fuses this shape of expert block (audit §15).
+    fn fuses_gated_ffn(&self, blocks: usize, rows: usize) -> bool {
+        self.device
+            .as_ref()
+            .is_some_and(|d| d.fuses_gated_ffn(blocks, rows))
+    }
+
+    fn gated_ffn_many(&self, ops: &mut [GatedFfn<'_>]) -> Result<(), ComputeError> {
+        match &self.device {
+            Some(d) => d.gated_ffn_many(ops),
+            None => qubivex_compute::gated_ffn_steps(self, ops),
+        }
     }
 
     fn dequant_row(

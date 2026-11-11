@@ -24,7 +24,9 @@ use std::time::Instant;
 
 use ash::vk;
 use qubivex_compute::ComputeError;
-use qubivex_compute::discrete::{DeviceBuffer, DeviceMatMul, DeviceUsage, Guard, TransferStats};
+use qubivex_compute::discrete::{
+    DeviceBuffer, DeviceGatedFfn, DeviceMatMul, DeviceUsage, DeviceWeights, Guard, TransferStats,
+};
 use qubivex_core::{DType, GgmlType};
 
 use crate::{BACKEND, VulkanConfig};
@@ -32,6 +34,15 @@ use crate::{BACKEND, VulkanConfig};
 /// The matmul shader (`shaders/matmul.comp`, compiled by `shaders/build.sh`, which also
 /// marks every `fma` NoContraction).
 pub(crate) const MATMUL_SPV: &[u8] = include_bytes!("matmul.spv");
+
+/// The fused matmul (`shaders/matmul_fused.comp`): several matrices per dispatch.
+pub(crate) const MATMUL_FUSED_SPV: &[u8] = include_bytes!("matmul_fused.spv");
+
+/// SwiGLU (`shaders/swiglu.comp`, built -O0).
+pub(crate) const SWIGLU_SPV: &[u8] = include_bytes!("swiglu.spv");
+
+/// Invocations per SwiGLU workgroup. Must equal `local_size_x` in the shader.
+const SWIGLU_GROUP: u32 = 256;
 
 /// Output rows per workgroup. Must equal `ROWS` in the shader.
 const ROWS: u32 = 8;
@@ -163,6 +174,35 @@ pub(crate) struct Shared {
     set_layout: vk::DescriptorSetLayout,
     layout: vk::PipelineLayout,
     pipelines: Vec<vk::Pipeline>,
+    /// The fused expert block's pipelines; `None` if the driver could not build them
+    /// (the device then runs expert blocks as separate submissions).
+    pub(crate) fused: Option<Fused>,
+}
+
+/// The fused matmul (one pipeline per dtype) and SwiGLU, on one layout: binding 0 the
+/// weights, 1 the inputs, 2 the outputs, 3 the table; 16 bytes of push constants.
+pub(crate) struct Fused {
+    set_layout: vk::DescriptorSetLayout,
+    layout: vk::PipelineLayout,
+    matmul: Vec<vk::Pipeline>,
+    swiglu: vk::Pipeline,
+}
+
+impl Fused {
+    /// Destroys every object.
+    ///
+    /// # Safety
+    /// Nothing may use them now or later.
+    unsafe fn destroy(&self, d: &ash::Device) {
+        // SAFETY: as the caller promises.
+        unsafe {
+            for &p in self.matmul.iter().chain([&self.swiglu]) {
+                d.destroy_pipeline(p, None);
+            }
+            d.destroy_pipeline_layout(self.layout, None);
+            d.destroy_descriptor_set_layout(self.set_layout, None);
+        }
+    }
 }
 
 impl Drop for Shared {
@@ -172,6 +212,9 @@ impl Drop for Shared {
         // submission waits for its fence). Objects are destroyed child first.
         unsafe {
             let _ = self.device.device_wait_idle();
+            if let Some(f) = &self.fused {
+                f.destroy(&self.device);
+            }
             for &p in &self.pipelines {
                 self.device.destroy_pipeline(p, None);
             }
@@ -456,6 +499,7 @@ impl Shared {
                 return Err(e);
             }
         };
+        let fused = create_fused(&device).ok();
         let shared = Arc::new(Self {
             entry,
             instance: instance.clone(),
@@ -469,6 +513,7 @@ impl Shared {
             set_layout,
             layout,
             pipelines,
+            fused,
         });
         Ok(Opened { shared, info })
     }
@@ -586,6 +631,131 @@ fn create_pipelines(
                 device.destroy_pipeline_layout(layout, None);
                 device.destroy_descriptor_set_layout(set_layout, None);
                 Err(err("compute pipelines", e))
+            }
+        }
+    }
+}
+
+/// The fused expert block's layout and pipelines.
+fn create_fused(device: &ash::Device) -> Result<Fused, ComputeError> {
+    let spv = |b: &[u8]| {
+        ash::util::read_spv(&mut std::io::Cursor::new(b)).map_err(|e| err("bad SPIR-V", e))
+    };
+    let (fused_code, swiglu_code) = (spv(MATMUL_FUSED_SPV)?, spv(SWIGLU_SPV)?);
+    let bindings: Vec<_> = (0..4)
+        .map(|b| {
+            vk::DescriptorSetLayoutBinding::default()
+                .binding(b)
+                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                .descriptor_count(1)
+                .stage_flags(vk::ShaderStageFlags::COMPUTE)
+        })
+        .collect();
+    let push = [vk::PushConstantRange::default()
+        .stage_flags(vk::ShaderStageFlags::COMPUTE)
+        .size(16)];
+    // SAFETY: each create-info and what it points to live until its call returns;
+    // on failure, the objects created so far are destroyed before returning.
+    unsafe {
+        let set_layout = device
+            .create_descriptor_set_layout(
+                &vk::DescriptorSetLayoutCreateInfo::default().bindings(&bindings),
+                None,
+            )
+            .map_err(|e| err("descriptor set layout", e))?;
+        let layouts = [set_layout];
+        let layout = match device.create_pipeline_layout(
+            &vk::PipelineLayoutCreateInfo::default()
+                .set_layouts(&layouts)
+                .push_constant_ranges(&push),
+            None,
+        ) {
+            Ok(l) => l,
+            Err(e) => {
+                device.destroy_descriptor_set_layout(set_layout, None);
+                return Err(err("pipeline layout", e));
+            }
+        };
+        let undo = || {
+            device.destroy_pipeline_layout(layout, None);
+            device.destroy_descriptor_set_layout(set_layout, None);
+        };
+        let module = |code: &[u32]| {
+            device
+                .create_shader_module(&vk::ShaderModuleCreateInfo::default().code(code), None)
+                .map_err(|e| err("shader module", e))
+        };
+        let fm = match module(&fused_code) {
+            Ok(m) => m,
+            Err(e) => {
+                undo();
+                return Err(e);
+            }
+        };
+        let sm = match module(&swiglu_code) {
+            Ok(m) => m,
+            Err(e) => {
+                device.destroy_shader_module(fm, None);
+                undo();
+                return Err(e);
+            }
+        };
+        let values: [u32; 6] = [0, 1, 2, 3, 4, 5];
+        let entries = [vk::SpecializationMapEntry::default()
+            .constant_id(0)
+            .offset(0)
+            .size(4)];
+        let specs: Vec<_> = values
+            .iter()
+            .map(|v| {
+                vk::SpecializationInfo::default()
+                    .map_entries(&entries)
+                    .data(std::slice::from_raw_parts((v as *const u32).cast(), 4))
+            })
+            .collect();
+        let mut infos: Vec<_> = specs
+            .iter()
+            .map(|s| {
+                vk::ComputePipelineCreateInfo::default()
+                    .stage(
+                        vk::PipelineShaderStageCreateInfo::default()
+                            .stage(vk::ShaderStageFlags::COMPUTE)
+                            .module(fm)
+                            .name(c"main")
+                            .specialization_info(s),
+                    )
+                    .layout(layout)
+            })
+            .collect();
+        infos.push(
+            vk::ComputePipelineCreateInfo::default()
+                .stage(
+                    vk::PipelineShaderStageCreateInfo::default()
+                        .stage(vk::ShaderStageFlags::COMPUTE)
+                        .module(sm)
+                        .name(c"main"),
+                )
+                .layout(layout),
+        );
+        let made = device.create_compute_pipelines(vk::PipelineCache::null(), &infos, None);
+        device.destroy_shader_module(fm, None);
+        device.destroy_shader_module(sm, None);
+        match made {
+            Ok(mut p) => {
+                let swiglu = p.pop().ok_or_else(|| err("compute pipelines", "missing"))?;
+                Ok(Fused {
+                    set_layout,
+                    layout,
+                    matmul: p,
+                    swiglu,
+                })
+            }
+            Err((p, e)) => {
+                for p in p.into_iter().filter(|p| *p != vk::Pipeline::null()) {
+                    device.destroy_pipeline(p, None);
+                }
+                undo();
+                Err(err("fused pipelines", e))
             }
         }
     }
@@ -908,6 +1078,12 @@ pub(crate) struct Submitter {
     staging: Option<Allocation>,
     xs: Option<Allocation>,
     ys: Option<Allocation>,
+    /// The fused block's descriptor pool (null without fused pipelines) and its size.
+    fused_pool: vk::DescriptorPool,
+    fused_sets: u32,
+    /// The fused block's intermediates (device-local) and its table (host-visible).
+    mid: Option<Allocation>,
+    table: Option<Allocation>,
 }
 
 // SAFETY: the handles are plain identifiers, used only through `&mut self`.
@@ -923,6 +1099,9 @@ impl Drop for Submitter {
                 d.destroy_query_pool(q, None);
             }
             d.destroy_descriptor_pool(self.descriptors, None);
+            if self.fused_pool != vk::DescriptorPool::null() {
+                d.destroy_descriptor_pool(self.fused_pool, None);
+            }
             d.destroy_fence(self.fence, None);
             d.destroy_command_pool(self.pool, None);
         }
@@ -930,9 +1109,18 @@ impl Drop for Submitter {
 }
 
 fn descriptor_pool(d: &ash::Device, sets: u32) -> Result<vk::DescriptorPool, ComputeError> {
+    descriptor_pool_of(d, sets, 3)
+}
+
+/// A pool of `sets` sets of `per` storage buffers.
+fn descriptor_pool_of(
+    d: &ash::Device,
+    sets: u32,
+    per: u32,
+) -> Result<vk::DescriptorPool, ComputeError> {
     let sizes = [vk::DescriptorPoolSize::default()
         .ty(vk::DescriptorType::STORAGE_BUFFER)
-        .descriptor_count(3 * sets)];
+        .descriptor_count(per * sets)];
     // SAFETY: the create-info is valid for the call.
     unsafe {
         d.create_descriptor_pool(
@@ -981,6 +1169,18 @@ impl Submitter {
                     return Err(cleanup(e));
                 }
             };
+            let fused_pool = if shared.fused.is_some() {
+                match descriptor_pool_of(d, 16, 4) {
+                    Ok(p) => p,
+                    Err(e) => {
+                        d.destroy_descriptor_pool(descriptors, None);
+                        d.destroy_fence(fence, None);
+                        return Err(cleanup(e));
+                    }
+                }
+            } else {
+                vk::DescriptorPool::null()
+            };
             let queries = if timestamps && shared.timestamp_mask != 0 {
                 match d.create_query_pool(
                     &vk::QueryPoolCreateInfo::default()
@@ -990,6 +1190,9 @@ impl Submitter {
                 ) {
                     Ok(q) => Some(q),
                     Err(e) => {
+                        if fused_pool != vk::DescriptorPool::null() {
+                            d.destroy_descriptor_pool(fused_pool, None);
+                        }
                         d.destroy_descriptor_pool(descriptors, None);
                         d.destroy_fence(fence, None);
                         return Err(cleanup(err("query pool", e)));
@@ -1009,6 +1212,10 @@ impl Submitter {
                 staging: None,
                 xs: None,
                 ys: None,
+                fused_pool,
+                fused_sets: 16,
+                mid: None,
+                table: None,
             })
         }
     }
@@ -1020,12 +1227,24 @@ impl Submitter {
         bytes: u64,
         usage: vk::BufferUsageFlags,
     ) -> Result<&'s mut Allocation, ComputeError> {
+        Self::scratch(shared, slot, bytes, usage, true)
+    }
+
+    /// A host or device buffer of at least `bytes` in `slot`, grown by doubling.
+    fn scratch<'s>(
+        shared: &Arc<Shared>,
+        slot: &'s mut Option<Allocation>,
+        bytes: u64,
+        usage: vk::BufferUsageFlags,
+        host: bool,
+    ) -> Result<&'s mut Allocation, ComputeError> {
         if slot.as_ref().is_none_or(|a| a.size < bytes) {
             *slot = None;
             let size = bytes.max(4096).next_power_of_two();
-            *slot = Some(Allocation::new(shared, size, usage, true)?);
+            *slot = Some(Allocation::new(shared, size, usage, host)?);
         }
-        slot.as_mut().ok_or_else(|| err("host buffer", "missing"))
+        slot.as_mut()
+            .ok_or_else(|| err("scratch buffer", "missing"))
     }
 
     /// Whether this submitter times its submissions on the GPU.
@@ -1109,17 +1328,15 @@ impl Submitter {
         }
     }
 
-    /// Copies `host` into a new device-local buffer.
-    pub(crate) fn upload(
-        &mut self,
-        host: &[u8],
+    /// New device-local memory for `len` bytes, padded to whole 32-bit words (the
+    /// shaders read words), counted against `capacity`.
+    fn allocate(
+        &self,
+        len: usize,
         counters: &Arc<Counters>,
         capacity: u64,
-        guard: Option<Guard>,
-    ) -> Result<DeviceBuffer, ComputeError> {
-        let len = host.len() as u64;
-        // The shader reads 32-bit words: pad to a multiple of 4 (at least one word).
-        let size = len.max(1).next_multiple_of(4);
+    ) -> Result<Allocation, ComputeError> {
+        let size = (len as u64).max(1).next_multiple_of(4);
         counters.reserve(size, capacity)?;
         let mut dst = match Allocation::new(
             &self.shared,
@@ -1134,7 +1351,18 @@ impl Submitter {
             }
         };
         dst.counted = Some(Arc::clone(counters));
-        let start = Instant::now();
+        Ok(dst)
+    }
+
+    /// Copies `host`, then zeros up to `size` bytes, into `dst` at `offset`, through
+    /// the staging buffer, in chunks.
+    fn copy_in(
+        &mut self,
+        dst: vk::Buffer,
+        offset: u64,
+        host: &[u8],
+        size: u64,
+    ) -> Result<(), ComputeError> {
         let shared = Arc::clone(&self.shared);
         let mut done = 0u64;
         while done < size {
@@ -1153,25 +1381,94 @@ impl Submitter {
             let real = host.len().min(to).saturating_sub(from);
             bytes[..real].copy_from_slice(&host[from..from + real]);
             bytes[real..usize::try_from(n).unwrap_or(0)].fill(0);
-            let (src, dbuf) = (stage.buffer, dst.buffer);
+            let src = stage.buffer;
             let _ = self.run(|d, cmd| {
                 let region = [vk::BufferCopy::default()
                     .src_offset(0)
-                    .dst_offset(done)
+                    .dst_offset(offset + done)
                     .size(n)];
                 // SAFETY: both buffers are live and large enough for the region.
-                unsafe { d.cmd_copy_buffer(cmd, src, dbuf, &region) };
+                unsafe { d.cmd_copy_buffer(cmd, src, dst, &region) };
             })?;
             done += n;
         }
+        Ok(())
+    }
+
+    /// Copies `host` into a new device-local buffer.
+    pub(crate) fn upload(
+        &mut self,
+        host: &[u8],
+        counters: &Arc<Counters>,
+        capacity: u64,
+        guard: Option<Guard>,
+    ) -> Result<DeviceBuffer, ComputeError> {
+        let dst = self.allocate(host.len(), counters, capacity)?;
+        let start = Instant::now();
+        self.copy_in(dst.buffer, 0, host, dst.size)?;
         counters.time(start);
         counters.uploads.fetch_add(1, Ordering::Relaxed);
-        counters.upload_bytes.fetch_add(len, Ordering::Relaxed);
+        counters
+            .upload_bytes
+            .fetch_add(host.len() as u64, Ordering::Relaxed);
         Ok(DeviceBuffer::new(
             host.len(),
             WeightBuffer { alloc: dst },
             guard,
         ))
+    }
+
+    /// New device-local memory of `len` bytes, its contents unspecified (an arena).
+    pub(crate) fn alloc(
+        &self,
+        len: usize,
+        counters: &Arc<Counters>,
+        capacity: u64,
+        guard: Option<Guard>,
+    ) -> Result<DeviceBuffer, ComputeError> {
+        let dst = self.allocate(len, counters, capacity)?;
+        Ok(DeviceBuffer::new(len, WeightBuffer { alloc: dst }, guard))
+    }
+
+    /// The allocation behind `b`, if it belongs to this device.
+    fn allocation_of<'b>(&self, b: &'b DeviceBuffer) -> Result<&'b Allocation, ComputeError> {
+        match b.state::<WeightBuffer>() {
+            Some(w) if Arc::ptr_eq(&w.alloc.shared, &self.shared) => Ok(&w.alloc),
+            _ => Err(ComputeError::Device {
+                backend: BACKEND,
+                detail: "the buffer belongs to another device".into(),
+            }),
+        }
+    }
+
+    /// Copies `host` into `buffer` at `offset`, counted as an upload.
+    pub(crate) fn write(
+        &mut self,
+        buffer: &DeviceBuffer,
+        offset: usize,
+        host: &[u8],
+        counters: &Counters,
+    ) -> Result<(), ComputeError> {
+        let (dst, size) = {
+            let a = self.allocation_of(buffer)?;
+            (a.buffer, a.size)
+        };
+        let (off, len) = (offset as u64, host.len() as u64);
+        if off.checked_add(len).is_none_or(|end| end > size) {
+            return Err(err(
+                "write",
+                format!("{len} bytes at {off} are outside a {size}-byte buffer"),
+            ));
+        }
+        if len == 0 {
+            return Ok(());
+        }
+        let start = Instant::now();
+        self.copy_in(dst, off, host, len)?;
+        counters.time(start);
+        counters.uploads.fetch_add(1, Ordering::Relaxed);
+        counters.upload_bytes.fetch_add(len, Ordering::Relaxed);
+        Ok(())
     }
 
     /// Runs `ops` as one submission.
@@ -1438,6 +1735,550 @@ impl Submitter {
         counters
             .activations_out
             .fetch_add(4 * yn as u64, Ordering::Relaxed);
+        Ok(())
+    }
+}
+
+/// One matrix of a fused dispatch, laid out: `ys[y + t·n ..] = W · xs[x + t·k ..]` for
+/// `t < tokens`, offsets in floats.
+struct FusedMat<'w> {
+    w: &'w DeviceWeights,
+    x: usize,
+    y: usize,
+    tokens: usize,
+}
+
+/// One fused dispatch: matrices of one dtype, one row count and one buffer.
+struct FusedGroup {
+    buffer: vk::Buffer,
+    base: u64,
+    range: u64,
+    dtype: usize,
+    blocks: u32,
+    count: u32,
+    tokens: u32,
+    /// Word offset of the group's first table entry.
+    tab: u32,
+}
+
+/// Words per table entry. Must match the shader's `8u * qm`.
+const ENTRY_WORDS: usize = 8;
+
+impl Submitter {
+    /// Splits `mats` into fused dispatches and appends their table entries to `table`:
+    /// consecutive matrices with the same buffer, dtype and row count share one, within
+    /// the device's dispatch and storage-buffer limits.
+    fn fused_groups(
+        &self,
+        mats: &[FusedMat<'_>],
+        table: &mut Vec<u32>,
+    ) -> Result<Vec<FusedGroup>, ComputeError> {
+        let lim = self.shared.limits;
+        let align = lim.min_storage_buffer_offset_alignment.max(4);
+        let max_range = u64::from(lim.max_storage_buffer_range);
+        let mut groups: Vec<FusedGroup> = Vec::new();
+        // Each new entry's weight offset in its buffer, rebased on its group below.
+        let first_entry = table.len();
+        let mut offsets: Vec<u64> = Vec::with_capacity(mats.len());
+        // The first and last byte of the open group's weights.
+        let mut span = (0u64, 0u64);
+        for m in mats {
+            let w = m.w;
+            let Some(dt) = dtype_index(w.dtype()) else {
+                return Err(ComputeError::Unsupported {
+                    backend: BACKEND,
+                    op: "matmul",
+                    dtype: w.dtype(),
+                });
+            };
+            let alloc = self.allocation_of(w.buffer())?;
+            let (n, k) = (w.rows(), w.cols());
+            let blocks = u32_of((n as u64).div_ceil(u64::from(ROWS)), "row blocks")?;
+            let tokens = u32_of(m.tokens, "tokens")?;
+            if tokens > lim.max_compute_work_group_count[1] {
+                return Err(err(
+                    "matmul",
+                    format!("{tokens} tokens exceed the dispatch limits"),
+                ));
+            }
+            let (off, end) = (w.offset() as u64, (w.offset() + w.len()) as u64);
+            let joins = groups.last().is_some_and(|g| {
+                let (lo, hi) = (span.0.min(off), span.1.max(end));
+                let base = lo / align * align;
+                g.buffer == alloc.buffer
+                    && g.dtype == dt
+                    && g.blocks == blocks
+                    && u64::from(g.count + 1) * u64::from(blocks)
+                        <= u64::from(lim.max_compute_work_group_count[0])
+                    && hi.next_multiple_of(4).min(alloc.size) - base <= max_range
+                    && hi - base <= u64::from(u32::MAX)
+            });
+            if joins {
+                span = (span.0.min(off), span.1.max(end));
+            } else {
+                if u64::from(blocks) > u64::from(lim.max_compute_work_group_count[0]) {
+                    return Err(err(
+                        "matmul",
+                        format!("{n} rows exceed the dispatch limits"),
+                    ));
+                }
+                span = (off, end);
+                groups.push(FusedGroup {
+                    buffer: alloc.buffer,
+                    base: 0,
+                    range: 0,
+                    dtype: dt,
+                    blocks,
+                    count: 0,
+                    tokens: 0,
+                    tab: u32_of(table.len(), "table")?,
+                });
+            }
+            let g = groups.last_mut().expect("a group");
+            g.count += 1;
+            g.tokens = g.tokens.max(tokens);
+            g.base = span.0 / align * align;
+            g.range = (span.1.next_multiple_of(4).min(alloc.size) - g.base).max(4);
+            if g.range > max_range {
+                return Err(err(
+                    "matmul",
+                    format!(
+                        "a {n} x {k} {} matrix is beyond the device's storage buffer range",
+                        w.dtype()
+                    ),
+                ));
+            }
+            // `w_base` is relative to the group's base, which may still move down as
+            // matrices join: it is filled in below.
+            offsets.push(off);
+            table.extend([
+                u32_of(n, "rows")?,
+                u32_of(k, "columns")?,
+                u32_of(w.len().checked_div(n).unwrap_or(0), "row bytes")?,
+                0,
+                u32_of(m.x, "activations")?,
+                u32_of(m.y, "outputs")?,
+                tokens,
+                0,
+            ]);
+        }
+        // Every entry's weight offset relative to its group's final base.
+        let mut i = 0;
+        for g in &groups {
+            for _ in 0..g.count {
+                let e = first_entry + i * ENTRY_WORDS;
+                table[e + 3] = u32_of(offsets[i] - g.base, "offset")?;
+                i += 1;
+            }
+        }
+        Ok(groups)
+    }
+
+    /// The fused descriptor pool with room for `count` sets, reset.
+    fn fused_sets(&mut self, count: u32) -> Result<Vec<vk::DescriptorSet>, ComputeError> {
+        let shared = Arc::clone(&self.shared);
+        let d = &shared.device;
+        let fused = shared
+            .fused
+            .as_ref()
+            .ok_or_else(|| err("fused", "no pipelines"))?;
+        if count > self.fused_sets {
+            let sets = count.next_power_of_two();
+            let pool = descriptor_pool_of(d, sets, 4)?;
+            // SAFETY: no set from the old pool is in use (nothing is in flight).
+            unsafe { d.destroy_descriptor_pool(self.fused_pool, None) };
+            self.fused_pool = pool;
+            self.fused_sets = sets;
+        }
+        let layouts = vec![fused.set_layout; count as usize];
+        // SAFETY: the pool has room for `count` sets of this layout after a reset, and
+        // none of its sets is in use.
+        unsafe {
+            d.reset_descriptor_pool(self.fused_pool, vk::DescriptorPoolResetFlags::empty())
+                .map_err(|e| err("descriptor reset", e))?;
+            d.allocate_descriptor_sets(
+                &vk::DescriptorSetAllocateInfo::default()
+                    .descriptor_pool(self.fused_pool)
+                    .set_layouts(&layouts),
+            )
+            .map_err(|e| err("descriptor sets", e))
+        }
+    }
+
+    /// Points `set`'s four bindings at the given ranges (`None`: the whole buffer).
+    fn write_set(&self, set: vk::DescriptorSet, bindings: [(vk::Buffer, u64, Option<u64>); 4]) {
+        let infos: Vec<[vk::DescriptorBufferInfo; 1]> = bindings
+            .iter()
+            .map(|&(b, off, range)| {
+                [vk::DescriptorBufferInfo::default()
+                    .buffer(b)
+                    .offset(off)
+                    .range(range.unwrap_or(vk::WHOLE_SIZE))]
+            })
+            .collect();
+        let writes: Vec<_> = infos
+            .iter()
+            .zip(0u32..)
+            .map(|(info, binding)| {
+                vk::WriteDescriptorSet::default()
+                    .dst_set(set)
+                    .dst_binding(binding)
+                    .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                    .buffer_info(info)
+            })
+            .collect();
+        // SAFETY: the set is not in use, and the buffers are live.
+        unsafe { self.shared.device.update_descriptor_sets(&writes, &[]) };
+    }
+
+    /// Runs `ops` as one submission: every gate and up as fused dispatches, SwiGLU, then
+    /// every down as fused dispatches, with the intermediates on the device. Each
+    /// output has the bits of the separate steps.
+    #[allow(clippy::too_many_lines)]
+    pub(crate) fn gated_ffn_many(
+        &mut self,
+        ops: &mut [DeviceGatedFfn<'_>],
+        counters: &Counters,
+    ) -> Result<(), ComputeError> {
+        let lim = self.shared.limits;
+        // Check and lay out before touching the GPU. Inputs: shared slices share one
+        // copy (as in `matmul_many`). Intermediates: every gate output, then every up
+        // output, in the same order, so SwiGLU is one elementwise pass.
+        let (mut xn, mut gn, mut yn) = (0usize, 0usize, 0usize);
+        let mut x_at: Vec<(usize, bool)> = Vec::with_capacity(ops.len());
+        let mut seen: Vec<(*const f32, usize, usize)> = Vec::new();
+        let mut g_at = Vec::with_capacity(ops.len());
+        let mut y_at = Vec::with_capacity(ops.len());
+        for op in ops.iter() {
+            let (g, u, d) = (op.gate, op.up, op.down);
+            if g.rows() != u.rows()
+                || g.cols() != u.cols()
+                || d.cols() != g.rows()
+                || op.xs.len() != op.s * g.cols()
+                || op.ys.len() != op.s * d.rows()
+            {
+                return Err(ComputeError::Shape {
+                    op: "gated ffn",
+                    detail: format!(
+                        "gate {} x {}, up {} x {}, down {} x {}, {} rows: {} inputs, {} outputs",
+                        g.rows(),
+                        g.cols(),
+                        u.rows(),
+                        u.cols(),
+                        d.rows(),
+                        d.cols(),
+                        op.s,
+                        op.xs.len(),
+                        op.ys.len()
+                    ),
+                });
+            }
+            match seen
+                .iter()
+                .find(|(p, l, _)| *p == op.xs.as_ptr() && *l == op.xs.len())
+            {
+                Some(&(_, _, b)) => x_at.push((b, false)),
+                None => {
+                    seen.push((op.xs.as_ptr(), op.xs.len(), xn));
+                    x_at.push((xn, true));
+                    xn += op.xs.len();
+                }
+            }
+            g_at.push(gn);
+            gn += op.s * g.rows();
+            y_at.push(yn);
+            yn += op.ys.len();
+        }
+        let max = u64::from(lim.max_storage_buffer_range);
+        let (xb, mb, yb) = (
+            4 * xn.max(1) as u64,
+            8 * gn.max(1) as u64,
+            4 * yn.max(1) as u64,
+        );
+        if xb > max || mb > max || yb > max || u32::try_from(2 * gn).is_err() {
+            return Err(err(
+                "gated ffn",
+                "the submission's activations exceed the storage buffer range",
+            ));
+        }
+        let first: Vec<FusedMat<'_>> = ops
+            .iter()
+            .zip(&x_at)
+            .zip(&g_at)
+            .flat_map(|((op, &(x, _)), &g)| {
+                [
+                    FusedMat {
+                        w: op.gate,
+                        x,
+                        y: g,
+                        tokens: op.s,
+                    },
+                    FusedMat {
+                        w: op.up,
+                        x,
+                        y: gn + g,
+                        tokens: op.s,
+                    },
+                ]
+            })
+            .filter(|m| m.tokens > 0)
+            .collect();
+        let second: Vec<FusedMat<'_>> = ops
+            .iter()
+            .zip(&g_at)
+            .zip(&y_at)
+            .map(|((op, &g), &y)| FusedMat {
+                w: op.down,
+                x: g,
+                y,
+                tokens: op.s,
+            })
+            .filter(|m| m.tokens > 0)
+            .collect();
+        let mut table = Vec::new();
+        let groups1 = self.fused_groups(&first, &mut table)?;
+        let groups2 = self.fused_groups(&second, &mut table)?;
+        counters.submissions.fetch_add(1, Ordering::Relaxed);
+        if gn == 0 {
+            // No rows: every output is empty.
+            return Ok(());
+        }
+        let swiglu_groups = u32_of(gn.div_ceil(SWIGLU_GROUP as usize), "SwiGLU groups")?;
+        if swiglu_groups > lim.max_compute_work_group_count[0] {
+            return Err(err("gated ffn", "SwiGLU exceeds the dispatch limits"));
+        }
+
+        // Inputs and the table in.
+        let start = Instant::now();
+        let shared = Arc::clone(&self.shared);
+        let storage = vk::BufferUsageFlags::STORAGE_BUFFER;
+        let xbuf = {
+            let x = Self::host_buffer(&shared, &mut self.xs, xb, storage)?;
+            let floats = x.floats_mut();
+            for (op, &(base, copy)) in ops.iter().zip(&x_at) {
+                if copy {
+                    floats[base..base + op.xs.len()].copy_from_slice(op.xs);
+                }
+            }
+            x.buffer
+        };
+        let tbuf = {
+            let t = Self::host_buffer(
+                &shared,
+                &mut self.table,
+                4 * table.len().max(1) as u64,
+                storage,
+            )?;
+            let words = t.floats_mut();
+            for (dst, &v) in words.iter_mut().zip(&table) {
+                *dst = f32::from_bits(v);
+            }
+            t.buffer
+        };
+        let ybuf = Self::host_buffer(&shared, &mut self.ys, yb, storage)?.buffer;
+        let mbuf = Self::scratch(&shared, &mut self.mid, mb, storage, false)?.buffer;
+        counters.time(start);
+        counters
+            .activations_in
+            .fetch_add(4 * xn as u64, Ordering::Relaxed);
+
+        // One descriptor set per fused dispatch.
+        let prepared = Instant::now();
+        let total = u32_of(groups1.len() + groups2.len(), "dispatches")?;
+        let sets = self.fused_sets(total.max(1))?;
+        for (set, g) in sets.iter().zip(&groups1) {
+            self.write_set(
+                *set,
+                [
+                    (g.buffer, g.base, Some(g.range)),
+                    (xbuf, 0, None),
+                    (mbuf, 0, None),
+                    (tbuf, 0, None),
+                ],
+            );
+        }
+        for (set, g) in sets[groups1.len()..].iter().zip(&groups2) {
+            self.write_set(
+                *set,
+                [
+                    (g.buffer, g.base, Some(g.range)),
+                    (mbuf, 0, None),
+                    (ybuf, 0, None),
+                    (tbuf, 0, None),
+                ],
+            );
+        }
+        let fused = shared
+            .fused
+            .as_ref()
+            .ok_or_else(|| err("fused", "no pipelines"))?;
+        let (layout, matmul, swiglu) = (fused.layout, &fused.matmul, fused.swiglu);
+        let swiglu_set = sets[0];
+        let gn32 = u32_of(gn, "intermediates")?;
+        let ran = self.run(|d, cmd| {
+            let push = |words: [u32; 4]| {
+                let mut b = [0u8; 16];
+                for (i, w) in words.iter().enumerate() {
+                    b[4 * i..4 * i + 4].copy_from_slice(&w.to_ne_bytes());
+                }
+                b
+            };
+            let between = [vk::MemoryBarrier::default()
+                .src_access_mask(vk::AccessFlags::SHADER_WRITE)
+                .dst_access_mask(vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE)];
+            // SAFETY: recording into a command buffer in the recording state, with
+            // objects that outlive the submission (it is waited for in `run`).
+            unsafe {
+                let dispatch = |set: vk::DescriptorSet, g: &FusedGroup| {
+                    d.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, matmul[g.dtype]);
+                    d.cmd_bind_descriptor_sets(
+                        cmd,
+                        vk::PipelineBindPoint::COMPUTE,
+                        layout,
+                        0,
+                        &[set],
+                        &[],
+                    );
+                    d.cmd_push_constants(
+                        cmd,
+                        layout,
+                        vk::ShaderStageFlags::COMPUTE,
+                        0,
+                        &push([g.blocks, g.count, g.tab, 0]),
+                    );
+                    d.cmd_dispatch(cmd, g.count * g.blocks, g.tokens, 1);
+                };
+                let barrier = |dst: vk::PipelineStageFlags, m: &[vk::MemoryBarrier<'_>]| {
+                    d.cmd_pipeline_barrier(
+                        cmd,
+                        vk::PipelineStageFlags::COMPUTE_SHADER,
+                        dst,
+                        vk::DependencyFlags::empty(),
+                        m,
+                        &[],
+                        &[],
+                    );
+                };
+                for (set, g) in sets.iter().zip(&groups1) {
+                    dispatch(*set, g);
+                }
+                barrier(vk::PipelineStageFlags::COMPUTE_SHADER, &between);
+                d.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, swiglu);
+                d.cmd_bind_descriptor_sets(
+                    cmd,
+                    vk::PipelineBindPoint::COMPUTE,
+                    layout,
+                    0,
+                    &[swiglu_set],
+                    &[],
+                );
+                d.cmd_push_constants(
+                    cmd,
+                    layout,
+                    vk::ShaderStageFlags::COMPUTE,
+                    0,
+                    &push([gn32, 0, gn32, 0]),
+                );
+                d.cmd_dispatch(cmd, swiglu_groups, 1, 1);
+                barrier(vk::PipelineStageFlags::COMPUTE_SHADER, &between);
+                for (set, g) in sets[groups1.len()..].iter().zip(&groups2) {
+                    dispatch(*set, g);
+                }
+                let to_host = [vk::MemoryBarrier::default()
+                    .src_access_mask(vk::AccessFlags::SHADER_WRITE)
+                    .dst_access_mask(vk::AccessFlags::HOST_READ)];
+                barrier(vk::PipelineStageFlags::HOST, &to_host);
+            }
+        })?;
+        counters.ran(prepared, &ran);
+
+        // Outputs back.
+        let start = Instant::now();
+        let y = self.ys.as_mut().ok_or_else(|| err("outputs", "missing"))?;
+        let floats = y.floats_mut();
+        for (op, &base) in ops.iter_mut().zip(&y_at) {
+            op.ys.copy_from_slice(&floats[base..base + op.ys.len()]);
+        }
+        counters.time(start);
+        counters
+            .activations_out
+            .fetch_add(4 * yn as u64, Ordering::Relaxed);
+        Ok(())
+    }
+
+    /// The SwiGLU shader alone, `g = silu(g) · u` in place, for the conformance tests.
+    pub(crate) fn swiglu(&mut self, g: &mut [f32], u: &[f32]) -> Result<(), ComputeError> {
+        let n = g.len();
+        if u.len() != n {
+            return Err(ComputeError::Shape {
+                op: "swiglu",
+                detail: format!("{n} gate values, {} up values", u.len()),
+            });
+        }
+        if n == 0 {
+            return Ok(());
+        }
+        let groups = u32_of(n.div_ceil(SWIGLU_GROUP as usize), "SwiGLU groups")?;
+        if groups > self.shared.limits.max_compute_work_group_count[0]
+            || 8 * n as u64 > u64::from(self.shared.limits.max_storage_buffer_range)
+        {
+            return Err(err(
+                "swiglu",
+                format!("{n} values exceed the device's limits"),
+            ));
+        }
+        let shared = Arc::clone(&self.shared);
+        let storage = vk::BufferUsageFlags::STORAGE_BUFFER;
+        let ybuf = {
+            let y = Self::host_buffer(&shared, &mut self.ys, 8 * n as u64, storage)?;
+            let floats = y.floats_mut();
+            floats[..n].copy_from_slice(g);
+            floats[n..2 * n].copy_from_slice(u);
+            y.buffer
+        };
+        let sets = self.fused_sets(1)?;
+        self.write_set(sets[0], [(ybuf, 0, None); 4]);
+        let fused = shared
+            .fused
+            .as_ref()
+            .ok_or_else(|| err("fused", "no pipelines"))?;
+        let (layout, pipeline) = (fused.layout, fused.swiglu);
+        let n32 = u32_of(n, "values")?;
+        let set = sets[0];
+        self.run(|d, cmd| {
+            let mut push = [0u8; 16];
+            for (i, w) in [n32, 0, n32, 0].iter().enumerate() {
+                push[4 * i..4 * i + 4].copy_from_slice(&w.to_ne_bytes());
+            }
+            let to_host = [vk::MemoryBarrier::default()
+                .src_access_mask(vk::AccessFlags::SHADER_WRITE)
+                .dst_access_mask(vk::AccessFlags::HOST_READ)];
+            // SAFETY: as in `gated_ffn_many`.
+            unsafe {
+                d.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, pipeline);
+                d.cmd_bind_descriptor_sets(
+                    cmd,
+                    vk::PipelineBindPoint::COMPUTE,
+                    layout,
+                    0,
+                    &[set],
+                    &[],
+                );
+                d.cmd_push_constants(cmd, layout, vk::ShaderStageFlags::COMPUTE, 0, &push);
+                d.cmd_dispatch(cmd, groups, 1, 1);
+                d.cmd_pipeline_barrier(
+                    cmd,
+                    vk::PipelineStageFlags::COMPUTE_SHADER,
+                    vk::PipelineStageFlags::HOST,
+                    vk::DependencyFlags::empty(),
+                    &to_host,
+                    &[],
+                    &[],
+                );
+            }
+        })?;
+        let y = self.ys.as_mut().ok_or_else(|| err("outputs", "missing"))?;
+        g.copy_from_slice(&y.floats_mut()[..n]);
         Ok(())
     }
 }

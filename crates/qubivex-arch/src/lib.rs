@@ -17,7 +17,7 @@
 pub mod ops;
 
 use qubivex_compute::tensor::{Tensor, TensorView, TensorViewMut};
-use qubivex_compute::{ComputeBackend, ComputeError, MatMul, WeightView};
+use qubivex_compute::{ComputeBackend, ComputeError, GatedFfn, MatMul, WeightView};
 use qubivex_core::{DType, Shape};
 use qubivex_core::{ExpertIdx, LayerIdx};
 use qubivex_model::ArchConfig;
@@ -125,7 +125,9 @@ pub trait ExpertProvider: Sync {
     /// them all at once and call `group` a single time with their weights, in the
     /// order of `experts`, instead of calling `each` per expert. Callers use it when
     /// the backend groups matmuls ([`ComputeBackend::groups_matmuls`]): one
-    /// submission per stage for the whole layer. The default always calls `each`.
+    /// submission per stage for the whole layer; or when it fuses the expert block
+    /// ([`ComputeBackend::fuses_gated_ffn`]): one submission for the whole layer's
+    /// experts. The default always calls `each`.
     ///
     /// # Errors
     /// As [`ExpertProvider::with_experts`], or whatever `group` returns.
@@ -1209,7 +1211,55 @@ impl Transformer {
                         store(users, &y);
                         Ok(())
                     };
-                    if be.groups_matmuls() {
+                    // The largest number of rows any expert computes: a fused block is
+                    // chosen by shape (decode, or a few concurrent sequences), not always.
+                    let max_rows = used
+                        .iter()
+                        .map(|ei| by_expert[ei.0 as usize].len())
+                        .max()
+                        .unwrap_or(0);
+                    if be.fuses_gated_ffn(used.len(), max_rows) {
+                        // Every expert of the layer as one fused block when all are
+                        // resident: gate and up, SwiGLU and down in one submission. Each
+                        // output has the separate steps' bits (GatedFfn).
+                        let mut group = |ws: &[ExpertWeights<'_>]| -> Result<(), ArchError> {
+                            let users: Vec<&[(usize, usize)]> = used
+                                .iter()
+                                .map(|ei| by_expert[ei.0 as usize].as_slice())
+                                .collect();
+                            let xes: Vec<Option<Vec<f32>>> = users
+                                .iter()
+                                .map(|u| {
+                                    let all = u.len() == s
+                                        && u.iter().enumerate().all(|(j, &(t, _))| j == t);
+                                    (!all).then(|| gather(u))
+                                })
+                                .collect();
+                            let mut ys: Vec<Vec<f32>> =
+                                users.iter().map(|u| vec![0f32; u.len() * h]).collect();
+                            let mut ops: Vec<GatedFfn<'_>> = ws
+                                .iter()
+                                .zip(&users)
+                                .zip(&xes)
+                                .zip(ys.iter_mut())
+                                .map(|(((w, u), xe), y)| GatedFfn {
+                                    gate: w.gate,
+                                    up: w.up,
+                                    down: w.down,
+                                    xs: xe.as_deref().unwrap_or(&x),
+                                    s: u.len(),
+                                    ys: y,
+                                })
+                                .collect();
+                            be.gated_ffn_many(&mut ops)?;
+                            drop(ops);
+                            for (u, y) in users.iter().zip(&ys) {
+                                store(u, y);
+                            }
+                            Ok(())
+                        };
+                        experts.with_experts_grouped(LayerIdx(li), &used, &mut group, &each)?;
+                    } else if be.groups_matmuls() {
                         // Every expert at once: one call for every gate and up, then one
                         // for every down. Each matmul has the same weight, input and
                         // kernel as on the per-expert path, so the same bits.

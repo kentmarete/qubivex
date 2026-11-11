@@ -14,17 +14,23 @@
 //!   and a per-copy latency. With [`SimConfig::delay`] the device also sleeps for that
 //!   time, so overlap and prefetch can be measured.
 //!
+//! - **Arenas.** [`DiscreteDevice::alloc`] and [`DiscreteDevice::write`] keep many copies
+//!   in one allocation, as a device expert cache's fixed-slot arenas do.
+//! - **A fused expert block**, when [`SimConfig::fuse_rows`] asks for one: a layer's
+//!   gated feed-forward blocks are one submission, so the fused path above the device
+//!   is exercised and tested here. Off by default.
+//!
 //! What it does not simulate: kernel speed (the kernels are the CPU's), asynchronous
 //! submission, and alignment or page-size rules of a real driver.
 //!
 //! Bits are the CPU's by construction: the same kernels on the same bytes.
 
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
 use qubivex_compute::discrete::{
-    DeviceBuffer, DeviceMatMul, DeviceUsage, DiscreteDevice, Guard, TransferStats,
+    DeviceBuffer, DeviceGatedFfn, DeviceMatMul, DeviceUsage, DiscreteDevice, Guard, TransferStats,
 };
 use qubivex_compute::host::PageAligned;
 use qubivex_compute::{ComputeBackend, ComputeError, WeightView};
@@ -43,6 +49,9 @@ pub struct SimConfig {
     pub latency: Duration,
     /// Sleep for the modelled transfer time, instead of only counting it.
     pub delay: bool,
+    /// Fuse a layer's expert blocks into one submission when no block has more than
+    /// this many activation rows ([`DiscreteDevice::fuses_gated_ffn`]); 0: never.
+    pub fuse_rows: usize,
 }
 
 impl SimConfig {
@@ -58,6 +67,7 @@ impl SimConfig {
             bandwidth: Self::PCIE4_BANDWIDTH,
             latency: Duration::from_micros(10),
             delay: false,
+            fuse_rows: 0,
         }
     }
 
@@ -90,15 +100,25 @@ struct Counters {
 /// One allocation's memory. Dropping it returns the bytes to the device.
 struct SimBuffer {
     device: usize,
-    bytes: PageAligned,
+    len: usize,
+    bytes: Memory,
     counters: Arc<Counters>,
+}
+
+/// An upload's bytes never change. An arena's are written later, so they sit behind a
+/// lock, held only to copy bytes in or out: never while computing, because the CPU
+/// kernels run on rayon, and a thread waiting inside them may pick up a task that
+/// writes the same arena.
+enum Memory {
+    Fixed(PageAligned),
+    Arena(RwLock<PageAligned>),
 }
 
 impl Drop for SimBuffer {
     fn drop(&mut self) {
         self.counters
             .used
-            .fetch_sub(self.bytes.len() as u64, Ordering::Relaxed);
+            .fetch_sub(self.len as u64, Ordering::Relaxed);
     }
 }
 
@@ -173,13 +193,80 @@ impl SimDevice {
         }
     }
 
-    fn bytes_of<'b>(&self, b: &'b DeviceBuffer) -> Result<&'b [u8], ComputeError> {
+    fn buffer_of<'b>(&self, b: &'b DeviceBuffer) -> Result<&'b SimBuffer, ComputeError> {
         match b.state::<SimBuffer>() {
-            Some(s) if s.device == self.id => Ok(s.bytes.as_slice()),
+            Some(s) if s.device == self.id => Ok(s),
             _ => Err(ComputeError::Device {
                 backend: "sim",
                 detail: "the buffer belongs to another device".into(),
             }),
+        }
+    }
+
+    /// New zeroed memory of `len` bytes, as an upload's or an arena's.
+    fn allocate(
+        &self,
+        len: usize,
+        guard: Option<Guard>,
+        arena: bool,
+    ) -> Result<DeviceBuffer, ComputeError> {
+        self.reserve(len as u64)?;
+        let bytes = match PageAligned::try_zeroed(len) {
+            Ok(b) => b,
+            Err(e) => {
+                self.counters.used.fetch_sub(len as u64, Ordering::Relaxed);
+                return Err(ComputeError::Device {
+                    backend: "sim",
+                    detail: format!("cannot allocate {len} bytes of host memory: {e}"),
+                });
+            }
+        };
+        let state = SimBuffer {
+            device: self.id,
+            len,
+            bytes: if arena {
+                Memory::Arena(RwLock::new(bytes))
+            } else {
+                Memory::Fixed(bytes)
+            },
+            counters: Arc::clone(&self.counters),
+        };
+        Ok(DeviceBuffer::new(len, state, guard))
+    }
+
+    /// Counts one copy to the device of `len` bytes.
+    fn uploaded(&self, len: u64) {
+        self.counters.uploads.fetch_add(1, Ordering::Relaxed);
+        self.counters.upload_bytes.fetch_add(len, Ordering::Relaxed);
+        self.transfer(len);
+    }
+
+    /// One matmul on the device's copy of its weights.
+    fn matmul_one(&self, op: &mut DeviceMatMul<'_>) -> Result<(), ComputeError> {
+        let range = op.w.offset()..op.w.offset() + op.w.len();
+        let copy;
+        let data = match &self.buffer_of(op.w.buffer())?.bytes {
+            Memory::Fixed(b) => &b.as_slice()[range],
+            Memory::Arena(lock) => {
+                copy = lock
+                    .read()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .as_slice()[range]
+                    .to_vec();
+                &copy[..]
+            }
+        };
+        let w = WeightView::new(op.w.dtype(), op.w.rows(), op.w.cols(), data)?;
+        self.cpu.matmul(&w, op.xs, op.s, op.ys)
+    }
+
+    /// Counts activations copied in and out by a submission, as one copy each way.
+    fn moved(&self, inb: u64, outb: u64) {
+        let c = &self.counters;
+        c.activations_in.fetch_add(inb, Ordering::Relaxed);
+        c.activations_out.fetch_add(outb, Ordering::Relaxed);
+        if inb + outb > 0 {
+            self.transfer(inb + outb);
         }
     }
 }
@@ -226,36 +313,90 @@ impl DiscreteDevice for SimDevice {
         bytes.as_mut_slice().copy_from_slice(host);
         let state = SimBuffer {
             device: self.id,
-            bytes,
+            len: host.len(),
+            bytes: Memory::Fixed(bytes),
             counters: Arc::clone(&self.counters),
         };
-        self.counters.uploads.fetch_add(1, Ordering::Relaxed);
-        self.counters.upload_bytes.fetch_add(len, Ordering::Relaxed);
-        self.transfer(len);
+        self.uploaded(len);
         Ok(DeviceBuffer::new(host.len(), state, guard))
+    }
+
+    fn alloc(&self, len: usize, guard: Option<Guard>) -> Result<DeviceBuffer, ComputeError> {
+        self.allocate(len, guard, true)
+    }
+
+    fn write(&self, buffer: &DeviceBuffer, offset: usize, host: &[u8]) -> Result<(), ComputeError> {
+        let b = self.buffer_of(buffer)?;
+        let Memory::Arena(lock) = &b.bytes else {
+            return Err(ComputeError::Device {
+                backend: "sim",
+                detail: "only an arena (alloc) can be written".into(),
+            });
+        };
+        let mut bytes = lock
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let dst = offset
+            .checked_add(host.len())
+            .and_then(|end| bytes.as_mut_slice().get_mut(offset..end))
+            .ok_or_else(|| ComputeError::Device {
+                backend: "sim",
+                detail: format!(
+                    "{} bytes at {offset} are outside a {}-byte buffer",
+                    host.len(),
+                    b.len
+                ),
+            })?;
+        dst.copy_from_slice(host);
+        drop(bytes);
+        self.uploaded(host.len() as u64);
+        Ok(())
     }
 
     fn matmul_many(&self, ops: &mut [DeviceMatMul<'_>]) -> Result<(), ComputeError> {
         self.counters.submissions.fetch_add(1, Ordering::Relaxed);
-        let mut moved = 0u64;
+        let (mut inb, mut outb) = (0u64, 0u64);
         for op in ops.iter_mut() {
-            let all = self.bytes_of(op.w.buffer())?;
-            let data = &all[op.w.offset()..op.w.offset() + op.w.len()];
-            let w = WeightView::new(op.w.dtype(), op.w.rows(), op.w.cols(), data)?;
-            let (inb, outb) = (size_of_val(op.xs) as u64, size_of_val(op.ys) as u64);
-            self.counters
-                .activations_in
-                .fetch_add(inb, Ordering::Relaxed);
-            self.counters
-                .activations_out
-                .fetch_add(outb, Ordering::Relaxed);
-            moved += inb + outb;
-            self.cpu.matmul(&w, op.xs, op.s, op.ys)?;
+            inb += size_of_val(op.xs) as u64;
+            outb += size_of_val(op.ys) as u64;
+            self.matmul_one(op)?;
         }
-        // One submission moves its activations as one copy each way.
-        if moved > 0 {
-            self.transfer(moved);
+        self.moved(inb, outb);
+        Ok(())
+    }
+
+    fn fuses_gated_ffn(&self, blocks: usize, rows: usize) -> bool {
+        blocks > 0 && rows <= self.config.fuse_rows
+    }
+
+    /// One submission: the intermediates stay on the device, so only each block's
+    /// inputs and outputs are copied.
+    fn gated_ffn_many(&self, ops: &mut [DeviceGatedFfn<'_>]) -> Result<(), ComputeError> {
+        self.counters.submissions.fetch_add(1, Ordering::Relaxed);
+        let (mut inb, mut outb) = (0u64, 0u64);
+        for op in ops.iter_mut() {
+            inb += size_of_val(op.xs) as u64;
+            outb += size_of_val(op.ys) as u64;
+            let ffn = op.gate.rows();
+            let mut g = vec![0f32; op.s * ffn];
+            let mut u = vec![0f32; op.s * ffn];
+            for (w, ys) in [(op.gate, &mut g), (op.up, &mut u)] {
+                self.matmul_one(&mut DeviceMatMul {
+                    w,
+                    xs: op.xs,
+                    s: op.s,
+                    ys,
+                })?;
+            }
+            qubivex_compute::math::swiglu(&mut g, &u);
+            self.matmul_one(&mut DeviceMatMul {
+                w: op.down,
+                xs: &g,
+                s: op.s,
+                ys: op.ys,
+            })?;
         }
+        self.moved(inb, outb);
         Ok(())
     }
 
