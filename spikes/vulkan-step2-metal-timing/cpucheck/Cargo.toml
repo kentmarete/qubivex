@@ -13,3 +13,4 @@ description = "Checks the Metal harness's outputs against the CPU backend, bit f
 qubivex-backend-cpu = { path = "../../../crates/qubivex-backend-cpu" }
 qubivex-compute = { path = "../../../crates/qubivex-compute" }
 qubivex-core = { path = "../../../crates/qubivex-core" }
+qubivex-arch = { path = "../../../crates/qubivex-arch" }
