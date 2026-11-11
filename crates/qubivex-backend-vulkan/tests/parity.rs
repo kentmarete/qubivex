@@ -561,3 +561,171 @@ fn speed() {
         }
     }
 }
+
+/// Timing, not a check (Step 2 of docs/engineering/VULKAN_EXECUTION_AUDIT.md):
+/// `cargo test --release -p qubivex-backend-vulkan --test parity -- --ignored
+/// --nocapture grouped_experts`.
+///
+/// One layer's routed experts, OLMoE-shaped Q4_K (gate and up 1024 x 2048, down
+/// 2048 x 1024, distinct weights per expert), at experts {1, 2, 4, 8} x tokens
+/// {1, 4, 10, 32}, two ways:
+/// - **A**, today: each expert on its own thread (at most 5 at once, as the engine's
+///   compute team), one submission for gate and up, then one for down;
+/// - **B**, grouped: one submission for every gate and up, then one for every down.
+///
+/// Wall time per layer from an untimed device; host submit, fence wait and GPU time
+/// (Σ and busy) from a timed one. Both ways give the same bits (checked).
+#[test]
+#[ignore = "timing; run by hand"]
+fn grouped_experts() {
+    let Some(plain) = device() else { return };
+    let Some(timed) = open(VulkanConfig {
+        timestamps: true,
+        ..VulkanConfig::default()
+    }) else {
+        return;
+    };
+    assert!(timed.timestamps(), "no timestamps on this device");
+    let q4k = DType::Ggml(GgmlType::Q4_K);
+    let (ffn, h) = (1024usize, 2048usize);
+    let host: Vec<[Vec<u8>; 3]> = (0..8u32)
+        .map(|e| {
+            [
+                weights(q4k, ffn, h, 100 + 3 * e),
+                weights(q4k, ffn, h, 101 + 3 * e),
+                weights(q4k, h, ffn, 102 + 3 * e),
+            ]
+        })
+        .collect();
+    let upload = |dev: &VulkanDevice| -> Vec<[DeviceWeights; 3]> {
+        host.iter()
+            .map(|m| {
+                let w = |i: usize, r, c| {
+                    let wv = WeightView::new(q4k, r, c, &m[i]).unwrap();
+                    DeviceWeights::like(dev.upload(&m[i], None).unwrap(), 0, &wv).unwrap()
+                };
+                [w(0, ffn, h), w(1, ffn, h), w(2, h, ffn)]
+            })
+            .collect()
+    };
+    let (wp, wt) = (upload(&plain), upload(&timed));
+    let expert_bytes: usize = host[0].iter().map(Vec::len).sum();
+    // One layer, one way: every expert's gate, up and down outputs.
+    type Out = Vec<(Vec<f32>, Vec<f32>, Vec<f32>)>;
+    let run = |dev: &VulkanDevice,
+               ws: &[[DeviceWeights; 3]],
+               n: usize,
+               s: usize,
+               x: &[f32],
+               g: &[f32],
+               grouped: bool|
+     -> Out {
+        let mut out: Out = (0..n)
+            .map(|_| (vec![0f32; s * ffn], vec![0f32; s * ffn], vec![0f32; s * h]))
+            .collect();
+        if grouped {
+            let mut ops: Vec<DeviceMatMul<'_>> = Vec::with_capacity(2 * n);
+            for (w, (gy, uy, _)) in ws.iter().zip(out.iter_mut()) {
+                ops.push(DeviceMatMul {
+                    w: &w[0],
+                    xs: x,
+                    s,
+                    ys: gy,
+                });
+                ops.push(DeviceMatMul {
+                    w: &w[1],
+                    xs: x,
+                    s,
+                    ys: uy,
+                });
+            }
+            dev.matmul_many(&mut ops).unwrap();
+            drop(ops);
+            let mut ops: Vec<DeviceMatMul<'_>> = ws
+                .iter()
+                .zip(out.iter_mut())
+                .map(|(w, (_, _, dy))| DeviceMatMul {
+                    w: &w[2],
+                    xs: g,
+                    s,
+                    ys: dy,
+                })
+                .collect();
+            dev.matmul_many(&mut ops).unwrap();
+        } else {
+            for (wave_w, wave_o) in ws[..n].chunks(5).zip(out.chunks_mut(5)) {
+                std::thread::scope(|sc| {
+                    for (w, (gy, uy, dy)) in wave_w.iter().zip(wave_o.iter_mut()) {
+                        sc.spawn(move || {
+                            dev.matmul_many(&mut [
+                                DeviceMatMul {
+                                    w: &w[0],
+                                    xs: x,
+                                    s,
+                                    ys: gy,
+                                },
+                                DeviceMatMul {
+                                    w: &w[1],
+                                    xs: x,
+                                    s,
+                                    ys: uy,
+                                },
+                            ])
+                            .unwrap();
+                            dev.matmul_many(&mut [DeviceMatMul {
+                                w: &w[2],
+                                xs: g,
+                                s,
+                                ys: dy,
+                            }])
+                            .unwrap();
+                        });
+                    }
+                });
+            }
+        }
+        out
+    };
+    eprintln!(
+        "experts tokens way | wall ms | submissions | host submit ms | fence wait ms | GPU sum ms | GPU busy ms | GB/s busy"
+    );
+    for n in [1usize, 2, 4, 8] {
+        for s in [1usize, 4, 10, 32] {
+            let x = acts(s * h, 5);
+            let g = acts(s * ffn, 6);
+            let a = run(&plain, &wp, n, s, &x, &g, false);
+            let b = run(&plain, &wp, n, s, &x, &g, true);
+            for (i, (oa, ob)) in a.iter().zip(&b).enumerate() {
+                assert_bits(&ob.0, &oa.0, &format!("gate e{i} n{n} s{s}"));
+                assert_bits(&ob.1, &oa.1, &format!("up e{i} n{n} s{s}"));
+                assert_bits(&ob.2, &oa.2, &format!("down e{i} n{n} s{s}"));
+            }
+            let reps = 30u32;
+            for grouped in [false, true] {
+                let _ = run(&plain, &wp, n, s, &x, &g, grouped);
+                let t = std::time::Instant::now();
+                for _ in 0..reps {
+                    let _ = run(&plain, &wp, n, s, &x, &g, grouped);
+                }
+                let wall = t.elapsed().as_secs_f64() * 1e3 / f64::from(reps);
+                let _ = run(&timed, &wt, n, s, &x, &g, grouped);
+                let before = timed.transfers();
+                for _ in 0..reps {
+                    let _ = run(&timed, &wt, n, s, &x, &g, grouped);
+                }
+                let d = timed.transfers().since(&before);
+                let per = |ns: u64| ns as f64 / 1e6 / f64::from(reps);
+                let busy = per(d.gpu_busy_ns);
+                eprintln!(
+                    "{n} {s:>2} {} | {wall:.3} | {} | {:.3} | {:.3} | {:.3} | {busy:.3} | {:.1}",
+                    if grouped { "B" } else { "A" },
+                    d.submissions / u64::from(reps),
+                    per(d.submit_ns),
+                    per(d.wait_ns),
+                    per(d.gpu_ns),
+                    (n * expert_bytes) as f64 / busy / 1e6,
+                );
+            }
+        }
+    }
+}

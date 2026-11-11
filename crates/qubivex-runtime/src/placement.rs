@@ -356,6 +356,11 @@ impl ComputeBackend for Placed {
         }
     }
 
+    /// A discrete device: each call is a submission and a fence wait.
+    fn groups_matmuls(&self) -> bool {
+        self.device.is_some()
+    }
+
     fn dequant_row(
         &self,
         w: &WeightView<'_>,
