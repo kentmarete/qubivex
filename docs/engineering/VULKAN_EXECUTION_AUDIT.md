@@ -465,29 +465,79 @@ Tests:
 
 Behaviour is unchanged without the flag.
 
-**Smoke run, on battery, one run of 16 tokens: not a measurement.** It is recorded only
-to steer the mains run.
+### Step 0 records (mains power, 2026-11-11)
 
-| | Untimed | Timed |
-|---|---|---|
-| Decode step | 35.2 ms | 41.5 ms |
-| Submissions per token | 305 | 305 |
-| Host submit (summed) | 5.5 ms | 16.0 ms |
-| Host wait (summed) | 86 ms | 91 ms |
-| GPU summed | — | 19.3 ms |
-| GPU busy | — | 19.3 ms |
-| GPU idle | — | 22.1 ms |
+Records: `docs/performance/baselines/2026-11-11-m3pro-vulkan-step0-*.json`.
 
-What the smoke run suggests, for the mains run to confirm or refute:
-1. **Submissions never overlap on the GPU** (summed = busy). The 8 submitters
-   overlap host work, not GPU work.
-2. **GPU busy (~19 ms) is well below the 34 ms kernel floor that §1.3 feared.** About
-   762 MB in 19.3 ms is ~39 GB/s, so the binding ceiling looks like the serial round
-   trips, not the kernels. If this holds, Steps 1–4 are aimed correctly.
-3. **Timestamps cost about 6 ms per token** here, mostly in host submit time. Tok/s
-   comes from untimed runs.
+Setup:
+- OLMoE Q4_K_M, the default 10-token prompt, 64 generated, 1 warm-up + 3 runs.
+- Run back to back on mains power.
+- Every record's tokens are identical across runs and equal to the PR #55 record
+  (`--reference …-vulkan-after.json`).
 
-Still to do for Step 0, on mains power:
-- untimed and timed records back to back, at the default 5 threads and at 8
-- a CPU record in the same session
-- commit them under `docs/performance/baselines/2026-11-1x-m3pro-vulkan-step0-*.json`
+Build: the binary was built from the working tree that was committed as 4c8e167. Its
+code is identical to that commit (the records say `835e761-dirty`; only docs changed
+after the build).
+
+The first untimed 5-thread run was disturbed and is not committed: copies 7.7 ms per
+step against 0.9 ms in every other run, and P95 43 ms. Both 5-thread runs were then
+repeated.
+
+Decode, per token:
+
+| Record | Threads | Timestamps | ms/token (median) | tok/s | Host submit Σ | Host wait Σ | GPU Σ | GPU busy | GPU idle |
+|---|---|---|---|---|---|---|---|---|---|
+| untimed-5t | 5 | off | 35.86 | 27.89 | 5.61 ms | 86.7 ms | — | — | — |
+| untimed-5t-repeat | 5 | off | 35.51 | 28.16 | 5.67 ms | 85.3 ms | — | — | — |
+| timed-5t | 5 | on | 39.00 | 25.64 | 10.76 ms | 90.8 ms | 19.52 ms | 19.52 ms | 19.39 ms |
+| timed-5t-repeat | 5 | on | 39.78 | 25.14 | 10.77 ms | 92.8 ms | 19.74 ms | 19.74 ms | 19.90 ms |
+| untimed-8t | 8 | off | 34.76 | 28.77 | 9.00 ms | 128.6 ms | — | — | — |
+| timed-8t | 8 | on | 36.83 | 27.15 | 16.19 ms | 128.3 ms | 17.15 ms | 17.15 ms | 19.69 ms |
+| cpu-5t | 5 | — | 23.11 | 43.28 | | | | | |
+
+Every decode token:
+- makes 305 submissions, each with a fence wait;
+- copies 3.13 MiB in and 2.70 MiB out;
+- spends 0.9 ms of host time in copies.
+
+The host Σ columns sum over the threads that submit, so they exceed wall time.
+
+### What Step 0 establishes
+
+1. **GPU submissions never overlap.** In every timed run, summed GPU time equals busy
+   time to within 0.01 ms. The 8 submitters overlap host work only: MoltenVK runs the
+   command buffers on its queue one at a time. Parallel submission is not a source of
+   GPU concurrency on this driver. Concurrency has to come from inside a command
+   buffer, or from fewer, larger submissions.
+2. **The binding ceiling is the round trips, not the kernels.**
+   - GPU busy is 19.5–19.7 ms of a ~39 ms timed token (17.2 of 36.8 at 8 threads).
+   - The GPU is idle about half the time.
+   - About 762 MB in 19.6 ms is about 39 GB/s while busy.
+   - The 34 ms kernel floor feared in §1.3 is refuted. With every round trip removed,
+     the GPU work alone would allow about 50 tok/s.
+3. **The cost of a round trip.**
+   - GPU time per submission: 19.6 ms / 305 ≈ 64 µs.
+   - Host wait per submission: 86 ms / 305 ≈ 280 µs. So about 220 µs per submission is
+     fixed latency (submit to fence signalled), not GPU work.
+   - The critical path is about 113 round trips × ~316 µs ≈ 35.7 ms, which matches the
+     untimed median (35.5–35.9 ms).
+4. **Host submission work is small.** Preparing and submitting takes 5.6 ms per token
+   summed over threads, about 18 µs per submission, and copies take 0.9 ms. On the
+   critical path that is at most about 113 × 18 µs ≈ 2 ms plus part of the copies.
+   **Step 1 can save at most about 2–3 ms (to about 30 tok/s).** It is worth doing
+   because it is cheap, but it cannot carry target 1 by itself.
+5. **Timestamps cost about 3.5–4 ms per token** (35.5–35.9 against 39.0–39.8), mostly
+   host submit time, which roughly doubles. Tok/s comes from untimed records only.
+6. **8 threads:** 34.76 ms against 35.5–35.9 (about 3% faster). It is not a substitute
+   for Step 2, and the default stays at 5.
+7. **The session is comparable to PR #55's:** CPU 43.28 tok/s (43.50 then), and Vulkan
+   untimed 27.9–28.2 tok/s (27.36 then).
+
+Consequences for the sequence:
+- Step 2's value depends on the grouped dispatch, not on submission concurrency.
+  Two submissions per layer for the experts take the critical path from 7 round trips
+  to 5 per layer, about 81 per token. At ~316 µs each that is about 26 ms, roughly
+  37 tok/s, provided the grouped dispatch's GPU time is no worse than the serial
+  dispatches it replaces. The kernel test's 24 matrices in one submission (1.26 ms)
+  against ~16 × 64 µs ≈ 1.0 ms today says to measure that before building on it.
+- Steps 3–4 target the ~16–19 ms of idle time directly.

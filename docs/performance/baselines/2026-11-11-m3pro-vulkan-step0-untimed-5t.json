@@ -1,0 +1,314 @@
+{
+  "schema": 1,
+  "label": "untimed-5t",
+  "started": "2026-11-11T11:22:42Z",
+  "build": {
+    "version": "0.1.0",
+    "git": "835e7615027c-dirty",
+    "rustc": "rustc 1.99.1 (58cf8f9c3 2026-10-13)",
+    "profile": "release",
+    "opt_level": "3",
+    "debug_assertions": false,
+    "target": "aarch64-apple-darwin",
+    "target_features": "aes,crc,dit,dotprod,dpb,dpb2,fcma,fhm,flagm,fp16,frintts,jsconv,lor,lse,neon,paca,pacg,pan,pmuv3,ras,rcpc,rcpc2,rdm,sb,sha2,sha3,ssbs,vh",
+    "rustflags": ""
+  },
+  "hardware": {
+    "cpu": {
+      "arch": "aarch64",
+      "vendor": {
+        "known": "Apple"
+      },
+      "model": {
+        "known": "Apple M3 Pro"
+      },
+      "logical_cores": {
+        "known": 11
+      },
+      "physical_cores": {
+        "known": 11
+      },
+      "tiers": {
+        "known": [
+          {
+            "name": "Performance",
+            "physical": 5,
+            "logical": 5
+          },
+          {
+            "name": "Efficiency",
+            "physical": 6,
+            "logical": 6
+          }
+        ]
+      },
+      "simd": [
+        "neon",
+        "fp16",
+        "dotprod",
+        "i8mm",
+        "bf16"
+      ],
+      "numa_nodes": {
+        "known": 1
+      }
+    },
+    "memory": {
+      "total": {
+        "known": 19327352832
+      },
+      "cgroup_limit": {
+        "known": "none"
+      }
+    },
+    "os": {
+      "family": "macos",
+      "name": {
+        "known": "macOS 27.2 (26B123)"
+      },
+      "kernel": {
+        "known": "27.2.0"
+      }
+    }
+  },
+  "model": {
+    "id": "olmoe-1b-7b-0125-instruct",
+    "name": "OLMoE-1B-7B-0125-Instruct Q4_K_M",
+    "architecture": "transformer_moe",
+    "dir": "~/.qubivex/models/olmoe-1b-7b-0125-instruct"
+  },
+  "config": {
+    "threads": 5,
+    "expert_cache": 3900702720,
+    "expert_slots": [
+      64,
+      64,
+      64,
+      64,
+      64,
+      64,
+      64,
+      64,
+      64,
+      64,
+      64,
+      64,
+      64,
+      64,
+      64,
+      64
+    ],
+    "cache_policy": "Lfru { decay_window: 256 }",
+    "io_threads": 4,
+    "expert_io": "buffered",
+    "verification": "verified",
+    "device": {
+      "backend": "vulkan",
+      "device": "Vulkan device 0 (Apple M3 Pro, integrated, MoltenVK 1.4.2), 18.00 GiB usable",
+      "ops": null,
+      "tensors": 81,
+      "bytes": 311027712
+    },
+    "context": 4096,
+    "prompt": "Write a long story about a lighthouse keeper.",
+    "prompt_tokens": 10,
+    "generated_tokens": 64,
+    "warmup_runs": 1,
+    "measured_runs": 3
+  },
+  "prefill": {
+    "ms": {
+      "n": 3,
+      "min": 202.70529200000001,
+      "median": 205.017166,
+      "p95": 206.323417,
+      "max": 206.323417,
+      "mean": 204.68195833333334
+    },
+    "tok_s_at_median": 48.77640343540794
+  },
+  "decode": {
+    "step_ms": {
+      "n": 189,
+      "min": 32.991333,
+      "median": 35.861125,
+      "p95": 37.163166999999994,
+      "max": 37.627833,
+      "mean": 35.89524759788358
+    },
+    "tok_s_at_median": 27.88534938599946,
+    "run_tok_s": [
+      28.03827172999182,
+      28.01471343955731,
+      27.529493860895336
+    ]
+  },
+  "memory": {
+    "rss_after_load": {
+      "known": 435142656
+    },
+    "peak_rss": {
+      "known": 1385005056
+    },
+    "peak_source": "sampled",
+    "plan_budget": 8931170467,
+    "ledger": {
+      "dense": 311027712,
+      "expert_cache": 3606822912,
+      "kv": 67108864,
+      "total": 3984959488
+    }
+  },
+  "experts": {
+    "hits": 26049,
+    "loads": 0,
+    "bytes_read": 0,
+    "evictions": 0,
+    "hit_rate": 1.0,
+    "bytes_per_token": 0,
+    "slab_allocs": 0,
+    "wait_ms_per_token": 0.0,
+    "read_retries": 0,
+    "read_timeouts": 0
+  },
+  "device": {
+    "gpu_timed": false,
+    "prefill": {
+      "steps": 3,
+      "wall_ms": 204.6819583333333,
+      "submissions": 1287.0,
+      "fence_waits": 1287.0,
+      "submit_ms": 17.438117666666667,
+      "wait_ms": 716.5564486666667,
+      "copy_ms": 8.042555666666667,
+      "bytes_in": 32776192.0,
+      "bytes_out": 26456576.0,
+      "uploads": 0.0,
+      "upload_bytes": 0.0
+    },
+    "decode": {
+      "steps": 189,
+      "wall_ms": 35.895247597883596,
+      "submissions": 305.0,
+      "fence_waits": 305.0,
+      "submit_ms": 5.61168444973545,
+      "wait_ms": 86.69299068253967,
+      "copy_ms": 0.9091598624338624,
+      "bytes_in": 3284992.0,
+      "bytes_out": 2826752.0,
+      "uploads": 0.0,
+      "upload_bytes": 0.0
+    }
+  },
+  "check": {
+    "deterministic": true,
+    "first_divergence": null,
+    "reference": "docs/performance/baselines/2026-11-11-m3pro-vulkan-after.json",
+    "reference_match": true,
+    "reference_divergence": null
+  },
+  "runs": [
+    {
+      "prefill_ms": 206.323417,
+      "decode_step_ms": {
+        "n": 63,
+        "min": 32.991333,
+        "median": 35.711917,
+        "p95": 36.720709,
+        "max": 37.627833,
+        "mean": 35.665536365079376
+      },
+      "decode_tok_s": 28.03827172999182
+    },
+    {
+      "prefill_ms": 205.017166,
+      "decode_step_ms": {
+        "n": 63,
+        "min": 34.3315,
+        "median": 35.68175,
+        "p95": 36.616792000000004,
+        "max": 37.345333000000004,
+        "mean": 35.69552842857143
+      },
+      "decode_tok_s": 28.01471343955731
+    },
+    {
+      "prefill_ms": 202.70529200000001,
+      "decode_step_ms": {
+        "n": 63,
+        "min": 34.849583,
+        "median": 36.311709,
+        "p95": 37.209917000000004,
+        "max": 37.524208,
+        "mean": 36.324678000000006
+      },
+      "decode_tok_s": 27.529493860895336
+    }
+  ],
+  "tokens": [
+    187,
+    187,
+    510,
+    1708,
+    5967,
+    6225,
+    10086,
+    285,
+    9979,
+    327,
+    247,
+    33848,
+    28900,
+    37159,
+    253,
+    3034,
+    503,
+    3472,
+    6150,
+    15,
+    7850,
+    8325,
+    273,
+    1708,
+    18753,
+    758,
+    253,
+    13862,
+    13,
+    26766,
+    35089,
+    15792,
+    949,
+    43286,
+    528,
+    12685,
+    15,
+    380,
+    43775,
+    13,
+    247,
+    637,
+    4907,
+    7195,
+    13,
+    574,
+    5262,
+    253,
+    2469,
+    10488,
+    1107,
+    275,
+    436,
+    29437,
+    3698,
+    13,
+    43981,
+    281,
+    253,
+    1708,
+    285,
+    253,
+    1708,
+    5967
+  ]
+}
