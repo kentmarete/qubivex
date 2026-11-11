@@ -6,30 +6,10 @@
 //! [`qubivex_compute::math::exp`] are used, so the bits are the same on every
 //! platform and on a GPU that evaluates them in the same order.
 
-use qubivex_compute::reduce::dot;
 
-/// RMSNorm in place: `x · w / sqrt(mean(x²) + eps)`.
-///
-/// The sum of squares uses the shared 64-lane reduction shape
-/// ([`qubivex_compute::reduce`]) and the rest is f32, so a GPU kernel with the same
-/// shape gives the same bits (ADR-011 §1).
-pub fn rms_norm(x: &mut [f32], w: &[f32], eps: f64) {
-    debug_assert_eq!(x.len(), w.len());
-    let r = rms_scale(x, eps);
-    for (v, g) in x.iter_mut().zip(w) {
-        *v = (*v * r) * g;
-    }
-}
-
-/// `1 / sqrt(mean(x²) + eps)`, the factor [`rms_norm`] applies.
-#[must_use]
-pub fn rms_scale(x: &[f32], eps: f64) -> f32 {
-    #[allow(clippy::cast_precision_loss)]
-    let n = x.len() as f32;
-    #[allow(clippy::cast_possible_truncation)]
-    let eps = eps as f32;
-    1.0 / (dot(x, x) / n + eps).sqrt()
-}
+/// RMSNorm in place and its factor (defined in `qubivex-compute`, so a device backend
+/// can give the same bits without depending on this crate).
+pub use qubivex_compute::math::{rms_norm, rms_scale};
 
 /// RoPE tables for `rotary_dim` dimensions: `cos` and `sin` of `pos · θ^(−2i/d)`.
 #[derive(Clone, Debug)]
