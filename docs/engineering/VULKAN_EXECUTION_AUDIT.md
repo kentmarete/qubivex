@@ -1,10 +1,11 @@
 # Vulkan decode: execution audit and plan
 
 - Date: 2026-11-11
-- Base: `main` at 9721f58 (PR #55, ADR-019 amendment 1 Proposed)
+- Base: `main` at 9721f58 (PR #55; ADR-019 amendment 1 accepted 2026-11-11)
 - Scope: OLMoE-1B-7B-0125-Instruct Q4_K_M, `--backend vulkan`, MoltenVK 1.4.2 on the M3 Pro
-- Status: audit only. No code changed. No benchmark was run for this report: the
-  machine was on battery. Every number marked *recorded* comes from a committed record.
+- Status: audit done. The owner's decisions (2026-11-11) are in §9, and the revised
+  sequence is in §8. No code changed by the audit. No benchmark was run for this report:
+  the machine was on battery. Every number marked *recorded* comes from a committed record.
   Every number marked *estimate* is arithmetic on recorded numbers. Estimates are not
   results.
 
@@ -335,50 +336,62 @@ What the forward pass needs is already shown by `qubivex-backend-metal`'s `Batch
 - `submit`, `submit_async` returning a `Pending`
 - `read` and `write`
 
-The pass is a fixed sequence with known parallel groups. Its shape depends on the
-model config and `s`, not on run-time data, except routing, which amendment 4 moved
-into buffers.
+The pass is a fixed sequence with known parallel groups. Its shape depends on the model
+config and `s`, not on run-time data, except routing, which amendment 4 moved into
+buffers. So the scheduler is a **recorded program, not a dynamic dependency graph**
+(owner decision §9.2). It has three layers, and only the first two are shared.
 
-**Recommendation: a recorded device program, not a dynamic dependency graph.**
+1. **The logical program (shared, backend-neutral).** It is built from the arch config
+   (dense or MoE), never from a model name. It is an ordered list of logical ops over
+   named device vectors:
+   - `matmul`, `rms_norm`, `rope`, `clamp`, `add`, `copy`, `swiglu`, `kv_store`,
+     `attention`, `moe_route`, `routed_matmul`, `moe_combine`, gather and scatter
+   - grouped into **parallel groups**: ops in a group are independent; consecutive
+     groups depend on each other
+   - with **host points**: the places where the host must read a value, such as router
+     logits when routing runs on the host, or the final logits.
 
-- A backend-neutral `DeviceProgram` trait in `qubivex-compute`, shaped like Metal's
-  `Batch`:
-  - ops: `matmul`, `rms_norm`, `rope`, `clamp`, `add`, `copy`, `swiglu`, `kv_store`,
-    `attention`, `moe_route`, `routed_matmul`, `moe_combine`, gather and scatter
-  - `concurrent(|b| …)` groups
-  - submit, async submit, read, write
-- One generic `DeviceForward` in `qubivex-runtime`, from `MetalForward`. It is driven by
-  the arch config, not by OLMoE, and adds a dense-FFN path, which `MetalForward` lacks
-  ("whole Metal layers need routed experts"). The CPU pass in `qubivex-arch` stays the
-  reference and is not rewritten (owner rule).
-- What each Phase 5 item maps to:
+   The CPU pass in `qubivex-arch` stays the reference and is not rewritten (owner rule).
+2. **The submission planner (shared).** It maps the logical program to physical
+   submissions. It cuts only at host points: a genuine data dependency on a
+   host-visible value. It also cuts where the backend's policy asks for it, for example
+   a maximum number of dispatches per command buffer, or an op the device cannot run
+   with the CPU's bits (§5), which goes to the host. Everything else inside a
+   submission is groups separated by barriers. One logical pass can therefore be one
+   submission (a whole token), one per layer, or finer, without changing the program.
+   The plan is data, so it can be logged, tested and counted by the bench.
+3. **The backend executor (per backend, independent).** It implements a small shared
+   trait: allocate device vectors; record a group of ops; insert the barrier between
+   groups; submit, submit async, wait; read and write host points. It also reports
+   per-op capability: whether the op is supported with strict bits, and how. Metal
+   keeps its implementation (`Batch`, `program.rs`, `kernels.metal`) and its parity
+   tests, with an adapter onto the trait. Vulkan gets its own command encoding,
+   synchronisation, memory management and GLSL kernels behind the same trait.
 
-  | Phase 5 item | In this design |
-  |---|---|
-  | Dependency tracking | program order, plus groups |
-  | Synchronisation planning | a barrier between groups, a fence per submission, `Pending` for async |
-  | Buffer lifetimes | a per-pass arena (Metal's `Bufs`), KV in `KvCache`'s device slot, pins as today |
-  | Command buffer reuse | replay of a recorded decode program (Step 4) |
-  | Backend strategies | the trait's implementations |
+| Phase 5 item | In this design |
+|---|---|
+| Dependency tracking | program order and parallel groups; host points for host dependencies |
+| Operation grouping | parallel groups; the planner's choice of submission boundaries |
+| Synchronisation planning | barriers between groups; a fence or `Pending` per submission, decided by the planner |
+| Buffer lifetimes | a per-pass arena of named vectors (Metal's `Bufs`), KV in `KvCache`'s device slot, pins as today |
+| Command buffer reuse | replay of a recorded decode submission (Step 4) |
+| Backend strategies | the executor trait and the planner's backend policy |
 
-- A general DAG scheduler would add a run-time planner, and a place for ordering bugs,
-  without a measured benefit. Revisit it if a model needs data-dependent control flow
-  beyond routing.
+A general DAG scheduler would add a run-time planner, and a place for ordering bugs,
+without a measured benefit. Revisit it only if a model needs data-dependent control
+flow beyond routing.
 
-Two ways to get there, to be chosen:
+## 8. Implementation sequence (revised 2026-11-11 after the owner's decisions)
 
-| | Extract first | Vulkan first |
-|---|---|---|
-| Order | make `MetalForward` generic over the trait (Metal's tests hold its bits), then implement Vulkan | write `VulkanForward` beside `MetalForward`, unify later |
-| Risk | touches the default Metal path | none to Metal |
-| Cost | one implementation | ~1 100 lines duplicated, two places to keep bit-identical |
-| Recommendation | **this one**, behind Metal's existing parity suite | |
+The rules for every step:
+- Each step is its own commit series, behind its own switch where it changes
+  behaviour, and can be reverted on its own.
+- Each step is benchmarked with the full `qubivex bench` on mains power, with identical
+  configuration: 10-token prompt, 64 generated, 5 threads, 1 warm-up + 3 runs.
+- `qubivex bench` is the authority. A change that improves kernel or shader timings but
+  regresses the bench is not kept, and no improvement is claimed from kernel timings.
 
-## 8. Proposed implementation sequence
-
-Each step is its own commit series, behind its own switch where it changes behaviour,
-and benchmarked on mains power with identical configuration (10-token prompt, 64
-generated, 5 threads, 1 warm-up + 3 runs). Every step has the same gates:
+Every step has the same gates:
 - the `qubivex-backend-vulkan` parity tests
 - `tests/vulkan.rs`
 - the fixtures
@@ -386,26 +399,48 @@ generated, 5 threads, 1 warm-up + 3 runs). Every step has the same gates:
 - every dtype
 - bench tokens identical to the reference
 - no prefill regression
+- no unbounded allocation
 
-| Step | What | Changes behaviour? | Expected (*estimate*) | Decides |
+Targets: 30 tok/s, then 35, then the CPU's 43.5.
+
+| Step | What | Changes behaviour? | Expected (*estimate*) | Gate to the next step |
 |---|---|---|---|---|
-| **0** | Measurement: device counters and GPU timestamps in `TransferStats` and the bench record (submissions, waits, host submit µs, blocked µs, GPU µs, bytes in/out). Run the 8-thread and grouped-submission experiments with timestamps | no (timestamps off by default, or their cost measured) | 0 | which ceiling binds (§1.3); whether Steps 1–2 are worth doing |
-| **1** | Host-side submission cost: bulk copies, one copy per shared input, push descriptors or cached sets, no per-call `Vec`s | no | 0.5–3 ms → 28–29.5 tok/s | |
-| **2** | Grouped experts: arch-level one-submission-per-stage when every expert is resident (backend capability flag), plus the grouped-dispatch kernel (variant C) if Step 0 shows serial dispatch costs | no bits change; path switch | 7 → 5 round trips per layer. **30–34 tok/s** if the grouped dispatch is faster than serial dispatches; ~0 if not | target 1 |
-| **3** | `DeviceProgram` trait; `MetalForward` → generic `DeviceForward` (Metal bits unchanged); Vulkan kernels for norms, RoPE, attention, KV store, SwiGLU, combine; correctly rounded `/` and `sqrt` with a probe. **Needs ADR-019 amendment 2** (the ADR calls this "its own decision") | new placement | 17 round trips per token. **35–45 tok/s** if kernels reach 27–33 GB/s; capped near 30–33 if they stay at 22.5 | target 2 |
-| **4** | Routing on the device and routed matmuls; one submission per token; replay of the recorded decode program | new placement | the GPU-busy floor | stretch |
-| **5** | Kernel throughput (only if Step 0 shows kernels bind): occupancy, grouped dispatch for QKV, revisit tiles for prefill | no bits change | toward Metal's 45 GB/s | stretch |
+| **0** | **Measurement (mandatory).** `TransferStats` and the bench record gain: submissions; fence waits; host time recording and submitting; time blocked in fence waits; GPU time from timestamp queries, as a per-submission sum and as the union of busy intervals, so GPU idle = wall − busy; activation bytes in and out; per-phase (prefill, decode) deltas per token. Timestamps are opt-in, and their cost is measured on against off. Then rerun the 5- and 8-thread decode with timestamps | no | 0 | which ceiling binds (§1.3) |
+| **1** | Host-side submission cost: bulk copies, one copy per shared input, push descriptors or cached sets, no per-call `Vec`s. Each is a separate commit and measured alone | no | 0.5–3 ms → 28–29.5 tok/s | |
+| **2** | Grouped experts: one submission per stage per layer when every expert is resident (a backend capability, generic to any MoE), plus the grouped-dispatch kernel (variant C) if Step 0 shows serial dispatch costs. Measured at experts {1, 2, 4, 8} × tokens {1, 4, 10, 32} against the current path | no bits change; path switch | 7 → 5 round trips per layer; **30–34 tok/s** if the grouped dispatch beats serial dispatches, ~0 if not | target 1 |
+| **3a** | **ADR-019 amendment 2** (Proposed, for the owner): the shared GPU-pass contract (§7: logical program, submission planner, executor trait), the submission strategy, and the numerical capability requirements (3b). Written before the code it governs | — | — | owner acceptance |
+| **3b** | **Numerical capabilities and conformance.** Device-open probes for `fma`, `/`, `sqrt`, the `1/sqrt` pair, `exp`'s building blocks, and subnormal handling. Shader correction (an `fma` refinement) where it is proven correct over the inputs used. Otherwise, per-op CPU fallback for the sensitive op, or refusing strict Vulkan on that device. Approximate arithmetic only as an explicitly selected mode under ADR-010, never silently. **One shared conformance suite**, CPU, Metal and Vulkan, op by op (norms, softmax, routing, RoPE, attention, SwiGLU, combine, matmul per dtype), bit for bit against the CPU | strict stays the default | 0 | suite green on Metal and MoltenVK |
+| **3c** | **The shared layers and the Metal adapter.** The logical program and submission planner in a shared crate; Metal's adapter onto the executor trait. Metal's implementation, placement and parity tests unchanged; Metal bench within noise | no (Metal path re-plumbed only) | 0 | Metal bits and bench unchanged |
+| **3d** | **The Vulkan executor and kernels.** Command encoding, barriers, the per-pass arena and device KV, and GLSL kernels for norms, RoPE, attention, KV store, SwiGLU and combine, each in the conformance suite. Then the whole-layer plan: one submission per layer, only router logits returned | new placement, opt-in until measured | 17 round trips per token; **35–45 tok/s** if kernels reach 27–33 GB/s, near 30–33 if they stay at 22.5 | target 2 |
+| **4** | Routing on the device and routed matmuls (descriptor arrays or buffer device addresses); the planner makes a token one submission when every expert is resident; replay of the recorded decode submission | new plan | toward the GPU-busy floor | stretch |
+| **5** | Kernel throughput, only if Step 0 or 3d shows kernels bind: occupancy, grouped QKV, token tiles for prefill revisited with timestamps | no bits change | toward Metal's 45 GB/s | 43.5 tok/s |
 
-Steps 1 and 2 stay within the `DiscreteDevice` interface and are cheap to revert.
-Step 3 is the substantial architectural change. Nothing in it should start before the
-owner decides §9.
+Steps 0 to 2 stay within the `DiscreteDevice` interface. Step 3 is the substantial
+architectural change, and nothing in it starts before amendment 2 is accepted.
 
-## 9. Decisions for the owner
+## 9. Owner decisions (2026-11-11)
 
-1. **The order.** Measure first (Step 0), then the in-interface steps (1–2), then the
-   device-resident pass (3–4)? Or go straight to Step 3 after Step 0?
-2. **Extract first or Vulkan first** for the device program (§7).
-3. **Division and square root on drivers that do not round them correctly:** emulate
-   with an `fma` correction, refuse the device as for a split `fma`, or allow a lossy
-   opt-in under ADR-010.
-4. **ADR-019 amendment 1 is still Proposed.** Accept it before amendment 2 builds on it?
+1. **Order.** Step 0, then 1 and 2, then 3 and 4. Step 0 is mandatory: the records
+   conflict on GPU time against submission overhead. Do not jump to Step 3.
+2. **Shared GPU-pass architecture first.** Share the execution contract and the
+   scheduler abstraction, not backend implementations. Metal is the reference: its
+   implementation and parity tests are preserved. Vulkan's command encoding,
+   synchronisation, memory management and kernels sit behind the shared interface.
+   Start from a recorded sequence of operations with explicit parallel groups, not a
+   general dependency-graph framework.
+3. **Numerics.** Strict parity stays the default. Device-open capability tests cover
+   division, square root, `fma` and other sensitive arithmetic. Use shader correction
+   where it is reliable. Otherwise run the sensitive op on the CPU, or reject strict
+   Vulkan on that device. Approximate arithmetic is only an explicitly selected mode;
+   parity is never compromised silently. Shared CPU, Metal and Vulkan numerical
+   conformance tests.
+4. **ADR-019.** Amendment 1 accepted, subject to the existing parity and regression
+   checks; they were rerun and passed (ADR-019, amendment 1 "Acceptance"). Amendment 2
+   is separate: the shared GPU-pass architecture, submission strategy and numerical
+   capability requirements.
+5. **Logical passes are separate from physical submissions.** The scheduler groups
+   logical operations into fewer submissions where genuine data dependencies allow
+   (§7). Backends stay independent, and there are no model-specific shortcuts.
+6. **Discipline.** Each optimisation is independent, benchmarked and revertible. The
+   full bench is the authority. Targets: 30, then 35, then 43.5 tok/s. No claims from
+   isolated shader timings.

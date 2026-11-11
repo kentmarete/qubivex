@@ -3,7 +3,7 @@
 Last updated: 2026-11-11
 
 ## Current phase
-**Vulkan kernel speed (2026-11-11; ADR-019 amendment 1, Proposed).** Decode on MoltenVK 4.2x faster with the same bits.
+**Vulkan kernel speed (2026-11-11; ADR-019 amendment 1, accepted 2026-11-11).** Decode on MoltenVK 4.2x faster with the same bits.
 - Shader: Q4_K, Q6_K and Q8_0 decode a block at a time (scales once per block, each byte once for all the weights it holds); a Q4_K header is read as four words. No `precise`: `shaders/build.sh` marks every add, subtract and `fma` `NoContraction`, because SPIRV-Cross turned every `precise` multiply into an unoptimised helper call. Q4_K's `t - m` is `fma(t, 1, -m)` with `t` kept rounded by an integer OR.
 - Device: 8 submitters (own command buffer, fence and host buffers), the queue locked only around `vkQueueSubmit`, so a layer's experts overlap their round trips.
 - Measured, OLMoE Q4_K_M, mains power: decode 153.3 -> 36.55 ms per token (6.52 -> 27.36 tok/s), prefill 8.2 -> 48.9 tok/s, tokens identical. The CPU in the same session: 43.50 tok/s, prefill 77.0. Records `docs/performance/baselines/2026-11-11-m3pro-vulkan-*.json`; steps in ADR-019 amendment 1 and BENCHMARKING.md.

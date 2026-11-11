@@ -1,7 +1,9 @@
 # ADR-019: The Vulkan backend, a discrete device with the CPU's bits
 
 - Status: **Accepted (2026-11-11)** by owner decision; amendment 1 (2026-11-11, kernel
-  speed) Proposed
+  speed) accepted 2026-11-11 by owner decision, after its parity and regression checks
+  were rerun on `main` at 9721f58 (§ Amendment 1, "Acceptance"). Amendment 2 (the shared
+  GPU pass) is to be written separately.
 - Date: 2026-11-11
 - Related: ADR-007 (backends), ADR-010 (lossless by default), ADR-011 (device execution
   and parity), ADR-018 (discrete device memory).
@@ -207,6 +209,18 @@ bookworm) and Mesa 25.0.7 (trixie):
     unchanged.
   - The shared-memory tree: a build without it was no faster, so it stays (no subgroup
     operations).
+
+### Acceptance (2026-11-11)
+The owner accepted this amendment, subject to the existing parity and regression
+checks. They were rerun on `main` at 9721f58 (release build, `QUBIVEX_REQUIRE_VULKAN=1`,
+MoltenVK 1.4.2), and all passed:
+- `qubivex-backend-vulkan` parity: 8 passed, including every dtype, shape and batch and
+  many matrices at offsets in one submission. The ignored timing test was not run.
+- `qubivex-runtime` `tests/vulkan.rs`: 4 passed. These are the fixture bits, concurrent
+  requests, a small device cache that evicts, and real OLMoE (the CPU's prompt logits
+  and Colibri's tokens).
+
+The speed figures above are unchanged: they come from the mains-power records.
 
 ### Consequences
 - The kernel timing test (`cargo test --release -p qubivex-backend-vulkan --test parity
