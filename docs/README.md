@@ -99,7 +99,7 @@ to discover a gap by hitting it.
 
 **Hardware and platforms**
 
-- CUDA. Vulkan runs (ADR-019, Proposed) with the CPU's bits but slower than the CPU;
+- CUDA. Vulkan runs (ADR-019) with the CPU's bits but slower than the CPU;
   Metal is the fast GPU backend, on macOS.
 - Windows.
 - Multiple GPUs, and splitting a model across devices.
