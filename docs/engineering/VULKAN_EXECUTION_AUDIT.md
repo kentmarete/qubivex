@@ -1998,3 +1998,7 @@ is QKV → attention on the host (the KV cache in host memory, §8 Step 4).
    not built (the exhaustive test is the proof on this one).
 4. **Next:** attention on the device (the KV cache on the device), which would make a
    layer one submission.
+
+**Decided 2026-11-12 (owner):** Steps 3b and 3c accepted; `--vulkan-route` and
+`--vulkan-route-o` stay off by default; the fallbacks stay. Recorded as ADR-019
+amendment 4. Next: the GPU attention investigation (§19).

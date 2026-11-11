@@ -1,19 +1,19 @@
 # QUBIVEX Implementation Status
 
-Last updated: 2026-11-11
+Last updated: 2026-11-12
 
 ## Current phase
-**Vulkan Step 3c: the O projection and FFN norm in the routed submission (2026-11-12, branch `vulkan-step3c-onorm`; for review).** See docs/engineering/VULKAN_EXECUTION_AUDIT.md §18.
+**Vulkan Step 3c: the O projection and FFN norm in the routed submission (2026-11-12, PR #59; accepted by the owner 2026-11-12; ADR-019 amendment 4).** See docs/engineering/VULKAN_EXECUTION_AUDIT.md §18.
 - Built behind `--vulkan-route-o on|off` (default off; needs `--vulkan-route on`): the attention output projection (a fused entry), the residual and the FFN RMSNorm (`resnorm.comp`, the CPU's 64-lane sum of squares, `1 / sqrt(ss / n + eps)`) at the head of Step 3b's routed submission: two submissions per MoE layer. `rms_norm` moved into `qubivex-compute::math` unchanged. Step 3b is the fallback.
 - Parity: the scale on the device equals the CPU for every f32 input at six (n, eps) shapes (6 × 2³², 0 differences outside subnormals and NaN payloads), so MoltenVK's `sqrt` is correctly rounded here; the whole layer with its prelude bit for bit for every dtype pairing and OLMoE's shape; sim and Vulkan fixtures, concurrent, and real OLMoE (the CPU's logits, Colibri's tokens). Positive controls (`inversesqrt`, another tree, reordered multiplies, the norm before the residual) fail.
 - Measured on mains, alternated with Step 1a and Step 3b (audit §18.9): decode 30.93–31.13 → **28.95–29.18 ms/token (32.1–32.3 → 34.3–34.5 tok/s)**, submissions 49 → 33, prefill unchanged, concurrent +6.6% / +4.7% / +2.4% / +1.8% at 1 / 2 / 4 / 8 sequences, tokens identical everywhere. All gates pass; 35 tok/s not reached.
-- Next: owner review (Steps 3b and 3c acceptance and defaults, the ADR-019 amendment), then attention on the device.
+- Decided 2026-11-12: Steps 3b and 3c accepted; `--vulkan-route` and `--vulkan-route-o` stay off by default; Step 3a and the CPU backend stay the fallbacks (ADR-019 amendment 4). Next: the GPU attention investigation, on its own branch.
 
-**Vulkan Step 3b: routing in the expert submission (2026-11-11, branch `vulkan-step3b`, not pushed; for review).** See docs/engineering/VULKAN_EXECUTION_AUDIT.md §17.
+**Vulkan Step 3b: routing in the expert submission (2026-11-11, PR #58; accepted by the owner 2026-11-12; ADR-019 amendment 4).** See docs/engineering/VULKAN_EXECUTION_AUDIT.md §17.
 - Built behind `--vulkan-route on|off` (default off): router, softmax top-k (one workgroup per token, sums sequential), the routed experts' fused block (entry-major, expert index → arena slot through per-layer table templates) and the rank-order combine in one submission. Only with a fully provisioned device expert cache; the provider holds the layer quietly and records the same uses as Step 3a afterwards. Step 3a is the fallback and unchanged (`swiglu.spv`, `matmul*.spv` byte-identical).
 - Parity: route bit for bit against `math::route` (adversarial and 1 M+ random tokens; NaN tokens by NaN-ness), the whole layer against the CPU for every dtype pairing and OLMoE's shape, real OLMoE's CPU logits and Colibri's tokens with every layer routed; positive controls fail.
 - Measured on mains, alternated with Step 1a and Step 3a (audit §17.14): decode 33.06–33.15 → **30.82–31.28 ms/token (30.2 → 32.0–32.5 tok/s)**, submissions 65 → 49, prefill unchanged, concurrent +6.3% / +4.7% / +4.2% / +4.2% at 1 / 2 / 4 / 8 sequences, tokens identical everywhere. All gates pass; 35 tok/s not reached.
-- Next: owner review (acceptance, default on or off). §17.9 is built as Step 3c (above).
+- Accepted 2026-11-12, default off (ADR-019 amendment 4). §17.9 is built as Step 3c (above).
 
 **Vulkan Step 3a: the expert block in one submission (2026-11-11, branch `vulkan-step3a`; accepted by the owner 2026-11-11; ADR-019 amendment 3).** See docs/engineering/VULKAN_EXECUTION_AUDIT.md §16.
 - Built: a generic gated-FFN block op chosen by shape (`fuses_gated_ffn`), the device expert cache in two fixed-slot arenas, a fused matmul entry (same body; `matmul.spv` byte-identical) and SwiGLU on the device (built -O0), one command buffer per layer's experts. `--vulkan-fuse-rows N` (default 8, 0 off).
