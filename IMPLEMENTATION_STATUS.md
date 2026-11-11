@@ -13,7 +13,7 @@ Last updated: 2026-11-11
   - Host submit work is about 18 µs per submission.
   - So the round trips bind, not the kernels.
 - Step 1a (bulk copies) committed: neutral end to end. 1b and the other per-call clean-ups skipped (owner, 2026-11-11).
-- Next: Step 2 (grouped experts), estimate ≈ 32 tok/s; 37 is a target, not an expectation.
+- Step 2 (grouped experts) built (`c2a114a`, experiment `6c8b691`): 81 submissions per decode step instead of 305, same tokens, all tests pass. Battery diagnostic only: **slower** (35.9 → 37.3–38.3 ms), because grouping adds 3.2–3.5 ms of GPU time (dispatches in one command buffer serialise, while separate threads' command buffers overlap) and the expert hand-offs were already mostly hidden. Not accepted; owner to choose revert / keep off / investigate (audit §12).
 
 **Vulkan kernel speed (2026-11-11; ADR-019 amendment 1, accepted 2026-11-11).** Decode on MoltenVK 4.2x faster with the same bits.
 - Shader: Q4_K, Q6_K and Q8_0 decode a block at a time (scales once per block, each byte once for all the weights it holds); a Q4_K header is read as four words. No `precise`: `shaders/build.sh` marks every add, subtract and `fma` `NoContraction`, because SPIRV-Cross turned every `precise` multiply into an unoptimised helper call. Q4_K's `t - m` is `fma(t, 1, -m)` with `t` kept rounded by an integer OR.

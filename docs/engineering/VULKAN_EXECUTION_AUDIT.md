@@ -674,3 +674,94 @@ What can and cannot be monitored on this device:
   - Σ and busy per token;
   - per stage in the kernel test.
 - Memory traffic is computed: weight bytes per stage divided by GPU time.
+
+### Step 2 results so far (2026-11-11): grouping adds GPU time; not accepted
+
+Built: `c2a114a` (grouped experts) and `6c8b691` (the `QUBIVEX_VK_PARTS`
+experiment, default 1, which is today's behaviour). Each reverts on its own.
+
+Correctness:
+- With every expert resident, a decode step is 81 submissions (5 per layer plus the
+  head) against 305.
+- The tokens match the PR #55 reference.
+- Every test passes:
+  - the workspace (544);
+  - the Vulkan parity tests;
+  - `tests/vulkan.rs` with the real OLMoE (CPU prompt logits, Colibri tokens);
+  - a new test that resident experts take two submissions, a small RAM cache takes the
+    per-expert path, and the bits match either way.
+
+**Kernel test** (`parity.rs`, `grouped_experts`, mains not required: a guide only).
+Columns: wall ms per layer, host submit ms, then GPU busy ms from timestamps.
+- A is today's shape: one thread per expert, at most 5 at once.
+- B is grouped.
+- The bits are identical in every shape.
+
+| experts × tokens | A wall | B wall | A submit | B submit | A GPU | B GPU |
+|---|---|---|---|---|---|---|
+| 1 × 1 | 0.51–0.64 | 0.46–0.49 | 0.04 | 0.04 | 0.18–0.21 | 0.15–0.16 |
+| 2 × 1 | 0.52–0.55 | 0.57–0.59 | 0.10 | 0.03 | 0.24 | 0.25 |
+| 4 × 1 | 0.68–0.70 | 0.82–0.85 | 0.27 | 0.03 | 0.39–0.41 | 0.50 |
+| 8 × 1 | 1.41–1.44 | 1.36–1.39 | 0.56 | 0.04 | 0.78–0.83 | 0.98–1.00 |
+| 8 × 4 | 3.63–3.65 | 3.69–3.70 | 0.54 | 0.04–0.05 | 2.86–2.88 | 3.21–3.22 |
+| 8 × 10 | 8.28 | 8.29 | 0.55 | 0.04 | 7.47 | 7.72 |
+| 8 × 32 | 25.08 | 25.06 | 0.59 | 0.05 | 24.09 | 24.42 |
+
+What the kernel test shows:
+- Grouping cuts host submit time by 10–14× at 8 experts.
+- It also costs about 20–25% more GPU time at 4–8 experts with 1 token.
+- Several things changed nothing:
+  - `MVK_CONFIG_USE_MTLHEAP` (untracked resources);
+  - spreading the ops over up to 16 command buffers in one `VkSubmitInfo`;
+  - a single 24 576-row dispatch of the same bytes, which was slower still
+    (1.67 ms, about 17 GB/s).
+- One `VkSubmitInfo` per command buffer (still one fence) recovered some wall time at
+  8 × 1 (1.26–1.31 ms). GPU time did not move (0.95–0.99).
+- MoltenVK 1.4.2 exposes one queue per family and no concurrent-dispatch setting.
+
+**End-to-end diagnostic (battery: not records).** The Mac was on battery, so these
+are single 32-token runs, run back to back, for attribution only. No throughput is
+claimed from them.
+
+| | ms/token (untimed) | GPU busy (timed) | GPU idle (timed) | submissions |
+|---|---|---|---|---|
+| base (Step 1a) | 35.89 | 19.59 | 19.25 | 305 |
+| B, 1 command buffer | 38.27 | 23.06 | 17.87 | 81 |
+| B, 8 `VkSubmitInfo`s | 37.34 | 22.75 | 16.29 | 81 |
+
+Reading:
+1. **Grouping adds 3.2–3.5 ms of GPU execution per token.** The kernel test predicted
+   this: 16 layers × about 0.2 ms.
+   - Dispatches in one command buffer run one after another.
+   - Command buffers from separate threads evidently overlap on the GPU.
+   - The busy union cannot see that overlap: MoltenVK's timestamps bracket each command
+     buffer, and the queue reports them as serial.
+   - The finding "submissions never overlap on the GPU" (§10, item 1) therefore holds
+     for the timestamp intervals only. It is not evidence that the GPU executed them one
+     at a time.
+2. **Idle fell by only 1–3 ms, against the 4.5 ms estimated.** The 5 expert threads
+   were already hiding most of the expert-stage hand-offs: while one thread runs
+   SwiGLU on the host, another's command buffer runs.
+   - Per-gap arithmetic is valid for the serial dense hand-offs (3 per layer plus the
+     head).
+   - It is not valid for the expert stages.
+   - That is the overlap the reconciliation above could not separate.
+3. **The net result is slower end to end.** The owner's condition, "no GPU execution
+   penalty", is not met, so Step 2 as built is not accepted.
+
+Options (owner to choose; nothing further is built until then):
+- **(a) Revert** `c2a114a` and `6c8b691`. Back to Step 1a exactly.
+- **(b) Keep the mechanism, off for Vulkan.** `groups_matmuls()` returns `false` for
+  Vulkan (or for every device), and the parts experiment goes.
+  - The grouped provider path and its tests remain for Step 3, where a whole layer is
+    one submission anyway, and the same GPU-concurrency question has to be answered
+    there.
+- **(c) Investigate the GPU penalty first.**
+  - It decides Step 3 as well: a layer in one command buffer serialises its dispatches
+    the same way.
+  - Candidates: a grouped-dispatch shader that keeps several independent matrices in
+    flight in one dispatch (variant C, with work interleaved across matrices rather
+    than one giant matrix); or measuring under Xcode's Metal capture, to see the real
+    overlap and the per-dispatch tail.
+- The formal mains-power, alternated records are still owed for whichever option
+  ships. They were not run because the machine was on battery.
