@@ -531,6 +531,11 @@ pub(crate) struct DeviceArgs {
     /// at most --vulkan-fuse-rows tokens when the device expert cache holds every expert.
     #[arg(long, value_name = "on|off")]
     vulkan_route: Option<String>,
+    /// With --backend vulkan and --vulkan-route on: put each routed layer's attention
+    /// output projection, residual and FFN norm in the same submission (on|off, default
+    /// off), so a MoE layer is two submissions instead of three.
+    #[arg(long, value_name = "on|off")]
+    vulkan_route_o: Option<String>,
     /// With a discrete device: an explicit VRAM budget, for example 6GiB; replaces the
     /// profile's fraction of the device's memory.
     #[arg(long)]
@@ -563,19 +568,25 @@ impl DeviceArgs {
                 || self.vulkan_vram.is_some()
                 || self.vulkan_timestamps
                 || self.vulkan_fuse_rows.is_some()
-                || self.vulkan_route.is_some())
+                || self.vulkan_route.is_some()
+                || self.vulkan_route_o.is_some())
         {
             return Err(
-                "--vulkan-device, --vulkan-vram, --vulkan-timestamps, --vulkan-fuse-rows and \
-                 --vulkan-route need --backend vulkan"
+                "--vulkan-device, --vulkan-vram, --vulkan-timestamps, --vulkan-fuse-rows, \
+                 --vulkan-route and --vulkan-route-o need --backend vulkan"
                     .to_owned(),
             );
         }
-        let route = match self.vulkan_route.as_deref() {
-            None | Some("off") => false,
-            Some("on") => true,
-            Some(other) => return Err(format!("--vulkan-route {other:?}: use on or off")),
+        let on_off = |flag: &str, v: Option<&str>| match v {
+            None | Some("off") => Ok(false),
+            Some("on") => Ok(true),
+            Some(other) => Err(format!("{flag} {other:?}: use on or off")),
         };
+        let route = on_off("--vulkan-route", self.vulkan_route.as_deref())?;
+        let route_o = on_off("--vulkan-route-o", self.vulkan_route_o.as_deref())?;
+        if route_o && !route {
+            return Err("--vulkan-route-o on needs --vulkan-route on".to_owned());
+        }
         let vulkan = qubivex_runtime::VulkanConfig {
             device: self.vulkan_device,
             capacity: self
@@ -587,6 +598,7 @@ impl DeviceArgs {
             timestamps: self.vulkan_timestamps,
             fuse_rows: self.vulkan_fuse_rows,
             route,
+            route_o,
         };
         let sim = backend == qubivex_runtime::BackendKind::Sim;
         if !sim && (self.sim_vram.is_some() || self.sim_bandwidth.is_some() || self.sim_delay) {
