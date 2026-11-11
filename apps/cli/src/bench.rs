@@ -17,7 +17,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use qubivex_core::Bytes;
 use qubivex_hardware::{CpuInfo, Host, MemoryInfo, OperatingSystem, Probed};
 use qubivex_model::{ArchitectureRegistry, find};
-use qubivex_runtime::{Engine, Logits};
+use qubivex_runtime::{Engine, Logits, TransferStats};
 use serde::{Deserialize, Serialize};
 
 use crate::models::roots;
@@ -65,6 +65,10 @@ pub(crate) struct Record {
     decode: Decode,
     memory: Memory,
     experts: Experts,
+    /// A discrete device's submissions, waits, copies and GPU time during the measured
+    /// runs; absent on the CPU and Metal (and before 2026-11-11).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    device: Option<DeviceRecord>,
     check: Check,
     runs: Vec<RunSummary>,
     /// Greedy tokens of the first measured run (prefill's token first); a later
@@ -216,6 +220,75 @@ struct Decode {
     tok_s_at_median: f64,
     /// Decode tokens per second of each run (steps over their summed time).
     run_tok_s: Vec<f64>,
+}
+
+/// A discrete device's work per step, averaged over the measured runs: a prefill step
+/// is the whole prompt pass, a decode step one token.
+#[derive(Debug, Serialize, Deserialize)]
+struct DeviceRecord {
+    /// Whether GPU time was measured (`--vulkan-timestamps`); without it the GPU
+    /// fields are absent.
+    gpu_timed: bool,
+    prefill: DevicePhase,
+    decode: DevicePhase,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct DevicePhase {
+    /// Steps measured.
+    steps: usize,
+    /// Wall time per step, as the step timings measure it.
+    wall_ms: f64,
+    /// Submissions per step, and the fence waits among them (submissions with work).
+    submissions: f64,
+    fence_waits: f64,
+    /// Host time preparing and submitting, and blocked on fences, summed over the
+    /// threads that submit (concurrent submissions overlap, so these can exceed wall).
+    submit_ms: f64,
+    wait_ms: f64,
+    /// Host time copying activations in and out.
+    copy_ms: f64,
+    /// Activation bytes in and out, and weight uploads (device cache misses).
+    bytes_in: f64,
+    bytes_out: f64,
+    uploads: f64,
+    upload_bytes: f64,
+    /// GPU time summed over submissions, the time the GPU was busy (their union), and
+    /// wall time minus that; only when timed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    gpu_ms: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    gpu_busy_ms: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    gpu_idle_ms: Option<f64>,
+}
+
+impl DevicePhase {
+    #[allow(clippy::cast_precision_loss)]
+    fn of(stats: &[TransferStats], wall: Duration, steps: usize, timed: bool) -> Self {
+        let n = steps.max(1) as f64;
+        let sum = |f: fn(&TransferStats) -> u64| stats.iter().map(f).sum::<u64>() as f64;
+        let per = |f: fn(&TransferStats) -> u64| sum(f) / n;
+        let ms_per = |f: fn(&TransferStats) -> u64| sum(f) / 1e6 / n;
+        let wall_ms = ms(wall) / n;
+        let busy = ms_per(|t| t.gpu_busy_ns);
+        Self {
+            steps,
+            wall_ms,
+            submissions: per(|t| t.submissions),
+            fence_waits: per(|t| t.fence_waits),
+            submit_ms: ms_per(|t| t.submit_ns),
+            wait_ms: ms_per(|t| t.wait_ns),
+            copy_ms: ms_per(|t| t.transfer_ns),
+            bytes_in: per(|t| t.activations_in),
+            bytes_out: per(|t| t.activations_out),
+            uploads: per(|t| t.uploads),
+            upload_bytes: per(|t| t.upload_bytes),
+            gpu_ms: timed.then(|| ms_per(|t| t.gpu_ns)),
+            gpu_busy_ms: timed.then_some(busy),
+            gpu_idle_ms: timed.then(|| (wall_ms - busy).max(0.0)),
+        }
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -398,6 +471,8 @@ struct Sample {
     prefill: Duration,
     steps: Vec<Duration>,
     tokens: Vec<u32>,
+    /// A discrete device's counters over the prefill pass and over the decode steps.
+    device: Option<(TransferStats, TransferStats)>,
 }
 
 fn ms(d: Duration) -> f64 {
@@ -416,12 +491,15 @@ fn argmax(logits: &[f32]) -> u32 {
 }
 
 fn one_run(engine: &Engine, prompt: &[u32], generated: usize) -> Result<Sample, String> {
+    let transfers = || engine.device_report().map(|r| r.transfers);
     let mut cache = engine.new_cache();
+    let start = transfers();
     let t = Instant::now();
     let logits = engine
         .forward(prompt, &mut cache, Logits::Last, None)
         .map_err(|e| chain(&e))?;
     let prefill = t.elapsed();
+    let after_prefill = transfers();
     let mut next = argmax(&logits);
     let mut tokens = Vec::with_capacity(generated);
     let mut steps = Vec::with_capacity(generated.saturating_sub(1));
@@ -435,11 +513,17 @@ fn one_run(engine: &Engine, prompt: &[u32], generated: usize) -> Result<Sample, 
         next = argmax(&logits);
         tokens.push(next);
     }
+    let end = transfers();
     engine.end_turn();
+    let device = match (start, after_prefill, end) {
+        (Some(a), Some(b), Some(c)) => Some((b.since(&a), c.since(&b))),
+        _ => None,
+    };
     Ok(Sample {
         prefill,
         steps,
         tokens,
+        device,
     })
 }
 
@@ -672,6 +756,7 @@ pub(crate) fn bench(a: &BenchArgs<'_>) -> Result<String, String> {
             }
         })
         .collect();
+    let device = device_record(&samples);
     let prefill = Stats::of(&prefill_ms).ok_or("no measured runs")?;
     let step_ms = Stats::of(&all_steps);
     let tokens = first.unwrap_or_default();
@@ -775,6 +860,7 @@ pub(crate) fn bench(a: &BenchArgs<'_>) -> Result<String, String> {
                 .zip(prefetch_after)
                 .map(|(b, a)| prefetch_record(b, a)),
         },
+        device,
         check: Check {
             deterministic: first_divergence.is_none(),
             first_divergence,
@@ -800,6 +886,51 @@ pub(crate) fn bench(a: &BenchArgs<'_>) -> Result<String, String> {
         ));
     }
     Ok(if a.json { json } else { render(&record) })
+}
+
+/// The device's work over the measured runs, if the engine has a discrete device.
+fn device_record(samples: &[Sample]) -> Option<DeviceRecord> {
+    let pairs: Vec<(TransferStats, TransferStats)> =
+        samples.iter().map(|s| s.device).collect::<Option<_>>()?;
+    if pairs.is_empty() {
+        return None;
+    }
+    let (pre, dec): (Vec<_>, Vec<_>) = pairs.into_iter().unzip();
+    let timed = pre.iter().chain(&dec).any(|t| t.timed > 0);
+    let prefill_wall = samples.iter().map(|s| s.prefill).sum();
+    let decode_wall = samples.iter().flat_map(|s| &s.steps).sum();
+    let decode_steps = samples.iter().map(|s| s.steps.len()).sum();
+    Some(DeviceRecord {
+        gpu_timed: timed,
+        prefill: DevicePhase::of(&pre, prefill_wall, samples.len(), timed),
+        decode: DevicePhase::of(&dec, decode_wall, decode_steps, timed),
+    })
+}
+
+// Byte averages are whole numbers of floats per step, far below 2^53.
+#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+fn render_device(s: &mut String, d: &DeviceRecord) {
+    use std::fmt::Write;
+    for (name, p) in [("prefill", &d.prefill), ("decode", &d.decode)] {
+        let gpu = match (p.gpu_ms, p.gpu_busy_ms, p.gpu_idle_ms) {
+            (Some(g), Some(b), Some(i)) => {
+                format!("; GPU {g:.2} ms summed, busy {b:.2} ms, idle {i:.2} ms")
+            }
+            _ => "; GPU not timed (--vulkan-timestamps)".to_owned(),
+        };
+        let _ = writeln!(
+            s,
+            "  device    {name} per step: {:.1} submissions ({:.1} waits), wall {:.2} ms, submit {:.2} ms, wait {:.2} ms, copies {:.2} ms, {} in, {} out{gpu}",
+            p.submissions,
+            p.fence_waits,
+            p.wall_ms,
+            p.submit_ms,
+            p.wait_ms,
+            p.copy_ms,
+            Bytes(p.bytes_in as u64),
+            Bytes(p.bytes_out as u64),
+        );
+    }
 }
 
 fn known<T: std::fmt::Display>(p: &Probed<T>) -> String {
@@ -931,6 +1062,9 @@ fn render(r: &Record) -> String {
             p.wasted_bytes,
             p.cancelled
         );
+    }
+    if let Some(d) = &r.device {
+        render_device(&mut s, d);
     }
     let k = &r.check;
     let reference = match (k.reference_match, k.reference_divergence) {

@@ -158,6 +158,8 @@ pub(crate) struct Shared {
     queue_family: u32,
     memory: vk::PhysicalDeviceMemoryProperties,
     pub(crate) limits: vk::PhysicalDeviceLimits,
+    /// The valid bits of the queue's timestamps; 0 when it has none.
+    timestamp_mask: u64,
     set_layout: vk::DescriptorSetLayout,
     layout: vk::PipelineLayout,
     pipelines: Vec<vk::Pipeline>,
@@ -422,6 +424,12 @@ impl Shared {
                     .position(|q| q.queue_flags.contains(vk::QueueFlags::COMPUTE))
             })
             .ok_or_else(|| err("device", format!("{} has no compute queue", info.name)))?;
+        let valid_bits = queues[family].timestamp_valid_bits;
+        let timestamp_mask = match valid_bits {
+            0 => 0,
+            64.. => u64::MAX,
+            b => (1u64 << b) - 1,
+        };
         let family = u32::try_from(family).map_err(|e| err("queue family", e))?;
         let mut names = Vec::new();
         // Required wherever it is listed (MoltenVK).
@@ -457,6 +465,7 @@ impl Shared {
             queue_family: family,
             memory,
             limits: props.limits,
+            timestamp_mask,
             set_layout,
             layout,
             pipelines,
@@ -718,6 +727,60 @@ pub(crate) struct Counters {
     activations_out: AtomicU64,
     submissions: AtomicU64,
     transfer_ns: AtomicU64,
+    fence_waits: AtomicU64,
+    submit_ns: AtomicU64,
+    wait_ns: AtomicU64,
+    timed: AtomicU64,
+    gpu_ns: AtomicU64,
+    busy: Mutex<Busy>,
+}
+
+/// The union of GPU busy intervals, in device nanoseconds.
+///
+/// Concurrent submissions finish out of order, so intervals arrive a little out of
+/// order. The most recent [`Busy::WINDOW`] are kept, and the older half is folded
+/// into the total, in start order, once the window is full. This is exact while no
+/// interval arrives more than half a window late; at most [`crate::SUBMITTERS`] can be
+/// in flight, far fewer than that.
+#[derive(Debug, Default)]
+struct Busy {
+    pending: Vec<(u64, u64)>,
+    /// The end of the folded intervals' union.
+    frontier: u64,
+    folded_ns: u64,
+}
+
+impl Busy {
+    const WINDOW: usize = 64;
+
+    /// Adds `[start, end)` to the union `(frontier, total)`.
+    fn fold(frontier: &mut u64, total: &mut u64, (start, end): (u64, u64)) {
+        if end > *frontier {
+            *total += end - start.max(*frontier);
+            *frontier = end;
+        }
+    }
+
+    fn add(&mut self, interval: (u64, u64)) {
+        self.pending.push(interval);
+        if self.pending.len() >= Self::WINDOW {
+            self.pending.sort_unstable();
+            let old: Vec<_> = self.pending.drain(..Self::WINDOW / 2).collect();
+            for i in old {
+                Self::fold(&mut self.frontier, &mut self.folded_ns, i);
+            }
+        }
+    }
+
+    fn total(&self) -> u64 {
+        let mut pending = self.pending.clone();
+        pending.sort_unstable();
+        let (mut frontier, mut total) = (self.frontier, self.folded_ns);
+        for i in pending {
+            Self::fold(&mut frontier, &mut total, i);
+        }
+        total
+    }
 }
 
 impl Counters {
@@ -760,6 +823,25 @@ impl Counters {
         }
     }
 
+    /// Counts one completed matmul submission.
+    fn ran(&self, prepared: Instant, ran: &Ran) {
+        let ns = |d: std::time::Duration| u64::try_from(d.as_nanos()).unwrap_or(u64::MAX);
+        self.fence_waits.fetch_add(1, Ordering::Relaxed);
+        self.submit_ns.fetch_add(
+            ns(ran.submitted.saturating_duration_since(prepared)),
+            Ordering::Relaxed,
+        );
+        self.wait_ns.fetch_add(ran.wait_ns, Ordering::Relaxed);
+        if let Some((start, end)) = ran.gpu {
+            self.timed.fetch_add(1, Ordering::Relaxed);
+            self.gpu_ns.fetch_add(end - start, Ordering::Relaxed);
+            self.busy
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .add((start, end));
+        }
+    }
+
     pub(crate) fn transfers(&self) -> TransferStats {
         TransferStats {
             uploads: self.uploads.load(Ordering::Relaxed),
@@ -768,6 +850,16 @@ impl Counters {
             activations_out: self.activations_out.load(Ordering::Relaxed),
             submissions: self.submissions.load(Ordering::Relaxed),
             transfer_ns: self.transfer_ns.load(Ordering::Relaxed),
+            fence_waits: self.fence_waits.load(Ordering::Relaxed),
+            submit_ns: self.submit_ns.load(Ordering::Relaxed),
+            wait_ns: self.wait_ns.load(Ordering::Relaxed),
+            timed: self.timed.load(Ordering::Relaxed),
+            gpu_ns: self.gpu_ns.load(Ordering::Relaxed),
+            gpu_busy_ns: self
+                .busy
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .total(),
         }
     }
 }
@@ -775,6 +867,16 @@ impl Counters {
 /// A weight allocation's state inside a [`DeviceBuffer`].
 pub(crate) struct WeightBuffer {
     alloc: Allocation,
+}
+
+/// One completed submission's timing.
+pub(crate) struct Ran {
+    /// When `vkQueueSubmit` returned.
+    submitted: Instant,
+    /// Host time blocked on the fence.
+    wait_ns: u64,
+    /// GPU start and end, in device nanoseconds, when timed.
+    gpu: Option<(u64, u64)>,
 }
 
 /// The command pool, fence, descriptor pool, and reusable host buffers.
@@ -785,6 +887,8 @@ pub(crate) struct Submitter {
     fence: vk::Fence,
     descriptors: vk::DescriptorPool,
     sets: u32,
+    /// Two timestamp queries (start, end), when submissions are timed.
+    queries: Option<vk::QueryPool>,
     staging: Option<Allocation>,
     xs: Option<Allocation>,
     ys: Option<Allocation>,
@@ -799,6 +903,9 @@ impl Drop for Submitter {
         // buffer is freed with its pool.
         unsafe {
             let d = &self.shared.device;
+            if let Some(q) = self.queries {
+                d.destroy_query_pool(q, None);
+            }
             d.destroy_descriptor_pool(self.descriptors, None);
             d.destroy_fence(self.fence, None);
             d.destroy_command_pool(self.pool, None);
@@ -823,7 +930,7 @@ fn descriptor_pool(d: &ash::Device, sets: u32) -> Result<vk::DescriptorPool, Com
 }
 
 impl Submitter {
-    pub(crate) fn new(shared: &Arc<Shared>) -> Result<Self, ComputeError> {
+    pub(crate) fn new(shared: &Arc<Shared>, timestamps: bool) -> Result<Self, ComputeError> {
         let d = &shared.device;
         // SAFETY: each create-info is valid for its call; objects created before a
         // failure are destroyed.
@@ -858,6 +965,23 @@ impl Submitter {
                     return Err(cleanup(e));
                 }
             };
+            let queries = if timestamps && shared.timestamp_mask != 0 {
+                match d.create_query_pool(
+                    &vk::QueryPoolCreateInfo::default()
+                        .query_type(vk::QueryType::TIMESTAMP)
+                        .query_count(2),
+                    None,
+                ) {
+                    Ok(q) => Some(q),
+                    Err(e) => {
+                        d.destroy_descriptor_pool(descriptors, None);
+                        d.destroy_fence(fence, None);
+                        return Err(cleanup(err("query pool", e)));
+                    }
+                }
+            } else {
+                None
+            };
             Ok(Self {
                 shared: Arc::clone(shared),
                 pool,
@@ -865,6 +989,7 @@ impl Submitter {
                 fence,
                 descriptors,
                 sets: 64,
+                queries,
                 staging: None,
                 xs: None,
                 ys: None,
@@ -887,13 +1012,19 @@ impl Submitter {
         slot.as_mut().ok_or_else(|| err("host buffer", "missing"))
     }
 
+    /// Whether this submitter times its submissions on the GPU.
+    pub(crate) const fn timed(&self) -> bool {
+        self.queries.is_some()
+    }
+
     /// Records with `record`, submits, and waits.
     fn run(
         &mut self,
         record: impl FnOnce(&ash::Device, vk::CommandBuffer),
-    ) -> Result<(), ComputeError> {
+    ) -> Result<Ran, ComputeError> {
         let d = &self.shared.device;
         let cmds = [self.cmd];
+        let queries = self.queries;
         // SAFETY: the command buffer is not in flight (the last submission was waited
         // for), its pool allows reset, and the queue is externally synchronised by the
         // queue lock.
@@ -906,7 +1037,14 @@ impl Submitter {
                     .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT),
             )
             .map_err(|e| err("begin", e))?;
+            if let Some(q) = queries {
+                d.cmd_reset_query_pool(self.cmd, q, 0, 2);
+                d.cmd_write_timestamp(self.cmd, vk::PipelineStageFlags::TOP_OF_PIPE, q, 0);
+            }
             record(d, self.cmd);
+            if let Some(q) = queries {
+                d.cmd_write_timestamp(self.cmd, vk::PipelineStageFlags::BOTTOM_OF_PIPE, q, 1);
+            }
             d.end_command_buffer(self.cmd).map_err(|e| err("end", e))?;
             let submit = [vk::SubmitInfo::default().command_buffers(&cmds)];
             {
@@ -918,10 +1056,40 @@ impl Submitter {
                 d.queue_submit(self.shared.queue, &submit, self.fence)
                     .map_err(|e| err("submit", e))?;
             }
+            let submitted = Instant::now();
             let waited = d.wait_for_fences(&[self.fence], true, u64::MAX);
+            let wait_ns = u64::try_from(submitted.elapsed().as_nanos()).unwrap_or(u64::MAX);
             d.reset_fences(&[self.fence])
                 .map_err(|e| err("fence reset", e))?;
-            waited.map_err(|e| err("wait", e))
+            waited.map_err(|e| err("wait", e))?;
+            let gpu = match queries {
+                None => None,
+                Some(q) => {
+                    let mut t = [0u64; 2];
+                    // The fence has signalled, so both results are available.
+                    d.get_query_pool_results(
+                        q,
+                        0,
+                        &mut t,
+                        vk::QueryResultFlags::TYPE_64 | vk::QueryResultFlags::WAIT,
+                    )
+                    .map_err(|e| err("timestamps", e))?;
+                    let period = f64::from(self.shared.limits.timestamp_period);
+                    #[allow(
+                        clippy::cast_possible_truncation,
+                        clippy::cast_sign_loss,
+                        clippy::cast_precision_loss
+                    )]
+                    let ns = |v: u64| ((v & self.shared.timestamp_mask) as f64 * period) as u64;
+                    let (start, end) = (ns(t[0]), ns(t[1]));
+                    Some((start, end.max(start)))
+                }
+            };
+            Ok(Ran {
+                submitted,
+                wait_ns,
+                gpu,
+            })
         }
     }
 
@@ -970,7 +1138,7 @@ impl Submitter {
             bytes[..real].copy_from_slice(&host[from..from + real]);
             bytes[real..usize::try_from(n).unwrap_or(0)].fill(0);
             let (src, dbuf) = (stage.buffer, dst.buffer);
-            self.run(|d, cmd| {
+            let _ = self.run(|d, cmd| {
                 let region = [vk::BufferCopy::default()
                     .src_offset(0)
                     .dst_offset(done)
@@ -1120,6 +1288,7 @@ impl Submitter {
             .fetch_add(4 * xn as u64, Ordering::Relaxed);
 
         // Descriptor sets, one per op.
+        let prepared = Instant::now();
         let d = &shared.device;
         let count = u32::try_from(plan.len()).map_err(|e| err("ops", e))?;
         if count > self.sets {
@@ -1178,7 +1347,7 @@ impl Submitter {
         }
 
         let (layout, pipelines) = (shared.layout, shared.pipelines.clone());
-        self.run(|d, cmd| {
+        let ran = self.run(|d, cmd| {
             // SAFETY: recording into a command buffer in the recording state, with
             // objects that outlive the submission (it is waited for in `run`).
             unsafe {
@@ -1219,6 +1388,7 @@ impl Submitter {
                 );
             }
         })?;
+        counters.ran(prepared, &ran);
 
         // Outputs back.
         let start = Instant::now();
@@ -1243,4 +1413,40 @@ impl Submitter {
 /// leaves no submission in flight: `run` waits before it can return or unwind).
 pub(crate) fn lock(m: &Mutex<Submitter>) -> MutexGuard<'_, Submitter> {
     m.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Busy;
+
+    /// The union against a direct computation, with intervals arriving out of order
+    /// (up to a few late, as concurrent submissions finish) across several folds.
+    #[test]
+    fn busy_is_the_union_of_intervals() {
+        let mut want = Vec::new();
+        for i in 0u64..500 {
+            // Overlapping pairs, gaps every fifth interval.
+            let start = i * 100 + if i % 5 == 0 { 30 } else { 0 };
+            want.push((start, start + 150));
+        }
+        let mut busy = Busy::default();
+        for chunk in want.chunks(4) {
+            for &iv in chunk.iter().rev() {
+                busy.add(iv);
+            }
+        }
+        let mut sorted = want.clone();
+        sorted.sort_unstable();
+        let (mut frontier, mut total) = (0, 0);
+        for iv in sorted {
+            Busy::fold(&mut frontier, &mut total, iv);
+        }
+        assert_eq!(busy.total(), total);
+        // A simple check of the arithmetic: [0, 10) and [5, 20) and [30, 40) cover 30.
+        let mut b = Busy::default();
+        for iv in [(30, 40), (0, 10), (5, 20)] {
+            b.add(iv);
+        }
+        assert_eq!(b.total(), 30);
+    }
 }

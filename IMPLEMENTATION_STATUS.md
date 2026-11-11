@@ -3,6 +3,10 @@
 Last updated: 2026-11-11
 
 ## Current phase
+**Vulkan submission plan, Step 0: measurement (2026-11-11, in progress, branch `vulkan-submission-audit`).** See docs/engineering/VULKAN_EXECUTION_AUDIT.md for the audit, the owner's decisions and the sequence.
+- Built: device counters and opt-in GPU timestamps (`--vulkan-timestamps`), and a per-phase `device` block in `qubivex bench` records. Behaviour is unchanged without the flag; the tests pass, timed runs included.
+- Not yet done: the mains-power records (untimed and timed, at 5 and 8 threads, plus a CPU record in the same session). A battery smoke run suggests GPU submissions never overlap and GPU busy is about 19 ms of a 35 ms token; unconfirmed.
+
 **Vulkan kernel speed (2026-11-11; ADR-019 amendment 1, accepted 2026-11-11).** Decode on MoltenVK 4.2x faster with the same bits.
 - Shader: Q4_K, Q6_K and Q8_0 decode a block at a time (scales once per block, each byte once for all the weights it holds); a Q4_K header is read as four words. No `precise`: `shaders/build.sh` marks every add, subtract and `fma` `NoContraction`, because SPIRV-Cross turned every `precise` multiply into an unoptimised helper call. Q4_K's `t - m` is `fma(t, 1, -m)` with `t` kept rounded by an integer OR.
 - Device: 8 submitters (own command buffer, fence and host buffers), the queue locked only around `vkQueueSubmit`, so a layer's experts overlap their round trips.

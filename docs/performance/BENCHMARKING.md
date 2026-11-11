@@ -140,6 +140,29 @@ pools are smaller than top-k, or any holds fewer than half its layer's experts,
 `--backend metal` runs the CPU pass, and the record's
 `config.device.fallback` says so. Measure prefill at several prompt lengths (`--prompt-tokens`): the token-tiled and grouped kernels switch on at 4 tokens and at 2 routed entries per expert. Results: ADR-011 amendments 1–6.
 
+### Discrete-device timings (`device` in the record)
+
+With `--backend vulkan` or `sim`, the record has a `device` block: per prefill pass and
+per decode token, averaged over the measured runs. It holds:
+- wall time
+- submissions and fence waits
+- host time preparing and submitting, and blocked on fences, summed over the threads
+  that submit, so these can exceed wall
+- activation copy time and bytes in and out
+- weight uploads (device-cache misses)
+
+`--vulkan-timestamps` adds GPU time from timestamp queries:
+- `gpu_ms`: summed per submission
+- `gpu_busy_ms`: the union of the submissions' intervals
+- `gpu_idle_ms`: wall minus busy
+
+Summed and busy are equal when submissions never overlap on the GPU.
+
+Timestamps are not free on MoltenVK: an unmeasured smoke run on battery went from
+35.2 to 41.5 ms per token with them on. So take tok/s from a run without
+`--vulkan-timestamps`, and GPU attribution from a run with it, back to back. Quote
+both records.
+
 ### How to read the numbers
 
 - **Report the median, and the P95 next to it.** A P95 far above the median means jitter

@@ -517,6 +517,10 @@ pub(crate) struct DeviceArgs {
     /// its largest device-local heap).
     #[arg(long)]
     vulkan_vram: Option<String>,
+    /// With --backend vulkan: time every submission on the GPU with timestamp
+    /// queries (for `bench`'s device timings; adds two timestamps per submission).
+    #[arg(long)]
+    vulkan_timestamps: bool,
     /// With a discrete device: an explicit VRAM budget, for example 6GiB; replaces the
     /// profile's fraction of the device's memory.
     #[arg(long)]
@@ -544,8 +548,15 @@ impl DeviceArgs {
             }
         };
         let vulkan = backend == qubivex_runtime::BackendKind::Vulkan;
-        if !vulkan && (self.vulkan_device.is_some() || self.vulkan_vram.is_some()) {
-            return Err("--vulkan-device and --vulkan-vram need --backend vulkan".to_owned());
+        if !vulkan
+            && (self.vulkan_device.is_some()
+                || self.vulkan_vram.is_some()
+                || self.vulkan_timestamps)
+        {
+            return Err(
+                "--vulkan-device, --vulkan-vram and --vulkan-timestamps need --backend vulkan"
+                    .to_owned(),
+            );
         }
         let vulkan = qubivex_runtime::VulkanConfig {
             device: self.vulkan_device,
@@ -555,6 +566,7 @@ impl DeviceArgs {
                 .map(plan::parse_bytes)
                 .transpose()?
                 .map(|b| b.0),
+            timestamps: self.vulkan_timestamps,
         };
         let sim = backend == qubivex_runtime::BackendKind::Sim;
         if !sim && (self.sim_vram.is_some() || self.sim_bandwidth.is_some() || self.sim_delay) {
@@ -873,10 +885,7 @@ fn memory_options(
         backend: qubivex_runtime::BackendKind::Cpu,
         metal_ops: qubivex_runtime::MetalOps::default(),
         sim: None,
-        vulkan: qubivex_runtime::VulkanConfig {
-            device: None,
-            capacity: None,
-        },
+        vulkan: qubivex_runtime::VulkanConfig::default(),
         vram_budget: None,
         io_threads,
         expert_io: if direct_io {

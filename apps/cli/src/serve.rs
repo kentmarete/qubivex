@@ -310,6 +310,7 @@ impl ServeFlags {
             sim_delay: false,
             vulkan_device: None,
             vulkan_vram: None,
+            vulkan_timestamps: false,
             vram_budget: None,
         };
         let profile = self

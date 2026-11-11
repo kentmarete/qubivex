@@ -444,3 +444,50 @@ architectural change, and nothing in it starts before amendment 2 is accepted.
 6. **Discipline.** Each optimisation is independent, benchmarked and revertible. The
    full bench is the authority. Targets: 30, then 35, then 43.5 tok/s. No claims from
    isolated shader timings.
+
+## 10. Step 0 status (2026-11-11)
+
+Built on branch `vulkan-submission-audit`:
+- `TransferStats` gains:
+  - `fence_waits`, `submit_ns`, `wait_ns`
+  - `timed`, `gpu_ns`, `gpu_busy_ns`
+  - `since()`
+- `VulkanConfig::timestamps` / `--vulkan-timestamps` adds a two-query timestamp pool
+  per submitter, read after the fence.
+- The busy union tolerates out-of-order arrival up to half a 64-interval window.
+- The bench record gains a per-phase `device` block (docs/performance/BENCHMARKING.md).
+
+Tests:
+- The Vulkan parity tests, now with a timed run checked bit for bit.
+- The union's unit test.
+- `tests/vulkan.rs`, including OLMoE.
+- The CLI tests.
+
+Behaviour is unchanged without the flag.
+
+**Smoke run, on battery, one run of 16 tokens: not a measurement.** It is recorded only
+to steer the mains run.
+
+| | Untimed | Timed |
+|---|---|---|
+| Decode step | 35.2 ms | 41.5 ms |
+| Submissions per token | 305 | 305 |
+| Host submit (summed) | 5.5 ms | 16.0 ms |
+| Host wait (summed) | 86 ms | 91 ms |
+| GPU summed | — | 19.3 ms |
+| GPU busy | — | 19.3 ms |
+| GPU idle | — | 22.1 ms |
+
+What the smoke run suggests, for the mains run to confirm or refute:
+1. **Submissions never overlap on the GPU** (summed = busy). The 8 submitters
+   overlap host work, not GPU work.
+2. **GPU busy (~19 ms) is well below the 34 ms kernel floor that §1.3 feared.** About
+   762 MB in 19.3 ms is ~39 GB/s, so the binding ceiling looks like the serial round
+   trips, not the kernels. If this holds, Steps 1–4 are aimed correctly.
+3. **Timestamps cost about 6 ms per token** here, mostly in host submit time. Tok/s
+   comes from untimed runs.
+
+Still to do for Step 0, on mains power:
+- untimed and timed records back to back, at the default 5 threads and at 8
+- a CPU record in the same session
+- commit them under `docs/performance/baselines/2026-11-1x-m3pro-vulkan-step0-*.json`

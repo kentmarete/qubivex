@@ -273,6 +273,7 @@ impl DiscreteDevice for SimDevice {
             activations_out: c.activations_out.load(Ordering::Relaxed),
             submissions: c.submissions.load(Ordering::Relaxed),
             transfer_ns: c.transfer_ns.load(Ordering::Relaxed),
+            ..TransferStats::default()
         }
     }
 }

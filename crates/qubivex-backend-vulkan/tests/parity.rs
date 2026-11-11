@@ -238,8 +238,8 @@ fn large_submissions_reuse_and_grow_their_buffers() {
 #[test]
 fn capacity_is_enforced_and_freed_on_drop() {
     let Some(dev) = open(VulkanConfig {
-        device: None,
         capacity: Some(1000),
+        ..VulkanConfig::default()
     }) else {
         return;
     };
@@ -315,6 +315,64 @@ fn transfers_are_counted() {
         (64, 32, 1)
     );
     assert!(t.transfer_ns > 0);
+    // One fenced matmul submission, timed on the host only (timestamps are opt-in).
+    assert_eq!(
+        (t.fence_waits, t.timed, t.gpu_ns, t.gpu_busy_ns),
+        (1, 0, 0, 0)
+    );
+    assert!(t.wait_ns > 0 && t.submit_ns > 0, "{t:?}");
+}
+
+/// With timestamps on, every matmul submission is timed on the GPU, the bits are
+/// unchanged, and the busy union is at most the sum (one submitter at a time here, so
+/// they are close) and at most the host's wait.
+#[test]
+fn timestamps_time_every_submission_without_changing_bits() {
+    let Some(dev) = open(VulkanConfig {
+        timestamps: true,
+        ..VulkanConfig::default()
+    }) else {
+        return;
+    };
+    if !dev.timestamps() {
+        eprintln!("the queue has no timestamps: skipped");
+        return;
+    }
+    let dtype = DType::Ggml(GgmlType::Q4_K);
+    let (rows, cols, s) = (64, 512, 3);
+    let host = weights(dtype, rows, cols, 9);
+    let wv = WeightView::new(dtype, rows, cols, &host).unwrap();
+    let dw = DeviceWeights::like(dev.upload(&host, None).unwrap(), 0, &wv).unwrap();
+    let xs = acts(s * cols, 4);
+    let want = cpu(dtype, rows, cols, &host, &xs, s);
+    let n = 5;
+    for _ in 0..n {
+        let mut ys = vec![0.0; s * rows];
+        dev.matmul_many(&mut [DeviceMatMul {
+            w: &dw,
+            xs: &xs,
+            s,
+            ys: &mut ys,
+        }])
+        .unwrap();
+        assert_bits(&ys, &want, "timed Q4_K");
+    }
+    let t = dev.transfers();
+    assert_eq!((t.fence_waits, t.timed), (n, n), "{t:?}");
+    assert!(t.gpu_ns > 0, "{t:?}");
+    assert!(t.gpu_busy_ns > 0 && t.gpu_busy_ns <= t.gpu_ns, "{t:?}");
+    assert!(t.gpu_busy_ns <= t.wait_ns + t.submit_ns, "{t:?}");
+    let before = t;
+    let mut ys = vec![0.0; s * rows];
+    dev.matmul_many(&mut [DeviceMatMul {
+        w: &dw,
+        xs: &xs,
+        s,
+        ys: &mut ys,
+    }])
+    .unwrap();
+    let d = dev.transfers().since(&before);
+    assert_eq!((d.submissions, d.fence_waits, d.timed), (1, 1, 1), "{d:?}");
 }
 
 #[test]
