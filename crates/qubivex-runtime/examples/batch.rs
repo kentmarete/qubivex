@@ -8,12 +8,13 @@
 //! ```text
 //! cargo run --release -p qubivex-runtime --example batch -- \
 //!     <MODEL_DIR> <TOKENIZER_JSON> [--cache-mb N] [--steps N] [--runs N] [--sizes 1,2,4,8] \
-//!     [--metal layers|token] [--vulkan on] [--threads N]
+//!     [--metal layers|token] [--vulkan on] [--vulkan-fuse-rows N] [--threads N]
 //! ```
 //!
 //! `--metal` runs whole layers on Metal, routed on the host (`layers`) or on the GPU
 //! (`token`). `--vulkan on` runs on the default Vulkan device, with the device expert
-//! cache sized like `qubivex bench`'s (every expert resident when the RAM cache is).
+//! cache sized like `qubivex bench`'s (every expert resident when the RAM cache is);
+//! `--vulkan-fuse-rows N` as `qubivex --vulkan-fuse-rows` (0: experts unfused).
 
 use std::error::Error;
 use std::path::PathBuf;
@@ -160,14 +161,14 @@ fn median(mut v: Vec<Duration>) -> Duration {
 }
 
 fn main() -> Result<(), Box<dyn Error>> {
-    let usage = "usage: batch <MODEL_DIR> <TOKENIZER_JSON> [--cache-mb N] [--steps N] [--runs N] [--sizes 1,2,4,8] [--metal layers|token] [--vulkan on] [--threads N] [--prefetch on|off]";
+    let usage = "usage: batch <MODEL_DIR> <TOKENIZER_JSON> [--cache-mb N] [--steps N] [--runs N] [--sizes 1,2,4,8] [--metal layers|token] [--vulkan on] [--vulkan-fuse-rows N] [--threads N] [--prefetch on|off]";
     let mut args = std::env::args().skip(1);
     let dir = PathBuf::from(args.next().ok_or(usage)?);
     let tok = Tokenizer::from_hf_dir(&PathBuf::from(args.next().ok_or(usage)?))?;
     let (mut cache_mb, mut steps, mut runs) = (None, 32usize, 3usize);
     let mut sizes = vec![1usize, 2, 4, 8];
     let mut metal = None;
-    let vulkan = VulkanConfig::default();
+    let mut vulkan = VulkanConfig::default();
     let mut on_vulkan = false;
     let mut threads = None;
     let mut prefetch = None;
@@ -178,6 +179,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             "--steps" => steps = value.parse()?,
             "--runs" => runs = value.parse()?,
             "--threads" => threads = Some(value.parse()?),
+            "--vulkan-fuse-rows" => vulkan.fuse_rows = Some(value.parse()?),
             "--vulkan" => {
                 on_vulkan = match value.as_str() {
                     "on" => true,
