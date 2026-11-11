@@ -60,7 +60,8 @@ use std::sync::{Arc, Mutex, MutexGuard, TryLockError};
 pub use device::{PhysicalInfo, list};
 use qubivex_compute::ComputeError;
 use qubivex_compute::discrete::{
-    DeviceBuffer, DeviceGatedFfn, DeviceMatMul, DeviceUsage, DiscreteDevice, Guard, TransferStats,
+    DeviceBuffer, DeviceGatedFfn, DeviceMatMul, DeviceRoutedMoe, DeviceUsage, DiscreteDevice,
+    Guard, TransferStats,
 };
 use qubivex_core::DType;
 
@@ -92,6 +93,11 @@ pub struct VulkanConfig {
     /// than this many rows ([`DiscreteDevice::fuses_gated_ffn`]). `None`: [`FUSE_ROWS`];
     /// `Some(0)`: never (each expert's matmuls are submitted on their own, as before).
     pub fuse_rows: Option<usize>,
+    /// Route MoE layers on the device (Step 3b, audit §17): the router, softmax top-k,
+    /// the routed experts' fused block and the combine in one submission, for layers
+    /// of at most [`VulkanConfig::fuse_rows`] tokens whose experts are all on the
+    /// device. Off by default; Step 3a (routing on the host) is the fallback.
+    pub route: bool,
 }
 
 /// A Vulkan GPU as a discrete device. See the crate documentation.
@@ -110,6 +116,9 @@ pub struct VulkanDevice {
     fuse_rows: usize,
     /// The largest arena a fused dispatch can address.
     max_arena: u64,
+    /// Route MoE layers of up to this many tokens on the device; 0 when off or not
+    /// available.
+    route_rows: usize,
 }
 
 impl std::fmt::Debug for VulkanDevice {
@@ -147,6 +156,11 @@ impl VulkanDevice {
         } else {
             0
         };
+        let route_rows = if config.route && opened.shared.routed.is_some() {
+            fuse_rows
+        } else {
+            0
+        };
         // Offsets inside a bound range are 32-bit in the shaders.
         let max_arena =
             u64::from(opened.shared.limits.max_storage_buffer_range).min(u64::from(u32::MAX)) / 256
@@ -160,6 +174,7 @@ impl VulkanDevice {
             fused,
             fuse_rows,
             max_arena,
+            route_rows,
         })
     }
 
@@ -198,6 +213,26 @@ impl VulkanDevice {
     /// the device has no fused pipelines or the driver fails.
     pub fn swiglu(&self, g: &mut [f32], u: &[f32]) -> Result<(), ComputeError> {
         self.submitter().swiglu(g, u)
+    }
+
+    /// The routing shader alone: `s` tokens' router logits (`s × experts`) to their top
+    /// `k` ids and weights (`s × k` each), for the numerical conformance tests, which
+    /// check it against [`qubivex_compute::math::route`].
+    ///
+    /// # Errors
+    /// [`ComputeError::Shape`] for inconsistent lengths; [`ComputeError::Device`] when
+    /// the device has no routing pipelines or the driver fails.
+    pub fn route(
+        &self,
+        logits: &[f32],
+        s: usize,
+        k: usize,
+        renormalise: bool,
+        ids: &mut [u32],
+        weights: &mut [f32],
+    ) -> Result<(), ComputeError> {
+        self.submitter()
+            .route(logits, s, k, renormalise, ids, weights)
     }
 
     /// Whether submissions are timed on the GPU (asked for, and the queue supports it).
@@ -257,9 +292,10 @@ impl DiscreteDevice for VulkanDevice {
         } else {
             format!(", {}", i.driver)
         };
-        let experts = match self.fuse_rows {
-            0 => "experts unfused".to_owned(),
-            n => format!("experts fused up to {n} rows"),
+        let experts = match (self.fuse_rows, self.route_rows) {
+            (0, _) => "experts unfused".to_owned(),
+            (n, 0) => format!("experts fused up to {n} rows"),
+            (n, _) => format!("experts fused and routed on the device up to {n} rows"),
         };
         format!(
             "Vulkan device {} ({}, {}{driver}), {} usable, {experts}",
@@ -307,6 +343,19 @@ impl DiscreteDevice for VulkanDevice {
 
     fn max_arena(&self) -> u64 {
         self.max_arena
+    }
+
+    fn routes_moe(&self, experts: usize, k: usize, s: usize) -> bool {
+        k > 0 && k <= experts && s > 0 && s <= self.route_rows
+    }
+
+    /// One submission when the layer's experts sit in one buffer per matrix kind (the
+    /// arenas); otherwise `Ok(false)`, and the caller routes on the host.
+    fn routed_moe(&self, op: &mut DeviceRoutedMoe<'_>) -> Result<bool, ComputeError> {
+        if !self.routes_moe(op.experts.len(), op.k, op.s) {
+            return Ok(false);
+        }
+        self.submitter().routed_moe(op, &self.counters)
     }
 
     fn usage(&self) -> DeviceUsage {
@@ -357,7 +406,11 @@ mod tests {
             ),
             ("swiglu.spv", built("swiglu.spv"), crate::device::SWIGLU_SPV),
             ("route.spv", built("route.spv"), crate::device::ROUTE_SPV),
-            ("combine.spv", built("combine.spv"), crate::device::COMBINE_SPV),
+            (
+                "combine.spv",
+                built("combine.spv"),
+                crate::device::COMBINE_SPV,
+            ),
         ];
         let _ = std::fs::remove_dir_all(&out);
         for (name, built, checked_in) in pairs {

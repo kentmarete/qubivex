@@ -25,7 +25,8 @@ use std::time::Instant;
 use ash::vk;
 use qubivex_compute::ComputeError;
 use qubivex_compute::discrete::{
-    DeviceBuffer, DeviceGatedFfn, DeviceMatMul, DeviceUsage, DeviceWeights, Guard, TransferStats,
+    DeviceBuffer, DeviceGatedFfn, DeviceMatMul, DeviceRoutedMoe, DeviceUsage, DeviceWeights, Guard,
+    TransferStats,
 };
 use qubivex_core::{DType, GgmlType};
 
@@ -42,11 +43,9 @@ pub(crate) const MATMUL_FUSED_SPV: &[u8] = include_bytes!("matmul_fused.spv");
 pub(crate) const SWIGLU_SPV: &[u8] = include_bytes!("swiglu.spv");
 
 /// `shaders/route.comp`: routing on the device (Step 3b).
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) const ROUTE_SPV: &[u8] = include_bytes!("route.spv");
 
 /// `shaders/combine.comp`: the rank-order combine on the device (Step 3b).
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) const COMBINE_SPV: &[u8] = include_bytes!("combine.spv");
 
 /// Invocations per SwiGLU workgroup. Must equal `local_size_x` in the shader.
@@ -185,6 +184,15 @@ pub(crate) struct Shared {
     /// The fused expert block's pipelines; `None` if the driver could not build them
     /// (the device then runs expert blocks as separate submissions).
     pub(crate) fused: Option<Fused>,
+    /// Routing and combine on the device (Step 3b), on the fused layout; `None` without
+    /// fused pipelines or if the driver could not build them.
+    pub(crate) routed: Option<Routed>,
+}
+
+/// The routed layer's own pipelines, on [`Fused`]'s layout.
+pub(crate) struct Routed {
+    route: vk::Pipeline,
+    combine: vk::Pipeline,
 }
 
 /// The fused matmul (one pipeline per dtype) and SwiGLU, on one layout: binding 0 the
@@ -220,6 +228,10 @@ impl Drop for Shared {
         // submission waits for its fence). Objects are destroyed child first.
         unsafe {
             let _ = self.device.device_wait_idle();
+            if let Some(r) = &self.routed {
+                self.device.destroy_pipeline(r.route, None);
+                self.device.destroy_pipeline(r.combine, None);
+            }
             if let Some(f) = &self.fused {
                 f.destroy(&self.device);
             }
@@ -508,6 +520,9 @@ impl Shared {
             }
         };
         let fused = create_fused(&device).ok();
+        let routed = fused
+            .as_ref()
+            .and_then(|f| create_routed(&device, f.layout).ok());
         let shared = Arc::new(Self {
             entry,
             instance: instance.clone(),
@@ -522,6 +537,7 @@ impl Shared {
             layout,
             pipelines,
             fused,
+            routed,
         });
         Ok(Opened { shared, info })
     }
@@ -764,6 +780,61 @@ fn create_fused(device: &ash::Device) -> Result<Fused, ComputeError> {
                 }
                 undo();
                 Err(err("fused pipelines", e))
+            }
+        }
+    }
+}
+
+/// The route and combine pipelines on the fused `layout`.
+fn create_routed(device: &ash::Device, layout: vk::PipelineLayout) -> Result<Routed, ComputeError> {
+    let spv = |b: &[u8]| {
+        ash::util::read_spv(&mut std::io::Cursor::new(b)).map_err(|e| err("bad SPIR-V", e))
+    };
+    let codes = [spv(ROUTE_SPV)?, spv(COMBINE_SPV)?];
+    // SAFETY: each create-info and what it points to live until its call returns;
+    // modules are destroyed after pipeline creation, pipelines on failure.
+    unsafe {
+        let mut modules = Vec::with_capacity(2);
+        for code in &codes {
+            match device
+                .create_shader_module(&vk::ShaderModuleCreateInfo::default().code(code), None)
+            {
+                Ok(m) => modules.push(m),
+                Err(e) => {
+                    for m in modules {
+                        device.destroy_shader_module(m, None);
+                    }
+                    return Err(err("shader module", e));
+                }
+            }
+        }
+        let infos: Vec<_> = modules
+            .iter()
+            .map(|&m| {
+                vk::ComputePipelineCreateInfo::default()
+                    .stage(
+                        vk::PipelineShaderStageCreateInfo::default()
+                            .stage(vk::ShaderStageFlags::COMPUTE)
+                            .module(m)
+                            .name(c"main"),
+                    )
+                    .layout(layout)
+            })
+            .collect();
+        let made = device.create_compute_pipelines(vk::PipelineCache::null(), &infos, None);
+        for m in modules {
+            device.destroy_shader_module(m, None);
+        }
+        match made {
+            Ok(p) if p.len() == 2 => Ok(Routed {
+                route: p[0],
+                combine: p[1],
+            }),
+            Ok(p) | Err((p, _)) => {
+                for p in p.into_iter().filter(|p| *p != vk::Pipeline::null()) {
+                    device.destroy_pipeline(p, None);
+                }
+                Err(err("routed pipelines", "not created"))
             }
         }
     }
@@ -1092,6 +1163,11 @@ pub(crate) struct Submitter {
     /// The fused block's intermediates (device-local) and its table (host-visible).
     mid: Option<Allocation>,
     table: Option<Allocation>,
+    /// The routed layer's router logits and expert outputs (device-local), and its
+    /// routes (host-visible, read back).
+    logits: Option<Allocation>,
+    contrib: Option<Allocation>,
+    routes: Option<Allocation>,
 }
 
 // SAFETY: the handles are plain identifiers, used only through `&mut self`.
@@ -1224,6 +1300,9 @@ impl Submitter {
                 fused_sets: 16,
                 mid: None,
                 table: None,
+                logits: None,
+                contrib: None,
+                routes: None,
             })
         }
     }
@@ -2287,6 +2366,518 @@ impl Submitter {
         })?;
         let y = self.ys.as_mut().ok_or_else(|| err("outputs", "missing"))?;
         g.copy_from_slice(&y.floats_mut()[..n]);
+        Ok(())
+    }
+}
+
+/// One dispatch of a routed layer: pipeline, descriptor set, push constants, groups.
+type Step = (vk::Pipeline, vk::DescriptorSet, [u32; 4], (u32, u32));
+
+/// One kind of matrix (gate, up or down) across every expert of a routed layer: one
+/// buffer, one dtype, one shape.
+struct Kind {
+    buffer: vk::Buffer,
+    size: u64,
+    dtype: usize,
+    n: usize,
+    k: usize,
+    row_bytes: usize,
+}
+
+impl Submitter {
+    /// The kind of matrix `i` of every expert, if they all share a buffer, dtype and
+    /// shape; `None` otherwise (the layer is then routed on the host).
+    fn kind_of(&self, op: &DeviceRoutedMoe<'_>, i: usize) -> Result<Option<Kind>, ComputeError> {
+        let mut kind: Option<Kind> = None;
+        for e in op.experts {
+            let w = &e[i];
+            let Some(dt) = dtype_index(w.dtype()) else {
+                return Ok(None);
+            };
+            let a = self.allocation_of(w.buffer())?;
+            let (n, k) = (w.rows(), w.cols());
+            let row_bytes = w.len().checked_div(n).unwrap_or(0);
+            match &kind {
+                None => {
+                    kind = Some(Kind {
+                        buffer: a.buffer,
+                        size: a.size,
+                        dtype: dt,
+                        n,
+                        k,
+                        row_bytes,
+                    });
+                }
+                Some(c) => {
+                    if c.buffer != a.buffer
+                        || c.dtype != dt
+                        || c.n != n
+                        || c.k != k
+                        || c.row_bytes != row_bytes
+                    {
+                        return Ok(None);
+                    }
+                }
+            }
+        }
+        Ok(kind)
+    }
+
+    /// Runs a MoE layer as one submission (Step 3b, audit §17.5): the router as a fused
+    /// dispatch, routing on the device, which writes the routed entries of the table,
+    /// every (token, rank) entry's gate and up, SwiGLU, every entry's down, and the
+    /// rank-order combine. Returns `Ok(false)`, with nothing written, when the layer's
+    /// experts are not all in one buffer per matrix kind with one dtype and shape, or the
+    /// shape is past the device's limits.
+    #[allow(clippy::too_many_lines)]
+    pub(crate) fn routed_moe(
+        &mut self,
+        op: &mut DeviceRoutedMoe<'_>,
+        counters: &Counters,
+    ) -> Result<bool, ComputeError> {
+        let shared = Arc::clone(&self.shared);
+        let (Some(fused), Some(routed)) = (shared.fused.as_ref(), shared.routed.as_ref()) else {
+            return Ok(false);
+        };
+        let lim = shared.limits;
+        let (ne, cols, s, k) = (op.router.rows(), op.router.cols(), op.s, op.k);
+        let rows = op.ys.len().checked_div(s).unwrap_or(0);
+        if s == 0
+            || k == 0
+            || k > ne
+            || op.experts.len() != ne
+            || op.xs.len() != s * cols
+            || op.ys.len() != s * rows
+            || op.ids.len() != s * k
+            || op.weights.len() != s * k
+        {
+            return Err(ComputeError::Shape {
+                op: "routed moe",
+                detail: format!(
+                    "{ne}-row router, {} experts, top {k}, {s} tokens, {} outputs",
+                    op.experts.len(),
+                    op.ys.len()
+                ),
+            });
+        }
+        let (Some(g), Some(u), Some(d)) = (
+            self.kind_of(op, 0)?,
+            self.kind_of(op, 1)?,
+            self.kind_of(op, 2)?,
+        ) else {
+            return Ok(false);
+        };
+        let ffn = g.n;
+        if g.buffer != u.buffer
+            || g.dtype != u.dtype
+            || g.n != u.n
+            || g.row_bytes != u.row_bytes
+            || g.k != cols
+            || d.k != ffn
+            || d.n != rows
+        {
+            return Ok(false);
+        }
+        let Some(rdt) = dtype_index(op.router.dtype()) else {
+            return Ok(false);
+        };
+        let ra = self.allocation_of(op.router.buffer())?;
+        let (rbuf, rsize) = (ra.buffer, ra.size);
+
+        // Each binding's base (aligned down to the first matrix it reads) and range.
+        let align = lim.min_storage_buffer_offset_alignment.max(4);
+        let max_range = u64::from(lim.max_storage_buffer_range);
+        let bind = |offs: &mut dyn Iterator<Item = (u64, u64)>, size: u64| {
+            let (lo, hi) = offs.fold((u64::MAX, 0), |(lo, hi), (o, l)| (lo.min(o), hi.max(o + l)));
+            let base = lo / align * align;
+            let range = (hi.next_multiple_of(4).min(size) - base).max(4);
+            (range <= max_range && hi - base <= u64::from(u32::MAX)).then_some((base, range))
+        };
+        let span = |i: usize| -> Vec<(u64, u64)> {
+            op.experts
+                .iter()
+                .map(|e| (e[i].offset() as u64, e[i].len() as u64))
+                .collect()
+        };
+        let (gu_spans, d_spans) = ([span(0), span(1)].concat(), span(2));
+        let Some((gu_base, gu_range)) = bind(&mut gu_spans.iter().copied(), g.size) else {
+            return Ok(false);
+        };
+        let Some((d_base, d_range)) = bind(&mut d_spans.iter().copied(), d.size) else {
+            return Ok(false);
+        };
+        let Some((r_base, r_range)) = bind(
+            &mut std::iter::once((op.router.offset() as u64, op.router.len() as u64)),
+            rsize,
+        ) else {
+            return Ok(false);
+        };
+
+        // Dispatch sizes, all known here: the GPU only picks which expert each entry
+        // reads.
+        let rows_of = |n: usize| (n as u64).div_ceil(u64::from(ROWS));
+        let (rb, gb, db) = (rows_of(ne), rows_of(ffn), rows_of(rows));
+        let sk = s * k;
+        let gn = sk * ffn;
+        let maxx = u64::from(lim.max_compute_work_group_count[0]);
+        if s as u64 > u64::from(lim.max_compute_work_group_count[1])
+            || rb > maxx
+            || 2 * sk as u64 * gb > maxx
+            || sk as u64 * db > maxx
+            || (gn as u64).div_ceil(u64::from(SWIGLU_GROUP)) > maxx
+            || ((s * rows) as u64).div_ceil(256) > maxx
+            || s.div_ceil(64) as u64 > maxx
+        {
+            return Ok(false);
+        }
+        let (xb, lb, mb, cb, rtb, yb) = (
+            4 * (s * cols) as u64,
+            4 * (s * ne) as u64,
+            8 * gn as u64,
+            4 * (sk * rows) as u64,
+            8 * sk as u64,
+            4 * (s * rows) as u64,
+        );
+        if [xb, lb, mb, cb, rtb, yb].iter().any(|&b| b > max_range) {
+            return Ok(false);
+        }
+
+        // The table: the router's entry, the header, the templates (3 per expert), and
+        // room for the routed entries (2 per (token, rank) for gate and up, then 1 for
+        // down), which the route shader writes.
+        let hdr = 8usize;
+        let tpl = 16usize;
+        let ent = tpl + 24 * ne;
+        let words = ent + 24 * sk;
+        let mut table = vec![0u32; words];
+        let w32 = |v: u64, what: &str| u32_of(v, what);
+        table[..8].copy_from_slice(&[
+            u32_of(ne, "experts")?,
+            u32_of(cols, "columns")?,
+            u32_of(op.router.len() / ne, "row bytes")?,
+            w32(op.router.offset() as u64 - r_base, "offset")?,
+            0,
+            0,
+            u32_of(s, "tokens")?,
+            0,
+        ]);
+        table[hdr..hdr + 6].copy_from_slice(&[
+            u32::from(op.renormalise),
+            u32_of(tpl, "table")?,
+            u32_of(ent, "table")?,
+            u32_of(cols, "columns")?,
+            u32_of(ffn, "ffn")?,
+            u32_of(rows, "rows")?,
+        ]);
+        for (e, ws) in op.experts.iter().enumerate() {
+            for (i, (kind, base)) in [(&g, gu_base), (&u, gu_base), (&d, d_base)]
+                .into_iter()
+                .enumerate()
+            {
+                let at = tpl + 24 * e + 8 * i;
+                table[at..at + 4].copy_from_slice(&[
+                    u32_of(kind.n, "rows")?,
+                    u32_of(kind.k, "columns")?,
+                    u32_of(kind.row_bytes, "row bytes")?,
+                    w32(ws[i].offset() as u64 - base, "offset")?,
+                ]);
+            }
+        }
+        counters.submissions.fetch_add(1, Ordering::Relaxed);
+
+        // Inputs and the table in.
+        let start = Instant::now();
+        let storage = vk::BufferUsageFlags::STORAGE_BUFFER;
+        let xbuf = {
+            let x = Self::host_buffer(&shared, &mut self.xs, xb, storage)?;
+            x.floats_mut()[..op.xs.len()].copy_from_slice(op.xs);
+            x.buffer
+        };
+        let tbuf = {
+            let t = Self::host_buffer(&shared, &mut self.table, 4 * words as u64, storage)?;
+            for (dst, &v) in t.floats_mut().iter_mut().zip(&table) {
+                *dst = f32::from_bits(v);
+            }
+            t.buffer
+        };
+        let ybuf = Self::host_buffer(&shared, &mut self.ys, yb, storage)?.buffer;
+        let rtbuf = Self::host_buffer(&shared, &mut self.routes, rtb, storage)?.buffer;
+        let lbuf = Self::scratch(&shared, &mut self.logits, lb, storage, false)?.buffer;
+        let mbuf = Self::scratch(&shared, &mut self.mid, mb, storage, false)?.buffer;
+        let cbuf = Self::scratch(&shared, &mut self.contrib, cb, storage, false)?.buffer;
+        counters.time(start);
+        counters.activations_in.fetch_add(xb, Ordering::Relaxed);
+
+        let prepared = Instant::now();
+        let sets = self.fused_sets(5)?;
+        let whole = |b: vk::Buffer| (b, 0, None);
+        // Router, route, gate/up (and SwiGLU, which reads binding 2), down, combine.
+        self.write_set(
+            sets[0],
+            [
+                (rbuf, r_base, Some(r_range)),
+                whole(xbuf),
+                whole(lbuf),
+                whole(tbuf),
+            ],
+        );
+        self.write_set(
+            sets[1],
+            [whole(tbuf), whole(lbuf), whole(rtbuf), whole(tbuf)],
+        );
+        self.write_set(
+            sets[2],
+            [
+                (g.buffer, gu_base, Some(gu_range)),
+                whole(xbuf),
+                whole(mbuf),
+                whole(tbuf),
+            ],
+        );
+        self.write_set(
+            sets[3],
+            [
+                (d.buffer, d_base, Some(d_range)),
+                whole(mbuf),
+                whole(cbuf),
+                whole(tbuf),
+            ],
+        );
+        self.write_set(
+            sets[4],
+            [whole(rtbuf), whole(cbuf), whole(ybuf), whole(tbuf)],
+        );
+        let layout = fused.layout;
+        let n32 = |v: usize, what: &str| u32_of(v, what);
+        let (rb, gb, db) = (
+            u32_of(rb, "row blocks")?,
+            u32_of(gb, "row blocks")?,
+            u32_of(db, "row blocks")?,
+        );
+        let (s32, ne32, k32, sk32, gn32, rows32) = (
+            n32(s, "tokens")?,
+            n32(ne, "experts")?,
+            n32(k, "top k")?,
+            n32(sk, "entries")?,
+            n32(gn, "intermediates")?,
+            n32(rows, "rows")?,
+        );
+        let (hdr32, ent32) = (n32(hdr, "table")?, n32(ent, "table")?);
+        let steps: [Step; 6] = [
+            (fused.matmul[rdt], sets[0], [rb, 1, 0, 0], (rb, s32)),
+            (
+                routed.route,
+                sets[1],
+                [s32, ne32, k32, hdr32],
+                (s32.div_ceil(64), 1),
+            ),
+            (
+                fused.matmul[g.dtype],
+                sets[2],
+                [gb, 2 * sk32, ent32, 0],
+                (2 * sk32 * gb, 1),
+            ),
+            (
+                fused.swiglu,
+                sets[2],
+                [gn32, 0, gn32, 0],
+                (gn32.div_ceil(SWIGLU_GROUP), 1),
+            ),
+            (
+                fused.matmul[d.dtype],
+                sets[3],
+                [db, sk32, ent32 + 16 * sk32, 0],
+                (sk32 * db, 1),
+            ),
+            (
+                routed.combine,
+                sets[4],
+                [s32, k32, rows32, 0],
+                ((s32 * rows32).div_ceil(256), 1),
+            ),
+        ];
+        let ran = self.run(|dev, cmd| {
+            let between = [vk::MemoryBarrier::default()
+                .src_access_mask(vk::AccessFlags::SHADER_WRITE)
+                .dst_access_mask(vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE)];
+            let to_host = [vk::MemoryBarrier::default()
+                .src_access_mask(vk::AccessFlags::SHADER_WRITE)
+                .dst_access_mask(vk::AccessFlags::HOST_READ)];
+            // SAFETY: recording into a command buffer in the recording state, with
+            // objects that outlive the submission (it is waited for in `run`).
+            unsafe {
+                for (i, (pipeline, set, words, (x, y))) in steps.iter().enumerate() {
+                    if i > 0 {
+                        dev.cmd_pipeline_barrier(
+                            cmd,
+                            vk::PipelineStageFlags::COMPUTE_SHADER,
+                            vk::PipelineStageFlags::COMPUTE_SHADER,
+                            vk::DependencyFlags::empty(),
+                            &between,
+                            &[],
+                            &[],
+                        );
+                    }
+                    let mut push = [0u8; 16];
+                    for (j, w) in words.iter().enumerate() {
+                        push[4 * j..4 * j + 4].copy_from_slice(&w.to_ne_bytes());
+                    }
+                    dev.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, *pipeline);
+                    dev.cmd_bind_descriptor_sets(
+                        cmd,
+                        vk::PipelineBindPoint::COMPUTE,
+                        layout,
+                        0,
+                        &[*set],
+                        &[],
+                    );
+                    dev.cmd_push_constants(cmd, layout, vk::ShaderStageFlags::COMPUTE, 0, &push);
+                    dev.cmd_dispatch(cmd, *x, *y, 1);
+                }
+                dev.cmd_pipeline_barrier(
+                    cmd,
+                    vk::PipelineStageFlags::COMPUTE_SHADER,
+                    vk::PipelineStageFlags::HOST,
+                    vk::DependencyFlags::empty(),
+                    &to_host,
+                    &[],
+                    &[],
+                );
+            }
+        })?;
+        counters.ran(prepared, &ran);
+
+        // Outputs and routes back.
+        let start = Instant::now();
+        let y = self.ys.as_mut().ok_or_else(|| err("outputs", "missing"))?;
+        op.ys.copy_from_slice(&y.floats_mut()[..op.ys.len()]);
+        let r = self
+            .routes
+            .as_mut()
+            .ok_or_else(|| err("routes", "missing"))?;
+        let rt = r.floats_mut();
+        for (id, v) in op.ids.iter_mut().zip(&rt[..sk]) {
+            *id = v.to_bits();
+        }
+        op.weights.copy_from_slice(&rt[sk..2 * sk]);
+        counters.time(start);
+        counters
+            .activations_out
+            .fetch_add(yb + rtb, Ordering::Relaxed);
+        Ok(true)
+    }
+}
+
+impl Submitter {
+    /// The route shader alone over `s` tokens' logits (`s × ne`), for the numerical
+    /// conformance tests, which check it against [`qubivex_compute::math::route`].
+    pub(crate) fn route(
+        &mut self,
+        logits: &[f32],
+        s: usize,
+        k: usize,
+        renormalise: bool,
+        ids: &mut [u32],
+        weights: &mut [f32],
+    ) -> Result<(), ComputeError> {
+        let shared = Arc::clone(&self.shared);
+        let (Some(fused), Some(routed)) = (shared.fused.as_ref(), shared.routed.as_ref()) else {
+            return Err(err("route", "no routing pipelines"));
+        };
+        let ne = logits.len().checked_div(s).unwrap_or(0);
+        if s == 0 || k == 0 || k > ne || ids.len() != s * k || weights.len() != s * k {
+            return Err(ComputeError::Shape {
+                op: "route",
+                detail: format!("{} logits, {s} tokens, top {k}", logits.len()),
+            });
+        }
+        let sk = s * k;
+        let (hdr, tpl) = (0usize, 8usize);
+        let ent = tpl + 24 * ne;
+        let words = ent + 24 * sk;
+        let mut table = vec![0u32; words];
+        table[hdr..hdr + 6].copy_from_slice(&[
+            u32::from(renormalise),
+            u32_of(tpl, "table")?,
+            u32_of(ent, "table")?,
+            1,
+            1,
+            1,
+        ]);
+        let storage = vk::BufferUsageFlags::STORAGE_BUFFER;
+        let lbuf = {
+            let x = Self::host_buffer(&shared, &mut self.xs, 4 * logits.len() as u64, storage)?;
+            x.floats_mut()[..logits.len()].copy_from_slice(logits);
+            x.buffer
+        };
+        let tbuf = {
+            let t = Self::host_buffer(&shared, &mut self.table, 4 * words as u64, storage)?;
+            for (dst, &v) in t.floats_mut().iter_mut().zip(&table) {
+                *dst = f32::from_bits(v);
+            }
+            t.buffer
+        };
+        let rbuf = Self::host_buffer(&shared, &mut self.routes, 8 * sk as u64, storage)?.buffer;
+        let sets = self.fused_sets(1)?;
+        let set = sets[0];
+        self.write_set(
+            set,
+            [
+                (tbuf, 0, None),
+                (lbuf, 0, None),
+                (rbuf, 0, None),
+                (tbuf, 0, None),
+            ],
+        );
+        let (layout, pipeline) = (fused.layout, routed.route);
+        let words4 = [
+            u32_of(s, "tokens")?,
+            u32_of(ne, "experts")?,
+            u32_of(k, "top k")?,
+            u32_of(hdr, "table")?,
+        ];
+        let groups = u32_of(s.div_ceil(64), "groups")?;
+        self.run(|d, cmd| {
+            let mut push = [0u8; 16];
+            for (i, w) in words4.iter().enumerate() {
+                push[4 * i..4 * i + 4].copy_from_slice(&w.to_ne_bytes());
+            }
+            let to_host = [vk::MemoryBarrier::default()
+                .src_access_mask(vk::AccessFlags::SHADER_WRITE)
+                .dst_access_mask(vk::AccessFlags::HOST_READ)];
+            // SAFETY: as in `gated_ffn_many`.
+            unsafe {
+                d.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, pipeline);
+                d.cmd_bind_descriptor_sets(
+                    cmd,
+                    vk::PipelineBindPoint::COMPUTE,
+                    layout,
+                    0,
+                    &[set],
+                    &[],
+                );
+                d.cmd_push_constants(cmd, layout, vk::ShaderStageFlags::COMPUTE, 0, &push);
+                d.cmd_dispatch(cmd, groups, 1, 1);
+                d.cmd_pipeline_barrier(
+                    cmd,
+                    vk::PipelineStageFlags::COMPUTE_SHADER,
+                    vk::PipelineStageFlags::HOST,
+                    vk::DependencyFlags::empty(),
+                    &to_host,
+                    &[],
+                    &[],
+                );
+            }
+        })?;
+        let r = self
+            .routes
+            .as_mut()
+            .ok_or_else(|| err("routes", "missing"))?;
+        let rt = r.floats_mut();
+        for (id, v) in ids.iter_mut().zip(&rt[..sk]) {
+            *id = v.to_bits();
+        }
+        weights.copy_from_slice(&rt[sk..2 * sk]);
         Ok(())
     }
 }
