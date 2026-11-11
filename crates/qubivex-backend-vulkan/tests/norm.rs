@@ -76,7 +76,8 @@ impl Classes {
             return;
         }
         if self.other.len() < 1000 {
-            self.other.push((ss.to_bits(), got.to_bits(), want.to_bits()));
+            self.other
+                .push((ss.to_bits(), got.to_bits(), want.to_bits()));
         }
     }
 
@@ -140,7 +141,11 @@ fn rms_scale_edges() {
     // Perfect squares and their neighbours, where a square root rounds near a tie.
     for i in 1..4096u32 {
         let v = (i * i) as f32;
-        ss.extend([v, f32::from_bits(v.to_bits() - 1), f32::from_bits(v.to_bits() + 1)]);
+        ss.extend([
+            v,
+            f32::from_bits(v.to_bits() - 1),
+            f32::from_bits(v.to_bits() + 1),
+        ]);
     }
     let mut r = Rng(0x2545_f491);
     ss.extend((0..1 << 20).map(|_| f32::from_bits(r.next() & 0x7fff_ffff)));

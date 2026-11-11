@@ -1191,6 +1191,11 @@ pub(crate) struct Submitter {
     logits: Option<Allocation>,
     contrib: Option<Allocation>,
     routes: Option<Allocation>,
+    /// The prelude's attention outputs and residual stream (host-visible, the residual
+    /// read back) and the O projection's outputs (device-local), Step 3c.
+    att: Option<Allocation>,
+    hs: Option<Allocation>,
+    oproj: Option<Allocation>,
 }
 
 // SAFETY: the handles are plain identifiers, used only through `&mut self`.
@@ -1326,6 +1331,9 @@ impl Submitter {
                 logits: None,
                 contrib: None,
                 routes: None,
+                att: None,
+                hs: None,
+                oproj: None,
             })
         }
     }
@@ -2465,11 +2473,12 @@ impl Submitter {
         let lim = shared.limits;
         let (ne, cols, s, k) = (op.router.rows(), op.router.cols(), op.s, op.k);
         let rows = op.ys.len().checked_div(s).unwrap_or(0);
+        let xs_len = if op.prelude.is_some() { 0 } else { s * cols };
         if s == 0
             || k == 0
             || k > ne
             || op.experts.len() != ne
-            || op.xs.len() != s * cols
+            || op.xs.len() != xs_len
             || op.ys.len() != s * rows
             || op.ids.len() != s * k
             || op.weights.len() != s * k
@@ -2506,6 +2515,35 @@ impl Submitter {
         };
         let ra = self.allocation_of(op.router.buffer())?;
         let (rbuf, rsize) = (ra.buffer, ra.size);
+        // The prelude's O projection (Step 3c): one dtype with a kernel, `cols` rows.
+        let pre = match &op.prelude {
+            None => None,
+            Some(p) => {
+                let Some(odt) = dtype_index(p.o.dtype()) else {
+                    return Ok(false);
+                };
+                let (on, ok) = (p.o.rows(), p.o.cols());
+                if on != cols
+                    || ok == 0
+                    || p.att.len() != s * ok
+                    || p.hs.len() != s * cols
+                    || p.norm.len() != cols
+                {
+                    return Err(ComputeError::Shape {
+                        op: "routed moe prelude",
+                        detail: format!(
+                            "O {on} x {ok}, {} attention outputs, {} residuals, {} norm \
+                             weights, for {s} tokens of {cols}",
+                            p.att.len(),
+                            p.hs.len(),
+                            p.norm.len()
+                        ),
+                    });
+                }
+                let oa = self.allocation_of(p.o.buffer())?;
+                Some((odt, ok, p.o.len() / on, oa.buffer, oa.size))
+            }
+        };
 
         // Each binding's base (aligned down to the first matrix it reads) and range.
         let align = lim.min_storage_buffer_offset_alignment.max(4);
@@ -2534,6 +2572,18 @@ impl Submitter {
             rsize,
         ) else {
             return Ok(false);
+        };
+        let o_bind = match (&op.prelude, pre) {
+            (Some(p), Some((_, _, _, _, osize))) => {
+                let Some(b) = bind(
+                    &mut std::iter::once((p.o.offset() as u64, p.o.len() as u64)),
+                    osize,
+                ) else {
+                    return Ok(false);
+                };
+                Some(b)
+            }
+            _ => None,
         };
 
         // Dispatch sizes, all known here: the GPU only picks which expert each entry
@@ -2565,6 +2615,14 @@ impl Submitter {
         if [xb, lb, mb, cb, rtb, yb].iter().any(|&b| b > max_range) {
             return Ok(false);
         }
+        // The prelude's buffers: attention outputs, residual stream, O outputs.
+        let (ab, hb) = match pre {
+            Some((_, ok, ..)) => (4 * (s * ok) as u64, 4 * (s * cols) as u64),
+            None => (0, 0),
+        };
+        if ab > max_range || hb > max_range || (pre.is_some() && rows_of(cols) > maxx) {
+            return Ok(false);
+        }
 
         // The table: the router's entry, the header, the templates (3 per expert), and
         // room for the routed entries (2 per (token, rank) for gate and up, then 1 for
@@ -2572,9 +2630,26 @@ impl Submitter {
         let hdr = 8usize;
         let tpl = 16usize;
         let ent = tpl + 24 * ne;
-        let words = ent + 24 * sk;
+        // With a prelude: the O projection's entry, then the norm weights as bits.
+        let (o_at, norm_at) = (ent + 24 * sk, ent + 24 * sk + 8);
+        let words = if pre.is_some() { norm_at + cols } else { o_at };
         let mut table = vec![0u32; words];
         let w32 = |v: u64, what: &str| u32_of(v, what);
+        if let (Some(p), Some((_, ok, orb, ..)), Some((o_base, _))) = (&op.prelude, pre, o_bind) {
+            table[o_at..o_at + 8].copy_from_slice(&[
+                u32_of(cols, "rows")?,
+                u32_of(ok, "columns")?,
+                u32_of(orb, "row bytes")?,
+                w32(p.o.offset() as u64 - o_base, "offset")?,
+                0,
+                0,
+                u32_of(s, "tokens")?,
+                0,
+            ]);
+            for (dst, w) in table[norm_at..].iter_mut().zip(p.norm) {
+                *dst = w.to_bits();
+            }
+        }
         table[..8].copy_from_slice(&[
             u32_of(ne, "experts")?,
             u32_of(cols, "columns")?,
@@ -2617,6 +2692,24 @@ impl Submitter {
             x.floats_mut()[..op.xs.len()].copy_from_slice(op.xs);
             x.buffer
         };
+        // The prelude's inputs: attention outputs and the residual stream.
+        let pre_bufs = match &op.prelude {
+            Some(p) => {
+                let abuf = {
+                    let a = Self::host_buffer(&shared, &mut self.att, ab, storage)?;
+                    a.floats_mut()[..p.att.len()].copy_from_slice(p.att);
+                    a.buffer
+                };
+                let hbuf = {
+                    let h = Self::host_buffer(&shared, &mut self.hs, hb, storage)?;
+                    h.floats_mut()[..p.hs.len()].copy_from_slice(p.hs);
+                    h.buffer
+                };
+                let obuf = Self::scratch(&shared, &mut self.oproj, hb, storage, false)?.buffer;
+                Some((abuf, hbuf, obuf))
+            }
+            None => None,
+        };
         let tbuf = {
             let t = Self::host_buffer(&shared, &mut self.table, 4 * words as u64, storage)?;
             for (dst, &v) in t.floats_mut().iter_mut().zip(&table) {
@@ -2630,10 +2723,12 @@ impl Submitter {
         let mbuf = Self::scratch(&shared, &mut self.mid, mb, storage, false)?.buffer;
         let cbuf = Self::scratch(&shared, &mut self.contrib, cb, storage, false)?.buffer;
         counters.time(start);
-        counters.activations_in.fetch_add(xb, Ordering::Relaxed);
+        counters
+            .activations_in
+            .fetch_add(if pre.is_some() { ab + hb } else { xb }, Ordering::Relaxed);
 
         let prepared = Instant::now();
-        let sets = self.fused_sets(5)?;
+        let sets = self.fused_sets(if pre.is_some() { 7 } else { 5 })?;
         let whole = |b: vk::Buffer| (b, 0, None);
         // Router, route, gate/up (and SwiGLU, which reads binding 2), down, combine.
         self.write_set(
@@ -2687,7 +2782,52 @@ impl Submitter {
             n32(rows, "rows")?,
         );
         let (hdr32, ent32) = (n32(hdr, "table")?, n32(ent, "table")?);
-        let steps: [Step; 6] = [
+        // The prelude (Step 3c, audit §18.3): the O projection, then the residual and
+        // norm, which writes the activations the router and the experts read.
+        let mut steps: Vec<Step> = Vec::with_capacity(8);
+        if let (
+            Some((odt, _, _, wbuf, _)),
+            Some((o_base, o_range)),
+            Some((abuf, hbuf, obuf)),
+            Some(p),
+        ) = (pre, o_bind, pre_bufs, &op.prelude)
+        {
+            let ob = u32_of(rows_of(cols), "row blocks")?;
+            // `eps as f32`, as `math::rms_scale` converts it.
+            #[allow(clippy::cast_possible_truncation)]
+            let eps = p.eps as f32;
+            self.write_set(
+                sets[5],
+                [
+                    (wbuf, o_base, Some(o_range)),
+                    whole(abuf),
+                    whole(obuf),
+                    whole(tbuf),
+                ],
+            );
+            self.write_set(
+                sets[6],
+                [whole(hbuf), whole(obuf), whole(xbuf), whole(tbuf)],
+            );
+            steps.push((
+                fused.matmul[odt],
+                sets[5],
+                [ob, 1, n32(o_at, "table")?, 0],
+                (ob, s32),
+            ));
+            steps.push((
+                routed.resnorm,
+                sets[6],
+                [
+                    n32(cols, "columns")?,
+                    n32(norm_at, "table")?,
+                    eps.to_bits(),
+                    0,
+                ],
+                (s32, 1),
+            ));
+        }
+        steps.extend([
             (fused.matmul[rdt], sets[0], [rb, 1, 0, 0], (rb, s32)),
             (routed.route, sets[1], [s32, ne32, k32, hdr32], (s32, 1)),
             (
@@ -2714,7 +2854,7 @@ impl Submitter {
                 [s32, k32, rows32, 0],
                 ((s32 * rows32).div_ceil(256), 1),
             ),
-        ];
+        ]);
         let ran = self.run(|dev, cmd| {
             let between = [vk::MemoryBarrier::default()
                 .src_access_mask(vk::AccessFlags::SHADER_WRITE)
@@ -2779,10 +2919,17 @@ impl Submitter {
             *id = v.to_bits();
         }
         op.weights.copy_from_slice(&rt[sk..2 * sk]);
+        if let Some(p) = op.prelude.as_mut() {
+            let h = self
+                .hs
+                .as_mut()
+                .ok_or_else(|| err("residuals", "missing"))?;
+            p.hs.copy_from_slice(&h.floats_mut()[..p.hs.len()]);
+        }
         counters.time(start);
         counters
             .activations_out
-            .fetch_add(yb + rtb, Ordering::Relaxed);
+            .fetch_add(yb + rtb + hb, Ordering::Relaxed);
         Ok(true)
     }
 }

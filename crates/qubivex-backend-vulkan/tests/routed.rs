@@ -1,7 +1,8 @@
 //! Routing on the Vulkan device (audit §17, Step 3b) against the CPU, bit for bit: the
 //! route shader alone against `qubivex_compute::math::route`, and the whole routed layer
 //! (router, routing, the routed experts' fused block, combine) in one submission against
-//! `qubivex_compute::routed_moe_steps` on the CPU.
+//! `qubivex_compute::routed_moe_steps` on the CPU; with its prelude (audit §18, Step 3c:
+//! the O projection, residual and FFN norm first), the residual stream as well.
 //!
 //! Exceptions, as the parity contract states them (ADR-011 amendment 7): a token with a
 //! NaN logit has NaN probabilities; their payloads are outside the contract, and
@@ -20,13 +21,18 @@
 
 use qubivex_backend_cpu::CpuBackend;
 use qubivex_backend_vulkan::{VulkanConfig, VulkanDevice};
-use qubivex_compute::discrete::{DeviceRoutedMoe, DeviceWeights, DiscreteDevice};
-use qubivex_compute::{RoutedMoe, WeightView, math, routed_moe_steps};
+use qubivex_compute::discrete::{DeviceMoePrelude, DeviceRoutedMoe, DeviceWeights, DiscreteDevice};
+use qubivex_compute::{MoePrelude, RoutedMoe, WeightView, math, routed_moe_steps};
 use qubivex_core::{DType, GgmlType, Shape};
 
 fn device(route: bool) -> Option<VulkanDevice> {
+    device_with(route, false)
+}
+
+fn device_with(route: bool, route_o: bool) -> Option<VulkanDevice> {
     match VulkanDevice::new(VulkanConfig {
         route,
+        route_o,
         ..VulkanConfig::default()
     }) {
         Ok(d) => Some(d),
@@ -540,4 +546,311 @@ fn the_routed_layer_is_declined_outside_its_conditions() {
     );
     let Some(off) = device(false) else { return };
     assert!(!off.routes_moe(l.experts, l.k, 1), "off by default");
+}
+
+/// A layer's prelude (Step 3c): the O projection's weights (`h × att`), the attention
+/// outputs, the residual stream and the norm weights.
+struct Pre {
+    dtype: DType,
+    att_cols: usize,
+    o: Vec<u8>,
+    att: Vec<f32>,
+    hs: Vec<f32>,
+    norm: Vec<f32>,
+    eps: f64,
+}
+
+fn pre(l: Layer, dtype: DType, att_cols: usize, s: usize, seed: u32, eps: f64) -> Pre {
+    let mut r = Rng(seed.wrapping_mul(2_246_822_519).max(1));
+    Pre {
+        dtype,
+        att_cols,
+        o: weights(dtype, l.h, att_cols, seed),
+        att: acts(s * att_cols, seed as usize + 3),
+        // A residual stream of mixed magnitudes, and norm weights near 1.
+        hs: (0..s * l.h)
+            .map(|_| {
+                let v = r.next();
+                f32::from_bits((v & 0x807f_ffff) | ((120 + (v >> 24) % 10) << 23))
+            })
+            .collect(),
+        norm: (0..l.h)
+            .map(|_| 0.5 + (r.next() >> 8) as f32 / (1u32 << 24) as f32)
+            .collect(),
+        eps,
+    }
+}
+
+/// A layer's outputs, ids, weights and residual stream.
+type WithPre = (Vec<f32>, Vec<u32>, Vec<f32>, Vec<f32>);
+
+/// The CPU's layer with its prelude: outputs, ids, weights and the residual stream.
+fn cpu_layer_pre(l: Layer, h: &Host, p: &Pre, s: usize, norm: bool) -> WithPre {
+    let views: Vec<[WeightView<'_>; 3]> = h
+        .experts
+        .iter()
+        .map(|[g, u, d]| {
+            [
+                WeightView::new(l.gu, l.ffn, l.h, g).unwrap(),
+                WeightView::new(l.gu, l.ffn, l.h, u).unwrap(),
+                WeightView::new(l.down, l.h, l.ffn, d).unwrap(),
+            ]
+        })
+        .collect();
+    let (mut ys, mut ids, mut ws, mut hs) = (
+        vec![0f32; s * l.h],
+        vec![0u32; s * l.k],
+        vec![0f32; s * l.k],
+        p.hs.clone(),
+    );
+    routed_moe_steps(
+        &CpuBackend::new(),
+        &mut RoutedMoe {
+            router: WeightView::new(l.router, l.experts, l.h, &h.router).unwrap(),
+            experts: &views,
+            k: l.k,
+            renormalise: norm,
+            xs: &[],
+            s,
+            ys: &mut ys,
+            ids: &mut ids,
+            weights: &mut ws,
+            prelude: Some(MoePrelude {
+                o: WeightView::new(p.dtype, l.h, p.att_cols, &p.o).unwrap(),
+                att: &p.att,
+                hs: &mut hs,
+                norm: &p.norm,
+                eps: p.eps,
+            }),
+        },
+    )
+    .unwrap();
+    (ys, ids, ws, hs)
+}
+
+/// The layer with its prelude on the device, if it ran.
+fn gpu_layer_pre(
+    dev: &VulkanDevice,
+    l: Layer,
+    router: &DeviceWeights,
+    experts: &[[DeviceWeights; 3]],
+    p: &Pre,
+    s: usize,
+    norm: bool,
+) -> Option<WithPre> {
+    let o =
+        DeviceWeights::new(dev.upload(&p.o, None).unwrap(), 0, p.dtype, l.h, p.att_cols).unwrap();
+    let (mut ys, mut ids, mut ws, mut hs) = (
+        vec![0f32; s * l.h],
+        vec![0u32; s * l.k],
+        vec![0f32; s * l.k],
+        p.hs.clone(),
+    );
+    let ran = dev
+        .routed_moe(&mut DeviceRoutedMoe {
+            router,
+            experts,
+            k: l.k,
+            renormalise: norm,
+            xs: &[],
+            s,
+            ys: &mut ys,
+            ids: &mut ids,
+            weights: &mut ws,
+            prelude: Some(DeviceMoePrelude {
+                o: &o,
+                att: &p.att,
+                hs: &mut hs,
+                norm: &p.norm,
+                eps: p.eps,
+            }),
+        })
+        .unwrap();
+    if !ran {
+        assert_eq!(
+            bits(&hs),
+            bits(&p.hs),
+            "declined: the residual stream untouched"
+        );
+    }
+    ran.then_some((ys, ids, ws, hs))
+}
+
+/// The layer with its prelude in one submission equals the CPU's separate steps (the O
+/// matmul, `hs += o`, `rms_norm`, then the layer): outputs, ids, weights and the residual
+/// stream, for every dtype pairing, an O projection of each dtype, a width with a short
+/// last chunk of the norm's sum (65), 1 to 8 tokens.
+#[test]
+fn the_routed_layer_with_its_prelude_matches_the_cpu() {
+    let Some(dev) = device_with(true, true) else {
+        return;
+    };
+    let q4 = DType::Ggml(GgmlType::Q4_K);
+    let q6 = DType::Ggml(GgmlType::Q6_K);
+    let q8 = DType::Ggml(GgmlType::Q8_0);
+    // (layer, O dtype, attention width)
+    let cases = [
+        (
+            Layer {
+                h: 512,
+                ffn: 256,
+                experts: 8,
+                k: 2,
+                router: DType::F32,
+                gu: q4,
+                down: q4,
+            },
+            q4,
+            512,
+        ),
+        (
+            Layer {
+                h: 512,
+                ffn: 256,
+                experts: 16,
+                k: 4,
+                router: q8,
+                gu: q4,
+                down: q6,
+            },
+            q6,
+            768,
+        ),
+        (
+            Layer {
+                h: 256,
+                ffn: 512,
+                experts: 6,
+                k: 6,
+                router: DType::F16,
+                gu: q6,
+                down: q6,
+            },
+            q8,
+            128,
+        ),
+        (
+            Layer {
+                h: 64,
+                ffn: 96,
+                experts: 12,
+                k: 3,
+                router: DType::F32,
+                gu: q8,
+                down: q8,
+            },
+            DType::F16,
+            96,
+        ),
+        (
+            Layer {
+                h: 65,
+                ffn: 130,
+                experts: 5,
+                k: 1,
+                router: DType::BF16,
+                gu: DType::F32,
+                down: DType::F16,
+            },
+            DType::F32,
+            70,
+        ),
+    ];
+    for (c, &(l, odt, att)) in cases.iter().enumerate() {
+        let h = host(l, 41 + c as u32, c % 2 == 1);
+        let (router, experts) = place(&dev, l, &h, true);
+        for s in [1, 2, 4, 8] {
+            for (norm, eps) in [(false, 1e-5), (true, 1e-6)] {
+                let p = pre(l, odt, att, s, 97 + c as u32 + s as u32, eps);
+                let what = format!("{l:?} O {odt} x {att}, {s} tokens, renormalise {norm}");
+                let want = cpu_layer_pre(l, &h, &p, s, norm);
+                let before = dev.transfers().submissions;
+                let got = gpu_layer_pre(&dev, l, &router, &experts, &p, s, norm)
+                    .unwrap_or_else(|| panic!("{what}: not run"));
+                assert_eq!(
+                    dev.transfers().submissions - before,
+                    1,
+                    "{what}: one submission"
+                );
+                assert_eq!(bits(&got.3), bits(&want.3), "{what}: residual stream");
+                assert_eq!(got.1, want.1, "{what}: ids");
+                assert_eq!(bits(&got.2), bits(&want.2), "{what}: weights");
+                assert_eq!(bits(&got.0), bits(&want.0), "{what}: outputs");
+            }
+        }
+    }
+}
+
+/// OLMoE's layer shape with its prelude: a 2048 × 2048 O projection (Q4_K and Q6_K), 64
+/// experts of 2048 × 1024, top 8, at 1 and 4 tokens.
+#[test]
+fn olmoe_layer_shapes_with_the_prelude_match_the_cpu() {
+    let Some(dev) = device_with(true, true) else {
+        return;
+    };
+    let q4 = DType::Ggml(GgmlType::Q4_K);
+    let q6 = DType::Ggml(GgmlType::Q6_K);
+    let l = Layer {
+        h: 2048,
+        ffn: 1024,
+        experts: 64,
+        k: 8,
+        router: DType::F32,
+        gu: q4,
+        down: q6,
+    };
+    let h = host(l, 9, false);
+    let (router, experts) = place(&dev, l, &h, true);
+    for odt in [q4, q6] {
+        for s in [1, 4] {
+            let p = pre(l, odt, 2048, s, 13 + s as u32, 1e-5);
+            let want = cpu_layer_pre(l, &h, &p, s, false);
+            let got = gpu_layer_pre(&dev, l, &router, &experts, &p, s, false).unwrap();
+            assert_eq!(bits(&got.3), bits(&want.3), "{odt}, {s} tokens: residual");
+            assert_eq!(got.1, want.1, "{odt}, {s} tokens: ids");
+            assert_eq!(bits(&got.0), bits(&want.0), "{odt}, {s} tokens: outputs");
+        }
+    }
+}
+
+/// A prelude is declined, with nothing written, when `route_o` is off (Step 3b still
+/// runs without one) and when the experts are not in one buffer.
+#[test]
+fn the_prelude_is_declined_outside_its_conditions() {
+    let l = Layer {
+        h: 64,
+        ffn: 96,
+        experts: 4,
+        k: 2,
+        router: DType::F32,
+        gu: DType::F32,
+        down: DType::F32,
+    };
+    let h = host(l, 3, false);
+    let p = pre(l, DType::F32, 64, 1, 5, 1e-5);
+    let Some(off) = device_with(true, false) else {
+        return;
+    };
+    assert!(off.routes_moe(l.experts, l.k, 1));
+    assert!(!off.routes_moe_prelude(l.experts, l.k, 1), "off by default");
+    let (router, arena) = place(&off, l, &h, true);
+    assert!(gpu_layer_pre(&off, l, &router, &arena, &p, 1, false).is_none());
+    let xs = acts(l.h, 1);
+    assert!(gpu_layer(&off, l, &router, &arena, &xs, 1, false).is_some());
+    let Some(on) = device_with(true, true) else {
+        return;
+    };
+    assert!(on.routes_moe_prelude(l.experts, l.k, 1));
+    let (router, own) = place(&on, l, &h, false);
+    assert!(
+        gpu_layer_pre(&on, l, &router, &own, &p, 1, false).is_none(),
+        "separate buffers"
+    );
+    let Some(no_route) = device_with(false, true) else {
+        return;
+    };
+    assert!(
+        !no_route.routes_moe_prelude(l.experts, l.k, 1),
+        "needs --vulkan-route"
+    );
 }
