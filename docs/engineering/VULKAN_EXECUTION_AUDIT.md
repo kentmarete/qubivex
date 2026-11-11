@@ -1906,3 +1906,95 @@ already binds for the router and the gate/up entries. Extra per-submitter memory
   --variant routed='--vulkan-route on' --variant routedo='--vulkan-route on
   --vulkan-route-o on'`; decode, prefill, submissions per token (49 → 33), concurrent at
   1, 2, 4 and 8.
+
+### 18.7 What was built (separate commits, each compiling alone)
+
+| Commit | What |
+|---|---|
+| Compute | `rms_norm` and `rms_scale` move into `qubivex-compute::math` unchanged (re-exported by `qubivex-arch::ops`); `rms_scale_of(ss, n, eps)` is the scalar step, which `rms_scale` now calls. |
+| Shaders | `rms.glsl` (`1 / sqrt(ss / n + eps)`), `resnorm.comp` (residual, 64-lane sum of squares, scale, two multiplies; one workgroup of 64 per token) and `rms_scale.comp` (the scale alone, for the conformance tests), all `-O0`. The five existing `.spv` files are byte-identical. `VulkanDevice::rms_scale`. |
+| Interface | `MoePrelude` and `RoutedMoe::prelude` (then `xs` is empty); `residual_norm` and `prelude_steps` (the reference); `ComputeBackend::routes_moe_prelude` and `DiscreteDevice::routes_moe_prelude`, both `false` by default; `DeviceMoePrelude`. Arch: before the O matmul, a MoE layer is offered with its prelude when the backend says so, nothing is traced and no lookahead is wanted; declined, it runs as before. Runtime: `OnDevice` resolves the O view. Sim: `SimConfig::route_prelude`. |
+| Vulkan | `routed_moe` with a prelude: the O projection as a fused entry over the dense buffer, then `resnorm` writing the activations the router and experts read, then Step 3b's six dispatches: 8 dispatches, 7 barriers, one command buffer. The norm weights travel in the table buffer. Declined (Step 3b runs) when the O dtype has no kernel or past the limits. `VulkanConfig::route_o`, off by default, effective only with `route`. |
+| CLI, bench | `--vulkan-route-o on\|off` (needs `--vulkan-route on`); the batch example and `scripts/bench-vulkan-baseline` pass it on. |
+
+Also fixed: Step 3b had left `Ffn`'s doc comment and derive above `RoutedLayer`.
+
+### 18.8 Correctness
+
+- **Scale, every input** (`tests/norm.rs`, ignored, 41 s): `1 / sqrt(ss / n + eps)` on
+  the device against `rms_scale_of` on the CPU for every f32 bit pattern of `ss`, at
+  (n, eps) = (1, 0), (2048, 1e-5), (4096, 1e-6), (128, 1e-6), (896, 1e-6) and (7, 1e-5):
+  **0 differences** outside the excluded classes. At (1, 0), 16,777,214 subnormal
+  inputs differ (the GPU flushes them: ADR-011 §1); every shape has 16,777,213 NaN
+  inputs with different payloads (ADR-011 amendment 7). So MoltenVK's `sqrt` and
+  division are correctly rounded over the whole range here. In the normal suite: edge
+  values (±0, ±∞, NaN, perfect squares and their neighbours up to 4095², 2²⁰ random) at
+  the same six shapes.
+- **Whole layer with its prelude** against `routed_moe_steps` on the CPU (`tests/routed.rs`):
+  the residual stream, ids, weights and outputs bit for bit, one submission each, for
+  five layer shapes with O in Q4_K, Q6_K, Q8_0, f16 and f32, attention widths 70 to 768,
+  a width of 65 (a one-element last chunk in the norm's sum), 1, 2, 4 and 8 tokens, eps
+  1e-5 and 1e-6, with and without renormalisation; OLMoE's shape (O 2048 × 2048 in Q4_K
+  and Q6_K, 64 experts, top 8) at 1 and 4 tokens. Declined with nothing written when
+  `route_o` is off (Step 3b still runs), when the experts are in separate buffers, and
+  without `route`.
+- **Positive controls** (each restored after): `inversesqrt(q)` for `1 / sqrt(q)` fails
+  the scale test (1-ulp differences); in `resnorm.comp`, a different final tree
+  (`((a0 + a1) + a2) + a3`), `v · (r · w)` for `(v · r) · w`, and the norm taken
+  before the residual each fail both prelude layer tests; in the reference, the norm
+  before the residual fails both sim prelude tests.
+- **Runtime:** sim (fixtures): the CPU's prompt logits and tokens, **2 submissions per
+  layer + 1** per pass, the same store and device-cache hits as Step 3b, nothing routed
+  with a device cache short of the model, concurrent requests. Vulkan: the fixtures'
+  logits and tokens with the prelude, 2 per layer + 1 submissions, concurrent; **real
+  OLMoE: the CPU's prompt logits and Colibri's 12 tokens, every layer routed with its
+  prelude**. Step 3a and 3b tests unchanged and passing.
+
+### 18.9 Measured on mains (the acceptance records)
+
+`scripts/bench-vulkan-baseline --tag step3c --variant routed='--vulkan-route on' --variant routedo='--vulkan-route on --vulkan-route-o on'`,
+AC power, untimed, 3 alternated rounds (records `2026-11-12-m3pro-vulkan-step3c-{base,routed,routedo}-{1,2,3}.json`,
+log `…-step3c-mains.txt`). Every record's tokens equal the Step 1a reference. Swap was
+about 7 GB in use for the whole session (left from earlier work); the rounds alternate,
+so it affects every variant alike.
+
+| Round | Step 1a ms/token | Step 3b | **Step 3c** | Step 1a prefill ms | Step 3b | Step 3c |
+|---|---|---|---|---|---|---|
+| 1 | 35.47 | 30.93 | **29.05** | 200.0 | 195.9 | 195.8 |
+| 2 | 35.22 | 31.04 | **29.18** | 200.0 | 195.6 | 195.8 |
+| 3 | 35.62 | 31.13 | **28.95** | 200.1 | 196.0 | 195.5 |
+| tok/s | 28.1–28.4 | 32.1–32.3 | **34.3–34.5** | | | |
+| submissions/token | 305 | 49 | **33** | | | |
+
+- Against Step 3b: **−1.9 to −2.2 ms per token (−6.2%)**, as estimated (§18.5), about
+  three times the run-to-run spread. Against the permanent Step 1a baseline: −6.4 ms
+  (−18%).
+- Prefill: unchanged (195.5–195.8 against 195.6–196.0 ms; the 10-token prompt is not
+  routed).
+
+Concurrent tok/s (batch example, 32 tokens per sequence, median of 3, per round; tokens
+identical in every mode):
+
+| N | Step 1a | Step 3b | **Step 3c** | Gain over 3b |
+|---|---|---|---|---|
+| 1 | 28.36–28.61 | 32.36–32.69 | **34.49–34.88** | +6.6% |
+| 2 | 34.27–34.60 | 39.44–39.69 | **41.32–41.50** | +4.7% |
+| 4 | 40.27–40.35 | 44.88–45.00 | **46.00–46.06** | +2.4% |
+| 8 | 44.48–44.73 | 48.25–48.34 | **49.07–49.18** | +1.8% |
+
+**Gates:** identical tokens (yes, every record and mode); numerical correctness (§18.8);
+no prefill regression (yes); no concurrent regression (a gain at every N, smaller as N
+grows, since more sequences already hide the round trips); a measured single-stream gain
+over Step 3b (yes, −6.2%). **35 tok/s: not reached (34.3–34.5).** What remains per layer
+is QKV → attention on the host (the KV cache in host memory, §8 Step 4).
+
+### 18.10 Not done; for the owner
+
+1. **Acceptance**, and the defaults: `--vulkan-route-o` is off, and needs
+   `--vulkan-route` (also off, pending Step 3b's acceptance, §17.15).
+2. **ADR-019 amendment** for Steps 3b and 3c (routing and the prelude on the device; the
+   square root proven exhaustively on MoltenVK) is not written; it follows acceptance.
+3. **A device-open probe** for division and square root on drivers other than MoltenVK is
+   not built (the exhaustive test is the proof on this one).
+4. **Next:** attention on the device (the KV cache on the device), which would make a
+   layer one submission.
