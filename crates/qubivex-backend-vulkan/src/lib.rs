@@ -70,10 +70,11 @@ pub(crate) const BACKEND: &str = "vulkan";
 /// compute threads running a layer's experts.
 const SUBMITTERS: usize = 8;
 
-/// [`VulkanConfig::fuse_rows`]'s default: fuse expert blocks of up to 4 rows. In the
+/// [`VulkanConfig::fuse_rows`]'s default: fuse expert blocks of up to 8 rows. In the
 /// harness (audit §15.2) fusion saved 15% of GPU time at 1 row per expert and 3% at 4,
-/// and was neutral or slightly slower at 10.
-pub const FUSE_ROWS: usize = 4;
+/// and was neutral or slightly slower at 10. End to end (audit §16) 8 beat 4 by 1% with
+/// 8 concurrent sequences and equalled it below; above 8 nothing was measured to gain.
+pub const FUSE_ROWS: usize = 8;
 
 /// Which device a [`VulkanDevice`] opens, and how much of its memory it may use.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]

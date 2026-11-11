@@ -522,7 +522,7 @@ pub(crate) struct DeviceArgs {
     #[arg(long)]
     vulkan_timestamps: bool,
     /// With --backend vulkan: run a layer's experts as one fused submission when no
-    /// expert computes more than N rows (default 4; 0: never, each expert's matmuls
+    /// expert computes more than N rows (default 8; 0: never, each expert's matmuls
     /// submitted on their own as before).
     #[arg(long, value_name = "N")]
     vulkan_fuse_rows: Option<usize>,
