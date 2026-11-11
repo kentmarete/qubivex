@@ -14,7 +14,7 @@ use qubivex_arch::DenseMatmul;
 use qubivex_backend_cpu::CpuBackend;
 use qubivex_backend_metal::{MetalBackend, MetalWeights, ResidentMatMul};
 use qubivex_compute::host::PageAligned;
-use qubivex_compute::{ComputeBackend, ComputeError, GatedFfn, MatMul, WeightView};
+use qubivex_compute::{ComputeBackend, ComputeError, GatedFfn, MatMul, RoutedMoe, WeightView};
 use qubivex_core::DType;
 
 /// The compute backend an engine uses.
@@ -372,6 +372,20 @@ impl ComputeBackend for Placed {
         match &self.device {
             Some(d) => d.gated_ffn_many(ops),
             None => qubivex_compute::gated_ffn_steps(self, ops),
+        }
+    }
+
+    /// Whether the discrete device routes this layer shape on the device (Step 3b).
+    fn routes_moe(&self, experts: usize, k: usize, s: usize) -> bool {
+        self.device
+            .as_ref()
+            .is_some_and(|d| d.routes_moe(experts, k, s))
+    }
+
+    fn routed_moe(&self, op: &mut RoutedMoe<'_>) -> Result<bool, ComputeError> {
+        match &self.device {
+            Some(d) => d.routed_moe(op),
+            None => Ok(false),
         }
     }
 

@@ -9,8 +9,8 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use qubivex_arch::{
-    ArchError, DenseWeights, ExpertProvider, ExpertWeights, KvCache, Logits, Segment, Sources,
-    Tracer, Transformer,
+    ArchError, DenseWeights, ExpertProvider, ExpertWeights, HeldLayerFn, KvCache, Logits, Segment,
+    Sources, Tracer, Transformer,
 };
 use qubivex_backend_cpu::sim::{SimConfig, SimDevice};
 use qubivex_compute::WeightView;
@@ -22,7 +22,7 @@ use qubivex_expert_stream::mirror::{MirrorPolicy, MirroredSource};
 use qubivex_expert_stream::policy::SaturationGauge;
 use qubivex_expert_stream::predict::{Lookahead, LookaheadConfig};
 use qubivex_expert_stream::{
-    Batch, ExpertKey, ExpertSource, ExpertStore, Lease, Next, Occupancy, Policy, PoolSpec,
+    Batch, ExpertKey, ExpertSource, ExpertStore, Held, Lease, Next, Occupancy, Policy, PoolSpec,
     PrefetchStats, ReadTimeout, StoreError, StoreStats,
 };
 use qubivex_hardware::{Host, Probed, ResourceProbe, SystemProbe};
@@ -585,6 +585,76 @@ impl ExpertProvider for StoreProvider<'_> {
             error: Mutex::new(None),
         }
         .run(held)
+    }
+
+    /// Holds the whole layer for routing on the discrete device (Step 3b), when every
+    /// expert is resident in RAM: quiet leases ([`ExpertStore::hold_layer`]) and device
+    /// pins that count no use. Missing experts are queued as prefetches (loaded now
+    /// without I/O threads, as the Metal pass does), and this pass routes on the host.
+    /// After `f` runs, its used experts are recorded exactly as `acquire_many` and the
+    /// device cache would have recorded them on the host-routed path.
+    fn with_layer_held(
+        &self,
+        layer: LayerIdx,
+        experts: u32,
+        f: &mut HeldLayerFn<'_>,
+    ) -> Result<bool, ArchError> {
+        let Some(dev) = self.device else {
+            return Ok(false);
+        };
+        let at = |e: &StoreError| store_err(layer, ExpertIdx(0), e);
+        let mut held = None;
+        for attempt in 0..2 {
+            match self.store.hold_layer(layer, experts).map_err(|e| at(&e))? {
+                Held::All(v) => {
+                    held = Some(v);
+                    break;
+                }
+                Held::TooSmall => return Ok(false),
+                Held::Missing(missing) => {
+                    if attempt == 1 {
+                        return Ok(false);
+                    }
+                    if self.store.io_threads() > 0 {
+                        self.store.prefetch(&missing, false).map_err(|e| at(&e))?;
+                        return Ok(false);
+                    }
+                    // Nobody reads ahead: load them now (they count as uses, as any
+                    // acquire does), then hold again.
+                    for lease in self.store.acquire_many(&missing).map_err(|e| at(&e))? {
+                        drop(lease.map_err(|e| at(&e))?);
+                    }
+                }
+            }
+        }
+        let Some(held) = held else {
+            return Ok(false);
+        };
+        let pins = held
+            .iter()
+            .map(|l| dev.hold(l.key(), l.slab()))
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(ArchError::from)?;
+        let ws = held
+            .iter()
+            .map(|l| self.weights(layer, l.key().1, l.bytes()))
+            .collect::<Result<Vec<_>, _>>()?;
+        let used = f(&ws)?;
+        drop(pins);
+        let Some(used) = used else {
+            return Ok(false);
+        };
+        // The uses the host-routed path records: the store's (heat, recency, hits, the
+        // trace), the lookahead's, and the device cache's hits and recency.
+        let keys: Vec<ExpertKey> = used.iter().map(|&e| (layer, e)).collect();
+        self.store.record_uses(&keys).map_err(|e| at(&e))?;
+        self.after_demand(layer, &used);
+        for &e in &used {
+            if let Some(l) = held.get(e.0 as usize) {
+                drop(dev.ensure(l.key(), l.slab()).map_err(ArchError::from)?);
+            }
+        }
+        Ok(true)
     }
 
     fn wants_lookahead(&self) -> bool {
