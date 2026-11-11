@@ -195,7 +195,8 @@ impl DiscreteDevice for VulkanDevice {
     }
 
     fn upload(&self, host: &[u8], guard: Option<Guard>) -> Result<DeviceBuffer, ComputeError> {
-        self.submitter().upload(host, &self.counters, self.capacity, guard)
+        self.submitter()
+            .upload(host, &self.counters, self.capacity, guard)
     }
 
     fn matmul_many(&self, ops: &mut [DeviceMatMul<'_>]) -> Result<(), ComputeError> {

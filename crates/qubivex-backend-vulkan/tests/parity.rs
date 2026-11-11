@@ -412,7 +412,8 @@ fn speed() {
                 time(&mut op, 20)
             };
             // 24 ops (8 experts x 3): each expert's outputs in their own vectors.
-            let mut outs: Vec<Vec<f32>> = (0..24).map(|i| vec![0f32; s * shapes[i % 3].0]).collect();
+            let mut outs: Vec<Vec<f32>> =
+                (0..24).map(|i| vec![0f32; s * shapes[i % 3].0]).collect();
             let mut layer: Vec<_> = outs
                 .iter_mut()
                 .enumerate()
