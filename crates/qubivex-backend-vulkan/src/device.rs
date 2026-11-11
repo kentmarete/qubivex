@@ -39,6 +39,9 @@ const ROWS: u32 = 8;
 /// Bytes of the staging buffer for uploads; larger uploads go in chunks.
 const STAGING: u64 = 64 << 20;
 
+/// Most command buffers one submission records into.
+const PARTS: u32 = 16;
+
 /// Shader dtype codes, in pipeline order. Must match `DT_*` in the shader.
 const DTYPES: [DType; 6] = [
     DType::F32,
@@ -899,7 +902,9 @@ pub(crate) struct Ran {
 pub(crate) struct Submitter {
     shared: Arc<Shared>,
     pool: vk::CommandPool,
-    cmd: vk::CommandBuffer,
+    /// Command buffers: a submission records its ops into up to [`PARTS`] of them and
+    /// submits them together, under one fence.
+    cmds: Vec<vk::CommandBuffer>,
     fence: vk::Fence,
     descriptors: vk::DescriptorPool,
     sets: u32,
@@ -963,14 +968,14 @@ impl Submitter {
                 d.destroy_command_pool(pool, None);
                 e
             };
-            let cmd = d
+            let cmds = d
                 .allocate_command_buffers(
                     &vk::CommandBufferAllocateInfo::default()
                         .command_pool(pool)
                         .level(vk::CommandBufferLevel::PRIMARY)
-                        .command_buffer_count(1),
+                        .command_buffer_count(PARTS),
                 )
-                .map_err(|e| cleanup(err("command buffer", e)))?[0];
+                .map_err(|e| cleanup(err("command buffer", e)))?;
             let fence = d
                 .create_fence(&vk::FenceCreateInfo::default(), None)
                 .map_err(|e| cleanup(err("fence", e)))?;
@@ -1001,7 +1006,7 @@ impl Submitter {
             Ok(Self {
                 shared: Arc::clone(shared),
                 pool,
-                cmd,
+                cmds,
                 fence,
                 descriptors,
                 sets: 64,
@@ -1033,36 +1038,49 @@ impl Submitter {
         self.queries.is_some()
     }
 
-    /// Records with `record`, submits, and waits.
+    /// Records `parts` command buffers (at least 1, at most [`PARTS`]) with `record`,
+    /// called with each buffer and its index, submits them together under one fence,
+    /// and waits. The timestamps bracket the first and last buffer.
     fn run(
         &mut self,
-        record: impl FnOnce(&ash::Device, vk::CommandBuffer),
+        parts: usize,
+        mut record: impl FnMut(&ash::Device, vk::CommandBuffer, usize),
     ) -> Result<Ran, ComputeError> {
         let d = &self.shared.device;
-        let cmds = [self.cmd];
+        let parts = parts.clamp(1, PARTS as usize);
+        let cmds = &self.cmds[..parts];
         let queries = self.queries;
-        // SAFETY: the command buffer is not in flight (the last submission was waited
-        // for), its pool allows reset, and the queue is externally synchronised by the
+        // SAFETY: the command buffers are not in flight (the last submission was waited
+        // for), their pool allows reset, and the queue is externally synchronised by the
         // queue lock.
         unsafe {
-            d.reset_command_buffer(self.cmd, vk::CommandBufferResetFlags::empty())
-                .map_err(|e| err("reset", e))?;
-            d.begin_command_buffer(
-                self.cmd,
-                &vk::CommandBufferBeginInfo::default()
-                    .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT),
-            )
-            .map_err(|e| err("begin", e))?;
-            if let Some(q) = queries {
-                d.cmd_reset_query_pool(self.cmd, q, 0, 2);
-                d.cmd_write_timestamp(self.cmd, vk::PipelineStageFlags::TOP_OF_PIPE, q, 0);
+            for (i, &cmd) in cmds.iter().enumerate() {
+                d.reset_command_buffer(cmd, vk::CommandBufferResetFlags::empty())
+                    .map_err(|e| err("reset", e))?;
+                d.begin_command_buffer(
+                    cmd,
+                    &vk::CommandBufferBeginInfo::default()
+                        .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT),
+                )
+                .map_err(|e| err("begin", e))?;
+                if let Some(q) = queries
+                    && i == 0
+                {
+                    d.cmd_reset_query_pool(cmd, q, 0, 2);
+                    d.cmd_write_timestamp(cmd, vk::PipelineStageFlags::TOP_OF_PIPE, q, 0);
+                }
+                record(d, cmd, i);
+                if let Some(q) = queries
+                    && i + 1 == parts
+                {
+                    d.cmd_write_timestamp(cmd, vk::PipelineStageFlags::BOTTOM_OF_PIPE, q, 1);
+                }
+                d.end_command_buffer(cmd).map_err(|e| err("end", e))?;
             }
-            record(d, self.cmd);
-            if let Some(q) = queries {
-                d.cmd_write_timestamp(self.cmd, vk::PipelineStageFlags::BOTTOM_OF_PIPE, q, 1);
-            }
-            d.end_command_buffer(self.cmd).map_err(|e| err("end", e))?;
-            let submit = [vk::SubmitInfo::default().command_buffers(&cmds)];
+            let submit: Vec<vk::SubmitInfo<'_>> = cmds
+                .chunks(1)
+                .map(|c| vk::SubmitInfo::default().command_buffers(c))
+                .collect();
             {
                 let _queue = self
                     .shared
@@ -1154,7 +1172,7 @@ impl Submitter {
             bytes[..real].copy_from_slice(&host[from..from + real]);
             bytes[real..usize::try_from(n).unwrap_or(0)].fill(0);
             let (src, dbuf) = (stage.buffer, dst.buffer);
-            let _ = self.run(|d, cmd| {
+            let _ = self.run(1, |d, cmd, _| {
                 let region = [vk::BufferCopy::default()
                     .src_offset(0)
                     .dst_offset(done)
@@ -1383,11 +1401,23 @@ impl Submitter {
         }
 
         let (layout, pipelines) = (shared.layout, shared.pipelines.clone());
-        let ran = self.run(|d, cmd| {
+        // EXPERIMENT: QUBIVEX_VK_PARTS spreads the ops over that many command buffers.
+        static WANT: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+        let want = *WANT.get_or_init(|| {
+            std::env::var("QUBIVEX_VK_PARTS")
+                .ok()
+                .and_then(|v| v.parse::<usize>().ok())
+                .unwrap_or(1)
+        });
+        let parts = want.clamp(1, PARTS as usize).min(plan.len().max(1));
+        let ran = self.run(parts, |d, cmd, part| {
             // SAFETY: recording into a command buffer in the recording state, with
             // objects that outlive the submission (it is waited for in `run`).
             unsafe {
-                for (set, p) in sets.iter().zip(&plan) {
+                for (i, (set, p)) in sets.iter().zip(&plan).enumerate() {
+                    if i * parts / plan.len().max(1) != part {
+                        continue;
+                    }
                     let (dt, params, groups, s) = (p.dtype, p.params, p.groups, p.tokens);
                     if groups == 0 || s == 0 {
                         continue;
