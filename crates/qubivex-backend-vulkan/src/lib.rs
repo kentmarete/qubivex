@@ -33,7 +33,8 @@
 
 mod device;
 
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard, TryLockError};
 
 pub use device::{PhysicalInfo, list};
 use qubivex_compute::ComputeError;
@@ -43,6 +44,10 @@ use qubivex_compute::discrete::{
 use qubivex_core::DType;
 
 pub(crate) const BACKEND: &str = "vulkan";
+
+/// Submissions that can be in flight at once: one per concurrent caller, such as the
+/// compute threads running a layer's experts.
+const SUBMITTERS: usize = 8;
 
 /// Which device a [`VulkanDevice`] opens, and how much of its memory it may use.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -56,7 +61,11 @@ pub struct VulkanConfig {
 
 /// A Vulkan GPU as a discrete device. See the crate documentation.
 pub struct VulkanDevice {
-    submitter: Mutex<device::Submitter>,
+    /// [`SUBMITTERS`] submitters: a caller takes a free one, so up to that many
+    /// submissions are recorded, in flight and waited for at once.
+    submitters: Vec<Mutex<device::Submitter>>,
+    /// Where the next caller starts looking for a free submitter.
+    next: AtomicUsize,
     counters: Arc<device::Counters>,
     capacity: u64,
     info: PhysicalInfo,
@@ -81,14 +90,33 @@ impl VulkanDevice {
         let opened = device::Shared::open(&config)?;
         let mut submitter = device::Submitter::new(&opened.shared)?;
         fused_fma(&mut submitter, &opened.info)?;
+        let mut submitters = vec![Mutex::new(submitter)];
+        for _ in 1..SUBMITTERS {
+            submitters.push(Mutex::new(device::Submitter::new(&opened.shared)?));
+        }
         let heap = opened.info.device_local;
         let capacity = config.capacity.unwrap_or(heap);
         Ok(Self {
-            submitter: Mutex::new(submitter),
+            submitters,
+            next: AtomicUsize::new(0),
             counters: Arc::default(),
             capacity,
             info: opened.info,
         })
+    }
+
+    /// A free submitter if there is one, else the next in turn once it is free.
+    fn submitter(&self) -> MutexGuard<'_, device::Submitter> {
+        let n = self.submitters.len();
+        let start = self.next.fetch_add(1, Ordering::Relaxed);
+        for i in 0..n {
+            match self.submitters[(start + i) % n].try_lock() {
+                Ok(g) => return g,
+                Err(TryLockError::Poisoned(p)) => return p.into_inner(),
+                Err(TryLockError::WouldBlock) => {}
+            }
+        }
+        device::lock(&self.submitters[start % n])
     }
 
     /// The physical device.
@@ -162,11 +190,11 @@ impl DiscreteDevice for VulkanDevice {
     }
 
     fn upload(&self, host: &[u8], guard: Option<Guard>) -> Result<DeviceBuffer, ComputeError> {
-        device::lock(&self.submitter).upload(host, &self.counters, self.capacity, guard)
+        self.submitter().upload(host, &self.counters, self.capacity, guard)
     }
 
     fn matmul_many(&self, ops: &mut [DeviceMatMul<'_>]) -> Result<(), ComputeError> {
-        device::lock(&self.submitter).matmul_many(ops, &self.counters)
+        self.submitter().matmul_many(ops, &self.counters)
     }
 
     fn usage(&self) -> DeviceUsage {

@@ -186,7 +186,77 @@ void main() {
         uint row = p.w_base + r * p.row_bytes;
         uint x = p.x_base + tok * p.k;
         uint full = p.k / 64u * 64u;
-        for (uint c = 0u; c < full; c += 64u) {
+        // The quantised formats decode a block at a time: the block's scales once, and
+        // each byte once for every weight it holds. Each lane still gets the same
+        // weights, from the same operations, in the same order as `weight` gives.
+        uint c = 0u;
+        if (DTYPE == DT_Q4_K) {
+            // A chunk of 64 is one group g: lane l's two weights are the low and high
+            // nibbles of the same byte.
+            for (; c + 256u <= full; c += 256u) {
+                uint blk = row + 144u * (c / 256u);
+                precise float d = f16_at(blk);
+                precise float dmin = f16_at(blk + 2u);
+                for (uint g = 0u; g < 4u; g++) {
+                    uvec2 s0 = scale_min_k4(2u * g, blk + 4u);
+                    uvec2 s1 = scale_min_k4(2u * g + 1u, blk + 4u);
+                    precise float d0 = d * float(s0.x);
+                    precise float m0 = dmin * float(s0.y);
+                    precise float d1 = d * float(s1.x);
+                    precise float m1 = dmin * float(s1.y);
+                    uint v = byte_at(blk + 16u + 32u * g + lane);
+                    precise float t0 = d0 * float(v & 0xFu);
+                    precise float y0 = t0 - m0;
+                    precise float t1 = d1 * float(v >> 4);
+                    precise float y1 = t1 - m1;
+                    uint j = x + c + 64u * g + lane;
+                    a0 = fma(y0, xs[j], a0);
+                    a1 = fma(y1, xs[j + 32u], a1);
+                }
+            }
+        } else if (DTYPE == DT_Q6_K) {
+            // A half of 128 is two chunks: lane l's four weights share qh[32h + l] and
+            // take ql[64h + l] and ql[64h + l + 32], low nibbles in the first chunk and
+            // high nibbles in the second.
+            for (; c + 256u <= full; c += 256u) {
+                uint blk = row + 210u * (c / 256u);
+                precise float d = f16_at(blk + 208u);
+                for (uint h = 0u; h < 2u; h++) {
+                    uint la = byte_at(blk + 64u * h + lane);
+                    uint lb = byte_at(blk + 64u * h + lane + 32u);
+                    uint hb = byte_at(blk + 128u + 32u * h + lane);
+                    uint sc = blk + 192u + 8u * h + lane / 16u;
+                    uint j = x + c + 128u * h + lane;
+                    for (uint qq = 0u; qq < 4u; qq++) {
+                        uint lo = qq >= 2u ? ((qq & 1u) == 0u ? la : lb) >> 4
+                                           : ((qq & 1u) == 0u ? la : lb) & 0xFu;
+                        int q = int(lo | (((hb >> (2u * qq)) & 3u) << 4)) - 32;
+                        precise float s = d * float(i8_at(sc + 2u * qq));
+                        precise float y = s * float(q);
+                        if ((qq & 1u) == 0u) {
+                            a0 = fma(y, xs[j + 32u * qq], a0);
+                        } else {
+                            a1 = fma(y, xs[j + 32u * qq], a1);
+                        }
+                    }
+                }
+            }
+        } else if (DTYPE == DT_Q8_0) {
+            // A chunk of 64 is two blocks of 32: lane l takes weight l of each.
+            for (; c < full; c += 64u) {
+                uint b0 = row + 34u * (c / 32u);
+                uint b1 = b0 + 34u;
+                precise float d0 = f16_at(b0);
+                precise float d1 = f16_at(b1);
+                precise float q0 = float(i8_at(b0 + 2u + lane));
+                precise float q1 = float(i8_at(b1 + 2u + lane));
+                precise float y0 = q0 * d0;
+                precise float y1 = q1 * d1;
+                a0 = fma(y0, xs[x + c + lane], a0);
+                a1 = fma(y1, xs[x + c + lane + 32u], a1);
+            }
+        }
+        for (; c < full; c += 64u) {
             uint j0 = c + lane;
             uint j1 = j0 + 32u;
             a0 = fma(weight(row, j0), xs[x + j0], a0);
