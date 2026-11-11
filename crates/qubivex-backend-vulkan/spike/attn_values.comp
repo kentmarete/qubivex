@@ -1,0 +1,26 @@
+// Values: out[i] = fma chain over positions in order, from zero, one invocation per
+// (dimension, head, token). Grid: (ceil(d / 64), heads, tokens).
+#version 450
+layout(local_size_x = 64) in;
+#include "attn_split.glsl"
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    uint h = gl_WorkGroupID.y;
+    uint t = gl_WorkGroupID.z;
+    uint s = gl_NumWorkGroups.z;
+    uint span = p.p0 + s;
+    uint d = D;
+    if (i >= d) {
+        return;
+    }
+    uint n = p.p0 + t + 1u;
+    uint g = h / GROUP;
+    uint stride = KVH * d;
+    uint sb = (t * HEADS + h) * span;
+    uint vb = p.v_base + g * d + i;
+    float o = 0.0;
+    for (uint j = 0u; j < n; j++) {
+        o = fma(sc[sb + j], kv[vb + j * stride], o);
+    }
+    out_[(t * HEADS + h) * d + i] = o;
+}

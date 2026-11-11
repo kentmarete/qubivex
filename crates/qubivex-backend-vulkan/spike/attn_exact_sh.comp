@@ -1,0 +1,14 @@
+// Exact attention, scores in shared memory (at most MAX_POS positions; binding 3
+// unused). See attn_body.glsl.
+#version 450
+layout(local_size_x = 128) in;
+layout(std430, set = 0, binding = 0) readonly buffer Q { float q[]; };
+layout(std430, set = 0, binding = 1) readonly buffer KV { float kv[]; };
+layout(std430, set = 0, binding = 2) writeonly buffer Out { float out_[]; };
+layout(push_constant) uniform P { uint dg; uint kh; uint p0; uint v_base; } p;
+const uint MAX_POS = 4096u;
+shared float ssc[MAX_POS];
+#define SCORE_SETUP
+#define SCORE(j) ssc[(j)]
+#define SCORE_BARRIER memoryBarrierShared(); barrier();
+#include "attn_body.glsl"

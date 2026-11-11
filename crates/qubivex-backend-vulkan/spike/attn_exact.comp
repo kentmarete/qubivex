@@ -1,0 +1,13 @@
+// Exact attention, scores in a device scratch buffer (binding 3: [token][head][span]).
+// See attn_body.glsl.
+#version 450
+layout(local_size_x = 128) in;
+layout(std430, set = 0, binding = 0) readonly buffer Q { float q[]; };
+layout(std430, set = 0, binding = 1) readonly buffer KV { float kv[]; };
+layout(std430, set = 0, binding = 2) writeonly buffer Out { float out_[]; };
+layout(std430, set = 0, binding = 3) coherent buffer Scratch { float sc[]; };
+layout(push_constant) uniform P { uint dg; uint kh; uint p0; uint v_base; } p;
+#define SCORE_SETUP uint sb = (t * heads + h) * span;
+#define SCORE(j) sc[sb + (j)]
+#define SCORE_BARRIER memoryBarrierBuffer(); memoryBarrierShared(); barrier();
+#include "attn_body.glsl"
