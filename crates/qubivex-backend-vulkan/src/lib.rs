@@ -7,9 +7,11 @@
 //! host-visible buffer and reads its outputs back.
 //!
 //! Every output has the CPU backend's bits: the shader (`shaders/matmul.comp`)
-//! dequantises each weight with the CPU's operations and sums with the CPU's 64-lane
-//! reduction shape, using shared memory rather than subgroup operations so the result
-//! does not depend on the driver's subgroup size. On MoltenVK the backend turns Metal's
+//! dequantises each weight with the CPU's operations (block-wise for the K-quants and
+//! Q8_0) and sums with the CPU's 64-lane reduction shape, using shared memory rather
+//! than subgroup operations so the result does not depend on the driver's subgroup
+//! size. Every add, subtract and `fma` is `NoContraction`, so no multiply is fused
+//! into what consumes it (ADR-019 amendment 1). On MoltenVK the backend turns Metal's
 //! fast math off at instance creation (`MVK_CONFIG_FAST_MATH_ENABLED`). Apple GPUs
 //! flush f32 subnormals to zero, as under Metal (ADR-011 §1).
 //!
@@ -23,9 +25,12 @@
 //! one, [`VulkanDevice::new`] returns [`ComputeError::Device`]. `QUBIVEX_VULKAN_LIBRARY`
 //! names the loader explicitly.
 //!
-//! Not built: weights or activations kept on the device across submissions, several
-//! queues, asynchronous copies, and kernels tuned for speed (each weight is
-//! dequantised per element, and each activation row reads the weights again).
+//! Up to 8 submissions are in flight at once, one per concurrent caller; each still
+//! completes before its call returns.
+//!
+//! Not built: activations kept on the device across submissions (whole layers on the
+//! device), several queues, asynchronous copies, and token tiles (each activation row
+//! reads the weights again).
 
 // FFI into Vulkan through ash (RUST_GUIDELINES §3: GPU backends may opt in). The
 // unsafe code is confined to `device.rs`.
