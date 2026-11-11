@@ -526,6 +526,11 @@ pub(crate) struct DeviceArgs {
     /// submitted on their own as before).
     #[arg(long, value_name = "N")]
     vulkan_fuse_rows: Option<usize>,
+    /// With --backend vulkan: route MoE layers on the device (on|off, default off): the
+    /// router, top-k, the fused experts and the combine in one submission, for layers of
+    /// at most --vulkan-fuse-rows tokens when the device expert cache holds every expert.
+    #[arg(long, value_name = "on|off")]
+    vulkan_route: Option<String>,
     /// With a discrete device: an explicit VRAM budget, for example 6GiB; replaces the
     /// profile's fraction of the device's memory.
     #[arg(long)]
@@ -557,14 +562,20 @@ impl DeviceArgs {
             && (self.vulkan_device.is_some()
                 || self.vulkan_vram.is_some()
                 || self.vulkan_timestamps
-                || self.vulkan_fuse_rows.is_some())
+                || self.vulkan_fuse_rows.is_some()
+                || self.vulkan_route.is_some())
         {
             return Err(
-                "--vulkan-device, --vulkan-vram, --vulkan-timestamps and --vulkan-fuse-rows \
-                 need --backend vulkan"
+                "--vulkan-device, --vulkan-vram, --vulkan-timestamps, --vulkan-fuse-rows and \
+                 --vulkan-route need --backend vulkan"
                     .to_owned(),
             );
         }
+        let route = match self.vulkan_route.as_deref() {
+            None | Some("off") => false,
+            Some("on") => true,
+            Some(other) => return Err(format!("--vulkan-route {other:?}: use on or off")),
+        };
         let vulkan = qubivex_runtime::VulkanConfig {
             device: self.vulkan_device,
             capacity: self
@@ -575,6 +586,7 @@ impl DeviceArgs {
                 .map(|b| b.0),
             timestamps: self.vulkan_timestamps,
             fuse_rows: self.vulkan_fuse_rows,
+            route,
         };
         let sim = backend == qubivex_runtime::BackendKind::Sim;
         if !sim && (self.sim_vram.is_some() || self.sim_bandwidth.is_some() || self.sim_delay) {

@@ -17,7 +17,7 @@
 pub mod ops;
 
 use qubivex_compute::tensor::{Tensor, TensorView, TensorViewMut};
-use qubivex_compute::{ComputeBackend, ComputeError, GatedFfn, MatMul, WeightView};
+use qubivex_compute::{ComputeBackend, ComputeError, GatedFfn, MatMul, RoutedMoe, WeightView};
 use qubivex_core::{DType, Shape};
 use qubivex_core::{ExpertIdx, LayerIdx};
 use qubivex_model::ArchConfig;
@@ -86,6 +86,11 @@ pub struct ExpertWeights<'a> {
     pub down: WeightView<'a>,
 }
 
+/// What [`ExpertProvider::with_layer_held`] calls with every expert of a layer: the
+/// experts it used, or `None` if it did not run.
+pub type HeldLayerFn<'f> =
+    dyn FnMut(&[ExpertWeights<'_>]) -> Result<Option<Vec<ExpertIdx>>, ArchError> + 'f;
+
 /// Routed experts, lent one at a time.
 pub trait ExpertProvider: Sync {
     /// Calls `f` with the expert's weights while they are held.
@@ -140,6 +145,28 @@ pub trait ExpertProvider: Sync {
     ) -> Result<(), ArchError> {
         let _ = group;
         self.with_experts(layer, experts, each)
+    }
+
+    /// Holds every expert `0..experts` of `layer` for an operation that chooses among
+    /// them itself (routing on the device, [`ComputeBackend::routed_moe`]), if the
+    /// provider can hold all of them now, and calls `f` once with their weights, indexed
+    /// by expert id. `f` returns the experts it used (distinct, ascending), or `None` if
+    /// it did not run; the provider records those uses as [`ExpertProvider::with_experts`]
+    /// would have. Returns whether `f` ran. Holding is not a use.
+    ///
+    /// The default holds nothing and returns `false` without calling `f`; the caller
+    /// then routes on the host.
+    ///
+    /// # Errors
+    /// As [`ExpertProvider::with_experts`], or whatever `f` returns.
+    fn with_layer_held(
+        &self,
+        layer: LayerIdx,
+        experts: u32,
+        f: &mut HeldLayerFn<'_>,
+    ) -> Result<bool, ArchError> {
+        let _ = (layer, experts, f);
+        Ok(false)
     }
 
     /// Whether the provider wants [`ExpertProvider::lookahead`] calls. When `false`
@@ -528,6 +555,16 @@ struct DecoderConfig {
 
 /// Each layer's FFN.
 #[derive(Clone, Debug)]
+/// One MoE layer's inputs for routing on the device.
+struct RoutedLayer<'a> {
+    layer: u32,
+    router: WeightView<'a>,
+    k: usize,
+    renormalise: bool,
+    xs: &'a [f32],
+    s: usize,
+}
+
 enum Ffn {
     /// Routed SwiGLU experts (`transformer_moe`).
     Moe {
@@ -897,6 +934,45 @@ impl Transformer {
     /// Positions are counted in the caches only once the whole pass has succeeded, so
     /// a failure anywhere leaves every cache as it was.
     #[allow(clippy::too_many_lines)]
+    /// Runs a MoE layer routed on the device ([`ComputeBackend::routed_moe`]) over the
+    /// provider's held experts, writing the combined outputs into `o`. Returns `false`,
+    /// with `o` untouched, when the provider cannot hold the layer or the backend
+    /// declines; the caller then routes on the host.
+    fn routed_on_device(
+        &self,
+        l: RoutedLayer<'_>,
+        experts: &dyn ExpertProvider,
+        be: &dyn ComputeBackend,
+        o: &mut [f32],
+    ) -> Result<bool, ArchError> {
+        let ne = u32::try_from(l.router.rows())
+            .map_err(|_| ArchError::Input("too many experts".into()))?;
+        let mut ids = vec![0u32; l.s * l.k];
+        let mut weights = vec![0f32; l.s * l.k];
+        experts.with_layer_held(LayerIdx(l.layer), ne, &mut |ws| {
+            let views: Vec<[WeightView<'_>; 3]> =
+                ws.iter().map(|w| [w.gate, w.up, w.down]).collect();
+            let ran = be.routed_moe(&mut RoutedMoe {
+                router: l.router,
+                experts: &views,
+                k: l.k,
+                renormalise: l.renormalise,
+                xs: l.xs,
+                s: l.s,
+                ys: o,
+                ids: &mut ids,
+                weights: &mut weights,
+            })?;
+            if !ran {
+                return Ok(None);
+            }
+            let mut used: Vec<u32> = ids.clone();
+            used.sort_unstable();
+            used.dedup();
+            Ok(Some(used.into_iter().map(ExpertIdx).collect()))
+        })
+    }
+
     fn forward_segments(
         &self,
         segments: &mut [Segment<'_>],
@@ -941,6 +1017,9 @@ impl Transformer {
             Ffn::Dense { .. } => (0, 0, false),
         };
         let vocab = usize_of(c.vocab)?;
+        // Routing on the device skips the router and routing trace points, so a pass
+        // that is traced routes on the host.
+        let tracing = trace.is_some();
         let mut emit =
             |point, layer: Option<u32>, token: usize, values: &[f32], experts: &[u32]| {
                 if let Some(t) = trace.as_deref_mut() {
@@ -1103,6 +1182,25 @@ impl Transformer {
             for xt in x.chunks_exact_mut(h) {
                 rms_norm(xt, &norms.ffn, c.rms_eps);
             }
+            // Router, routing, experts and combine as one backend operation when the
+            // backend routes this shape and the provider holds the whole layer.
+            let routed = match &self.ffn {
+                Ffn::Moe { router, .. } if !tracing && be.routes_moe(ne, k_top, s) => self
+                    .routed_on_device(
+                        RoutedLayer {
+                            layer: li,
+                            router: dense.view(&n(router))?,
+                            k: k_top,
+                            renormalise: norm_topk_prob,
+                            xs: &x,
+                            s,
+                        },
+                        experts,
+                        be,
+                        &mut o,
+                    )?,
+                _ => false,
+            };
             match &self.ffn {
                 Ffn::Dense { gate, up, down } => {
                     let (wg, wu) = (dense.view(&n(gate))?, dense.view(&n(up))?);
@@ -1129,6 +1227,8 @@ impl Transformer {
                         emit(TracePoint::Ffn, Some(li), t, &o[t * h..(t + 1) * h], &[]);
                     }
                 }
+                // Routed on the device: the combined outputs are already in `o`.
+                Ffn::Moe { .. } if routed => {}
                 Ffn::Moe {
                     router: router_name,
                     ..

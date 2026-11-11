@@ -209,3 +209,143 @@ fn olmoe_on_vulkan_matches_the_cpu() {
     eprintln!("{r:?}");
     assert!(r.experts.evictions > 0, "{r:?}");
 }
+
+/// Step 3b: a Vulkan engine routing MoE layers on the device, with a device expert
+/// cache that holds every expert.
+fn vulkan_routed(id: &str) -> Option<Engine> {
+    load(
+        meta(id),
+        EngineOptions {
+            backend: BackendKind::Vulkan,
+            vulkan: VulkanConfig {
+                capacity: Some(1 << 30),
+                route: true,
+                ..VulkanConfig::default()
+            },
+            expert_cache_bytes: Some(1 << 30),
+            max_context: Some(256),
+            ..EngineOptions::default()
+        },
+    )
+}
+
+/// Passes `f` until one routes every layer on the device (missing experts are
+/// prefetched; until they land a pass routes on the host); returns that pass's value.
+fn when_routed<T>(e: &Engine, layers: u64, mut f: impl FnMut() -> T) -> T {
+    for _ in 0..100 {
+        let before = e.device_report().unwrap().routed_layers;
+        let v = f();
+        if e.device_report().unwrap().routed_layers - before >= layers {
+            return v;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    panic!("never routed every layer on the device");
+}
+
+/// Routing on the device (Step 3b) gives the CPU's prompt logits and tokens on every
+/// MoE fixture, alone and with concurrent requests.
+#[test]
+fn routed_on_vulkan_matches_the_cpu_bits() {
+    const SHORT: &[u32] = &[72, 101, 108, 108, 111];
+    for id in MOE {
+        let c = cpu(id, Some(1 << 30));
+        let mut cache = c.new_cache();
+        let want = bits(&c.forward(SHORT, &mut cache, Logits::All, None).unwrap());
+        let want_run = run(&c);
+        drop(c);
+        let Some(e) = vulkan_routed(id) else {
+            return;
+        };
+        let layers = u64::from(meta(id).config.dims.layers);
+        let got = when_routed(&e, layers, || {
+            let mut cache = e.new_cache();
+            bits(&e.forward(SHORT, &mut cache, Logits::All, None).unwrap())
+        });
+        assert_eq!(got, want, "{id}: prompt logits");
+        assert_eq!(run(&e), want_run, "{id}");
+        assert!(
+            e.placement().device.as_deref().unwrap().contains("routed"),
+            "{id}"
+        );
+
+        let prompts: [&[u32]; 4] = [&[72, 101], &[108, 108, 111], &[44, 32, 101], &[120]];
+        let c = cpu(id, Some(1 << 30));
+        let want: Vec<_> = prompts
+            .iter()
+            .map(|p| c.generate(p, 8, Sampling::default(), |_| true).unwrap())
+            .collect();
+        drop(c);
+        let before = e.device_report().unwrap().routed_layers;
+        let got: Vec<_> = std::thread::scope(|s| {
+            let hs: Vec<_> = prompts
+                .iter()
+                .map(|p| {
+                    let e = &e;
+                    s.spawn(move || e.generate(p, 8, Sampling::default(), |_| true).unwrap())
+                })
+                .collect();
+            hs.into_iter().map(|h| h.join().unwrap()).collect()
+        });
+        assert_eq!(got, want, "{id}: concurrent");
+        assert!(e.device_report().unwrap().routed_layers > before, "{id}");
+    }
+}
+
+/// The real OLMoE (set `QUBIVEX_OLMOE_GGUF_DIR`) routed on the device, every expert
+/// held there: the CPU's prompt logits and Colibri's greedy tokens.
+#[test]
+fn olmoe_routed_on_vulkan_matches_the_cpu() {
+    let Ok(dir) = std::env::var("QUBIVEX_OLMOE_GGUF_DIR") else {
+        eprintln!("skipping: QUBIVEX_OLMOE_GGUF_DIR not set");
+        return;
+    };
+    const PROMPT: [u32; 5] = [510, 5347, 273, 6181, 310];
+    const COLIBRI: [u32; 12] = [
+        7785, 15, 187, 187, 510, 3565, 3448, 273, 6181, 310, 5112, 15,
+    ];
+    let meta =
+        || ModelMetadata::load(Path::new(&dir), &ArchitectureRegistry::with_builtins()).unwrap();
+    let logits = |e: &Engine| {
+        let mut c = e.new_cache();
+        bits(&e.forward(&PROMPT, &mut c, Logits::All, None).unwrap())
+    };
+    let cpu = Engine::load(
+        meta(),
+        EngineOptions {
+            expert_cache_bytes: Some(4 << 30),
+            max_context: Some(64),
+            ..EngineOptions::default()
+        },
+    )
+    .unwrap();
+    let want = logits(&cpu);
+    drop(cpu);
+    let Some(e) = load(
+        meta(),
+        EngineOptions {
+            backend: BackendKind::Vulkan,
+            vulkan: VulkanConfig {
+                route: true,
+                ..VulkanConfig::default()
+            },
+            expert_cache_bytes: Some(4 << 30),
+            max_context: Some(64),
+            ..EngineOptions::default()
+        },
+    ) else {
+        return;
+    };
+    eprintln!("{}", e.placement().device.as_deref().unwrap_or(""));
+    let layers = u64::from(meta().config.dims.layers);
+    let got = when_routed(&e, layers, || logits(&e));
+    assert!(got == want, "prompt logits differ from the CPU");
+    let before = e.device_report().unwrap().routed_layers;
+    let toks = e
+        .generate(&PROMPT, 12, Sampling::default(), |_| true)
+        .unwrap();
+    assert_eq!(toks, COLIBRI);
+    let r = e.device_report().unwrap();
+    eprintln!("{r:?}");
+    assert!(r.routed_layers - before >= 12 * layers, "{r:?}");
+}

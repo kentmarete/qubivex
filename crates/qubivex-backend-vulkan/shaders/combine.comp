@@ -1,0 +1,48 @@
+// QUBIVEX Vulkan MoE combine (audit §17, Step 3b): each token's output from its ranks'
+// expert outputs, as the CPU does it: y = 0, then y = fma(w_r, out_r, y) for each rank r
+// in order (`qubivex_compute::combine_ranks`).
+//
+// Built -O0, so no optimiser can rewrite fma(w, x, 0) for the first rank; every fma is
+// NoContraction (build.sh), and fma is single-rounded on every device that opens
+// (ADR-019 §5's probe).
+#version 450
+
+layout(local_size_x = 256) in;
+
+// The routes: weights at [s·k, 2·s·k).
+layout(std430, set = 0, binding = 0) readonly buffer Routes {
+    float rt[];
+};
+
+// One output row per (token, rank): s·k × rows.
+layout(std430, set = 0, binding = 1) readonly buffer Contrib {
+    float contrib[];
+};
+
+// s × rows.
+layout(std430, set = 0, binding = 2) writeonly buffer Out {
+    float y[];
+};
+
+layout(push_constant) uniform Params {
+    uint s;
+    uint k;
+    uint rows;
+    uint unused;
+} p;
+
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    if (i >= p.s * p.rows) {
+        return;
+    }
+    uint t = i / p.rows;
+    uint c = i - t * p.rows;
+    uint sk = p.s * p.k;
+    float acc = 0.0;
+    for (uint r = 0u; r < p.k; r++) {
+        uint j = t * p.k + r;
+        acc = fma(rt[sk + j], contrib[j * p.rows + c], acc);
+    }
+    y[i] = acc;
+}

@@ -1487,3 +1487,315 @@ Step 3a is accepted. The open points are settled:
    fixed-slot arenas and their accounting (`used` vs `held`, working buffers), the
    per-shader `-O0` rule, and the NaN wording.
 3. **Next: Step 3b**, routing in the same submission, investigated separately.
+
+## 17. Step 3b: routing in the expert submission (design, 2026-11-11)
+
+Owner brief (2026-11-11): move MoE routing into the same GPU execution path as the fused
+expert block, behind its own switch, with Step 3a kept as the fallback and the benchmark
+reference. Acceptance: identical tokens, numerical correctness, no prefill or concurrent
+regression, a measured single-stream gain over Step 3a; 35 tok/s is a target, not a
+promise.
+
+### 17.1 The routing implementation today (audit)
+
+All in `Transformer::forward_segments` (`qubivex-arch`), per MoE layer:
+1. `x = rms_norm(hs, ffn_norm)` on the host.
+2. `be.matmul(router, x)`: **one submission**, s × ne logits read back.
+3. `ops::route` per token on the host: `softmax` (max by `f32::max`, `exp(v − m)`, a
+   sequential f32 sum from +0, a division per value), then a stable sort by
+   `f32::total_cmp` descending with ties to the lower id, truncated to k, then (OLMoE:
+   `norm_topk_prob = false`) an optional renormalisation by `Iterator::sum`.
+4. Trace points `RouterLogits` and `RoutingWeights` (tests and diagnostics only).
+5. `by_expert`: each routed expert's (token, rank) users; `used` in ascending expert id.
+6. `ExpertProvider::with_experts_grouped(layer, used, …)`: `ExpertStore::acquire_many`
+   (counts hits, heat, recency and the trace, and may start loads), `after_demand`
+   (lookahead prediction bookkeeping), then if every lease is ready, device pins
+   (`OnDevice::ensure`, copying any expert without a device copy) and **one fused
+   submission** (Step 3a); otherwise the per-expert waves.
+7. Host combine: per token, `out = 0; out = fma(w_r, y_r, out)` in rank order; then
+   `hs += out`.
+
+### 17.2 Every CPU/GPU synchronisation point (decode, s = 1, Step 3a)
+
+| # | Per layer | Submission | Host work after the wait |
+|---|---|---|---|
+| 1 | QKV | `matmul_many` (3 matmuls) | clip, QK norm, RoPE, KV store, attention |
+| 2 | O | `matmul` | residual, FFN norm |
+| (2′) | lookahead router | `matmul`, only with a predictor (off in the bench) | prediction |
+| 3 | router | `matmul` | softmax, top-k, `acquire_many`, pins |
+| 4 | expert block | `gated_ffn_many` | combine, residual |
+| — | head (per token) | `matmul` | sampling |
+
+4 per layer + 1 = **65 per token**, the recorded count. Every one is a host wait on a
+fence: the GPU idles while the host works. Step 0 measured about 140 µs of GPU idle per
+serial hand-off.
+
+### 17.3 What can move to the GPU, and what Step 3b moves
+
+| Edge | Real dependency | Step 3b |
+|---|---|---|
+| router → softmax/top-k → expert block | data only: the GPU can choose | **removed**: router, routing, experts and combine in one submission |
+| top-k → which expert weights | on the host today because the store leases experts | the host **holds every expert of the layer** before submitting (Metal's `hold_layer`, ADR-011 amendment 4); the GPU picks among them |
+| expert block → combine | data only | **combine on the device** (rank-order `fma`, already probed single-rounded) |
+| O → residual → FFN norm → router | data only, but the norm needs `sqrt` and division on the device (audit §5) | not in Step 3b (17.9) |
+| QKV → attention → O | host KV cache | not in Step 3b (Step 3c) |
+
+After Step 3b: **3 per layer + 1 = 49 submissions per token.**
+
+### 17.4 Selected expert index → arena slot
+
+Step 3a put every expert of a layer in one arena (its size class), at
+`slot × stride`. Step 3b gives the GPU a per-layer **expert table**: for each of the
+layer's ne experts, three table templates (gate, up, down) in the fused shader's 8-word
+format, with `w_base = slot × stride + (matrix offset inside the expert)`. The host
+writes them at submit time from `OnDevice::weights`, which already resolves a host
+weight view to (buffer, offset). The route kernel copies the chosen experts' templates
+into the dispatch table, filling in the input and output offsets. So:
+- no descriptor indexing, no buffer device addresses: one binding for the whole arena,
+  as in Step 3a (MoltenVK's per-encoder residency cost, §15.2, is avoided);
+- the routed path is used only when **every expert of the layer resolves into one
+  buffer with one dtype per matrix kind**; otherwise that layer runs Step 3a.
+
+Residency rule (the condition for the GPU to choose):
+- **RAM:** `ExpertStore::hold_layer(layer, ne)` returns `Held::All` (every expert ready;
+  leases taken quietly: no heat, recency, hits or trace). `Held::Missing`: those experts
+  are queued as prefetches with I/O threads (loaded now without), and this layer runs
+  Step 3a. `Held::TooSmall`: Step 3a.
+- **Device:** only when the device cache is **fully provisioned**: each arena has a slot
+  for every expert of every layer in its class, so holding a layer can never evict
+  anything. Missing device copies are made at hold time (counted misses); held
+  copies are pinned for the submission and not counted as hits or refreshed.
+- **After the submission** the routed ids come back with the outputs (no extra wait).
+  The host then does what `acquire_many` would have done: `record_uses` for the layer's
+  distinct experts in ascending id (same heat, recency, hits and trace as Step 3a),
+  `after_demand` with the same list, and a device-cache hit and recency refresh for
+  each.
+
+### 17.5 Descriptor and dispatch dependencies (one command buffer)
+
+All dispatches use Step 3a's fused pipeline layout (4 storage bindings, 16-byte push),
+so no new layout; two new pipelines (`route`, `combine`).
+
+| Step | Pipeline | Dispatch | Reads | Writes |
+|---|---|---|---|---|
+| 1 | fused matmul (router dtype) | `blocks(ne) × 1, s` | dense buffer, x, table[router] | logits |
+| barrier | | | | |
+| 2 | **route** (new) | `ceil(s/64)` | logits, table[templates] | logits → p in place, routes (ids, weights), table[routed entries] |
+| barrier | | | | |
+| 3 | fused matmul (gate/up dtype) | `2·s·k · blocks(ffn), 1` | arena, x, table | mid (gate, up) |
+| barrier | | | | |
+| 4 | SwiGLU (Step 3a's) | `s·k·ffn / 256` | mid | mid |
+| barrier | | | | |
+| 5 | fused matmul (down dtype) | `s·k · blocks(h), 1` | arena, mid, table | contrib |
+| barrier | | | | |
+| 6 | **combine** (new) | `s·h / 256` | contrib, routes | y |
+| barrier → host | | | | |
+
+- Dispatch sizes depend only on s, k, ne and the shapes, all known on the host: **no
+  indirect dispatch**. The GPU decides only *which* expert each entry reads.
+- Entries are **entry-major**: entry j = (token t, rank r) is one 1-row matrix of
+  expert ids[j]. Step 3a's fused dispatch already reads the weights once per token row
+  (grid y is the token), so this is the same GPU work as grouping by expert, and its
+  output layout is the combine's `contrib` layout directly (no gather or scatter).
+- 6 dispatches and 5 barriers, against Step 3a's router submission (1 dispatch) plus
+  its block (3 dispatches, 2 barriers).
+
+### 17.6 Bits
+
+- Router matmul: the fused entry runs `matmul.comp`'s body unchanged (Step 3a proof).
+- Route: `ops::route`'s operations in its order, one invocation per token, as Metal's
+  `moe_route`: `f32::max` fold from −∞ (NaN-ignoring, as Rust's `max`), `math::exp`
+  ported unchanged (shared with `swiglu.comp` through an include; `swiglu.spv` must stay
+  byte-identical), a sequential sum from +0, a correctly rounded division; top-k by
+  selection over `total_cmp` keys (sign-magnitude to two's complement) descending, ties
+  to the lower id, which is the order the stable sort defines; renormalisation as a
+  sequential sum from −0 (`Iterator::sum` for f32). Built `-O0` (it contains `exp`).
+- Gate/up, SwiGLU, down: Step 3a's kernels.
+- Combine: `out = 0; out = fma(w_r, y_r, out)` per rank, as the host loop.
+- **Tests (new, each against the CPU, bit for bit):** route alone over adversarial
+  logits (ties, pairs of ties, −∞, +∞, NaN, all equal, subnormal differences) and
+  millions of random tokens, with and without renormalisation, at ne ∈ {8, 60, 64, 128}
+  and k ∈ {1, 2, 8}; the whole routed layer (router + experts + combine) against the
+  host steps for every dtype pairing and s ∈ {1, 2, 4, 8}, in arenas; a positive control
+  (ties to the higher id) that must fail. Existing gates: fixtures, `tests/vulkan.rs`
+  with real OLMoE (CPU logits, Colibri's tokens), bench tokens equal to the Step 1a
+  reference.
+- Division: correctly rounded on MoltenVK in Safe mode (§15.1, 2³³ divisions); the
+  route test adds millions of softmax divisions. A device-open division probe for other
+  drivers is not part of 3b (ADR-019 "Not decided").
+
+### 17.7 Interfaces (generic, no model-specific path)
+
+- `qubivex-compute`: `RoutedMoe` (router, the layer's gate/up/down for every expert, k,
+  renormalise, xs, s; outputs ys, ids, weights), `ComputeBackend::{routes_moe(experts,
+  k, s), routed_moe}` with defaults "no" / "not run". `softmax` and `route` move from
+  `qubivex-arch::ops` into `qubivex-compute::math` unchanged (re-exported), as SwiGLU did,
+  so a backend can be checked against them. `DiscreteDevice` gains the same pair.
+- `qubivex-arch`: `ExpertProvider::with_layer_held(layer, experts, f)`, default "not
+  held". The MoE stage asks it first when the backend routes this shape and no trace is
+  being taken; if the backend or the provider declines, the layer runs Step 3a
+  unchanged.
+- `qubivex-runtime`: `StoreProvider::with_layer_held` (hold, device pins, record uses);
+  `OnDevice::{routes_moe, routed_moe}` (fully provisioned check, templates).
+- `qubivex-backend-vulkan`: `route.comp`, `combine.comp`, `exp.glsl` include; one
+  submission; **`--vulkan-route on|off` (default off)** and `VulkanConfig::route`.
+  Shape rule: s ≤ the fuse-rows threshold (8), ne ≤ 256, k ≤ ne.
+- Sim device: an opt-in routed path for the runtime tests (`SimConfig::route`), running
+  the host steps, so the provider and accounting are tested without a GPU.
+
+### 17.8 Memory and execution overhead (estimates)
+
+- **Device memory:** the fully provisioned condition means the whole model's experts on
+  the device: OLMoE 1024 experts, 1.81 + 2.09 GB of arenas (the bench's
+  `--expert-cache-mb 3720` already holds all of them). Nothing new in the ledger.
+  Per-submitter working buffers grow by: logits s·ne·4 B, routes s·k·8 B, table
+  (1 + 3ne + 3sk)·32 B ≈ 7 KiB, contrib s·k·h·4 B (64 KiB at s = 1, 512 KiB at s = 8):
+  under 1 MiB per submitter, in the 256 MiB device reserve.
+- **Host:** per layer, `hold_layer` (64 quiet leases) and 64 device pins under the cache
+  lock, plus about 6 KiB of templates: an estimated 10–20 µs, against one host round
+  trip removed.
+- **GPU:** route ~ne·(1 + k) scalar steps per token on one invocation, and an
+  elementwise combine: a few µs; two more barriers (MoltenVK splits encoders at each).
+- **Gain:** 16 fewer serial hand-offs per token. At Step 0's ~140 µs of GPU idle each,
+  plus the router submission's own host cost, **about 2–3.5 ms per token: 33.0 → about
+  29.5–31 ms (32–34 tok/s)**. An estimate, not a measurement. 35 tok/s (28.6 ms) probably
+  needs 17.9 as well.
+- **First passes:** holding a layer needs all 64 of its experts in RAM, so missing ones
+  are prefetched; until they land, that layer runs Step 3a. The bench's warm-up absorbs
+  this.
+
+### 17.9 Next, not in 3b: the O projection and FFN norm in the same submission
+
+O → residual → FFN `rms_norm` → router would make a layer two submissions (QKV;
+everything else), another 16 hand-offs. It needs `sqrt` and division on the device with
+the CPU's bits (`1/sqrt(ss/n + eps)`), proven exhaustively over f32 like SwiGLU, and the
+64-lane reduction for the sum of squares (the matmul body's tree). It is a separate,
+separately switched step, after 3b is measured.
+
+### 17.10 Benchmark plan
+
+- Mains power, untimed, alternated, 3 rounds: `scripts/bench-vulkan-baseline --tag
+  step3b --variant step3a= --variant routed='--vulkan-route on'`. That gives Step 1a
+  (the permanent baseline), Step 3a (same binary, switch off) and Step 3b, per round, all
+  tokens checked against the Step 1a reference.
+- Concurrent: the batch example at 1, 2, 4 and 8 sequences, the three variants.
+- Prefill: the bench's 10-token prompt (> 8 rows per expert, so not routed) and a
+  128-token prompt record: must equal Step 3a.
+- Report: decode ms/token, tok/s, submissions per token (expect 65 → 49), routed layers
+  per token, prefill, concurrent tok/s; accept only beyond the run-to-run spread
+  (~0.7 ms).
+
+### 17.11 What was built (separate commits, each compiling alone)
+
+| Commit | What |
+|---|---|
+| Compute | `RoutedMoe`, `ComputeBackend::{routes_moe, routed_moe}` and `DiscreteDevice`'s pair, declined by default; reference steps (`routed_moe_steps`, `route_tokens`, `combine_ranks`). `softmax` and `route` move into `qubivex-compute::math` unchanged. |
+| Arch | `ExpertProvider::with_layer_held` (default: not held). The MoE stage offers the layer to the backend when it routes the shape and no trace is taken; otherwise Step 3a, unchanged. |
+| Sim | `SimConfig::route_rows`: an opt-in routed layer in one submission, entry-major, for the runtime tests. |
+| Runtime | `StoreProvider::with_layer_held`: quiet `hold_layer` leases and device pins (`OnDevice::hold`, no hit, no recency); missing experts prefetched (loaded now without I/O threads); after the pass `record_uses`, `after_demand` and the device-cache hit for the used experts only, so the counts equal Step 3a's (tested). Routing on the device only with a **fully provisioned** device cache (an arena slot for every expert of every layer). `DeviceReport::routed_layers`. |
+| Shaders | `route.comp`, `combine.comp` (both `-O0`); `exp` moved into `exp.glsl`. **`swiglu.spv`, `matmul.spv` and `matmul_fused.spv` byte-identical.** |
+| Vulkan | `routed_moe`: 6 dispatches, 5 barriers, one command buffer (§17.5), on Step 3a's fused layout; declined (Step 3a runs) when a matrix kind spans buffers, dtypes or shapes, or past the limits. `VulkanConfig::route`, `--vulkan-route on\|off` (**default off**), up to `--vulkan-fuse-rows` tokens, at most 256 experts. `VulkanDevice::route` (the shader alone, for conformance tests). |
+| Route kernel | One workgroup per token, logits in shared memory, `exp` and ranks in parallel; the max and both sums stay sequential in one invocation. The first version (one invocation per token) added 1.4 ms of GPU time per token; this one adds 0.3. |
+| CLI, bench | `--vulkan-route`; the batch example and `scripts/bench-vulkan-baseline` pass it on. |
+
+### 17.12 Correctness
+
+- **Route alone** (`tests/routed.rs`, against `math::route`): ids and weights bit for bit
+  at 8, 60, 64 and 128 experts × k = 1, 2, 8 × renormalise on/off, over adversarial
+  logits (ties, pairs of ties, all equal, ±0, ±∞, a spread past `exp`'s underflow,
+  ×10³⁰ and ×10⁻³⁰) and 8192 random tokens each, plus 4 × 2¹⁸ tokens at OLMoE's shape.
+  Tokens with a NaN logit: every weight NaN on both; ids not compared (`total_cmp`
+  orders NaNs by payload, which is outside the contract, ADR-011 amendment 7).
+- **Whole layer** (against `routed_moe_steps` on the CPU): outputs, ids and weights bit
+  for bit for Q4_K/Q4_K, Q4_K/Q6_K (Q8_0 router), Q6_K/Q6_K (f16 router), Q8_0, and
+  f32/f16 (bf16 router), 1, 2, 4 and 8 tokens, with and without a router tie; OLMoE's
+  shape (64 × 2048 × 1024, top 8, Q4_K and Q6_K down) at 1 and 4 tokens; one submission
+  each. Declined for separate buffers, past the token limit, and when off.
+- **Positive controls** (each restored after): ties to the higher id fails 3 tests;
+  `x · (1/sum)` instead of `x / sum` fails 4; the combine in reverse rank order fails 2;
+  in the runtime, a wrong id-to-expert mapping fails the sim tests (the concurrent test
+  was strengthened to compare logits after it first passed the mutation). Starting the
+  softmax sum at −0 instead of +0 cannot differ (the maximum contributes `exp(0) = 1`).
+- **Runtime:** sim (fixtures): the CPU's bits, 3 submissions per layer + 1, the same
+  store and device-cache hits as Step 3a, nothing routed with a device cache short of the
+  model, concurrent requests. Vulkan: the fixtures' logits and tokens with routing on,
+  alone and 4 concurrent; **real OLMoE: the CPU's prompt logits and Colibri's 12 tokens,
+  every layer routed** (1024 experts, 4.21 GB on the device). Step 3a's tests unchanged
+  and passing.
+
+### 17.13 Measured: battery diagnostic only (not an acceptance record)
+
+The machine was on battery for the whole session, so `scripts/bench-vulkan-baseline`
+refused to run and **nothing here is a mains record**. Same binary, Step 3a
+(`--vulkan-route off`) alternated with Step 3b (`on`), OLMoE Q4_K_M, 5 threads, 10-token
+prompt, 128 generated, 1 + 3 runs, every run's tokens equal to the Step 1a reference:
+
+| Round | Step 3a ms/token | Step 3b ms/token | Step 3a tok/s | Step 3b tok/s |
+|---|---|---|---|---|
+| 1 | 33.08 | **31.14** | 30.23 | **32.11** |
+| 2 | 32.85 | **31.25** | 30.44 | **32.00** |
+| 3 | 32.95 | **31.23** | 30.35 | **32.02** |
+
+- −1.6 to −1.9 ms per token (−5.5%), more than twice the run-to-run spread; submissions
+  per decode token 65 → 49; prefill 197.4–198.7 against 198.0–199.8 ms (the 10-token
+  prompt is not routed: unchanged).
+- Timed (`--vulkan-timestamps`): GPU idle 14.39 → 11.86 ms per token (−2.5 ms, the
+  estimate in §17.8), GPU busy 20.52 → 20.82 (+0.3 ms: the route and combine dispatches
+  and two more encoder boundaries).
+- Concurrent (batch example, 32 tokens per sequence, median of 3, 2 rounds, tokens
+  identical in every mode):
+
+  | N | Step 3a concurrent tok/s | Step 3b concurrent tok/s | Gain |
+  |---|---|---|---|
+  | 1 | 30.45–30.56 | 32.22–32.34 | +5.6% |
+  | 2 | 37.57 | 39.23–39.29 | +4.5% |
+  | 4 | 42.78–42.96 | 44.59–44.64 | +4.0% |
+  | 8 | 45.99–46.04 | 47.90–47.91 | +4.1% |
+
+- **Against the 35 tok/s target:** 32.0 tok/s on battery. Not reached. The remaining
+  per-layer round trips are QKV and O; §17.9 (the O projection, residual and FFN norm
+  joining the routed submission) removes another 16 per token, and needs `sqrt` and
+  division proven on the device first.
+
+### 17.14 Measured on mains (the acceptance records)
+
+`scripts/bench-vulkan-baseline --tag step3b --variant step3a= --variant routed='--vulkan-route on'`,
+AC power, untimed, 3 alternated rounds (records `2026-11-11-m3pro-vulkan-step3b-{base,step3a,routed}-{1,2,3}.json`,
+log `…-step3b-mains.txt`). Every record's tokens equal the Step 1a reference.
+
+| Round | Step 1a ms/token | Step 3a | **Step 3b** | Step 1a prefill ms | Step 3a | Step 3b |
+|---|---|---|---|---|---|---|
+| 1 | 35.60 | 33.06 | **30.82** | 199.8 | 195.1 | 195.0 |
+| 2 | 35.40 | 33.15 | **31.28** | 199.7 | 195.5 | 195.4 |
+| 3 | 36.21 | 33.14 | **31.16** | 200.5 | 195.6 | 195.3 |
+| tok/s | 27.6–28.3 | 30.2–30.3 | **32.0–32.5** | | | |
+| submissions/token | 305 | 65 | **49** | | | |
+
+- Against Step 3a: **−1.8 to −2.3 ms per token (−6.4%)**, about three times the run-to-run
+  spread. Against the permanent Step 1a baseline: −4.6 ms (−13%).
+- Prefill: unchanged against Step 3a (195.0–195.4 against 195.1–195.6 ms).
+
+Concurrent tok/s (batch example, 32 tokens per sequence, median of 3, per round; tokens
+identical in every mode):
+
+| N | Step 1a | Step 3a | **Step 3b** | Gain over 3a |
+|---|---|---|---|---|
+| 1 | 27.93–28.05 | 30.33–30.47 | **32.26–32.49** | +6.3% |
+| 2 | 34.17–34.41 | 37.65–37.83 | **39.47–39.61** | +4.7% |
+| 4 | 40.15–40.19 | 43.04–43.21 | **44.92–44.98** | +4.2% |
+| 8 | 44.48–44.52 | 46.34–46.44 | **48.32–48.34** | +4.2% |
+
+**Gates:** identical tokens (yes, every record and mode); numerical correctness (§17.12);
+no prefill regression (yes); no concurrent regression (a gain at every N); a measured
+single-stream gain over Step 3a (yes, −6.4%). **35 tok/s: not reached (32.0–32.5).**
+
+### 17.15 Not done; for the owner
+
+1. **Acceptance**, and whether `--vulkan-route` becomes the default (it is off).
+2. **Default.** `--vulkan-route` stays off until accepted.
+3. **ADR-019 amendment 4** (routing on the device: residency rule, the route kernel's
+   order argument, the 256-expert limit) is not written; it follows acceptance, as
+   amendment 3 did for Step 3a.
+4. **A device-open division probe** for drivers other than MoltenVK (§17.6) is not
+   built.
+5. **Next:** §17.9.

@@ -34,11 +34,11 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, PoisonError, Weak};
 
 use qubivex_compute::discrete::{
-    DeviceBuffer, DeviceGatedFfn, DeviceMatMul, DeviceUsage, DeviceWeights, DiscreteDevice,
-    TransferStats,
+    DeviceBuffer, DeviceGatedFfn, DeviceMatMul, DeviceRoutedMoe, DeviceUsage, DeviceWeights,
+    DiscreteDevice, TransferStats,
 };
 use qubivex_compute::host::PageAligned;
-use qubivex_compute::{ComputeError, GatedFfn, MatMul, WeightView};
+use qubivex_compute::{ComputeError, GatedFfn, MatMul, RoutedMoe, WeightView};
 use qubivex_core::Bytes;
 use qubivex_expert_stream::{ExpertKey, Slab};
 use qubivex_memory::{LayerExperts, MemoryLedger, Owner, Tier};
@@ -80,6 +80,9 @@ pub struct DeviceReport {
     pub transfers: TransferStats,
     /// Its expert cache.
     pub experts: DeviceCacheStats,
+    /// MoE layers routed on the device (Step 3b): router, routing, experts and combine
+    /// in one submission.
+    pub routed_layers: u64,
 }
 
 /// Arena slots start at multiples of this many bytes (any storage-buffer offset
@@ -197,6 +200,10 @@ pub(crate) struct OnDevice {
     misses: AtomicU64,
     evictions: AtomicU64,
     over_budget: AtomicU64,
+    /// Whether every arena has a slot for every expert of every layer of its class, so
+    /// holding a whole layer on the device never evicts (routing on the device).
+    provisioned: bool,
+    routed: AtomicU64,
 }
 
 impl std::fmt::Debug for OnDevice {
@@ -296,6 +303,17 @@ impl OnDevice {
         let dense = device.upload(host, Some(Box::new(charge)))?;
         let start = host.as_ptr() as usize;
         let (arenas, class_of) = plan_arenas(layers, ram_slots, budget, device.max_arena());
+        let provisioned = !arenas.is_empty()
+            && arenas.iter().enumerate().all(|(k, a)| {
+                let need: u64 = layers
+                    .iter()
+                    .zip(&class_of)
+                    .filter(|(_, c)| **c == Some(k))
+                    .map(|(l, _)| u64::from(l.experts))
+                    .sum();
+                a.slots as u64 >= need
+            })
+            && class_of.iter().all(Option::is_some);
         let free = arenas
             .iter()
             .map(|a| (0..a.slots).rev().collect())
@@ -319,7 +337,16 @@ impl OnDevice {
             misses: AtomicU64::new(0),
             evictions: AtomicU64::new(0),
             over_budget: AtomicU64::new(0),
+            provisioned,
+            routed: AtomicU64::new(0),
         })
+    }
+
+    /// Whether a layer of `experts` experts, top `k`, over `s` tokens should be routed
+    /// on the device: the device routes the shape and the cache holds every expert of
+    /// every layer, so holding a layer evicts nothing.
+    pub(crate) fn routes_moe(&self, experts: usize, k: usize, s: usize) -> bool {
+        self.provisioned && self.device.routes_moe(experts, k, s)
     }
 
     pub(crate) fn describe(&self) -> String {
@@ -406,6 +433,18 @@ impl OnDevice {
     /// The device copy of the expert `key` held in `slab`, copied now if the device has
     /// none. Hold the returned pin while computing the expert.
     pub(crate) fn ensure(&self, key: ExpertKey, slab: &Slab) -> Result<Pin, ComputeError> {
+        self.copy_of(key, slab, true)
+    }
+
+    /// As [`OnDevice::ensure`], for a layer held whole before the device chooses among
+    /// its experts: holding is not a use, so a copy already there is pinned without
+    /// counting a hit or refreshing its recency. The pass then calls
+    /// [`OnDevice::ensure`] for the experts it used.
+    pub(crate) fn hold(&self, key: ExpertKey, slab: &Slab) -> Result<Pin, ComputeError> {
+        self.copy_of(key, slab, false)
+    }
+
+    fn copy_of(&self, key: ExpertKey, slab: &Slab, used: bool) -> Result<Pin, ComputeError> {
         let host = slab.bytes();
         let addr = host.as_ptr() as usize;
         let class = self
@@ -423,8 +462,10 @@ impl OnDevice {
             && e.key == key
             && e.len == host.len()
         {
-            e.last_use = now;
-            self.hits.fetch_add(1, Ordering::Relaxed);
+            if used {
+                e.last_use = now;
+                self.hits.fetch_add(1, Ordering::Relaxed);
+            }
             return Ok(self.pin_of(&e.home));
         }
         let slot = match (class, &arena) {
@@ -632,6 +673,33 @@ impl OnDevice {
         self.device.gated_ffn_many(&mut batch)
     }
 
+    /// The layer routed on the device, if the device runs it; `Ok(false)` otherwise,
+    /// with nothing written. Every expert's copy must be pinned by the caller.
+    pub(crate) fn routed_moe(&self, op: &mut RoutedMoe<'_>) -> Result<bool, ComputeError> {
+        op.check()?;
+        let router = self.weights(&op.router)?;
+        let experts = op
+            .experts
+            .iter()
+            .map(|[g, u, d]| Ok([self.weights(g)?, self.weights(u)?, self.weights(d)?]))
+            .collect::<Result<Vec<_>, ComputeError>>()?;
+        let ran = self.device.routed_moe(&mut DeviceRoutedMoe {
+            router: &router,
+            experts: &experts,
+            k: op.k,
+            renormalise: op.renormalise,
+            xs: op.xs,
+            s: op.s,
+            ys: &mut *op.ys,
+            ids: &mut *op.ids,
+            weights: &mut *op.weights,
+        })?;
+        if ran {
+            self.routed.fetch_add(1, Ordering::Relaxed);
+        }
+        Ok(ran)
+    }
+
     pub(crate) fn report(&self) -> DeviceReport {
         let (held, own) = {
             let c = self.shared.lock();
@@ -659,6 +727,7 @@ impl OnDevice {
                 detached: self.shared.detached.load(Ordering::Relaxed),
                 over_budget: self.over_budget.load(Ordering::Relaxed),
             },
+            routed_layers: self.routed.load(Ordering::Relaxed),
         }
     }
 }

@@ -3,6 +3,12 @@
 Last updated: 2026-11-11
 
 ## Current phase
+**Vulkan Step 3b: routing in the expert submission (2026-11-11, branch `vulkan-step3b`, not pushed; for review).** See docs/engineering/VULKAN_EXECUTION_AUDIT.md §17.
+- Built behind `--vulkan-route on|off` (default off): router, softmax top-k (one workgroup per token, sums sequential), the routed experts' fused block (entry-major, expert index → arena slot through per-layer table templates) and the rank-order combine in one submission. Only with a fully provisioned device expert cache; the provider holds the layer quietly and records the same uses as Step 3a afterwards. Step 3a is the fallback and unchanged (`swiglu.spv`, `matmul*.spv` byte-identical).
+- Parity: route bit for bit against `math::route` (adversarial and 1 M+ random tokens; NaN tokens by NaN-ness), the whole layer against the CPU for every dtype pairing and OLMoE's shape, real OLMoE's CPU logits and Colibri's tokens with every layer routed; positive controls fail.
+- Measured on mains, alternated with Step 1a and Step 3a (audit §17.14): decode 33.06–33.15 → **30.82–31.28 ms/token (30.2 → 32.0–32.5 tok/s)**, submissions 65 → 49, prefill unchanged, concurrent +6.3% / +4.7% / +4.2% / +4.2% at 1 / 2 / 4 / 8 sequences, tokens identical everywhere. All gates pass; 35 tok/s not reached.
+- Next: owner review (acceptance, default on or off), then §17.9 (O projection and FFN norm in the same submission).
+
 **Vulkan Step 3a: the expert block in one submission (2026-11-11, branch `vulkan-step3a`; accepted by the owner 2026-11-11; ADR-019 amendment 3).** See docs/engineering/VULKAN_EXECUTION_AUDIT.md §16.
 - Built: a generic gated-FFN block op chosen by shape (`fuses_gated_ffn`), the device expert cache in two fixed-slot arenas, a fused matmul entry (same body; `matmul.spv` byte-identical) and SwiGLU on the device (built -O0), one command buffer per layer's experts. `--vulkan-fuse-rows N` (default 8, 0 off).
 - Parity: the fused block equals the CPU for every dtype pairing (Q6_K down included) and OLMoE's shapes; device SwiGLU exhaustive over 2 × 2³²: 0 differences outside subnormals (ADR-011) and NaN payloads; a positive control (-O build) fails; real OLMoE gives the CPU's logits and Colibri's tokens.

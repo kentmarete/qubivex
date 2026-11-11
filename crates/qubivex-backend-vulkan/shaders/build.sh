@@ -47,3 +47,5 @@ build() {
 build matmul -O
 build matmul_fused -O
 build swiglu -O0
+build route -O0
+build combine -O0

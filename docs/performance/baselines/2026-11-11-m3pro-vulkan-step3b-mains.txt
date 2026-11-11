@@ -1,0 +1,155 @@
+building the baseline (bench/vulkan-step1a) ...
+building the working tree ...
+round 1 of 3
+qubivex bench: warm-up 1/1
+qubivex bench: run 1/5
+qubivex bench: run 2/5
+qubivex bench: run 3/5
+qubivex bench: run 4/5
+qubivex bench: run 5/5
+  base: /Users/kennethmarete/fin/qubivex/docs/performance/baselines/2026-11-11-m3pro-vulkan-step3b-base-1.json
+qubivex bench: warm-up 1/1
+qubivex bench: run 1/5
+qubivex bench: run 2/5
+qubivex bench: run 3/5
+qubivex bench: run 4/5
+qubivex bench: run 5/5
+  step3a: /Users/kennethmarete/fin/qubivex/docs/performance/baselines/2026-11-11-m3pro-vulkan-step3b-step3a-1.json
+qubivex bench: warm-up 1/1
+qubivex bench: run 1/5
+qubivex bench: run 2/5
+qubivex bench: run 3/5
+qubivex bench: run 4/5
+qubivex bench: run 5/5
+  routed: /Users/kennethmarete/fin/qubivex/docs/performance/baselines/2026-11-11-m3pro-vulkan-step3b-routed-1.json
+round 2 of 3
+qubivex bench: warm-up 1/1
+qubivex bench: run 1/5
+qubivex bench: run 2/5
+qubivex bench: run 3/5
+qubivex bench: run 4/5
+qubivex bench: run 5/5
+  base: /Users/kennethmarete/fin/qubivex/docs/performance/baselines/2026-11-11-m3pro-vulkan-step3b-base-2.json
+qubivex bench: warm-up 1/1
+qubivex bench: run 1/5
+qubivex bench: run 2/5
+qubivex bench: run 3/5
+qubivex bench: run 4/5
+qubivex bench: run 5/5
+  step3a: /Users/kennethmarete/fin/qubivex/docs/performance/baselines/2026-11-11-m3pro-vulkan-step3b-step3a-2.json
+qubivex bench: warm-up 1/1
+qubivex bench: run 1/5
+qubivex bench: run 2/5
+qubivex bench: run 3/5
+qubivex bench: run 4/5
+qubivex bench: run 5/5
+  routed: /Users/kennethmarete/fin/qubivex/docs/performance/baselines/2026-11-11-m3pro-vulkan-step3b-routed-2.json
+round 3 of 3
+qubivex bench: warm-up 1/1
+qubivex bench: run 1/5
+qubivex bench: run 2/5
+qubivex bench: run 3/5
+qubivex bench: run 4/5
+qubivex bench: run 5/5
+  base: /Users/kennethmarete/fin/qubivex/docs/performance/baselines/2026-11-11-m3pro-vulkan-step3b-base-3.json
+qubivex bench: warm-up 1/1
+qubivex bench: run 1/5
+qubivex bench: run 2/5
+qubivex bench: run 3/5
+qubivex bench: run 4/5
+qubivex bench: run 5/5
+  step3a: /Users/kennethmarete/fin/qubivex/docs/performance/baselines/2026-11-11-m3pro-vulkan-step3b-step3a-3.json
+qubivex bench: warm-up 1/1
+qubivex bench: run 1/5
+qubivex bench: run 2/5
+qubivex bench: run 3/5
+qubivex bench: run 4/5
+qubivex bench: run 5/5
+  routed: /Users/kennethmarete/fin/qubivex/docs/performance/baselines/2026-11-11-m3pro-vulkan-step3b-routed-3.json
+
+| record | decode ms/token (median) | tok/s | prefill ms | submissions/token | tokens = baseline |
+|---|---:|---:|---:|---:|---|
+| 2026-11-11-m3pro-vulkan-step3b-base-1.json | 35.60 | 28.09 | 199.8 | 305 | True |
+| 2026-11-11-m3pro-vulkan-step3b-step3a-1.json | 33.06 | 30.25 | 195.1 | 65 | True |
+| 2026-11-11-m3pro-vulkan-step3b-routed-1.json | 30.82 | 32.45 | 195.0 | 49 | True |
+| 2026-11-11-m3pro-vulkan-step3b-base-2.json | 35.40 | 28.25 | 199.7 | 305 | True |
+| 2026-11-11-m3pro-vulkan-step3b-step3a-2.json | 33.15 | 30.17 | 195.5 | 65 | True |
+| 2026-11-11-m3pro-vulkan-step3b-routed-2.json | 31.28 | 31.97 | 195.4 | 49 | True |
+| 2026-11-11-m3pro-vulkan-step3b-base-3.json | 36.21 | 27.61 | 200.5 | 305 | True |
+| 2026-11-11-m3pro-vulkan-step3b-step3a-3.json | 33.14 | 30.18 | 195.6 | 65 | True |
+| 2026-11-11-m3pro-vulkan-step3b-routed-3.json | 31.16 | 32.09 | 195.3 | 49 | True |
+
+concurrent, round 1: baseline
+Vulkan device 0 (Apple M3 Pro, integrated, MoltenVK 1.4.2), 18.00 GiB usable; prefetch off; expert cache: 3720 MiB; 32 tokens per sequence, median of 3 runs
+| N | sequential tok/s | batched tok/s | speed-up | concurrent tok/s | speed-up | widest pass | tokens identical | read wait seq / conc | loads per token seq / conc |
+|---:|---:|---:|---:|---:|---:|---:|---|---:|---:|
+| 1 | 27.89 | 28.26 | 1.01x | 27.93 | 1.00x | 1 | yes | 0% / 0% | 0.0 / 0.0 |
+| 2 | 27.98 | 34.80 | 1.24x | 34.25 | 1.22x | 2 | yes | 0% / 0% | 0.0 / 0.0 |
+| 4 | 27.96 | 40.45 | 1.45x | 40.15 | 1.44x | 4 | yes | 0% / 0% | 0.0 / 0.0 |
+| 8 | 28.01 | 44.58 | 1.59x | 44.48 | 1.59x | 8 | yes | 0% / 0% | 0.0 / 0.0 |
+concurrent, round 1: step3a
+Vulkan device 0 (Apple M3 Pro, integrated, MoltenVK 1.4.2), 18.00 GiB usable, experts fused up to 8 rows; prefetch off; expert cache: 3720 MiB; 32 tokens per sequence, median of 3 runs
+| N | sequential tok/s | batched tok/s | speed-up | concurrent tok/s | speed-up | widest pass | tokens identical | read wait seq / conc | loads per token seq / conc |
+|---:|---:|---:|---:|---:|---:|---:|---|---:|---:|
+| 1 | 30.27 | 30.44 | 1.01x | 30.33 | 1.00x | 1 | yes | 0% / 0% | 0.0 / 0.0 |
+| 2 | 30.39 | 37.91 | 1.25x | 37.65 | 1.24x | 2 | yes | 0% / 0% | 0.0 / 0.0 |
+| 4 | 30.38 | 43.27 | 1.42x | 43.04 | 1.42x | 4 | yes | 0% / 0% | 0.0 / 0.0 |
+| 8 | 30.28 | 46.49 | 1.54x | 46.36 | 1.53x | 8 | yes | 0% / 0% | 0.0 / 0.0 |
+concurrent, round 1: routed
+Vulkan device 0 (Apple M3 Pro, integrated, MoltenVK 1.4.2), 18.00 GiB usable, experts fused and routed on the device up to 8 rows; prefetch off; expert cache: 3720 MiB; 32 tokens per sequence, median of 3 runs
+| N | sequential tok/s | batched tok/s | speed-up | concurrent tok/s | speed-up | widest pass | tokens identical | read wait seq / conc | loads per token seq / conc |
+|---:|---:|---:|---:|---:|---:|---:|---|---:|---:|
+| 1 | 32.37 | 32.37 | 1.00x | 32.49 | 1.00x | 1 | yes | 0% / 0% | 0.0 / 0.0 |
+| 2 | 32.27 | 39.77 | 1.23x | 39.47 | 1.22x | 2 | yes | 0% / 0% | 0.0 / 0.0 |
+| 4 | 32.26 | 45.09 | 1.40x | 44.92 | 1.39x | 4 | yes | 0% / 0% | 0.0 / 0.0 |
+| 8 | 32.31 | 48.50 | 1.50x | 48.34 | 1.50x | 8 | yes | 0% / 0% | 0.0 / 0.0 |
+
+concurrent, round 2: baseline
+Vulkan device 0 (Apple M3 Pro, integrated, MoltenVK 1.4.2), 18.00 GiB usable; prefetch off; expert cache: 3720 MiB; 32 tokens per sequence, median of 3 runs
+| N | sequential tok/s | batched tok/s | speed-up | concurrent tok/s | speed-up | widest pass | tokens identical | read wait seq / conc | loads per token seq / conc |
+|---:|---:|---:|---:|---:|---:|---:|---|---:|---:|
+| 1 | 27.93 | 28.05 | 1.00x | 28.05 | 1.00x | 1 | yes | 0% / 0% | 0.0 / 0.0 |
+| 2 | 28.02 | 34.82 | 1.24x | 34.41 | 1.23x | 2 | yes | 0% / 0% | 0.0 / 0.0 |
+| 4 | 27.92 | 40.45 | 1.45x | 40.19 | 1.44x | 4 | yes | 0% / 0% | 0.0 / 0.0 |
+| 8 | 27.91 | 44.63 | 1.60x | 44.49 | 1.59x | 8 | yes | 0% / 0% | 0.0 / 0.0 |
+concurrent, round 2: step3a
+Vulkan device 0 (Apple M3 Pro, integrated, MoltenVK 1.4.2), 18.00 GiB usable, experts fused up to 8 rows; prefetch off; expert cache: 3720 MiB; 32 tokens per sequence, median of 3 runs
+| N | sequential tok/s | batched tok/s | speed-up | concurrent tok/s | speed-up | widest pass | tokens identical | read wait seq / conc | loads per token seq / conc |
+|---:|---:|---:|---:|---:|---:|---:|---|---:|---:|
+| 1 | 30.47 | 30.45 | 1.00x | 30.47 | 1.00x | 1 | yes | 0% / 0% | 0.0 / 0.0 |
+| 2 | 30.47 | 38.10 | 1.25x | 37.79 | 1.24x | 2 | yes | 0% / 0% | 0.0 / 0.0 |
+| 4 | 30.49 | 43.40 | 1.42x | 43.21 | 1.42x | 4 | yes | 0% / 0% | 0.0 / 0.0 |
+| 8 | 30.46 | 46.58 | 1.53x | 46.44 | 1.52x | 8 | yes | 0% / 0% | 0.0 / 0.0 |
+concurrent, round 2: routed
+Vulkan device 0 (Apple M3 Pro, integrated, MoltenVK 1.4.2), 18.00 GiB usable, experts fused and routed on the device up to 8 rows; prefetch off; expert cache: 3720 MiB; 32 tokens per sequence, median of 3 runs
+| N | sequential tok/s | batched tok/s | speed-up | concurrent tok/s | speed-up | widest pass | tokens identical | read wait seq / conc | loads per token seq / conc |
+|---:|---:|---:|---:|---:|---:|---:|---|---:|---:|
+| 1 | 32.39 | 32.41 | 1.00x | 32.28 | 1.00x | 1 | yes | 0% / 0% | 0.0 / 0.0 |
+| 2 | 32.36 | 39.89 | 1.23x | 39.61 | 1.22x | 2 | yes | 0% / 0% | 0.0 / 0.0 |
+| 4 | 32.26 | 45.12 | 1.40x | 44.92 | 1.39x | 4 | yes | 0% / 0% | 0.0 / 0.0 |
+| 8 | 32.27 | 48.47 | 1.50x | 48.34 | 1.50x | 8 | yes | 0% / 0% | 0.0 / 0.0 |
+
+concurrent, round 3: baseline
+Vulkan device 0 (Apple M3 Pro, integrated, MoltenVK 1.4.2), 18.00 GiB usable; prefetch off; expert cache: 3720 MiB; 32 tokens per sequence, median of 3 runs
+| N | sequential tok/s | batched tok/s | speed-up | concurrent tok/s | speed-up | widest pass | tokens identical | read wait seq / conc | loads per token seq / conc |
+|---:|---:|---:|---:|---:|---:|---:|---|---:|---:|
+| 1 | 28.02 | 27.96 | 1.00x | 27.99 | 1.00x | 1 | yes | 0% / 0% | 0.0 / 0.0 |
+| 2 | 27.82 | 34.91 | 1.25x | 34.17 | 1.23x | 2 | yes | 0% / 0% | 0.0 / 0.0 |
+| 4 | 28.07 | 40.48 | 1.44x | 40.19 | 1.43x | 4 | yes | 0% / 0% | 0.0 / 0.0 |
+| 8 | 28.03 | 44.65 | 1.59x | 44.52 | 1.59x | 8 | yes | 0% / 0% | 0.0 / 0.0 |
+concurrent, round 3: step3a
+Vulkan device 0 (Apple M3 Pro, integrated, MoltenVK 1.4.2), 18.00 GiB usable, experts fused up to 8 rows; prefetch off; expert cache: 3720 MiB; 32 tokens per sequence, median of 3 runs
+| N | sequential tok/s | batched tok/s | speed-up | concurrent tok/s | speed-up | widest pass | tokens identical | read wait seq / conc | loads per token seq / conc |
+|---:|---:|---:|---:|---:|---:|---:|---|---:|---:|
+| 1 | 30.34 | 30.31 | 1.00x | 30.38 | 1.00x | 1 | yes | 0% / 0% | 0.0 / 0.0 |
+| 2 | 30.35 | 38.07 | 1.25x | 37.83 | 1.25x | 2 | yes | 0% / 0% | 0.0 / 0.0 |
+| 4 | 30.30 | 43.28 | 1.43x | 43.11 | 1.42x | 4 | yes | 0% / 0% | 0.0 / 0.0 |
+| 8 | 30.30 | 46.48 | 1.53x | 46.34 | 1.53x | 8 | yes | 0% / 0% | 0.0 / 0.0 |
+concurrent, round 3: routed
+Vulkan device 0 (Apple M3 Pro, integrated, MoltenVK 1.4.2), 18.00 GiB usable, experts fused and routed on the device up to 8 rows; prefetch off; expert cache: 3720 MiB; 32 tokens per sequence, median of 3 runs
+| N | sequential tok/s | batched tok/s | speed-up | concurrent tok/s | speed-up | widest pass | tokens identical | read wait seq / conc | loads per token seq / conc |
+|---:|---:|---:|---:|---:|---:|---:|---|---:|---:|
+| 1 | 32.18 | 32.25 | 1.00x | 32.26 | 1.00x | 1 | yes | 0% / 0% | 0.0 / 0.0 |
+| 2 | 32.25 | 39.82 | 1.23x | 39.53 | 1.23x | 2 | yes | 0% / 0% | 0.0 / 0.0 |
+| 4 | 32.22 | 45.17 | 1.40x | 44.98 | 1.40x | 4 | yes | 0% / 0% | 0.0 / 0.0 |
+| 8 | 32.25 | 48.44 | 1.50x | 48.32 | 1.50x | 8 | yes | 0% / 0% | 0.0 / 0.0 |

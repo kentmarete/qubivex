@@ -229,6 +229,31 @@ pub struct DeviceGatedFfn<'a> {
     pub ys: &'a mut [f32],
 }
 
+/// A mixture-of-experts layer as one submission, as [`crate::RoutedMoe`] with the
+/// weights in device memory. `experts` holds every expert of the layer by id; the
+/// caller keeps all of them on the device until the call returns.
+#[derive(Debug)]
+pub struct DeviceRoutedMoe<'a> {
+    /// `experts × cols` router.
+    pub router: &'a DeviceWeights,
+    /// Every expert's gate, up and down, indexed by expert id.
+    pub experts: &'a [[DeviceWeights; 3]],
+    /// Experts per token.
+    pub k: usize,
+    /// Whether the chosen probabilities are renormalised to sum to 1.
+    pub renormalise: bool,
+    /// `s × cols` activations.
+    pub xs: &'a [f32],
+    /// Tokens.
+    pub s: usize,
+    /// `s × rows` combined outputs.
+    pub ys: &'a mut [f32],
+    /// `s × k` chosen expert ids, in rank order per token.
+    pub ids: &'a mut [u32],
+    /// `s × k` routing weights.
+    pub weights: &'a mut [f32],
+}
+
 /// A device's memory.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct DeviceUsage {
@@ -398,6 +423,23 @@ pub trait DiscreteDevice: Send + Sync {
     fn max_arena(&self) -> u64 {
         u64::MAX
     }
+
+    /// Whether callers should offer a layer of `experts` experts, top `k`, over `s`
+    /// tokens as one [`DiscreteDevice::routed_moe`]. The default is `false`.
+    fn routes_moe(&self, experts: usize, k: usize, s: usize) -> bool {
+        let _ = (experts, k, s);
+        false
+    }
+
+    /// Runs the layer as one submission if this device can (routing on the device), and
+    /// says whether it did; `Ok(false)` writes nothing. The default declines.
+    ///
+    /// # Errors
+    /// As [`DiscreteDevice::matmul_many`].
+    fn routed_moe(&self, op: &mut DeviceRoutedMoe<'_>) -> Result<bool, ComputeError> {
+        let _ = op;
+        Ok(false)
+    }
 }
 
 /// [`DiscreteDevice::gated_ffn_many`] as separate steps (the default): one
@@ -449,4 +491,83 @@ pub fn gated_ffn_steps(
         })
         .collect();
     dev.matmul_many(&mut second)
+}
+
+/// [`DiscreteDevice::routed_moe`] as separate steps on `dev`: the router as one
+/// [`DiscreteDevice::matmul_many`], routing on the host ([`crate::route_tokens`]), every
+/// used expert's block as one [`DiscreteDevice::gated_ffn_many`], and the combine on the
+/// host ([`crate::combine_ranks`]). Every output has the bits of
+/// [`crate::routed_moe_steps`]; a simulated device uses it.
+///
+/// # Errors
+/// [`ComputeError::Shape`] for inconsistent shapes; otherwise as the device's calls.
+pub fn routed_moe_steps(
+    dev: &(impl DiscreteDevice + ?Sized),
+    op: &mut DeviceRoutedMoe<'_>,
+) -> Result<(), ComputeError> {
+    let (ne, cols, s, k) = (op.router.rows(), op.router.cols(), op.s, op.k);
+    let rows = op.ys.len().checked_div(s).unwrap_or(0);
+    if op.experts.len() != ne
+        || k == 0
+        || k > ne
+        || op.xs.len() != s * cols
+        || op.ids.len() != s * k
+        || op.weights.len() != s * k
+    {
+        return Err(ComputeError::Shape {
+            op: "routed moe",
+            detail: format!(
+                "{ne}-row router, {} experts, top {k}, {s} tokens",
+                op.experts.len()
+            ),
+        });
+    }
+    let mut logits = vec![0f32; s * ne];
+    dev.matmul_many(&mut [DeviceMatMul {
+        w: op.router,
+        xs: op.xs,
+        s,
+        ys: &mut logits,
+    }])?;
+    crate::route_tokens(&logits, s, k, op.renormalise, op.ids, op.weights);
+    let users = crate::users_by_expert(op.ids, k);
+    let xes: Vec<Vec<f32>> = users
+        .iter()
+        .map(|(_, u)| {
+            u.iter()
+                .flat_map(|&(t, _)| op.xs[t * cols..(t + 1) * cols].iter().copied())
+                .collect()
+        })
+        .collect();
+    let mut outs: Vec<Vec<f32>> = users
+        .iter()
+        .map(|(_, u)| vec![0f32; u.len() * rows])
+        .collect();
+    let mut blocks: Vec<DeviceGatedFfn<'_>> = users
+        .iter()
+        .zip(&xes)
+        .zip(outs.iter_mut())
+        .map(|(((e, u), xe), y)| {
+            let [gate, up, down] = &op.experts[*e as usize];
+            DeviceGatedFfn {
+                gate,
+                up,
+                down,
+                xs: xe,
+                s: u.len(),
+                ys: y,
+            }
+        })
+        .collect();
+    dev.gated_ffn_many(&mut blocks)?;
+    drop(blocks);
+    let mut contrib = vec![0f32; s * k * rows];
+    for ((_, u), y) in users.iter().zip(&outs) {
+        for (i, &(t, r)) in u.iter().enumerate() {
+            let j = t * k + r;
+            contrib[j * rows..(j + 1) * rows].copy_from_slice(&y[i * rows..(i + 1) * rows]);
+        }
+    }
+    crate::combine_ranks(&contrib, op.weights, k, op.ys);
+    Ok(())
 }

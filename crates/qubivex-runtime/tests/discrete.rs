@@ -272,6 +272,154 @@ fn fused_expert_blocks_are_one_submission() {
     assert_eq!(got, want);
 }
 
+/// As [`sim_fused`], with MoE layers of up to `route_rows` tokens also routed on the
+/// device (Step 3b); `device_cache` limits the device expert cache.
+fn sim_routed(id: &str, route_rows: usize, device_cache: Option<u64>) -> Engine {
+    let mut config = SimConfig::new(1 << 30);
+    config.fuse_rows = 64;
+    config.route_rows = route_rows;
+    Engine::load(
+        meta(id),
+        EngineOptions {
+            backend: BackendKind::Sim,
+            sim: Some(config),
+            vram_budget: Some(
+                device_cache.map_or(1 << 29, |c| c + VRAM_ACTIVATION_RESERVE.0 + dense_arena(id)),
+            ),
+            expert_cache_bytes: Some(1 << 30),
+            max_context: Some(256),
+            ..EngineOptions::default()
+        },
+    )
+    .unwrap()
+}
+
+/// Prompt logits, after enough passes that every layer is held whole (missing experts
+/// are prefetched, and a pass routes on the host until they land).
+fn routed_logits(e: &Engine, id: &str) -> Vec<u32> {
+    let logits = |e: &Engine| {
+        let mut c = e.new_cache();
+        bits(&e.forward(PROMPT, &mut c, Logits::All, None).unwrap())
+    };
+    for _ in 0..50 {
+        let before = e.device_report().unwrap().routed_layers;
+        let got = logits(e);
+        let after = e.device_report().unwrap().routed_layers;
+        if after - before == layers(id) {
+            return got;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    panic!("the layers were never all routed on the device");
+}
+
+/// Step 3b on the sim: a MoE layer's router, routing, experts and combine are one
+/// submission with the CPU's bits, and record the same uses as host routing.
+#[test]
+fn routed_layers_are_one_submission_with_the_cpu_bits() {
+    for id in MOE {
+        let want = {
+            let mut c = cpu(id, Some(1 << 30)).new_cache();
+            bits(
+                &cpu(id, Some(1 << 30))
+                    .forward(PROMPT, &mut c, Logits::All, None)
+                    .unwrap(),
+            )
+        };
+        let want_run = run(&cpu(id, Some(1 << 30)));
+        let e = sim_routed(id, 64, None);
+        assert_eq!(routed_logits(&e, id), want, "{id}");
+        let submissions = |e: &Engine| e.device_report().unwrap().transfers.submissions;
+        let before = submissions(&e);
+        let mut c = e.new_cache();
+        assert_eq!(
+            bits(&e.forward(PROMPT, &mut c, Logits::All, None).unwrap()),
+            want,
+            "{id}"
+        );
+        assert_eq!(
+            submissions(&e) - before,
+            3 * layers(id) + 1,
+            "{id}: QKV, O and the routed layer per layer, then the head"
+        );
+        assert_eq!(run(&e), want_run, "{id}");
+
+        // The same uses as routing on the host (Step 3a), once both are warm.
+        let f = sim_fused(id, 64);
+        for _ in 0..3 {
+            let _ = run(&f);
+        }
+        let uses = |e: &Engine| {
+            let (h, d) = (
+                e.store_stats().hits,
+                e.device_report().unwrap().experts.hits,
+            );
+            let _ = run(e);
+            (
+                e.store_stats().hits - h,
+                e.device_report().unwrap().experts.hits - d,
+            )
+        };
+        assert_eq!(uses(&e), uses(&f), "{id}: store and device-cache hits");
+
+        // Switched off, nothing is routed on the device.
+        let off = sim_routed(id, 0, None);
+        assert_eq!(run(&off), want_run, "{id}");
+        assert_eq!(off.device_report().unwrap().routed_layers, 0, "{id}");
+    }
+}
+
+/// A device cache that cannot hold every expert never routes on the device (holding a
+/// layer must not evict), and keeps the CPU's bits.
+#[test]
+fn a_device_cache_short_of_the_model_routes_on_the_host() {
+    for id in MOE {
+        let want_run = run(&cpu(id, Some(1 << 30)));
+        let e = sim_routed(id, 64, Some(2 * largest_expert(id)));
+        for _ in 0..3 {
+            assert_eq!(run(&e), want_run, "{id}");
+        }
+        assert_eq!(e.device_report().unwrap().routed_layers, 0, "{id}");
+    }
+}
+
+/// Concurrent requests routed on the device: each gets the CPU's prompt logits and
+/// tokens.
+#[test]
+fn concurrent_requests_routed_on_the_device() {
+    let id = "olmoe-tiny";
+    let prompts: Vec<Vec<u32>> = (0..4)
+        .map(|i| PROMPT.iter().map(|&t| t + i).collect())
+        .collect();
+    let both = |e: &Engine, p: &[u32]| {
+        let mut c = e.new_cache();
+        let logits = bits(&e.forward(p, &mut c, Logits::All, None).unwrap());
+        (
+            logits,
+            e.generate(p, 8, Sampling::default(), |_| true).unwrap(),
+        )
+    };
+    let c = cpu(id, Some(1 << 30));
+    let want: Vec<_> = prompts.iter().map(|p| both(&c, p)).collect();
+    let e = sim_routed(id, 64, None);
+    let _ = routed_logits(&e, id);
+    let before = e.device_report().unwrap().routed_layers;
+    for _ in 0..2 {
+        let got: Vec<_> = std::thread::scope(|s| {
+            let hs: Vec<_> = prompts
+                .iter()
+                .map(|p| {
+                    let e = &e;
+                    s.spawn(move || both(e, p))
+                })
+                .collect();
+            hs.into_iter().map(|h| h.join().unwrap()).collect()
+        });
+        assert_eq!(got, want);
+    }
+    assert!(e.device_report().unwrap().routed_layers > before);
+}
+
 /// Concurrent requests share the device and its cache; each gets the CPU's tokens.
 #[test]
 fn concurrent_requests_on_one_device() {

@@ -19,6 +19,9 @@
 //! - **A fused expert block**, when [`SimConfig::fuse_rows`] asks for one: a layer's
 //!   gated feed-forward blocks are one submission, so the fused path above the device
 //!   is exercised and tested here. Off by default.
+//! - **Routing on the device**, when [`SimConfig::route_rows`] asks for it: a MoE layer's
+//!   router, routing, experts and combine are one submission (Step 3b), so the routed
+//!   path above the device is tested here. Off by default.
 //!
 //! What it does not simulate: kernel speed (the kernels are the CPU's), asynchronous
 //! submission, and alignment or page-size rules of a real driver.
@@ -30,7 +33,8 @@ use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
 use qubivex_compute::discrete::{
-    DeviceBuffer, DeviceGatedFfn, DeviceMatMul, DeviceUsage, DiscreteDevice, Guard, TransferStats,
+    DeviceBuffer, DeviceGatedFfn, DeviceMatMul, DeviceRoutedMoe, DeviceUsage, DiscreteDevice,
+    Guard, TransferStats,
 };
 use qubivex_compute::host::PageAligned;
 use qubivex_compute::{ComputeBackend, ComputeError, WeightView};
@@ -52,6 +56,9 @@ pub struct SimConfig {
     /// Fuse a layer's expert blocks into one submission when no block has more than
     /// this many activation rows ([`DiscreteDevice::fuses_gated_ffn`]); 0: never.
     pub fuse_rows: usize,
+    /// Route MoE layers of at most this many tokens on the device, as one submission
+    /// ([`DiscreteDevice::routes_moe`]); 0: never.
+    pub route_rows: usize,
 }
 
 impl SimConfig {
@@ -68,6 +75,7 @@ impl SimConfig {
             latency: Duration::from_micros(10),
             delay: false,
             fuse_rows: 0,
+            route_rows: 0,
         }
     }
 
@@ -398,6 +406,60 @@ impl DiscreteDevice for SimDevice {
         }
         self.moved(inb, outb);
         Ok(())
+    }
+
+    fn routes_moe(&self, experts: usize, k: usize, s: usize) -> bool {
+        k > 0 && k <= experts && s > 0 && s <= self.config.route_rows
+    }
+
+    /// One submission: the router logits, the routing and the expert intermediates stay
+    /// on the device; the inputs, the combined outputs and the routes are copied.
+    fn routed_moe(&self, op: &mut DeviceRoutedMoe<'_>) -> Result<bool, ComputeError> {
+        if !self.routes_moe(op.experts.len(), op.k, op.s) {
+            return Ok(false);
+        }
+        let (ne, cols, s, k) = (op.router.rows(), op.router.cols(), op.s, op.k);
+        let rows = op.ys.len().checked_div(s).unwrap_or(0);
+        if op.experts.len() != ne || op.xs.len() != s * cols || op.ids.len() != s * k {
+            return Err(ComputeError::Shape {
+                op: "routed moe",
+                detail: format!("{ne}-row router, {} experts, {s} tokens", op.experts.len()),
+            });
+        }
+        self.counters.submissions.fetch_add(1, Ordering::Relaxed);
+        let mut logits = vec![0f32; s * ne];
+        self.matmul_one(&mut DeviceMatMul {
+            w: op.router,
+            xs: op.xs,
+            s,
+            ys: &mut logits,
+        })?;
+        qubivex_compute::route_tokens(&logits, s, k, op.renormalise, op.ids, op.weights);
+        // Entry-major, as a device does it: one row per (token, rank).
+        let mut contrib = vec![0f32; s * k * rows];
+        for (j, &e) in op.ids.iter().enumerate() {
+            let t = j / k;
+            let [gate, up, down] = &op.experts[e as usize];
+            let ffn = gate.rows();
+            let (mut g, mut u) = (vec![0f32; ffn], vec![0f32; ffn]);
+            let x = &op.xs[t * cols..(t + 1) * cols];
+            for (w, ys) in [(gate, &mut g), (up, &mut u)] {
+                self.matmul_one(&mut DeviceMatMul { w, xs: x, s: 1, ys })?;
+            }
+            qubivex_compute::math::swiglu(&mut g, &u);
+            self.matmul_one(&mut DeviceMatMul {
+                w: down,
+                xs: &g,
+                s: 1,
+                ys: &mut contrib[j * rows..(j + 1) * rows],
+            })?;
+        }
+        qubivex_compute::combine_ranks(&contrib, op.weights, k, op.ys);
+        self.moved(
+            size_of_val(op.xs) as u64,
+            (size_of_val(op.ys) + size_of_val(op.ids) + size_of_val(op.weights)) as u64,
+        );
+        Ok(true)
     }
 
     fn usage(&self) -> DeviceUsage {

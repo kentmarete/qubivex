@@ -85,6 +85,36 @@ pub fn swiglu(g: &mut [f32], u: &[f32]) {
     }
 }
 
+/// Softmax in place (max-subtracted, sequential sum).
+pub fn softmax(x: &mut [f32]) {
+    let m = x.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+    let mut sum = 0f32;
+    for v in x.iter_mut() {
+        *v = exp(*v - m);
+        sum += *v;
+    }
+    for v in x.iter_mut() {
+        *v /= sum;
+    }
+}
+
+/// Softmax routing of one token: the top `k` experts by probability (ties: the lower
+/// id), in rank order, with their probabilities (renormalised to sum to 1 when `norm`).
+#[must_use]
+pub fn route(logits: &[f32], k: usize, norm: bool) -> (Vec<u32>, Vec<f32>) {
+    let mut p = logits.to_vec();
+    softmax(&mut p);
+    let mut idx: Vec<u32> = (0..u32::try_from(p.len()).unwrap_or(u32::MAX)).collect();
+    idx.sort_by(|a, b| p[*b as usize].total_cmp(&p[*a as usize]).then(a.cmp(b)));
+    idx.truncate(k);
+    let mut w: Vec<f32> = idx.iter().map(|&e| p[e as usize]).collect();
+    if norm {
+        let sum: f32 = w.iter().sum();
+        w.iter_mut().for_each(|x| *x /= sum);
+    }
+    (idx, w)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
