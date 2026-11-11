@@ -1,6 +1,7 @@
 #!/bin/zsh
 # Builds the Metal timing harness and runs it on MoltenVK's own MSL for matmul.comp.
-# Usage: spikes/vulkan-step2-metal-timing/run.sh [shapes|focus|fused|check|dispatch|scale|all]
+# Usage: spikes/vulkan-step2-metal-timing/run.sh [shapes|focus|fused|check|dispatch|scale|all|
+#        swiglu-check|swiglu-time|binding-check|binding]
 # Env: REPS (default 200), TS=1 (add MoltenVK-style timestamps), THREADS (per-expert
 # threads, default 5), UNTRACKED=1 (untracked hazard tracking).
 set -e
@@ -21,6 +22,38 @@ if [[ -n $SEARCH ]]; then python3 $here/fuse.py $out/kernel.metal > $out/fused.m
 else python3 $here/fuse.py $out/kernel.metal --equal > $out/fused.metal; fi
 clang -O2 -fobjc-arc -framework Metal -framework Foundation -framework QuartzCore $here/main.m -o $out/harness
 mode=${1:-all}
+# Audit §15: the SwiGLU candidate (built as matmul.comp is, plus -O0 and precise variants,
+# and the native Metal backend's kernel as a control) and the weight-binding variants.
+if [[ $mode == swiglu-check || $mode == binding* || $mode == swiglu-time ]]; then
+  $here/swiglu/build.sh $out/swiglu swiglu -O
+  $here/swiglu/build.sh $out/swiglu swiglu-O0 -O0
+  $here/swiglu/build.sh $out/swiglu swiglu-precise -O $here/swiglu/swiglu-precise.comp
+  for b in arena array bda; do python3 $here/fuse.py $out/kernel.metal --equal --binding $b > $out/fused-$b.metal; done
+  clang -O2 -fobjc-arc -framework Metal -framework Foundation -framework QuartzCore $here/binding.m -o $out/binding
+  (cd $here/cpucheck && cargo build --release -q --bins)
+fi
+if [[ $mode == swiglu-check ]]; then
+  # Every f32 bit pattern of g, twice; the C reference against Rust by hash.
+  clang -O2 -ffp-contract=off -fobjc-arc -framework Metal -framework Foundation $here/swiglu/check.m -o $out/swiglu-check
+  $here/cpucheck/target/release/rusthash 12
+  $out/swiglu-check $out/swiglu/swiglu.metal $out/swiglu/swiglu-O0.metal $out/swiglu/swiglu-precise.metal $out/swiglu/control.metal
+  exit
+fi
+if [[ $mode == swiglu-time ]]; then
+  $out/binding $out swiglu
+  $here/cpucheck/target/release/swiglutime
+  exit
+fi
+if [[ $mode == binding-check ]]; then
+  mkdir -p $out/bind-check
+  $out/binding $out check $out/bind-check
+  $here/cpucheck/target/release/blockcheck $out/bind-check
+  exit
+fi
+if [[ $mode == binding ]]; then
+  $out/binding $out bench
+  exit
+fi
 if [[ $mode == check ]]; then
   mkdir -p $out/check
   FUSED_SRC=$out/fused.metal $out/harness $out/kernel.metal check $out/check

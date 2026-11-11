@@ -20,7 +20,20 @@ TS=1 THREADS=1 spikes/vulkan-step2-metal-timing/run.sh focus
 spikes/vulkan-step2-metal-timing/run.sh fused     # + the fused multi-matrix dispatch (audit §14)
 spikes/vulkan-step2-metal-timing/run.sh check     # fused vs unfused vs the CPU, bit for bit
 SEARCH=1 spikes/vulkan-step2-metal-timing/run.sh fused   # the table-search lookup instead of O(1)
+spikes/vulkan-step2-metal-timing/run.sh swiglu-check   # SwiGLU over all 2^32 g, twice (audit §15.1; ~2.5 min)
+spikes/vulkan-step2-metal-timing/run.sh swiglu-time    # SwiGLU on the GPU and on the host, at a layer's sizes
+spikes/vulkan-step2-metal-timing/run.sh binding-check  # bindings and the one-submission expert block, bit for bit
+spikes/vulkan-step2-metal-timing/run.sh binding        # arena / array / bda (/ bda-all) timing, 64-expert pool
 ```
+
+Audit §15 adds:
+- `swiglu/`: a GLSL SwiGLU built as `matmul.comp` is, plus `-O0` and `precise` builds.
+  `mvkmsl.c` makes MoltenVK translate it to MSL, and `check.m` runs the exhaustive comparison
+  with a C reference.
+- `binding.m`: the weight-binding variants, and the expert block in one command buffer.
+- `cpucheck`'s `rusthash`: the C reference against `ops::swiglu`, by hash over every input.
+- `cpucheck`'s `blockcheck`: the expert block against the CPU.
+- `cpucheck`'s `swiglutime`: host SwiGLU time.
 
 The fused prototype (audit §14) is in two parts:
 - `fuse.py` derives `fused0` from MoltenVK's kernel: the same body, with the push constants
