@@ -3,10 +3,9 @@
 //! Every function computes each output from its inputs in one fixed order, so a
 //! token's result does not depend on how many other tokens are processed with it.
 //! Only IEEE-754 basic operations, fused multiply-add and the portable
-//! [`exp`] are used, so the bits are the same on every
+//! [`qubivex_compute::math::exp`] are used, so the bits are the same on every
 //! platform and on a GPU that evaluates them in the same order.
 
-use qubivex_compute::math::exp;
 use qubivex_compute::reduce::dot;
 
 /// RMSNorm in place: `x · w / sqrt(mean(x²) + eps)`.
@@ -107,35 +106,9 @@ impl Rope {
 /// can give the same bits without depending on this crate).
 pub use qubivex_compute::math::swiglu;
 
-/// Softmax in place (max-subtracted, sequential sum).
-pub fn softmax(x: &mut [f32]) {
-    let m = x.iter().copied().fold(f32::NEG_INFINITY, f32::max);
-    let mut sum = 0f32;
-    for v in x.iter_mut() {
-        *v = exp(*v - m);
-        sum += *v;
-    }
-    for v in x.iter_mut() {
-        *v /= sum;
-    }
-}
-
-/// Softmax routing of one token: the top `k` experts by probability (ties: the lower
-/// id), in rank order, with their probabilities (renormalised to sum to 1 when `norm`).
-#[must_use]
-pub fn route(logits: &[f32], k: usize, norm: bool) -> (Vec<u32>, Vec<f32>) {
-    let mut p = logits.to_vec();
-    softmax(&mut p);
-    let mut idx: Vec<u32> = (0..u32::try_from(p.len()).unwrap_or(u32::MAX)).collect();
-    idx.sort_by(|a, b| p[*b as usize].total_cmp(&p[*a as usize]).then(a.cmp(b)));
-    idx.truncate(k);
-    let mut w: Vec<f32> = idx.iter().map(|&e| p[e as usize]).collect();
-    if norm {
-        let sum: f32 = w.iter().sum();
-        w.iter_mut().for_each(|x| *x /= sum);
-    }
-    (idx, w)
-}
+/// Softmax and top-k routing (defined in `qubivex-compute`, so a device backend can be
+/// checked against them without depending on this crate).
+pub use qubivex_compute::math::{route, softmax};
 
 /// Sequential f32 dot product.
 #[inline]
