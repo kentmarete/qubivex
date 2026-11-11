@@ -41,6 +41,14 @@ pub(crate) const MATMUL_FUSED_SPV: &[u8] = include_bytes!("matmul_fused.spv");
 /// SwiGLU (`shaders/swiglu.comp`, built -O0).
 pub(crate) const SWIGLU_SPV: &[u8] = include_bytes!("swiglu.spv");
 
+/// `shaders/route.comp`: routing on the device (Step 3b).
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) const ROUTE_SPV: &[u8] = include_bytes!("route.spv");
+
+/// `shaders/combine.comp`: the rank-order combine on the device (Step 3b).
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) const COMBINE_SPV: &[u8] = include_bytes!("combine.spv");
+
 /// Invocations per SwiGLU workgroup. Must equal `local_size_x` in the shader.
 const SWIGLU_GROUP: u32 = 256;
 

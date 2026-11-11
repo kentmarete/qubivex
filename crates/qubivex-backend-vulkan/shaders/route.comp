@@ -1,0 +1,149 @@
+// QUBIVEX Vulkan MoE routing (audit §17, Step 3b): `qubivex_compute::math::route` per
+// token, on the device, then the routed experts' entries of the fused dispatch table.
+//
+// One invocation per token runs the CPU's operations in its order:
+// - softmax: the maximum by Rust's `f32::max` (a NaN loses), `exp(v - max)` with
+//   `math::exp` (exp.glsl), a sequential sum from +0, and one division per value;
+// - the top k in `f32::total_cmp` order, highest first, ties to the lower id: the
+//   order the CPU's stable sort defines, found by selection;
+// - optionally, the weights renormalised by their sequential sum from -0 (Rust's
+//   `Iterator::sum` for f32) and one division each.
+// Then, for each (token, rank) entry j, it copies the chosen expert's three table
+// templates (gate, up, down: n, k, row bytes, weight offset; written by the host) into
+// the entries the fused dispatches read, with their input and output offsets: gate and
+// up read the token's activation row and write rows j of the gate and up intermediates;
+// down reads intermediate row j and writes output row j of `contrib`.
+//
+// Built -O0 (it contains exp's rounding idiom; build.sh), then every add, subtract and
+// fma NoContraction, as the other shaders. The divisions must be correctly rounded: the
+// routing parity tests check them on the device.
+#version 450
+
+layout(local_size_x = 64) in;
+
+// Router logits, s × ne; rewritten in place as the probabilities.
+layout(std430, set = 0, binding = 1) buffer Logits {
+    float lg[];
+};
+
+// The routes: ids (as u32 bits) at [0, s·k), weights at [s·k, 2·s·k).
+layout(std430, set = 0, binding = 2) buffer Routes {
+    float rt[];
+};
+
+// The table: a header at `p.hdr`, the templates, and the routed entries.
+layout(std430, set = 0, binding = 3) buffer Table {
+    uint tab[];
+};
+
+layout(push_constant) uniform Params {
+    uint s;
+    uint ne;
+    uint k;
+    uint hdr;
+} p;
+
+#include "exp.glsl"
+
+// Rust's `f32::max`: NaN loses.
+float rust_max(float a, float b) {
+    if (isnan(a)) {
+        return b;
+    }
+    if (isnan(b)) {
+        return a;
+    }
+    return b > a ? b : a;
+}
+
+// `f32::total_cmp`'s key: compare as signed integers.
+int total_key(float v) {
+    int b = floatBitsToInt(v);
+    return b ^ int(uint(b >> 31) >> 1u);
+}
+
+void main() {
+    uint t = gl_GlobalInvocationID.x;
+    if (t >= p.s) {
+        return;
+    }
+    // Header: renormalise, template base, entry base, cols, ffn, rows (words).
+    uint renorm = tab[p.hdr];
+    uint tpl = tab[p.hdr + 1u];
+    uint ent = tab[p.hdr + 2u];
+    uint cols = tab[p.hdr + 3u];
+    uint ffn = tab[p.hdr + 4u];
+    uint rows = tab[p.hdr + 5u];
+    uint sk = p.s * p.k;
+    uint gn = sk * ffn;
+    uint base = t * p.ne;
+
+    // Softmax (math::softmax).
+    float m = uintBitsToFloat(0xff800000u);
+    for (uint e = 0u; e < p.ne; e++) {
+        m = rust_max(m, lg[base + e]);
+    }
+    float sum = 0.0;
+    for (uint e = 0u; e < p.ne; e++) {
+        float v = qexp(lg[base + e] - m);
+        lg[base + e] = v;
+        sum = sum + v;
+    }
+    for (uint e = 0u; e < p.ne; e++) {
+        lg[base + e] = lg[base + e] / sum;
+    }
+
+    // Top k, highest first, ties to the lower id.
+    int pk = 0;
+    uint pid = 0u;
+    float wsum = uintBitsToFloat(0x80000000u);
+    for (uint r = 0u; r < p.k; r++) {
+        uint best = p.ne;
+        int bk = 0;
+        for (uint e = 0u; e < p.ne; e++) {
+            int ke = total_key(lg[base + e]);
+            bool after = r == 0u || ke < pk || (ke == pk && e > pid);
+            if (after && (best == p.ne || ke > bk)) {
+                best = e;
+                bk = ke;
+            }
+        }
+        pk = bk;
+        pid = best;
+        uint j = t * p.k + r;
+        float w = lg[base + best];
+        rt[j] = uintBitsToFloat(best);
+        rt[sk + j] = w;
+        wsum = wsum + w;
+
+        // The entry's three matrices: gate at ent + 16j, up at ent + 16j + 8, down at
+        // ent + 16·sk + 8j.
+        uint src = tpl + 24u * best;
+        uint g = ent + 16u * j;
+        uint u = g + 8u;
+        uint d = ent + 16u * sk + 8u * j;
+        for (uint i = 0u; i < 4u; i++) {
+            tab[g + i] = tab[src + i];
+            tab[u + i] = tab[src + 8u + i];
+            tab[d + i] = tab[src + 16u + i];
+        }
+        tab[g + 4u] = t * cols;
+        tab[g + 5u] = j * ffn;
+        tab[g + 6u] = 1u;
+        tab[g + 7u] = 0u;
+        tab[u + 4u] = t * cols;
+        tab[u + 5u] = gn + j * ffn;
+        tab[u + 6u] = 1u;
+        tab[u + 7u] = 0u;
+        tab[d + 4u] = j * ffn;
+        tab[d + 5u] = j * rows;
+        tab[d + 6u] = 1u;
+        tab[d + 7u] = 0u;
+    }
+    if (renorm != 0u) {
+        for (uint r = 0u; r < p.k; r++) {
+            uint j = sk + t * p.k + r;
+            rt[j] = rt[j] / wsum;
+        }
+    }
+}

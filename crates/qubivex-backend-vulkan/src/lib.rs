@@ -356,6 +356,8 @@ mod tests {
                 crate::device::MATMUL_FUSED_SPV,
             ),
             ("swiglu.spv", built("swiglu.spv"), crate::device::SWIGLU_SPV),
+            ("route.spv", built("route.spv"), crate::device::ROUTE_SPV),
+            ("combine.spv", built("combine.spv"), crate::device::COMBINE_SPV),
         ];
         let _ = std::fs::remove_dir_all(&out);
         for (name, built, checked_in) in pairs {
