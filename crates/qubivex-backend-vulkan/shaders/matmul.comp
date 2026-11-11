@@ -12,9 +12,13 @@
 //   chunk in lanes 0..rem, then the halving tree a[i] += a[i + w] for w = 32, 16, 8, 4,
 //   then (a0 + a1) + (a2 + a3).
 //
-// `precise` stops the compiler fusing or reassociating: only the explicit `fma` calls
-// are fused. glslang does not mark `fma` itself NoContraction, so `build.sh` does:
-// without it a driver may split an fma into two roundings (lavapipe does).
+// Contraction: only the explicit `fma` calls are fused. `build.sh` decorates every
+// floating-point add, subtract and `fma` with NoContraction, so no driver may fuse a
+// multiply into the add or subtract that consumes it, or split an fma into two
+// roundings (lavapipe does even so: ADR-019). Multiplies are left undecorated: the
+// shader uses `precise` nowhere, because SPIRV-Cross (MoltenVK) turns each
+// NoContraction operation into a call to an unoptimised helper, which made the
+// kernel several times slower when every multiply was decorated.
 //
 // One group of 32 invocations computes one output: invocation `lane` holds lanes `lane`
 // and `lane + 32`, so the w = 32 step is a per-invocation add. The rest of the tree goes
@@ -148,9 +152,9 @@ float weight(uint row, uint j) {
     } else if (DTYPE == DT_Q8_0) {
         // 34-byte blocks: f16 d, then 32 x i8. y = q * d.
         uint blk = row + 34u * (j / 32u);
-        precise float d = f16_at(blk);
-        precise float q = float(i8_at(blk + 2u + j % 32u));
-        precise float y = q * d;
+        float d = f16_at(blk);
+        float q = float(i8_at(blk + 2u + j % 32u));
+        float y = q * d;
         return y;
     } else if (DTYPE == DT_Q4_K) {
         // 144-byte blocks of 256: f16 d, f16 dmin, 12 scale bytes, 128 nibble bytes.
@@ -161,15 +165,15 @@ float weight(uint row, uint j) {
         uint e = j % 256u;
         uint g = e / 64u;
         uint hi = (e % 64u) / 32u;
-        precise float d = f16_at(blk);
-        precise float dmin = f16_at(blk + 2u);
+        float d = f16_at(blk);
+        float dmin = f16_at(blk + 2u);
         uvec2 sm = scale_min_k4(2u * g + hi, blk + 4u);
-        precise float d1 = d * float(sm.x);
-        precise float m1 = dmin * float(sm.y);
+        float d1 = d * float(sm.x);
+        float m1 = dmin * float(sm.y);
         uint v = byte_at(blk + 16u + 32u * g + e % 32u);
         uint q = hi == 0u ? (v & 0xFu) : (v >> 4);
-        precise float t = d1 * float(q);
-        precise float y = t - m1;
+        float t = d1 * float(q);
+        float y = t - m1;
         return y;
     } else {
         // Q6_K, 210-byte blocks of 256: ql 128, qh 64, 16 x i8 scales, f16 d.
@@ -186,9 +190,9 @@ float weight(uint row, uint j) {
         lo = qq >= 2u ? (lo >> 4) : (lo & 0xFu);
         uint hb = (byte_at(blk + 128u + 32u * h + l) >> (2u * qq)) & 3u;
         int q = int(lo | (hb << 4)) - 32;
-        precise float d = f16_at(blk + 208u);
-        precise float s = d * float(i8_at(blk + 192u + 8u * h + l / 16u + 2u * qq));
-        precise float y = s * float(q);
+        float d = f16_at(blk + 208u);
+        float s = d * float(i8_at(blk + 192u + 8u * h + l / 16u + 2u * qq));
+        float y = s * float(q);
         return y;
     }
 }
@@ -199,8 +203,8 @@ void main() {
     uint r = gl_WorkGroupID.x * ROWS + t / 32u;
     uint tok = gl_WorkGroupID.y;
 
-    precise float a0 = 0.0;
-    precise float a1 = 0.0;
+    float a0 = 0.0;
+    float a1 = 0.0;
     // Every invocation reaches the barriers below; rows past `n` compute nothing.
     if (r < p.n) {
         uint row = p.w_base + r * p.row_bytes;
@@ -218,20 +222,20 @@ void main() {
                 // The header in four words: d and dmin, then the 12 scale bytes.
                 uint h0 = word_at(blk);
                 uvec3 sw = uvec3(word_at(blk + 4u), word_at(blk + 8u), word_at(blk + 12u));
-                precise float d = f16_bits(h0 & 0xFFFFu);
-                precise float dmin = f16_bits(h0 >> 16);
+                float d = f16_bits(h0 & 0xFFFFu);
+                float dmin = f16_bits(h0 >> 16);
                 for (uint g = 0u; g < 4u; g++) {
                     uvec2 s0 = scale_min_k4w(2u * g, sw);
                     uvec2 s1 = scale_min_k4w(2u * g + 1u, sw);
-                    precise float d0 = d * float(s0.x);
-                    precise float m0 = dmin * float(s0.y);
-                    precise float d1 = d * float(s1.x);
-                    precise float m1 = dmin * float(s1.y);
+                    float d0 = d * float(s0.x);
+                    float m0 = dmin * float(s0.y);
+                    float d1 = d * float(s1.x);
+                    float m1 = dmin * float(s1.y);
                     uint v = byte_at(blk + 16u + 32u * g + lane);
-                    precise float t0 = d0 * float(v & 0xFu);
-                    precise float y0 = t0 - m0;
-                    precise float t1 = d1 * float(v >> 4);
-                    precise float y1 = t1 - m1;
+                    float t0 = d0 * float(v & 0xFu);
+                    float y0 = t0 - m0;
+                    float t1 = d1 * float(v >> 4);
+                    float y1 = t1 - m1;
                     uint j = x + c + 64u * g + lane;
                     a0 = fma(y0, xs[j], a0);
                     a1 = fma(y1, xs[j + 32u], a1);
@@ -243,7 +247,7 @@ void main() {
             // high nibbles in the second.
             for (; c + 256u <= full; c += 256u) {
                 uint blk = row + 210u * (c / 256u);
-                precise float d = f16_at(blk + 208u);
+                float d = f16_at(blk + 208u);
                 for (uint h = 0u; h < 2u; h++) {
                     uint la = byte_at(blk + 64u * h + lane);
                     uint lb = byte_at(blk + 64u * h + lane + 32u);
@@ -254,8 +258,8 @@ void main() {
                         uint lo = qq >= 2u ? ((qq & 1u) == 0u ? la : lb) >> 4
                                            : ((qq & 1u) == 0u ? la : lb) & 0xFu;
                         int q = int(lo | (((hb >> (2u * qq)) & 3u) << 4)) - 32;
-                        precise float s = d * float(i8_at(sc + 2u * qq));
-                        precise float y = s * float(q);
+                        float s = d * float(i8_at(sc + 2u * qq));
+                        float y = s * float(q);
                         if ((qq & 1u) == 0u) {
                             a0 = fma(y, xs[j + 32u * qq], a0);
                         } else {
@@ -269,12 +273,12 @@ void main() {
             for (; c < full; c += 64u) {
                 uint b0 = row + 34u * (c / 32u);
                 uint b1 = b0 + 34u;
-                precise float d0 = f16_at(b0);
-                precise float d1 = f16_at(b1);
-                precise float q0 = float(i8_at(b0 + 2u + lane));
-                precise float q1 = float(i8_at(b1 + 2u + lane));
-                precise float y0 = q0 * d0;
-                precise float y1 = q1 * d1;
+                float d0 = f16_at(b0);
+                float d1 = f16_at(b1);
+                float q0 = float(i8_at(b0 + 2u + lane));
+                float q1 = float(i8_at(b1 + 2u + lane));
+                float y0 = q0 * d0;
+                float y1 = q1 * d1;
                 a0 = fma(y0, xs[x + c + lane], a0);
                 a1 = fma(y1, xs[x + c + lane + 32u], a1);
             }
@@ -295,13 +299,13 @@ void main() {
     }
 
     // w = 32.
-    precise float s = a0 + a1;
+    float s = a0 + a1;
     red[t] = s;
     memoryBarrierShared();
     barrier();
     // w = 16, 8, 4 within each group of 32.
     for (uint wd = 16u; wd >= 4u; wd /= 2u) {
-        precise float v = 0.0;
+        float v = 0.0;
         if (lane < wd) {
             v = red[t] + red[t + wd];
         }
@@ -314,9 +318,9 @@ void main() {
         barrier();
     }
     if (lane == 0u && r < p.n) {
-        precise float b0 = red[t] + red[t + 1u];
-        precise float b1 = red[t + 2u] + red[t + 3u];
-        precise float y = b0 + b1;
+        float b0 = red[t] + red[t + 1u];
+        float b1 = red[t + 2u] + red[t + 3u];
+        float y = b0 + b1;
         ys[p.y_base + tok * p.n + r] = y;
     }
 }
