@@ -1799,3 +1799,110 @@ single-stream gain over Step 3a (yes, −6.4%). **35 tok/s: not reached (32.0–
 4. **A device-open division probe** for drivers other than MoltenVK (§17.6) is not
    built.
 5. **Next:** §17.9.
+
+## 18. Step 3c: the O projection and FFN norm in the routed submission (design, 2026-11-11)
+
+Owner brief (2026-11-11): start §17.9. Acceptance as Step 3b: identical tokens, numerical
+correctness, no prefill or concurrent regression, a measured single-stream gain over
+Step 3b, alternated against the permanent Step 1a baseline. Behind its own switch, Step 3b
+the fallback.
+
+### 18.1 What moves
+
+After Step 3b a MoE layer is three submissions: QKV; O; router through combine. Between
+the second and third the host does the attention residual (`hs += o`) and the FFN
+`rms_norm`. Both are data-only edges (§17.3). Step 3c runs them on the device, at the
+head of the routed submission:
+
+| # | Per layer | Submission | Host work after the wait |
+|---|---|---|---|
+| 1 | QKV | `matmul_many` (3 matmuls) | clip, QK norm, RoPE, KV store, attention |
+| 2 | **O, residual, FFN norm, router, routing, experts, combine** | `routed_moe` with a prelude | `hs += y` |
+| — | head (per token) | `matmul` | sampling |
+
+**2 per layer + 1 = 33 submissions per token** (Step 3b: 49). The QKV → attention → O
+edge stays on the host: the KV cache is in host memory (Step 4 in §8).
+
+### 18.2 Bits
+
+The device does the CPU's operations in its order:
+- **O:** the fused matmul entry, `matmul.comp`'s body unchanged (the Step 3a proof).
+- **Residual:** one f32 add per element, `hs[i] + o[i]`, as `*a += b` on the host.
+- **Sum of squares:** the shared 64-lane shape (`reduce::dot(x, x)`): lane l takes
+  elements l, l + 64, … in order, one `fma(v, v, acc)` each (a short last chunk lands in
+  lanes 0..rem, as the loop does), then the fixed halving tree, w = 32, 16, 8, 4, then
+  `(a0 + a1) + (a2 + a3)`. One workgroup of 64 invocations per token, the tree in shared
+  memory, as the matmul's.
+- **Scale:** `1 / sqrt(ss / n + eps)` with `n` and `eps` as f32
+  (`math::rms_scale_of`, split out of `rms_scale` with the same operations). Needs a
+  correctly rounded division and **square root**. Vulkan promises neither (2.5 and about
+  3 ULP); MoltenVK with fast math off gives correctly rounded division (§15.1). The square
+  root is checked here: `shaders/rms.glsl`, built -O0 (glslc -O may turn `1 / sqrt` into
+  `inversesqrt`), run alone by a probe shader over **every f32 input** for six (n, eps)
+  shapes, including (1, 0), which is `1 / sqrt(x)` itself.
+- **Output:** `(v · r) · w`, two multiplies, as `rms_norm`.
+
+`rms_norm`, `rms_scale` and the new `rms_scale_of` move from `qubivex-arch::ops` into
+`qubivex-compute::math` unchanged (re-exported), as SwiGLU and routing did.
+
+### 18.3 One command buffer
+
+Step 3b's six dispatches, preceded by two:
+
+| Step | Pipeline | Dispatch | Reads | Writes |
+|---|---|---|---|---|
+| 0a | fused matmul (O dtype) | `blocks(h) × 1, s` | dense buffer, attention outputs, table[O] | o |
+| barrier | | | | |
+| 0b | **resnorm** (new) | `s` workgroups of 64 | hs, o, table[norm weight] | hs (in place), x |
+| barrier | | | | |
+| 1–6 | Step 3b (§17.5), router reading x | | | |
+
+8 dispatches, 7 barriers; all on the fused layout (4 storage bindings, 16-byte push). The
+norm weight (h f32 values) goes into the table buffer, so no new binding. `hs` is a
+host-visible buffer written in and read back; `x` is the activation buffer Step 3b
+already binds for the router and the gate/up entries. Extra per-submitter memory:
+`s × (q_out + 2h) × 4` bytes and h words of table: 48 KiB at s = 1, 384 KiB at s = 8.
+
+### 18.4 Interfaces
+
+- `qubivex-compute`: `MoePrelude { o, att, hs, norm, eps }` and `RoutedMoe::prelude:
+  Option<MoePrelude>` (then `xs` is empty: the activations are computed);
+  `ComputeBackend::routes_moe_prelude(experts, k, s)`, default `false`; the reference
+  `routed_moe_steps` runs the prelude as separate steps (O matmul, the add, `rms_norm`)
+  first. `DeviceRoutedMoe` and `DiscreteDevice` gain the same.
+- `qubivex-arch`: before the O matmul, a MoE layer is offered whole (prelude included)
+  when the backend routes it with a prelude, no trace is taken and no lookahead is wanted
+  (the lookahead router reads `hs` after O on the host). If the provider cannot hold the
+  layer or the backend declines, nothing has been written and the layer runs as before
+  (Step 3b, then 3a).
+- `qubivex-runtime`: `OnDevice` resolves the O view like the router's.
+- Sim: `SimConfig::route_prelude`, the separate steps in one submission, for the runtime
+  tests.
+- `qubivex-backend-vulkan`: `resnorm.comp`, `rms_scale.comp` (the probe), `rms.glsl`;
+  `VulkanConfig::route_o`, **`--vulkan-route-o on|off` (default off)**, effective only
+  with `--vulkan-route on`. Declined (Step 3b runs) when the O matrix's dtype is not a
+  kernel's, its rows differ from the residual width, or past the limits.
+
+### 18.5 Estimates
+
+- 16 fewer serial hand-offs per token. At Step 3b's measured gain per removed hand-off
+  (2.0 ms for 16, §17.14), **about 2 ms per token: 31.0 → about 29 ms (about 34.5 tok/s)**.
+  An estimate, not a measurement.
+- GPU work added: the resnorm dispatch (one workgroup per token, 2048 elements, a scalar
+  square root and division) and one more encoder boundary; the O matmul moves, it is not
+  added.
+- Prefill: unchanged (10 tokens > 8 rows: not routed).
+
+### 18.6 Tests and benchmark
+
+- Scale probe: edge values (±0, ±∞, NaN, perfect squares and neighbours, 2^20 random) in
+  the normal suite; every f32 input for six shapes, ignored (`tests/norm.rs`).
+- Whole layer with a prelude against the host steps, bit for bit, every dtype pairing,
+  s ∈ {1, 2, 4, 8}, an n with a short last chunk, OLMoE's shape. Positive controls: the
+  residual added after the norm, `inversesqrt`, a sequential (not tree) sum.
+- Runtime: sim and Vulkan fixtures, concurrent, real OLMoE with every layer routed with
+  its prelude: the CPU's logits and Colibri's tokens.
+- Benchmark (mains, 3 alternated rounds): `scripts/bench-vulkan-baseline --tag step3c
+  --variant routed='--vulkan-route on' --variant routedo='--vulkan-route on
+  --vulkan-route-o on'`; decode, prefill, submissions per token (49 → 33), concurrent at
+  1, 2, 4 and 8.
