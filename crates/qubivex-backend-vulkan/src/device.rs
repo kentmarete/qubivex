@@ -3141,6 +3141,183 @@ pub(crate) fn lock(m: &Mutex<Submitter>) -> MutexGuard<'_, Submitter> {
     m.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
+/// An experimental compute pipeline on the fused layout (4 storage bindings, 16 bytes
+/// of push constants), for the investigation harness (audit §19). Destroyed on drop.
+#[cfg(feature = "spike")]
+pub struct SpikeKernel {
+    shared: Arc<Shared>,
+    pipeline: vk::Pipeline,
+}
+
+#[cfg(feature = "spike")]
+impl Drop for SpikeKernel {
+    fn drop(&mut self) {
+        // SAFETY: no submission using it is in flight (`spike_run` waits).
+        unsafe { self.shared.device.destroy_pipeline(self.pipeline, None) };
+    }
+}
+
+#[cfg(feature = "spike")]
+impl std::fmt::Debug for SpikeKernel {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SpikeKernel").finish_non_exhaustive()
+    }
+}
+
+/// One step of a spike run: a kernel, its push constants and its grid.
+#[cfg(feature = "spike")]
+pub type SpikeStep<'a> = (&'a SpikeKernel, [u32; 4], [u32; 3]);
+
+/// A spike run's timing: the host's wait on the fence, and the GPU time between the
+/// command buffer's timestamps when timed.
+#[cfg(feature = "spike")]
+#[derive(Clone, Copy, Debug)]
+pub struct SpikeTiming {
+    /// Nanoseconds blocked on the fence.
+    pub wait_ns: u64,
+    /// GPU nanoseconds, when the device was opened with timestamps.
+    pub gpu_ns: Option<u64>,
+}
+
+#[cfg(feature = "spike")]
+impl Submitter {
+    /// Builds `spv` as a pipeline on the fused layout.
+    pub(crate) fn spike_kernel(&self, spv: &[u8]) -> Result<SpikeKernel, ComputeError> {
+        let shared = Arc::clone(&self.shared);
+        let fused = shared
+            .fused
+            .as_ref()
+            .ok_or_else(|| err("spike", "no fused layout"))?;
+        let code = ash::util::read_spv(&mut std::io::Cursor::new(spv))
+            .map_err(|e| err("bad SPIR-V", e))?;
+        let d = &shared.device;
+        // SAFETY: the create-infos live until their calls return; the module is
+        // destroyed after pipeline creation.
+        unsafe {
+            let module = d
+                .create_shader_module(&vk::ShaderModuleCreateInfo::default().code(&code), None)
+                .map_err(|e| err("shader module", e))?;
+            let info = [vk::ComputePipelineCreateInfo::default()
+                .stage(
+                    vk::PipelineShaderStageCreateInfo::default()
+                        .stage(vk::ShaderStageFlags::COMPUTE)
+                        .module(module)
+                        .name(c"main"),
+                )
+                .layout(fused.layout)];
+            let made = d.create_compute_pipelines(vk::PipelineCache::null(), &info, None);
+            d.destroy_shader_module(module, None);
+            let pipeline = made.map_err(|(_, e)| err("spike pipeline", e))?[0];
+            Ok(SpikeKernel {
+                shared: Arc::clone(&shared),
+                pipeline,
+            })
+        }
+    }
+
+    /// Copies `bufs` into four host-visible buffers (bindings 0 to 3), records `steps`
+    /// `repeat` times with a barrier between every two dispatches, submits once, waits,
+    /// and copies every buffer back.
+    pub(crate) fn spike_run(
+        &mut self,
+        steps: &[SpikeStep<'_>],
+        bufs: [&mut [f32]; 4],
+        repeat: u32,
+    ) -> Result<SpikeTiming, ComputeError> {
+        let shared = Arc::clone(&self.shared);
+        let fused = shared
+            .fused
+            .as_ref()
+            .ok_or_else(|| err("spike", "no fused layout"))?;
+        let storage = vk::BufferUsageFlags::STORAGE_BUFFER;
+        let mut allocs = Vec::with_capacity(4);
+        for b in &bufs {
+            let mut a = Allocation::new(&shared, (4 * b.len() as u64).max(16), storage, true)?;
+            a.floats_mut()[..b.len()].copy_from_slice(b);
+            allocs.push(a);
+        }
+        let sets = self.fused_sets(1)?;
+        let whole = |a: &Allocation| (a.buffer, 0, None);
+        self.write_set(
+            sets[0],
+            [
+                whole(&allocs[0]),
+                whole(&allocs[1]),
+                whole(&allocs[2]),
+                whole(&allocs[3]),
+            ],
+        );
+        let (layout, set) = (fused.layout, sets[0]);
+        let ran = self.run(|dev, cmd| {
+            let between = [vk::MemoryBarrier::default()
+                .src_access_mask(vk::AccessFlags::SHADER_WRITE)
+                .dst_access_mask(vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE)];
+            let to_host = [vk::MemoryBarrier::default()
+                .src_access_mask(vk::AccessFlags::SHADER_WRITE)
+                .dst_access_mask(vk::AccessFlags::HOST_READ)];
+            // SAFETY: recording into a command buffer in the recording state, with
+            // objects that outlive the submission (`run` waits for it).
+            unsafe {
+                dev.cmd_bind_descriptor_sets(
+                    cmd,
+                    vk::PipelineBindPoint::COMPUTE,
+                    layout,
+                    0,
+                    &[set],
+                    &[],
+                );
+                let mut first = true;
+                for _ in 0..repeat {
+                    for (k, words, [x, y, z]) in steps {
+                        if !first {
+                            dev.cmd_pipeline_barrier(
+                                cmd,
+                                vk::PipelineStageFlags::COMPUTE_SHADER,
+                                vk::PipelineStageFlags::COMPUTE_SHADER,
+                                vk::DependencyFlags::empty(),
+                                &between,
+                                &[],
+                                &[],
+                            );
+                        }
+                        first = false;
+                        let mut push = [0u8; 16];
+                        for (j, w) in words.iter().enumerate() {
+                            push[4 * j..4 * j + 4].copy_from_slice(&w.to_ne_bytes());
+                        }
+                        dev.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, k.pipeline);
+                        dev.cmd_push_constants(
+                            cmd,
+                            layout,
+                            vk::ShaderStageFlags::COMPUTE,
+                            0,
+                            &push,
+                        );
+                        dev.cmd_dispatch(cmd, *x, *y, *z);
+                    }
+                }
+                dev.cmd_pipeline_barrier(
+                    cmd,
+                    vk::PipelineStageFlags::COMPUTE_SHADER,
+                    vk::PipelineStageFlags::HOST,
+                    vk::DependencyFlags::empty(),
+                    &to_host,
+                    &[],
+                    &[],
+                );
+            }
+        })?;
+        for (b, a) in bufs.into_iter().zip(allocs.iter_mut()) {
+            let n = b.len();
+            b.copy_from_slice(&a.floats_mut()[..n]);
+        }
+        Ok(SpikeTiming {
+            wait_ns: ran.wait_ns,
+            gpu_ns: ran.gpu.map(|(a, b)| b - a),
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::Busy;
