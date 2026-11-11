@@ -1,7 +1,8 @@
 # ADR-011: Device execution, buffer lifetimes and GPU parity
 
 - Status: **Accepted (2026-11-10)** by owner decision, for the parity contract and
-  amendments 1 to 6. The CPU stays the default backend; `--backend metal` is an opt-in.
+  amendments 1 to 6. Amendment 7 (2026-11-11, NaN payloads and signs) by owner decision
+  with Vulkan Step 3a. The CPU stays the default backend; `--backend metal` is an opt-in.
 - Date: 2026-11-03
 - Related: ADR-007 (backends; amendment 2026-11-03), ADR-010 (lossless by default),
   `docs/engineering/ARCHITECTURE_DECISIONS.md` §2.4–2.5, TENSOR_ARCHITECTURE §6.
@@ -504,3 +505,20 @@ tok/s; 2048 MiB: 221 against 117) and at 10 tokens (1024 MiB: 46.9 against 41.4)
   at load, for at most about 8% in a regime only `--backend metal` reaches.
 - Pools that pressure shrinks after load keep the pass chosen at load, as in amendment 3.
 - The CPU stays the default backend until the owner reviews amendments 2–6.
+
+## Amendment 7 (2026-11-11): NaN payloads and signs
+
+Owner decision with Vulkan Step 3a (ADR-019 amendment 3). §1's contract, for every GPU
+backend:
+- **NaN payloads and NaN sign bits are not part of parity.** Where the CPU's output is
+  NaN, a device's output must be NaN; its payload and sign are not compared. Apple GPUs
+  (Metal, and Vulkan through MoltenVK) return the canonical NaN from arithmetic, while the
+  CPU propagates an input's payload.
+- **NaN classification is part of parity.** A NaN where the CPU has a number, or the
+  reverse, is a difference, unless the subnormal exception explains it (for example a
+  flushed subnormal times an infinity: `0 · ∞` is NaN where the CPU's `tiny · ∞` is
+  infinite).
+- **Subnormals are unchanged** (§1): the flush is the one other exception.
+
+Parity tests that see NaNs classify each difference (subnormal, NaN payload, other),
+print the counts and fail on any other; everywhere else they compare exact bits.

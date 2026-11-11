@@ -3,7 +3,9 @@
 - Status: **Accepted (2026-11-11)** by owner decision; amendment 1 (2026-11-11, kernel
   speed) accepted 2026-11-11 by owner decision, after its parity and regression checks
   were rerun on `main` at 9721f58 (§ Amendment 1, "Acceptance"). Amendment 2 (the shared
-  GPU pass) is to be written separately.
+  GPU pass) is to be written separately. Amendment 3 (2026-11-11, the fused expert block,
+  Step 3a) records the implementation the owner accepted on 2026-11-11, and the parity
+  contract's wording for NaNs.
 - Date: 2026-11-11
 - Related: ADR-007 (backends), ADR-010 (lossless by default), ADR-011 (device execution
   and parity), ADR-018 (discrete device memory).
@@ -230,3 +232,128 @@ The speed figures above are unchanged: they come from the mains-power records.
   device, as Metal amendment 2 did, with the CPU's bits for norms, attention, softmax,
   routing and SwiGLU. That is its own decision. Token tiles for prefill and batched
   decode remain open.
+
+## Amendment 3 (2026-11-11): the fused expert block on two fixed-slot arenas (Step 3a)
+
+The owner accepted Step 3a on 2026-11-11 (audit `VULKAN_EXECUTION_AUDIT.md` §16). This
+amendment records what was built and the rules it adds. Amendment 2 is still reserved for
+the shared GPU-pass contract; nothing here depends on it.
+
+### The fused expert block
+- **A generic block op.** `qubivex-compute` gains `GatedFfn` (`ys = down · swiglu(gate ·
+  xs, up · xs)`) with `ComputeBackend::{fuses_gated_ffn, gated_ffn_many}` and
+  `DiscreteDevice::{fuses_gated_ffn, gated_ffn_many}`. The defaults run the separate steps
+  (two `matmul_many` with `math::swiglu` on the host between them), so a backend changes
+  nothing until it opts in. The MoE stage asks the backend by shape (number of blocks,
+  largest rows per expert) and, when every routed expert of the layer is resident, runs
+  them as one `gated_ffn_many`. It applies to any SwiGLU MoE; there is no model-specific
+  path.
+- **One submission per layer's experts on Vulkan:** fused gate and up dispatch(es),
+  barrier, SwiGLU, barrier, fused down dispatch(es), in one command buffer. The gate and
+  up outputs stay in a device-local working buffer; only the inputs and the block's
+  outputs cross host memory. Matrices are grouped into dispatches by (buffer, dtype,
+  rows), so experts outside an arena, or of mixed dtypes, still run, as extra dispatches
+  in the same submission.
+- **Shaders.** `matmul.comp`'s body is in `matmul_body.glsl`, shared by `matmul.comp`
+  (its SPIR-V is byte-identical, so the unfused pipeline did not change) and
+  `matmul_fused.comp` (each workgroup finds its matrix in a table, `wg.x / blocks`, and
+  skips rows past that matrix's tokens uniformly). `swiglu.comp` is the port of
+  `math::swiglu` with `math::exp`.
+- **Shape selection.** `--vulkan-fuse-rows N` (default 8, 0 turns fusion off): a layer
+  fuses when no expert has more than N rows. 8 was measured (audit §16.4): equal to 4
+  below 8 concurrent sequences, better at 8. A 128-token prompt never fuses, so prefill
+  is unchanged.
+
+### Two fixed-slot arenas, and memory accounting
+- **The device expert cache is one arena per expert size class**, divided into equal
+  slots (OLMoE Q4_K_M: Q4_K-down experts of 3 538 944 bytes and Q6_K-down experts of
+  4 079 616 bytes, so two arenas). A copy is a write into a free slot, never an
+  allocation; there is no fragmentation; every expert of a layer sits in one buffer.
+  New device methods: `alloc`, `write`, `max_arena`.
+- **Slot counts** follow the budget's distribution over layers (the RAM cache's rule,
+  `qubivex_memory::distribute`), capped per layer by the RAM cache's slots (the device
+  cache is inclusive, so it can never use more) and per arena by `max_arena`, the
+  largest buffer one binding can address (`maxStorageBufferRange`, at most 4 GiB). Slots
+  start at multiples of 256 bytes.
+- **Pins are per slot.** A forward pass holds a slot's pin while computing that expert;
+  eviction (least recently used within the class) and overwriting skip pinned slots. If
+  every slot of a class is pinned, the copy gets its own allocation over the budget
+  (`over_budget` counts it); the device's capacity stays the hard limit.
+- **No arenas** when the device has none (the default `alloc` refuses) or the budget
+  cannot give every layer one slot: each copy is its own allocation, as before.
+- **Accounting.** An arena is allocated on its class's first copy and charged to the
+  ledger's `Vram(0)` tier whole, at that moment. So the device cache's reported numbers
+  split:
+  - `experts.used`: device bytes the cache occupies, allocated arenas plus copies with
+    their own allocation. This is the ledger's VRAM expert-cache charge.
+  - `experts.held`: bytes of the expert copies it holds now.
+  - `experts.arena_bytes` and `arena_slots`: the planned arenas, allocated or not.
+
+  `used` can exceed `held` (an arena is charged before it fills), never the budget except
+  through counted `over_budget` copies.
+- **Working buffers are not charged to the ledger.** Each of the 8 submitters keeps a
+  device-local intermediate buffer (8 bytes per gate output) and its host buffers, grown
+  by doubling and reused, as `matmul_many`'s host buffers already were. The 8-row
+  default bounds them: on OLMoE, 8 bytes × 1024 × (tokens × 8 routed) is 64 KiB at one
+  decode token, 512 KiB at 8 sequences and at most 4 MiB (64 experts × 8 rows) per
+  submitter. They come out of the plan's 256 MiB device reserve (ADR-018).
+
+### SwiGLU compilation requirements
+- **`glslc -O` breaks the CPU's bits for any shader with a rounding idiom.** glslc's
+  optimiser runs before `build.sh` adds `NoContraction`, so it folds `exp`'s
+  `(x · log2e + SHIFT) − SHIFT` into `x · log2e`; `int(kf)` then truncates instead of
+  rounding (472 million of 2^32 inputs 1 ulp off; audit §15.1).
+- **Rule:** `build.sh` has a per-shader optimisation level. A shader with a rounding idiom
+  (today `swiglu.comp`) is built `-O0`, or uses `precise` on that idiom; the matmuls have
+  none and stay `-O`, proven by their parity tests. Every new shader is gated by an
+  exhaustive or targeted test against the CPU, and `spirv_is_current` keeps the checked-in
+  SPIR-V in step with `build.sh`.
+- `-O0` costs nothing measurable here: SwiGLU and its two barriers add at most about
+  3 µs of GPU time per layer.
+- The division in `silu` must be correctly rounded. MoltenVK's Safe math mode is on this
+  device (exhaustive test); other drivers are not assumed to be, and the tests are the
+  check on each.
+
+### Numerical parity contract
+The contract stays §5's: the CPU's bits. Step 3a states three points precisely; they apply
+to every GPU backend (Metal already behaves this way; ADR-011 amendment 7 records it in
+the cross-backend contract):
+1. **Subnormals: ADR-011 §1 unchanged.** A device that flushes f32 subnormals may differ
+   wherever an input, product, partial sum, intermediate (here `silu(g)`) or the exact
+   result is below `f32::MIN_POSITIVE` in magnitude. That includes a subnormal exact
+   result that IEEE rounding would round up to `f32::MIN_POSITIVE` but the device flushes
+   first. A flush can also turn a CPU infinity into a NaN (a flushed `silu(g)` times an
+   infinite `u`); that difference is the subnormal exception too, and is counted as such.
+2. **NaN payloads and NaN signs are outside the contract.** Where the CPU's output is
+   NaN, the device's output must be NaN, but its payload and sign bit are not compared.
+   The device's SwiGLU returns the canonical `0x7fc00000`; the CPU propagates the input
+   payload.
+3. **NaN classification is inside the contract.** A NaN where the CPU has a number, or a
+   number where the CPU has a NaN, fails, unless point 1 explains it.
+
+The tests follow it: exact bits everywhere else; the SwiGLU tests classify every
+difference as subnormal, NaN payload (both NaN) or other, print the counts, and fail on
+any other.
+
+### Measured
+Audit §16, every number recorded on mains power, untimed, alternated with the permanent
+Step 1a baseline (tag `bench/vulkan-step1a`, driver `scripts/bench-vulkan-baseline`):
+- **Correctness.** The fused block equals the CPU's separate steps bit for bit for
+  Q4_K/Q4_K, Q4_K/Q6_K, Q6_K/Q6_K, Q8_0, f32/f16 and bf16/f32 at 1, 3 and 8 experts × 1,
+  2, 4 and 10 rows, in an arena and in separate buffers, and at OLMoE's shapes. Device
+  SwiGLU over all 2 × 2^32 inputs: 0 differences outside the subnormal and NaN-payload
+  classes. Real OLMoE: the CPU's prompt logits and Colibri's tokens, with a device cache
+  that evicts. A `-O` build of SwiGLU fails the targeted test (positive control).
+- **Single stream** (10-token prompt, 128 generated, 5 threads): 35.78 → 33.00 ms per token
+  (27.95 → 30.30 tok/s), 305 → 65 submissions per token, prefill unchanged. The arenas
+  alone change nothing; the gain is the single submission.
+- **Concurrent** (the batch example): +11% at 1–2 sequences, +9.5% at 4, +5.7% at 8.
+
+### Consequences
+- Step 1a stays the permanent benchmark baseline, and Step 3a (`--vulkan-fuse-rows 8`) is
+  the reference that later Vulkan steps are measured against as well.
+- The arena layout is what lets a later step find an expert from its index alone: an
+  expert's device address is (class, slot), so a GPU-side table can map routed indices to
+  weights (Step 3b).
+- The working buffers are outside the ledger; a later step that keeps more on the device
+  (activations, KV) must charge them.

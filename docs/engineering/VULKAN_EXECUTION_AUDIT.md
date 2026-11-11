@@ -1477,13 +1477,13 @@ Optimising the execution path, not the kernel: the fused block runs the same sha
 with the same GPU work per output. It removes 240 submissions per token (305 → 65) and
 the host SwiGLU between the expert stages, and that alone is 2.8–3.5 ms per token.
 
-### 16.6 Not decided (owner)
+### 16.6 Owner decisions (2026-11-11)
 
-1. **NaN payloads in the parity contract** (§15.1, still open). The device's SwiGLU, like
-   Metal's, returns the canonical NaN; NaN-ness always matches. The tests count payload
-   differences separately and do not fail on them.
-2. **ADR-019 amendment** recording: the gated-FFN block op and its shape selection, the
-   arena cache and its accounting change (`used` vs `held`), and the per-shader `-O0` rule.
-   Not written yet; nothing is Proposed.
-3. **Next step.** §14.7's 3b (router and routing in the same submission, for resident
-   layers) is the next round trip to remove. Target 2 (35 tok/s) needs it or more.
+Step 3a is accepted. The open points are settled:
+1. **NaN payloads and signs** are outside the cross-backend parity contract; NaN
+   classification stays inside it, and subnormals stay ADR-011 §1's exception (ADR-011
+   amendment 7). The tests already classified this way; their wording now cites it.
+2. **ADR-019 amendment 3** records the gated-FFN block op and its shape selection, the two
+   fixed-slot arenas and their accounting (`used` vs `held`, working buffers), the
+   per-shader `-O0` rule, and the NaN wording.
+3. **Next: Step 3b**, routing in the same submission, investigated separately.

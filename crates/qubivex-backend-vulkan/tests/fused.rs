@@ -7,8 +7,9 @@
 //! SwiGLU is compared with these exceptions, counted and printed, never silent:
 //! - subnormals, which the GPU flushes (ADR-011 §1): an input, the CPU's intermediate
 //!   `silu(g)`, the exact `silu(g)` or the CPU's output below `f32::MIN_POSITIVE`;
-//! - NaN payloads: both NaN, different bits. Whether the parity contract counts NaN
-//!   payloads is an open owner decision (audit §15.1); NaN-ness itself must match.
+//! - NaN payloads: both NaN, different bits (payload or sign). The parity contract
+//!   excludes them (ADR-011 amendment 7); NaN-ness itself must match, and a NaN against
+//!   a number counts as "other" unless the subnormal exception explains it.
 
 #![allow(
     clippy::unwrap_used,
