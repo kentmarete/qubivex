@@ -49,3 +49,5 @@ build matmul_fused -O
 build swiglu -O0
 build route -O0
 build combine -O0
+build resnorm -O0
+build rms_scale -O0

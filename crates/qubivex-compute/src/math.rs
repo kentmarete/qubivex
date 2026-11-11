@@ -85,6 +85,37 @@ pub fn swiglu(g: &mut [f32], u: &[f32]) {
     }
 }
 
+/// RMSNorm in place: `x · w / sqrt(mean(x²) + eps)`.
+///
+/// The sum of squares uses the shared 64-lane reduction shape ([`crate::reduce`]) and
+/// the rest is f32, so a GPU kernel with the same shape gives the same bits (ADR-011 §1).
+pub fn rms_norm(x: &mut [f32], w: &[f32], eps: f64) {
+    debug_assert_eq!(x.len(), w.len());
+    let r = rms_scale(x, eps);
+    for (v, g) in x.iter_mut().zip(w) {
+        *v = (*v * r) * g;
+    }
+}
+
+/// `1 / sqrt(mean(x²) + eps)`, the factor [`rms_norm`] applies.
+#[must_use]
+pub fn rms_scale(x: &[f32], eps: f64) -> f32 {
+    #[allow(clippy::cast_precision_loss)]
+    let n = x.len() as f32;
+    #[allow(clippy::cast_possible_truncation)]
+    let eps = eps as f32;
+    rms_scale_of(crate::reduce::dot(x, x), n, eps)
+}
+
+/// [`rms_scale`] from the sum of squares `ss`, the length `n` and `eps`, all f32:
+/// `1 / sqrt(ss / n + eps)`, each operation correctly rounded. A device kernel gives
+/// the same bits with a correctly rounded division and square root, in this order.
+#[must_use]
+#[inline]
+pub fn rms_scale_of(ss: f32, n: f32, eps: f32) -> f32 {
+    1.0 / (ss / n + eps).sqrt()
+}
+
 /// Softmax in place (max-subtracted, sequential sum).
 pub fn softmax(x: &mut [f32]) {
     let m = x.iter().copied().fold(f32::NEG_INFINITY, f32::max);

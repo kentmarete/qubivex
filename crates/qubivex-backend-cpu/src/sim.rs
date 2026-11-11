@@ -59,6 +59,9 @@ pub struct SimConfig {
     /// Route MoE layers of at most this many tokens on the device, as one submission
     /// ([`DiscreteDevice::routes_moe`]); 0: never.
     pub route_rows: usize,
+    /// Route those layers with their prelude, the O projection, residual and norm, in
+    /// the same submission ([`DiscreteDevice::routes_moe_prelude`], Step 3c).
+    pub route_prelude: bool,
 }
 
 impl SimConfig {
@@ -76,6 +79,7 @@ impl SimConfig {
             delay: false,
             fuse_rows: 0,
             route_rows: 0,
+            route_prelude: false,
         }
     }
 
@@ -412,25 +416,59 @@ impl DiscreteDevice for SimDevice {
         k > 0 && k <= experts && s > 0 && s <= self.config.route_rows
     }
 
+    fn routes_moe_prelude(&self, experts: usize, k: usize, s: usize) -> bool {
+        self.config.route_prelude && self.routes_moe(experts, k, s)
+    }
+
     /// One submission: the router logits, the routing and the expert intermediates stay
     /// on the device; the inputs, the combined outputs and the routes are copied.
     fn routed_moe(&self, op: &mut DeviceRoutedMoe<'_>) -> Result<bool, ComputeError> {
         if !self.routes_moe(op.experts.len(), op.k, op.s) {
             return Ok(false);
         }
+        if op.prelude.is_some() && !self.config.route_prelude {
+            return Ok(false);
+        }
         let (ne, cols, s, k) = (op.router.rows(), op.router.cols(), op.s, op.k);
         let rows = op.ys.len().checked_div(s).unwrap_or(0);
-        if op.experts.len() != ne || op.xs.len() != s * cols || op.ids.len() != s * k {
+        let xs_len = if op.prelude.is_some() { 0 } else { s * cols };
+        if op.experts.len() != ne
+            || op.xs.len() != xs_len
+            || op.ids.len() != s * k
+            || op.prelude.as_ref().is_some_and(|p| {
+                p.o.rows() != cols
+                    || p.att.len() != s * p.o.cols()
+                    || p.hs.len() != s * cols
+                    || p.norm.len() != cols
+            })
+        {
             return Err(ComputeError::Shape {
                 op: "routed moe",
                 detail: format!("{ne}-row router, {} experts, {s} tokens", op.experts.len()),
             });
         }
         self.counters.submissions.fetch_add(1, Ordering::Relaxed);
+        // The prelude: the O projection, residual and norm, in the same submission.
+        let (normed, pre_in, pre_out) = match op.prelude.as_mut() {
+            Some(p) => {
+                let mut o = vec![0f32; s * cols];
+                self.matmul_one(&mut DeviceMatMul {
+                    w: p.o,
+                    xs: p.att,
+                    s,
+                    ys: &mut o,
+                })?;
+                let x = qubivex_compute::residual_norm(&o, p.hs, p.norm, p.eps);
+                let inb = size_of_val(p.att) + size_of_val(&*p.hs) + size_of_val(p.norm);
+                (Some(x), inb as u64, size_of_val(&*p.hs) as u64)
+            }
+            None => (None, 0, 0),
+        };
+        let xs: &[f32] = normed.as_deref().unwrap_or(op.xs);
         let mut logits = vec![0f32; s * ne];
         self.matmul_one(&mut DeviceMatMul {
             w: op.router,
-            xs: op.xs,
+            xs,
             s,
             ys: &mut logits,
         })?;
@@ -442,7 +480,7 @@ impl DiscreteDevice for SimDevice {
             let [gate, up, down] = &op.experts[e as usize];
             let ffn = gate.rows();
             let (mut g, mut u) = (vec![0f32; ffn], vec![0f32; ffn]);
-            let x = &op.xs[t * cols..(t + 1) * cols];
+            let x = &xs[t * cols..(t + 1) * cols];
             for (w, ys) in [(gate, &mut g), (up, &mut u)] {
                 self.matmul_one(&mut DeviceMatMul { w, xs: x, s: 1, ys })?;
             }
@@ -456,8 +494,8 @@ impl DiscreteDevice for SimDevice {
         }
         qubivex_compute::combine_ranks(&contrib, op.weights, k, op.ys);
         self.moved(
-            size_of_val(op.xs) as u64,
-            (size_of_val(op.ys) + size_of_val(op.ids) + size_of_val(op.weights)) as u64,
+            size_of_val(op.xs) as u64 + pre_in,
+            (size_of_val(op.ys) + size_of_val(op.ids) + size_of_val(op.weights)) as u64 + pre_out,
         );
         Ok(true)
     }

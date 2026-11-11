@@ -382,6 +382,14 @@ impl ComputeBackend for Placed {
             .is_some_and(|d| d.routes_moe(experts, k, s))
     }
 
+    /// Whether it routes this shape with the O projection, residual and norm in the
+    /// same submission (Step 3c).
+    fn routes_moe_prelude(&self, experts: usize, k: usize, s: usize) -> bool {
+        self.device
+            .as_ref()
+            .is_some_and(|d| d.routes_moe_prelude(experts, k, s))
+    }
+
     fn routed_moe(&self, op: &mut RoutedMoe<'_>) -> Result<bool, ComputeError> {
         match &self.device {
             Some(d) => d.routed_moe(op),

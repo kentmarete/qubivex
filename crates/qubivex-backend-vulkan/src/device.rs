@@ -52,6 +52,13 @@ pub(crate) const ROUTE_SPV: &[u8] = include_bytes!("route.spv");
 /// `shaders/combine.comp`: the rank-order combine on the device (Step 3b).
 pub(crate) const COMBINE_SPV: &[u8] = include_bytes!("combine.spv");
 
+/// `shaders/resnorm.comp`: the attention residual and the FFN RMSNorm on the device
+/// (audit §18).
+pub(crate) const RESNORM_SPV: &[u8] = include_bytes!("resnorm.spv");
+
+/// `shaders/rms_scale.comp`: the RMSNorm scale alone, for the conformance tests.
+pub(crate) const RMS_SCALE_SPV: &[u8] = include_bytes!("rms_scale.spv");
+
 /// Invocations per SwiGLU workgroup. Must equal `local_size_x` in the shader.
 const SWIGLU_GROUP: u32 = 256;
 
@@ -197,6 +204,9 @@ pub(crate) struct Shared {
 pub(crate) struct Routed {
     route: vk::Pipeline,
     combine: vk::Pipeline,
+    /// The residual and RMSNorm (audit §18) and the scale probe.
+    resnorm: vk::Pipeline,
+    rms_scale: vk::Pipeline,
 }
 
 /// The fused matmul (one pipeline per dtype) and SwiGLU, on one layout: binding 0 the
@@ -235,6 +245,8 @@ impl Drop for Shared {
             if let Some(r) = &self.routed {
                 self.device.destroy_pipeline(r.route, None);
                 self.device.destroy_pipeline(r.combine, None);
+                self.device.destroy_pipeline(r.resnorm, None);
+                self.device.destroy_pipeline(r.rms_scale, None);
             }
             if let Some(f) = &self.fused {
                 f.destroy(&self.device);
@@ -789,16 +801,21 @@ fn create_fused(device: &ash::Device) -> Result<Fused, ComputeError> {
     }
 }
 
-/// The route and combine pipelines on the fused `layout`.
+/// The route, combine, residual-norm and scale-probe pipelines on the fused `layout`.
 fn create_routed(device: &ash::Device, layout: vk::PipelineLayout) -> Result<Routed, ComputeError> {
     let spv = |b: &[u8]| {
         ash::util::read_spv(&mut std::io::Cursor::new(b)).map_err(|e| err("bad SPIR-V", e))
     };
-    let codes = [spv(ROUTE_SPV)?, spv(COMBINE_SPV)?];
+    let codes = [
+        spv(ROUTE_SPV)?,
+        spv(COMBINE_SPV)?,
+        spv(RESNORM_SPV)?,
+        spv(RMS_SCALE_SPV)?,
+    ];
     // SAFETY: each create-info and what it points to live until its call returns;
     // modules are destroyed after pipeline creation, pipelines on failure.
     unsafe {
-        let mut modules = Vec::with_capacity(2);
+        let mut modules = Vec::with_capacity(codes.len());
         for code in &codes {
             match device
                 .create_shader_module(&vk::ShaderModuleCreateInfo::default().code(code), None)
@@ -830,9 +847,11 @@ fn create_routed(device: &ash::Device, layout: vk::PipelineLayout) -> Result<Rou
             device.destroy_shader_module(m, None);
         }
         match made {
-            Ok(p) if p.len() == 2 => Ok(Routed {
+            Ok(p) if p.len() == 4 => Ok(Routed {
                 route: p[0],
                 combine: p[1],
+                resnorm: p[2],
+                rms_scale: p[3],
             }),
             Ok(p) | Err((p, _)) => {
                 for p in p.into_iter().filter(|p| *p != vk::Pipeline::null()) {
@@ -1172,6 +1191,11 @@ pub(crate) struct Submitter {
     logits: Option<Allocation>,
     contrib: Option<Allocation>,
     routes: Option<Allocation>,
+    /// The prelude's attention outputs and residual stream (host-visible, the residual
+    /// read back) and the O projection's outputs (device-local), Step 3c.
+    att: Option<Allocation>,
+    hs: Option<Allocation>,
+    oproj: Option<Allocation>,
 }
 
 // SAFETY: the handles are plain identifiers, used only through `&mut self`.
@@ -1307,6 +1331,9 @@ impl Submitter {
                 logits: None,
                 contrib: None,
                 routes: None,
+                att: None,
+                hs: None,
+                oproj: None,
             })
         }
     }
@@ -2446,11 +2473,12 @@ impl Submitter {
         let lim = shared.limits;
         let (ne, cols, s, k) = (op.router.rows(), op.router.cols(), op.s, op.k);
         let rows = op.ys.len().checked_div(s).unwrap_or(0);
+        let xs_len = if op.prelude.is_some() { 0 } else { s * cols };
         if s == 0
             || k == 0
             || k > ne
             || op.experts.len() != ne
-            || op.xs.len() != s * cols
+            || op.xs.len() != xs_len
             || op.ys.len() != s * rows
             || op.ids.len() != s * k
             || op.weights.len() != s * k
@@ -2487,6 +2515,35 @@ impl Submitter {
         };
         let ra = self.allocation_of(op.router.buffer())?;
         let (rbuf, rsize) = (ra.buffer, ra.size);
+        // The prelude's O projection (Step 3c): one dtype with a kernel, `cols` rows.
+        let pre = match &op.prelude {
+            None => None,
+            Some(p) => {
+                let Some(odt) = dtype_index(p.o.dtype()) else {
+                    return Ok(false);
+                };
+                let (on, ok) = (p.o.rows(), p.o.cols());
+                if on != cols
+                    || ok == 0
+                    || p.att.len() != s * ok
+                    || p.hs.len() != s * cols
+                    || p.norm.len() != cols
+                {
+                    return Err(ComputeError::Shape {
+                        op: "routed moe prelude",
+                        detail: format!(
+                            "O {on} x {ok}, {} attention outputs, {} residuals, {} norm \
+                             weights, for {s} tokens of {cols}",
+                            p.att.len(),
+                            p.hs.len(),
+                            p.norm.len()
+                        ),
+                    });
+                }
+                let oa = self.allocation_of(p.o.buffer())?;
+                Some((odt, ok, p.o.len() / on, oa.buffer, oa.size))
+            }
+        };
 
         // Each binding's base (aligned down to the first matrix it reads) and range.
         let align = lim.min_storage_buffer_offset_alignment.max(4);
@@ -2515,6 +2572,18 @@ impl Submitter {
             rsize,
         ) else {
             return Ok(false);
+        };
+        let o_bind = match (&op.prelude, pre) {
+            (Some(p), Some((_, _, _, _, osize))) => {
+                let Some(b) = bind(
+                    &mut std::iter::once((p.o.offset() as u64, p.o.len() as u64)),
+                    osize,
+                ) else {
+                    return Ok(false);
+                };
+                Some(b)
+            }
+            _ => None,
         };
 
         // Dispatch sizes, all known here: the GPU only picks which expert each entry
@@ -2546,6 +2615,14 @@ impl Submitter {
         if [xb, lb, mb, cb, rtb, yb].iter().any(|&b| b > max_range) {
             return Ok(false);
         }
+        // The prelude's buffers: attention outputs, residual stream, O outputs.
+        let (ab, hb) = match pre {
+            Some((_, ok, ..)) => (4 * (s * ok) as u64, 4 * (s * cols) as u64),
+            None => (0, 0),
+        };
+        if ab > max_range || hb > max_range || (pre.is_some() && rows_of(cols) > maxx) {
+            return Ok(false);
+        }
 
         // The table: the router's entry, the header, the templates (3 per expert), and
         // room for the routed entries (2 per (token, rank) for gate and up, then 1 for
@@ -2553,9 +2630,26 @@ impl Submitter {
         let hdr = 8usize;
         let tpl = 16usize;
         let ent = tpl + 24 * ne;
-        let words = ent + 24 * sk;
+        // With a prelude: the O projection's entry, then the norm weights as bits.
+        let (o_at, norm_at) = (ent + 24 * sk, ent + 24 * sk + 8);
+        let words = if pre.is_some() { norm_at + cols } else { o_at };
         let mut table = vec![0u32; words];
         let w32 = |v: u64, what: &str| u32_of(v, what);
+        if let (Some(p), Some((_, ok, orb, ..)), Some((o_base, _))) = (&op.prelude, pre, o_bind) {
+            table[o_at..o_at + 8].copy_from_slice(&[
+                u32_of(cols, "rows")?,
+                u32_of(ok, "columns")?,
+                u32_of(orb, "row bytes")?,
+                w32(p.o.offset() as u64 - o_base, "offset")?,
+                0,
+                0,
+                u32_of(s, "tokens")?,
+                0,
+            ]);
+            for (dst, w) in table[norm_at..].iter_mut().zip(p.norm) {
+                *dst = w.to_bits();
+            }
+        }
         table[..8].copy_from_slice(&[
             u32_of(ne, "experts")?,
             u32_of(cols, "columns")?,
@@ -2598,6 +2692,24 @@ impl Submitter {
             x.floats_mut()[..op.xs.len()].copy_from_slice(op.xs);
             x.buffer
         };
+        // The prelude's inputs: attention outputs and the residual stream.
+        let pre_bufs = match &op.prelude {
+            Some(p) => {
+                let abuf = {
+                    let a = Self::host_buffer(&shared, &mut self.att, ab, storage)?;
+                    a.floats_mut()[..p.att.len()].copy_from_slice(p.att);
+                    a.buffer
+                };
+                let hbuf = {
+                    let h = Self::host_buffer(&shared, &mut self.hs, hb, storage)?;
+                    h.floats_mut()[..p.hs.len()].copy_from_slice(p.hs);
+                    h.buffer
+                };
+                let obuf = Self::scratch(&shared, &mut self.oproj, hb, storage, false)?.buffer;
+                Some((abuf, hbuf, obuf))
+            }
+            None => None,
+        };
         let tbuf = {
             let t = Self::host_buffer(&shared, &mut self.table, 4 * words as u64, storage)?;
             for (dst, &v) in t.floats_mut().iter_mut().zip(&table) {
@@ -2611,10 +2723,12 @@ impl Submitter {
         let mbuf = Self::scratch(&shared, &mut self.mid, mb, storage, false)?.buffer;
         let cbuf = Self::scratch(&shared, &mut self.contrib, cb, storage, false)?.buffer;
         counters.time(start);
-        counters.activations_in.fetch_add(xb, Ordering::Relaxed);
+        counters
+            .activations_in
+            .fetch_add(if pre.is_some() { ab + hb } else { xb }, Ordering::Relaxed);
 
         let prepared = Instant::now();
-        let sets = self.fused_sets(5)?;
+        let sets = self.fused_sets(if pre.is_some() { 7 } else { 5 })?;
         let whole = |b: vk::Buffer| (b, 0, None);
         // Router, route, gate/up (and SwiGLU, which reads binding 2), down, combine.
         self.write_set(
@@ -2668,7 +2782,52 @@ impl Submitter {
             n32(rows, "rows")?,
         );
         let (hdr32, ent32) = (n32(hdr, "table")?, n32(ent, "table")?);
-        let steps: [Step; 6] = [
+        // The prelude (Step 3c, audit §18.3): the O projection, then the residual and
+        // norm, which writes the activations the router and the experts read.
+        let mut steps: Vec<Step> = Vec::with_capacity(8);
+        if let (
+            Some((odt, _, _, wbuf, _)),
+            Some((o_base, o_range)),
+            Some((abuf, hbuf, obuf)),
+            Some(p),
+        ) = (pre, o_bind, pre_bufs, &op.prelude)
+        {
+            let ob = u32_of(rows_of(cols), "row blocks")?;
+            // `eps as f32`, as `math::rms_scale` converts it.
+            #[allow(clippy::cast_possible_truncation)]
+            let eps = p.eps as f32;
+            self.write_set(
+                sets[5],
+                [
+                    (wbuf, o_base, Some(o_range)),
+                    whole(abuf),
+                    whole(obuf),
+                    whole(tbuf),
+                ],
+            );
+            self.write_set(
+                sets[6],
+                [whole(hbuf), whole(obuf), whole(xbuf), whole(tbuf)],
+            );
+            steps.push((
+                fused.matmul[odt],
+                sets[5],
+                [ob, 1, n32(o_at, "table")?, 0],
+                (ob, s32),
+            ));
+            steps.push((
+                routed.resnorm,
+                sets[6],
+                [
+                    n32(cols, "columns")?,
+                    n32(norm_at, "table")?,
+                    eps.to_bits(),
+                    0,
+                ],
+                (s32, 1),
+            ));
+        }
+        steps.extend([
             (fused.matmul[rdt], sets[0], [rb, 1, 0, 0], (rb, s32)),
             (routed.route, sets[1], [s32, ne32, k32, hdr32], (s32, 1)),
             (
@@ -2695,7 +2854,7 @@ impl Submitter {
                 [s32, k32, rows32, 0],
                 ((s32 * rows32).div_ceil(256), 1),
             ),
-        ];
+        ]);
         let ran = self.run(|dev, cmd| {
             let between = [vk::MemoryBarrier::default()
                 .src_access_mask(vk::AccessFlags::SHADER_WRITE)
@@ -2760,10 +2919,17 @@ impl Submitter {
             *id = v.to_bits();
         }
         op.weights.copy_from_slice(&rt[sk..2 * sk]);
+        if let Some(p) = op.prelude.as_mut() {
+            let h = self
+                .hs
+                .as_mut()
+                .ok_or_else(|| err("residuals", "missing"))?;
+            p.hs.copy_from_slice(&h.floats_mut()[..p.hs.len()]);
+        }
         counters.time(start);
         counters
             .activations_out
-            .fetch_add(yb + rtb, Ordering::Relaxed);
+            .fetch_add(yb + rtb + hb, Ordering::Relaxed);
         Ok(true)
     }
 }
@@ -2884,6 +3050,87 @@ impl Submitter {
             *id = v.to_bits();
         }
         weights.copy_from_slice(&rt[sk..2 * sk]);
+        Ok(())
+    }
+}
+
+impl Submitter {
+    /// The RMSNorm scale shader alone: `y[i] = 1 / sqrt(a[i] / n + eps)` (`rms.glsl`),
+    /// for the conformance tests, which check every f32 input against the CPU.
+    pub(crate) fn rms_scale(
+        &mut self,
+        a: &[f32],
+        n: f32,
+        eps: f32,
+        y: &mut [f32],
+    ) -> Result<(), ComputeError> {
+        let shared = Arc::clone(&self.shared);
+        let (Some(fused), Some(routed)) = (shared.fused.as_ref(), shared.routed.as_ref()) else {
+            return Err(err("rms scale", "no routing pipelines"));
+        };
+        if a.len() != y.len() || a.is_empty() {
+            return Err(ComputeError::Shape {
+                op: "rms scale",
+                detail: format!("{} inputs, {} outputs", a.len(), y.len()),
+            });
+        }
+        let bytes = 4 * a.len() as u64;
+        let storage = vk::BufferUsageFlags::STORAGE_BUFFER;
+        let abuf = {
+            let x = Self::host_buffer(&shared, &mut self.xs, bytes, storage)?;
+            x.floats_mut()[..a.len()].copy_from_slice(a);
+            x.buffer
+        };
+        let ybuf = Self::host_buffer(&shared, &mut self.ys, bytes, storage)?.buffer;
+        let sets = self.fused_sets(1)?;
+        let set = sets[0];
+        self.write_set(
+            set,
+            [
+                (abuf, 0, None),
+                (abuf, 0, None),
+                (ybuf, 0, None),
+                (abuf, 0, None),
+            ],
+        );
+        let (layout, pipeline) = (fused.layout, routed.rms_scale);
+        let count = u32_of(a.len(), "inputs")?;
+        let words4 = [count, n.to_bits(), eps.to_bits(), 0];
+        let groups = count.div_ceil(256);
+        self.run(|d, cmd| {
+            let mut push = [0u8; 16];
+            for (i, w) in words4.iter().enumerate() {
+                push[4 * i..4 * i + 4].copy_from_slice(&w.to_ne_bytes());
+            }
+            let to_host = [vk::MemoryBarrier::default()
+                .src_access_mask(vk::AccessFlags::SHADER_WRITE)
+                .dst_access_mask(vk::AccessFlags::HOST_READ)];
+            // SAFETY: as in `gated_ffn_many`.
+            unsafe {
+                d.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, pipeline);
+                d.cmd_bind_descriptor_sets(
+                    cmd,
+                    vk::PipelineBindPoint::COMPUTE,
+                    layout,
+                    0,
+                    &[set],
+                    &[],
+                );
+                d.cmd_push_constants(cmd, layout, vk::ShaderStageFlags::COMPUTE, 0, &push);
+                d.cmd_dispatch(cmd, groups, 1, 1);
+                d.cmd_pipeline_barrier(
+                    cmd,
+                    vk::PipelineStageFlags::COMPUTE_SHADER,
+                    vk::PipelineStageFlags::HOST,
+                    vk::DependencyFlags::empty(),
+                    &to_host,
+                    &[],
+                    &[],
+                );
+            }
+        })?;
+        let out = self.ys.as_mut().ok_or_else(|| err("outputs", "missing"))?;
+        y.copy_from_slice(&out.floats_mut()[..a.len()]);
         Ok(())
     }
 }

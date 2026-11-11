@@ -229,6 +229,21 @@ pub struct DeviceGatedFfn<'a> {
     pub ys: &'a mut [f32],
 }
 
+/// [`crate::MoePrelude`] with the O projection in device memory.
+#[derive(Debug)]
+pub struct DeviceMoePrelude<'a> {
+    /// `cols × att_cols` output projection.
+    pub o: &'a DeviceWeights,
+    /// `s × att_cols` attention outputs.
+    pub att: &'a [f32],
+    /// `s × cols` residual stream: read, and written back with the projection added.
+    pub hs: &'a mut [f32],
+    /// `cols` norm weights.
+    pub norm: &'a [f32],
+    /// The norm's epsilon.
+    pub eps: f64,
+}
+
 /// A mixture-of-experts layer as one submission, as [`crate::RoutedMoe`] with the
 /// weights in device memory. `experts` holds every expert of the layer by id; the
 /// caller keeps all of them on the device until the call returns.
@@ -242,7 +257,7 @@ pub struct DeviceRoutedMoe<'a> {
     pub k: usize,
     /// Whether the chosen probabilities are renormalised to sum to 1.
     pub renormalise: bool,
-    /// `s × cols` activations.
+    /// `s × cols` activations; empty with a prelude, which computes them.
     pub xs: &'a [f32],
     /// Tokens.
     pub s: usize,
@@ -252,6 +267,8 @@ pub struct DeviceRoutedMoe<'a> {
     pub ids: &'a mut [u32],
     /// `s × k` routing weights.
     pub weights: &'a mut [f32],
+    /// The O projection, residual and norm before the layer (Step 3c).
+    pub prelude: Option<DeviceMoePrelude<'a>>,
 }
 
 /// A device's memory.
@@ -431,6 +448,14 @@ pub trait DiscreteDevice: Send + Sync {
         false
     }
 
+    /// Whether callers should offer such a layer with its prelude (the O projection,
+    /// residual and norm, Step 3c) as one [`DiscreteDevice::routed_moe`]. The default is
+    /// `false`.
+    fn routes_moe_prelude(&self, experts: usize, k: usize, s: usize) -> bool {
+        let _ = (experts, k, s);
+        false
+    }
+
     /// Runs the layer as one submission if this device can (routing on the device), and
     /// says whether it did; `Ok(false)` writes nothing. The default declines.
     ///
@@ -507,10 +532,17 @@ pub fn routed_moe_steps(
 ) -> Result<(), ComputeError> {
     let (ne, cols, s, k) = (op.router.rows(), op.router.cols(), op.s, op.k);
     let rows = op.ys.len().checked_div(s).unwrap_or(0);
+    let xs_len = if op.prelude.is_some() { 0 } else { s * cols };
     if op.experts.len() != ne
         || k == 0
         || k > ne
-        || op.xs.len() != s * cols
+        || op.xs.len() != xs_len
+        || op.prelude.as_ref().is_some_and(|p| {
+            p.o.rows() != cols
+                || p.att.len() != s * p.o.cols()
+                || p.hs.len() != s * cols
+                || p.norm.len() != cols
+        })
         || op.ids.len() != s * k
         || op.weights.len() != s * k
     {
@@ -522,10 +554,24 @@ pub fn routed_moe_steps(
             ),
         });
     }
+    let normed = match op.prelude.as_mut() {
+        Some(p) => {
+            let mut o = vec![0f32; s * cols];
+            dev.matmul_many(&mut [DeviceMatMul {
+                w: p.o,
+                xs: p.att,
+                s,
+                ys: &mut o,
+            }])?;
+            Some(crate::residual_norm(&o, p.hs, p.norm, p.eps))
+        }
+        None => None,
+    };
+    let xs: &[f32] = normed.as_deref().unwrap_or(op.xs);
     let mut logits = vec![0f32; s * ne];
     dev.matmul_many(&mut [DeviceMatMul {
         w: op.router,
-        xs: op.xs,
+        xs,
         s,
         ys: &mut logits,
     }])?;
@@ -535,7 +581,7 @@ pub fn routed_moe_steps(
         .iter()
         .map(|(_, u)| {
             u.iter()
-                .flat_map(|&(t, _)| op.xs[t * cols..(t + 1) * cols].iter().copied())
+                .flat_map(|&(t, _)| xs[t * cols..(t + 1) * cols].iter().copied())
                 .collect()
         })
         .collect();

@@ -17,7 +17,9 @@
 pub mod ops;
 
 use qubivex_compute::tensor::{Tensor, TensorView, TensorViewMut};
-use qubivex_compute::{ComputeBackend, ComputeError, GatedFfn, MatMul, RoutedMoe, WeightView};
+use qubivex_compute::{
+    ComputeBackend, ComputeError, GatedFfn, MatMul, MoePrelude, RoutedMoe, WeightView,
+};
 use qubivex_core::{DType, Shape};
 use qubivex_core::{ExpertIdx, LayerIdx};
 use qubivex_model::ArchConfig;
@@ -553,9 +555,8 @@ struct DecoderConfig {
     names: Names,
 }
 
-/// Each layer's FFN.
-#[derive(Clone, Debug)]
 /// One MoE layer's inputs for routing on the device.
+#[derive(Debug)]
 struct RoutedLayer<'a> {
     layer: u32,
     router: WeightView<'a>,
@@ -563,8 +564,13 @@ struct RoutedLayer<'a> {
     renormalise: bool,
     xs: &'a [f32],
     s: usize,
+    /// The O projection, residual and norm, computed in the same operation (Step 3c);
+    /// `xs` is then empty.
+    prelude: Option<MoePrelude<'a>>,
 }
 
+/// Each layer's FFN.
+#[derive(Clone, Debug)]
 enum Ffn {
     /// Routed SwiGLU experts (`transformer_moe`).
     Moe {
@@ -949,6 +955,7 @@ impl Transformer {
             .map_err(|_| ArchError::Input("too many experts".into()))?;
         let mut ids = vec![0u32; l.s * l.k];
         let mut weights = vec![0f32; l.s * l.k];
+        let mut prelude = l.prelude;
         experts.with_layer_held(LayerIdx(l.layer), ne, &mut |ws| {
             let views: Vec<[WeightView<'_>; 3]> =
                 ws.iter().map(|w| [w.gate, w.up, w.down]).collect();
@@ -962,6 +969,7 @@ impl Transformer {
                 ys: o,
                 ids: &mut ids,
                 weights: &mut weights,
+                prelude: prelude.take(),
             })?;
             if !ran {
                 return Ok(None);
@@ -1151,301 +1159,335 @@ impl Transformer {
                     attend(qs, kl[g], vl[g], pos[t], out, scores);
                 });
             drop(kv);
-            be.matmul(&dense.view(&n(&c.names.o))?, &att, s, &mut o)?;
-            for t in 0..s {
-                emit(
-                    TracePoint::Attention,
-                    Some(li),
-                    t,
-                    &o[t * h..(t + 1) * h],
-                    &[],
-                );
-            }
-            for (a, b) in hs.iter_mut().zip(&o) {
-                *a += b;
-            }
-
-            // Lookahead: the next layer's MoE norm and router on this state. Its logits
-            // only go to the provider as a hint; routing below uses this layer's own.
-            if let (Some(next), Ffn::Moe { router, .. }) =
-                (self.norms.get(l + 1).filter(|_| lookahead), &self.ffn)
-            {
-                ahead_x.copy_from_slice(&hs);
-                rms_norm(&mut ahead_x, &next.ffn, c.rms_eps);
-                let ln = layer_name(router, li + 1);
-                be.matmul(&dense.view(&ln)?, &ahead_x, 1, &mut ahead)?;
-                experts.lookahead(LayerIdx(li + 1), &ahead);
-            }
-
-            // FFN.
-            x.copy_from_slice(&hs);
-            for xt in x.chunks_exact_mut(h) {
-                rms_norm(xt, &norms.ffn, c.rms_eps);
-            }
-            // Router, routing, experts and combine as one backend operation when the
-            // backend routes this shape and the provider holds the whole layer.
-            let routed = match &self.ffn {
-                Ffn::Moe { router, .. } if !tracing && be.routes_moe(ne, k_top, s) => self
-                    .routed_on_device(
+            // Step 3c: the O projection, the residual and the FFN norm at the head of the
+            // routed submission, when the backend routes this shape with them, no trace is
+            // taken and no lookahead wants `hs` on the host before the router. Declined,
+            // nothing is written and the layer runs below as before.
+            let whole = match &self.ffn {
+                Ffn::Moe { router, .. }
+                    if !tracing && !lookahead && be.routes_moe_prelude(ne, k_top, s) =>
+                {
+                    self.routed_on_device(
                         RoutedLayer {
                             layer: li,
                             router: dense.view(&n(router))?,
                             k: k_top,
                             renormalise: norm_topk_prob,
-                            xs: &x,
+                            xs: &[],
                             s,
+                            prelude: Some(MoePrelude {
+                                o: dense.view(&n(&c.names.o))?,
+                                att: &att,
+                                hs: &mut hs,
+                                norm: &norms.ffn,
+                                eps: c.rms_eps,
+                            }),
                         },
                         experts,
                         be,
                         &mut o,
-                    )?,
+                    )?
+                }
                 _ => false,
             };
-            match &self.ffn {
-                Ffn::Dense { gate, up, down } => {
-                    let (wg, wu) = (dense.view(&n(gate))?, dense.view(&n(up))?);
-                    let ffn = wg.rows();
-                    let mut g = vec![0f32; s * ffn];
-                    let mut u = vec![0f32; s * ffn];
-                    be.matmul_many(&mut [
-                        MatMul {
-                            w: wg,
-                            xs: &x,
-                            s,
-                            ys: &mut g,
-                        },
-                        MatMul {
-                            w: wu,
-                            xs: &x,
-                            s,
-                            ys: &mut u,
-                        },
-                    ])?;
-                    swiglu(&mut g, &u);
-                    be.matmul(&dense.view(&n(down))?, &g, s, &mut o)?;
-                    for t in 0..s {
-                        emit(TracePoint::Ffn, Some(li), t, &o[t * h..(t + 1) * h], &[]);
-                    }
+            if !whole {
+                be.matmul(&dense.view(&n(&c.names.o))?, &att, s, &mut o)?;
+                for t in 0..s {
+                    emit(
+                        TracePoint::Attention,
+                        Some(li),
+                        t,
+                        &o[t * h..(t + 1) * h],
+                        &[],
+                    );
                 }
-                // Routed on the device: the combined outputs are already in `o`.
-                Ffn::Moe { .. } if routed => {}
-                Ffn::Moe {
-                    router: router_name,
-                    ..
-                } => {
-                    be.matmul(&dense.view(&n(router_name))?, &x, s, &mut router)?;
-                    // Per token: top-K experts by probability (ties: lower id), in rank order.
-                    let mut picks: Vec<(Vec<u32>, Vec<f32>)> = Vec::with_capacity(s);
-                    for t in 0..s {
-                        let logits_t = &router[t * ne..(t + 1) * ne];
-                        emit(TracePoint::RouterLogits, Some(li), t, logits_t, &[]);
-                        let (idx, w) = route(logits_t, k_top, norm_topk_prob);
-                        emit(TracePoint::RoutingWeights, Some(li), t, &w, &idx);
-                        picks.push((idx, w));
-                    }
-                    // Expert-major: each expert once, over every token routed to it, then each
-                    // token's outputs combined in rank order.
-                    let mut contrib = vec![0f32; s * k_top * h];
-                    let mut by_expert: Vec<Vec<(usize, usize)>> = vec![Vec::new(); ne];
-                    for (t, (idx, _)) in picks.iter().enumerate() {
-                        for (r, &e) in idx.iter().enumerate() {
-                            by_expert[e as usize].push((t, r));
-                        }
-                    }
-                    // Every routed expert of the layer is requested at once, so the provider can
-                    // start all its loads first, and may compute several at once. Each writes
-                    // only its own rank slots of `contrib`, so neither the order they come back
-                    // in nor concurrency can change the result.
-                    let used: Vec<ExpertIdx> = by_expert
-                        .iter()
-                        .enumerate()
-                        .filter(|(_, u)| !u.is_empty())
-                        .map(|(e, _)| ExpertIdx(u32::try_from(e).unwrap_or(u32::MAX)))
-                        .collect();
-                    let slots = std::sync::Mutex::new(&mut contrib);
-                    // Writes an expert's outputs `y` (one row per user) into its users'
-                    // rank slots. A poisoned lock means another expert panicked
-                    // mid-copy; its slots are not ours, so ours are still written
-                    // correctly.
-                    let store = |users: &[(usize, usize)], y: &[f32]| {
-                        let mut contrib = slots
-                            .lock()
-                            .unwrap_or_else(std::sync::PoisonError::into_inner);
-                        for (j, &(t, r)) in users.iter().enumerate() {
-                            let dst = (t * k_top + r) * h;
-                            contrib[dst..dst + h].copy_from_slice(&y[j * h..(j + 1) * h]);
-                        }
-                    };
-                    // An expert's input rows: its users' rows of `x`.
-                    let gather = |users: &[(usize, usize)]| {
-                        let mut xe = vec![0f32; users.len() * h];
-                        for (j, &(t, _)) in users.iter().enumerate() {
-                            xe[j * h..(j + 1) * h].copy_from_slice(&x[t * h..(t + 1) * h]);
-                        }
-                        xe
-                    };
-                    let each = |ei: ExpertIdx, w: &ExpertWeights<'_>| {
-                        let users = &by_expert[ei.0 as usize];
-                        let n_t = users.len();
-                        let xe = gather(users);
-                        let ffn = w.gate.rows();
-                        let mut g = vec![0f32; n_t * ffn];
-                        let mut u = vec![0f32; n_t * ffn];
+                for (a, b) in hs.iter_mut().zip(&o) {
+                    *a += b;
+                }
+
+                // Lookahead: the next layer's MoE norm and router on this state. Its logits
+                // only go to the provider as a hint; routing below uses this layer's own.
+                if let (Some(next), Ffn::Moe { router, .. }) =
+                    (self.norms.get(l + 1).filter(|_| lookahead), &self.ffn)
+                {
+                    ahead_x.copy_from_slice(&hs);
+                    rms_norm(&mut ahead_x, &next.ffn, c.rms_eps);
+                    let ln = layer_name(router, li + 1);
+                    be.matmul(&dense.view(&ln)?, &ahead_x, 1, &mut ahead)?;
+                    experts.lookahead(LayerIdx(li + 1), &ahead);
+                }
+
+                // FFN.
+                x.copy_from_slice(&hs);
+                for xt in x.chunks_exact_mut(h) {
+                    rms_norm(xt, &norms.ffn, c.rms_eps);
+                }
+                // Router, routing, experts and combine as one backend operation when the
+                // backend routes this shape and the provider holds the whole layer.
+                let routed = match &self.ffn {
+                    Ffn::Moe { router, .. } if !tracing && be.routes_moe(ne, k_top, s) => self
+                        .routed_on_device(
+                            RoutedLayer {
+                                layer: li,
+                                router: dense.view(&n(router))?,
+                                k: k_top,
+                                renormalise: norm_topk_prob,
+                                xs: &x,
+                                s,
+                                prelude: None,
+                            },
+                            experts,
+                            be,
+                            &mut o,
+                        )?,
+                    _ => false,
+                };
+                match &self.ffn {
+                    Ffn::Dense { gate, up, down } => {
+                        let (wg, wu) = (dense.view(&n(gate))?, dense.view(&n(up))?);
+                        let ffn = wg.rows();
+                        let mut g = vec![0f32; s * ffn];
+                        let mut u = vec![0f32; s * ffn];
                         be.matmul_many(&mut [
                             MatMul {
-                                w: w.gate,
-                                xs: &xe,
-                                s: n_t,
+                                w: wg,
+                                xs: &x,
+                                s,
                                 ys: &mut g,
                             },
                             MatMul {
-                                w: w.up,
-                                xs: &xe,
-                                s: n_t,
+                                w: wu,
+                                xs: &x,
+                                s,
                                 ys: &mut u,
                             },
                         ])?;
                         swiglu(&mut g, &u);
-                        let mut y = vec![0f32; n_t * h];
-                        be.matmul(&w.down, &g, n_t, &mut y)?;
-                        store(users, &y);
-                        Ok(())
-                    };
-                    // The largest number of rows any expert computes: a fused block is
-                    // chosen by shape (decode, or a few concurrent sequences), not always.
-                    let max_rows = used
-                        .iter()
-                        .map(|ei| by_expert[ei.0 as usize].len())
-                        .max()
-                        .unwrap_or(0);
-                    if be.fuses_gated_ffn(used.len(), max_rows) {
-                        // Every expert of the layer as one fused block when all are
-                        // resident: gate and up, SwiGLU and down in one submission. Each
-                        // output has the separate steps' bits (GatedFfn).
-                        let mut group = |ws: &[ExpertWeights<'_>]| -> Result<(), ArchError> {
-                            let users: Vec<&[(usize, usize)]> = used
-                                .iter()
-                                .map(|ei| by_expert[ei.0 as usize].as_slice())
-                                .collect();
-                            let xes: Vec<Option<Vec<f32>>> = users
-                                .iter()
-                                .map(|u| {
-                                    let all = u.len() == s
-                                        && u.iter().enumerate().all(|(j, &(t, _))| j == t);
-                                    (!all).then(|| gather(u))
-                                })
-                                .collect();
-                            let mut ys: Vec<Vec<f32>> =
-                                users.iter().map(|u| vec![0f32; u.len() * h]).collect();
-                            let mut ops: Vec<GatedFfn<'_>> = ws
-                                .iter()
-                                .zip(&users)
-                                .zip(&xes)
-                                .zip(ys.iter_mut())
-                                .map(|(((w, u), xe), y)| GatedFfn {
-                                    gate: w.gate,
-                                    up: w.up,
-                                    down: w.down,
-                                    xs: xe.as_deref().unwrap_or(&x),
-                                    s: u.len(),
-                                    ys: y,
-                                })
-                                .collect();
-                            be.gated_ffn_many(&mut ops)?;
-                            drop(ops);
-                            for (u, y) in users.iter().zip(&ys) {
-                                store(u, y);
-                            }
-                            Ok(())
-                        };
-                        experts.with_experts_grouped(LayerIdx(li), &used, &mut group, &each)?;
-                    } else if be.groups_matmuls() {
-                        // Every expert at once: one call for every gate and up, then one
-                        // for every down. Each matmul has the same weight, input and
-                        // kernel as on the per-expert path, so the same bits.
-                        let mut group = |ws: &[ExpertWeights<'_>]| -> Result<(), ArchError> {
-                            let users: Vec<&[(usize, usize)]> = used
-                                .iter()
-                                .map(|ei| by_expert[ei.0 as usize].as_slice())
-                                .collect();
-                            // An expert used by every token in order reads `x` itself, so
-                            // the backend sees one shared input.
-                            let xes: Vec<Option<Vec<f32>>> = users
-                                .iter()
-                                .map(|u| {
-                                    let all = u.len() == s
-                                        && u.iter().enumerate().all(|(j, &(t, _))| j == t);
-                                    (!all).then(|| gather(u))
-                                })
-                                .collect();
-                            let mut gs: Vec<Vec<f32>> = Vec::with_capacity(ws.len());
-                            let mut us: Vec<Vec<f32>> = Vec::with_capacity(ws.len());
-                            for (w, u) in ws.iter().zip(&users) {
-                                gs.push(vec![0f32; u.len() * w.gate.rows()]);
-                                us.push(vec![0f32; u.len() * w.up.rows()]);
-                            }
-                            let mut ops = Vec::with_capacity(2 * ws.len());
-                            for ((((w, u), xe), g), up) in ws
-                                .iter()
-                                .zip(&users)
-                                .zip(&xes)
-                                .zip(gs.iter_mut())
-                                .zip(us.iter_mut())
-                            {
-                                let xs = xe.as_deref().unwrap_or(&x);
-                                ops.push(MatMul {
-                                    w: w.gate,
-                                    xs,
-                                    s: u.len(),
-                                    ys: g,
-                                });
-                                ops.push(MatMul {
-                                    w: w.up,
-                                    xs,
-                                    s: u.len(),
-                                    ys: up,
-                                });
-                            }
-                            be.matmul_many(&mut ops)?;
-                            drop(ops);
-                            for (g, u) in gs.iter_mut().zip(&us) {
-                                swiglu(g, u);
-                            }
-                            let mut ys: Vec<Vec<f32>> =
-                                users.iter().map(|u| vec![0f32; u.len() * h]).collect();
-                            let mut ops: Vec<MatMul<'_>> = ws
-                                .iter()
-                                .zip(&users)
-                                .zip(&gs)
-                                .zip(ys.iter_mut())
-                                .map(|(((w, u), g), y)| MatMul {
-                                    w: w.down,
-                                    xs: g,
-                                    s: u.len(),
-                                    ys: y,
-                                })
-                                .collect();
-                            be.matmul_many(&mut ops)?;
-                            drop(ops);
-                            for (u, y) in users.iter().zip(&ys) {
-                                store(u, y);
-                            }
-                            Ok(())
-                        };
-                        experts.with_experts_grouped(LayerIdx(li), &used, &mut group, &each)?;
-                    } else {
-                        experts.with_experts(LayerIdx(li), &used, &each)?;
+                        be.matmul(&dense.view(&n(down))?, &g, s, &mut o)?;
+                        for t in 0..s {
+                            emit(TracePoint::Ffn, Some(li), t, &o[t * h..(t + 1) * h], &[]);
+                        }
                     }
-                    for (t, (_, w)) in picks.iter().enumerate() {
-                        let out = &mut o[t * h..(t + 1) * h];
-                        out.fill(0.0);
-                        for (r, wr) in w.iter().enumerate() {
-                            let src = &contrib[(t * k_top + r) * h..(t * k_top + r + 1) * h];
-                            for (a, b) in out.iter_mut().zip(src) {
-                                *a = wr.mul_add(*b, *a);
+                    // Routed on the device: the combined outputs are already in `o`.
+                    Ffn::Moe { .. } if routed => {}
+                    Ffn::Moe {
+                        router: router_name,
+                        ..
+                    } => {
+                        be.matmul(&dense.view(&n(router_name))?, &x, s, &mut router)?;
+                        // Per token: top-K experts by probability (ties: lower id), in rank order.
+                        let mut picks: Vec<(Vec<u32>, Vec<f32>)> = Vec::with_capacity(s);
+                        for t in 0..s {
+                            let logits_t = &router[t * ne..(t + 1) * ne];
+                            emit(TracePoint::RouterLogits, Some(li), t, logits_t, &[]);
+                            let (idx, w) = route(logits_t, k_top, norm_topk_prob);
+                            emit(TracePoint::RoutingWeights, Some(li), t, &w, &idx);
+                            picks.push((idx, w));
+                        }
+                        // Expert-major: each expert once, over every token routed to it, then each
+                        // token's outputs combined in rank order.
+                        let mut contrib = vec![0f32; s * k_top * h];
+                        let mut by_expert: Vec<Vec<(usize, usize)>> = vec![Vec::new(); ne];
+                        for (t, (idx, _)) in picks.iter().enumerate() {
+                            for (r, &e) in idx.iter().enumerate() {
+                                by_expert[e as usize].push((t, r));
                             }
                         }
-                        emit(TracePoint::Moe, Some(li), t, out, &[]);
+                        // Every routed expert of the layer is requested at once, so the provider can
+                        // start all its loads first, and may compute several at once. Each writes
+                        // only its own rank slots of `contrib`, so neither the order they come back
+                        // in nor concurrency can change the result.
+                        let used: Vec<ExpertIdx> = by_expert
+                            .iter()
+                            .enumerate()
+                            .filter(|(_, u)| !u.is_empty())
+                            .map(|(e, _)| ExpertIdx(u32::try_from(e).unwrap_or(u32::MAX)))
+                            .collect();
+                        let slots = std::sync::Mutex::new(&mut contrib);
+                        // Writes an expert's outputs `y` (one row per user) into its users'
+                        // rank slots. A poisoned lock means another expert panicked
+                        // mid-copy; its slots are not ours, so ours are still written
+                        // correctly.
+                        let store = |users: &[(usize, usize)], y: &[f32]| {
+                            let mut contrib = slots
+                                .lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner);
+                            for (j, &(t, r)) in users.iter().enumerate() {
+                                let dst = (t * k_top + r) * h;
+                                contrib[dst..dst + h].copy_from_slice(&y[j * h..(j + 1) * h]);
+                            }
+                        };
+                        // An expert's input rows: its users' rows of `x`.
+                        let gather = |users: &[(usize, usize)]| {
+                            let mut xe = vec![0f32; users.len() * h];
+                            for (j, &(t, _)) in users.iter().enumerate() {
+                                xe[j * h..(j + 1) * h].copy_from_slice(&x[t * h..(t + 1) * h]);
+                            }
+                            xe
+                        };
+                        let each = |ei: ExpertIdx, w: &ExpertWeights<'_>| {
+                            let users = &by_expert[ei.0 as usize];
+                            let n_t = users.len();
+                            let xe = gather(users);
+                            let ffn = w.gate.rows();
+                            let mut g = vec![0f32; n_t * ffn];
+                            let mut u = vec![0f32; n_t * ffn];
+                            be.matmul_many(&mut [
+                                MatMul {
+                                    w: w.gate,
+                                    xs: &xe,
+                                    s: n_t,
+                                    ys: &mut g,
+                                },
+                                MatMul {
+                                    w: w.up,
+                                    xs: &xe,
+                                    s: n_t,
+                                    ys: &mut u,
+                                },
+                            ])?;
+                            swiglu(&mut g, &u);
+                            let mut y = vec![0f32; n_t * h];
+                            be.matmul(&w.down, &g, n_t, &mut y)?;
+                            store(users, &y);
+                            Ok(())
+                        };
+                        // The largest number of rows any expert computes: a fused block is
+                        // chosen by shape (decode, or a few concurrent sequences), not always.
+                        let max_rows = used
+                            .iter()
+                            .map(|ei| by_expert[ei.0 as usize].len())
+                            .max()
+                            .unwrap_or(0);
+                        if be.fuses_gated_ffn(used.len(), max_rows) {
+                            // Every expert of the layer as one fused block when all are
+                            // resident: gate and up, SwiGLU and down in one submission. Each
+                            // output has the separate steps' bits (GatedFfn).
+                            let mut group = |ws: &[ExpertWeights<'_>]| -> Result<(), ArchError> {
+                                let users: Vec<&[(usize, usize)]> = used
+                                    .iter()
+                                    .map(|ei| by_expert[ei.0 as usize].as_slice())
+                                    .collect();
+                                let xes: Vec<Option<Vec<f32>>> = users
+                                    .iter()
+                                    .map(|u| {
+                                        let all = u.len() == s
+                                            && u.iter().enumerate().all(|(j, &(t, _))| j == t);
+                                        (!all).then(|| gather(u))
+                                    })
+                                    .collect();
+                                let mut ys: Vec<Vec<f32>> =
+                                    users.iter().map(|u| vec![0f32; u.len() * h]).collect();
+                                let mut ops: Vec<GatedFfn<'_>> = ws
+                                    .iter()
+                                    .zip(&users)
+                                    .zip(&xes)
+                                    .zip(ys.iter_mut())
+                                    .map(|(((w, u), xe), y)| GatedFfn {
+                                        gate: w.gate,
+                                        up: w.up,
+                                        down: w.down,
+                                        xs: xe.as_deref().unwrap_or(&x),
+                                        s: u.len(),
+                                        ys: y,
+                                    })
+                                    .collect();
+                                be.gated_ffn_many(&mut ops)?;
+                                drop(ops);
+                                for (u, y) in users.iter().zip(&ys) {
+                                    store(u, y);
+                                }
+                                Ok(())
+                            };
+                            experts.with_experts_grouped(LayerIdx(li), &used, &mut group, &each)?;
+                        } else if be.groups_matmuls() {
+                            // Every expert at once: one call for every gate and up, then one
+                            // for every down. Each matmul has the same weight, input and
+                            // kernel as on the per-expert path, so the same bits.
+                            let mut group = |ws: &[ExpertWeights<'_>]| -> Result<(), ArchError> {
+                                let users: Vec<&[(usize, usize)]> = used
+                                    .iter()
+                                    .map(|ei| by_expert[ei.0 as usize].as_slice())
+                                    .collect();
+                                // An expert used by every token in order reads `x` itself, so
+                                // the backend sees one shared input.
+                                let xes: Vec<Option<Vec<f32>>> = users
+                                    .iter()
+                                    .map(|u| {
+                                        let all = u.len() == s
+                                            && u.iter().enumerate().all(|(j, &(t, _))| j == t);
+                                        (!all).then(|| gather(u))
+                                    })
+                                    .collect();
+                                let mut gs: Vec<Vec<f32>> = Vec::with_capacity(ws.len());
+                                let mut us: Vec<Vec<f32>> = Vec::with_capacity(ws.len());
+                                for (w, u) in ws.iter().zip(&users) {
+                                    gs.push(vec![0f32; u.len() * w.gate.rows()]);
+                                    us.push(vec![0f32; u.len() * w.up.rows()]);
+                                }
+                                let mut ops = Vec::with_capacity(2 * ws.len());
+                                for ((((w, u), xe), g), up) in ws
+                                    .iter()
+                                    .zip(&users)
+                                    .zip(&xes)
+                                    .zip(gs.iter_mut())
+                                    .zip(us.iter_mut())
+                                {
+                                    let xs = xe.as_deref().unwrap_or(&x);
+                                    ops.push(MatMul {
+                                        w: w.gate,
+                                        xs,
+                                        s: u.len(),
+                                        ys: g,
+                                    });
+                                    ops.push(MatMul {
+                                        w: w.up,
+                                        xs,
+                                        s: u.len(),
+                                        ys: up,
+                                    });
+                                }
+                                be.matmul_many(&mut ops)?;
+                                drop(ops);
+                                for (g, u) in gs.iter_mut().zip(&us) {
+                                    swiglu(g, u);
+                                }
+                                let mut ys: Vec<Vec<f32>> =
+                                    users.iter().map(|u| vec![0f32; u.len() * h]).collect();
+                                let mut ops: Vec<MatMul<'_>> = ws
+                                    .iter()
+                                    .zip(&users)
+                                    .zip(&gs)
+                                    .zip(ys.iter_mut())
+                                    .map(|(((w, u), g), y)| MatMul {
+                                        w: w.down,
+                                        xs: g,
+                                        s: u.len(),
+                                        ys: y,
+                                    })
+                                    .collect();
+                                be.matmul_many(&mut ops)?;
+                                drop(ops);
+                                for (u, y) in users.iter().zip(&ys) {
+                                    store(u, y);
+                                }
+                                Ok(())
+                            };
+                            experts.with_experts_grouped(LayerIdx(li), &used, &mut group, &each)?;
+                        } else {
+                            experts.with_experts(LayerIdx(li), &used, &each)?;
+                        }
+                        for (t, (_, w)) in picks.iter().enumerate() {
+                            let out = &mut o[t * h..(t + 1) * h];
+                            out.fill(0.0);
+                            for (r, wr) in w.iter().enumerate() {
+                                let src = &contrib[(t * k_top + r) * h..(t * k_top + r + 1) * h];
+                                for (a, b) in out.iter_mut().zip(src) {
+                                    *a = wr.mul_add(*b, *a);
+                                }
+                            }
+                            emit(TracePoint::Moe, Some(li), t, out, &[]);
+                        }
                     }
                 }
             }

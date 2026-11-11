@@ -211,8 +211,9 @@ fn olmoe_on_vulkan_matches_the_cpu() {
 }
 
 /// Step 3b: a Vulkan engine routing MoE layers on the device, with a device expert
-/// cache that holds every expert.
-fn vulkan_routed(id: &str) -> Option<Engine> {
+/// cache that holds every expert; with `route_o`, each routed layer's prelude (the O
+/// projection, residual and FFN norm) in the same submission (Step 3c).
+fn vulkan_routed(id: &str, route_o: bool) -> Option<Engine> {
     load(
         meta(id),
         EngineOptions {
@@ -220,6 +221,7 @@ fn vulkan_routed(id: &str) -> Option<Engine> {
             vulkan: VulkanConfig {
                 capacity: Some(1 << 30),
                 route: true,
+                route_o,
                 ..VulkanConfig::default()
             },
             expert_cache_bytes: Some(1 << 30),
@@ -243,18 +245,19 @@ fn when_routed<T>(e: &Engine, layers: u64, mut f: impl FnMut() -> T) -> T {
     panic!("never routed every layer on the device");
 }
 
-/// Routing on the device (Step 3b) gives the CPU's prompt logits and tokens on every
-/// MoE fixture, alone and with concurrent requests.
+/// Routing on the device (Step 3b), and with each layer's prelude (Step 3c), gives the
+/// CPU's prompt logits and tokens on every MoE fixture, alone and with concurrent
+/// requests; with the prelude, a pass is two submissions per layer and the head.
 #[test]
 fn routed_on_vulkan_matches_the_cpu_bits() {
     const SHORT: &[u32] = &[72, 101, 108, 108, 111];
-    for id in MOE {
+    for (id, route_o) in MOE.iter().flat_map(|id| [(*id, false), (*id, true)]) {
         let c = cpu(id, Some(1 << 30));
         let mut cache = c.new_cache();
         let want = bits(&c.forward(SHORT, &mut cache, Logits::All, None).unwrap());
         let want_run = run(&c);
         drop(c);
-        let Some(e) = vulkan_routed(id) else {
+        let Some(e) = vulkan_routed(id, route_o) else {
             return;
         };
         let layers = u64::from(meta(id).config.dims.layers);
@@ -262,7 +265,29 @@ fn routed_on_vulkan_matches_the_cpu_bits() {
             let mut cache = e.new_cache();
             bits(&e.forward(SHORT, &mut cache, Logits::All, None).unwrap())
         });
-        assert_eq!(got, want, "{id}: prompt logits");
+        assert_eq!(got, want, "{id}, prelude {route_o}: prompt logits");
+        if route_o {
+            let submissions = |e: &Engine| e.device_report().unwrap().transfers.submissions;
+            let before = submissions(&e);
+            let got = when_routed(&e, layers, || {
+                let mut cache = e.new_cache();
+                bits(&e.forward(SHORT, &mut cache, Logits::All, None).unwrap())
+            });
+            assert_eq!(got, want, "{id}: prompt logits");
+            assert_eq!(
+                submissions(&e) - before,
+                2 * layers + 1,
+                "{id}: QKV and the routed layer with its prelude per layer, then the head"
+            );
+            assert!(
+                e.placement()
+                    .device
+                    .as_deref()
+                    .unwrap()
+                    .contains("O projection"),
+                "{id}"
+            );
+        }
         assert_eq!(run(&e), want_run, "{id}");
         assert!(
             e.placement().device.as_deref().unwrap().contains("routed"),
@@ -293,7 +318,8 @@ fn routed_on_vulkan_matches_the_cpu_bits() {
 }
 
 /// The real OLMoE (set `QUBIVEX_OLMOE_GGUF_DIR`) routed on the device, every expert
-/// held there: the CPU's prompt logits and Colibri's greedy tokens.
+/// held there, without and with the prelude (Step 3c): the CPU's prompt logits and
+/// Colibri's greedy tokens.
 #[test]
 fn olmoe_routed_on_vulkan_matches_the_cpu() {
     let Ok(dir) = std::env::var("QUBIVEX_OLMOE_GGUF_DIR") else {
@@ -321,31 +347,34 @@ fn olmoe_routed_on_vulkan_matches_the_cpu() {
     .unwrap();
     let want = logits(&cpu);
     drop(cpu);
-    let Some(e) = load(
-        meta(),
-        EngineOptions {
-            backend: BackendKind::Vulkan,
-            vulkan: VulkanConfig {
-                route: true,
-                ..VulkanConfig::default()
+    for route_o in [false, true] {
+        let Some(e) = load(
+            meta(),
+            EngineOptions {
+                backend: BackendKind::Vulkan,
+                vulkan: VulkanConfig {
+                    route: true,
+                    route_o,
+                    ..VulkanConfig::default()
+                },
+                expert_cache_bytes: Some(4 << 30),
+                max_context: Some(64),
+                ..EngineOptions::default()
             },
-            expert_cache_bytes: Some(4 << 30),
-            max_context: Some(64),
-            ..EngineOptions::default()
-        },
-    ) else {
-        return;
-    };
-    eprintln!("{}", e.placement().device.as_deref().unwrap_or(""));
-    let layers = u64::from(meta().config.dims.layers);
-    let got = when_routed(&e, layers, || logits(&e));
-    assert!(got == want, "prompt logits differ from the CPU");
-    let before = e.device_report().unwrap().routed_layers;
-    let toks = e
-        .generate(&PROMPT, 12, Sampling::default(), |_| true)
-        .unwrap();
-    assert_eq!(toks, COLIBRI);
-    let r = e.device_report().unwrap();
-    eprintln!("{r:?}");
-    assert!(r.routed_layers - before >= 12 * layers, "{r:?}");
+        ) else {
+            return;
+        };
+        eprintln!("{}", e.placement().device.as_deref().unwrap_or(""));
+        let layers = u64::from(meta().config.dims.layers);
+        let got = when_routed(&e, layers, || logits(&e));
+        assert!(got == want, "prompt logits differ from the CPU");
+        let before = e.device_report().unwrap().routed_layers;
+        let toks = e
+            .generate(&PROMPT, 12, Sampling::default(), |_| true)
+            .unwrap();
+        assert_eq!(toks, COLIBRI);
+        let r = e.device_report().unwrap();
+        eprintln!("{r:?}");
+        assert!(r.routed_layers - before >= 12 * layers, "{r:?}");
+    }
 }

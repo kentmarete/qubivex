@@ -98,6 +98,10 @@ pub struct VulkanConfig {
     /// of at most [`VulkanConfig::fuse_rows`] tokens whose experts are all on the
     /// device. Off by default; Step 3a (routing on the host) is the fallback.
     pub route: bool,
+    /// With [`VulkanConfig::route`], put a routed layer's prelude in the same
+    /// submission (Step 3c, audit §18): the attention output projection, the residual
+    /// and the FFN RMSNorm. Off by default; Step 3b is the fallback.
+    pub route_o: bool,
 }
 
 /// A Vulkan GPU as a discrete device. See the crate documentation.
@@ -119,6 +123,8 @@ pub struct VulkanDevice {
     /// Route MoE layers of up to this many tokens on the device; 0 when off or not
     /// available.
     route_rows: usize,
+    /// Route them with their prelude (the O projection, residual and norm).
+    route_o: bool,
 }
 
 impl std::fmt::Debug for VulkanDevice {
@@ -175,6 +181,7 @@ impl VulkanDevice {
             fuse_rows,
             max_arena,
             route_rows,
+            route_o: config.route_o && route_rows > 0,
         })
     }
 
@@ -233,6 +240,24 @@ impl VulkanDevice {
     ) -> Result<(), ComputeError> {
         self.submitter()
             .route(logits, s, k, renormalise, ids, weights)
+    }
+
+    /// The RMSNorm scale shader alone: `y[i] = 1 / sqrt(a[i] / n + eps)`, for the
+    /// numerical conformance tests, which check it against the CPU's arithmetic
+    /// ([`qubivex_compute::math::rms_scale_of`]).
+    ///
+    /// # Errors
+    /// [`ComputeError::Shape`] when the lengths differ or are zero;
+    /// [`ComputeError::Device`] when the device has no routing pipelines or the driver
+    /// fails.
+    pub fn rms_scale(
+        &self,
+        a: &[f32],
+        n: f32,
+        eps: f32,
+        y: &mut [f32],
+    ) -> Result<(), ComputeError> {
+        self.submitter().rms_scale(a, n, eps, y)
     }
 
     /// Whether submissions are timed on the GPU (asked for, and the queue supports it).
@@ -295,6 +320,10 @@ impl DiscreteDevice for VulkanDevice {
         let experts = match (self.fuse_rows, self.route_rows) {
             (0, _) => "experts unfused".to_owned(),
             (n, 0) => format!("experts fused up to {n} rows"),
+            (n, _) if self.route_o => format!(
+                "experts fused and routed on the device with the O projection and FFN norm \
+                 up to {n} rows"
+            ),
             (n, _) => format!("experts fused and routed on the device up to {n} rows"),
         };
         format!(
@@ -349,10 +378,16 @@ impl DiscreteDevice for VulkanDevice {
         k > 0 && k <= experts && experts <= device::ROUTED_EXPERTS && s > 0 && s <= self.route_rows
     }
 
+    fn routes_moe_prelude(&self, experts: usize, k: usize, s: usize) -> bool {
+        self.route_o && self.routes_moe(experts, k, s)
+    }
+
     /// One submission when the layer's experts sit in one buffer per matrix kind (the
-    /// arenas); otherwise `Ok(false)`, and the caller routes on the host.
+    /// arenas); otherwise `Ok(false)`, and the caller routes on the host. A prelude is
+    /// run only with [`VulkanConfig::route_o`].
     fn routed_moe(&self, op: &mut DeviceRoutedMoe<'_>) -> Result<bool, ComputeError> {
-        if !self.routes_moe(op.experts.len(), op.k, op.s) {
+        if !self.routes_moe(op.experts.len(), op.k, op.s) || (op.prelude.is_some() && !self.route_o)
+        {
             return Ok(false);
         }
         self.submitter().routed_moe(op, &self.counters)
@@ -410,6 +445,16 @@ mod tests {
                 "combine.spv",
                 built("combine.spv"),
                 crate::device::COMBINE_SPV,
+            ),
+            (
+                "resnorm.spv",
+                built("resnorm.spv"),
+                crate::device::RESNORM_SPV,
+            ),
+            (
+                "rms_scale.spv",
+                built("rms_scale.spv"),
+                crate::device::RMS_SCALE_SPV,
             ),
         ];
         let _ = std::fs::remove_dir_all(&out);
