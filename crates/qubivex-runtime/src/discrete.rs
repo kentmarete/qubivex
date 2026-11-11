@@ -9,7 +9,7 @@
 //! only ever holds experts the RAM cache holds (an inclusive cache).
 //!
 //! **Fixed-slot arenas** (audit §15.5). Experts of one layer all have the same size,
-//! and a model has few distinct sizes (OLMoE Q4_K_M: two, from its Q4_K and Q6_K down
+//! and a model has few distinct sizes (a Q4_K_M file typically two, from Q4_K and Q6_K down
 //! projections). The cache keeps one device arena per size class, divided into equal
 //! slots: a copy is a write into a free slot, never an allocation, there is no
 //! fragmentation, and every expert of a layer sits in one buffer, so a fused expert
