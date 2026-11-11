@@ -3,7 +3,7 @@
 # (tag bench/vulkan-step1a; docs/performance/BENCHMARKING.md, "Vulkan baseline").
 #
 #   scripts/bench-vulkan-baseline [--rounds N] [--tag NAME] [--out DIR] [--no-concurrent]
-#                                 [--variant NAME='ARGS'] ...
+#                                 [--no-single] [--variant NAME='ARGS'] ...
 #
 # Builds the baseline once (a worktree and target directory under the scratch area) and
 # the working tree, both release. Then, round by round, alternates the baseline with
@@ -18,8 +18,8 @@
 #     sequences, sequential, batched and concurrent, tokens checked identical.
 # Refuses to run on battery. Prints a median table at the end.
 #
-# Env: QUBIVEX_MODELS (default ~/.qubivex/models), QUBIVEX_OLMOE_TOKENIZER_DIR (default
-# ~/.qubivex/tokenizers/olmoe-0125-instruct).
+# Env: QUBIVEX_MODELS (default ~/.qubivex/models), QUBIVEX_OLMOE_TOKENIZER_JSON (default
+# ~/.qubivex/tokenizers/olmoe-0125-instruct/tokenizer.json).
 set -eu
 setopt pipe_fail
 
@@ -28,13 +28,14 @@ TAG=bench/vulkan-step1a
 ENCODED=${ROOT//[^a-zA-Z0-9]/-}
 SCRATCH=/private/tmp/claude-$(id -u)/$ENCODED/vulkan-baseline
 MODELS=${QUBIVEX_MODELS:-$HOME/.qubivex/models}
-TOKENIZER=${QUBIVEX_OLMOE_TOKENIZER_DIR:-$HOME/.qubivex/tokenizers/olmoe-0125-instruct}
+TOKENIZER=${QUBIVEX_OLMOE_TOKENIZER_JSON:-$HOME/.qubivex/tokenizers/olmoe-0125-instruct/tokenizer.json}
 MODEL=olmoe-1b-7b-0125-instruct
 
 rounds=3
 name=step
 out=$ROOT/docs/performance/baselines
 concurrent=1
+single=1
 variants=()
 reference=$ROOT/docs/performance/baselines/2026-11-11-m3pro-vulkan-optb-base-1.json
 [[ -f $reference ]] || reference=""
@@ -44,6 +45,7 @@ while (( $# )); do
     --tag) name=$2; shift 2 ;;
     --out) out=$2; shift 2 ;;
     --no-concurrent) concurrent=0; shift ;;
+    --no-single) single=0; shift ;;
     --variant) variants+=("$2"); shift 2 ;;
     --reference) reference=$2; shift 2 ;;
     *) print -r -- "unknown argument $1" >&2; exit 2 ;;
@@ -67,9 +69,9 @@ if [[ $(git -C $base_tree rev-parse HEAD) != $(git -C $ROOT rev-parse "$TAG^{com
   git -C $base_tree checkout -q --detach $TAG
 fi
 print -r -- "building the baseline ($TAG) ..."
-(cd $base_tree && CARGO_TARGET_DIR=$base_target cargo build -q --release -p qubivex-cli -p qubivex-runtime --example batch)
+(cd $base_tree && CARGO_TARGET_DIR=$base_target cargo build -q --release -p qubivex-cli -p qubivex-runtime --bins --example batch)
 print -r -- "building the working tree ..."
-(cd $ROOT && cargo build -q --release -p qubivex-cli -p qubivex-runtime --example batch)
+(cd $ROOT && cargo build -q --release -p qubivex-cli -p qubivex-runtime --bins --example batch)
 
 base_bin=$base_target/release/qubivex
 head_bin=$ROOT/target/release/qubivex
@@ -92,7 +94,7 @@ bench() { # label binary record extra...
   print -r -- "  $label: $record"
 }
 
-for r in $(seq 1 $rounds); do
+for r in $( (( single )) && seq 1 $rounds); do
   print -r -- "round $r of $rounds"
   bench base $base_bin $out/$date-m3pro-vulkan-$name-base-$r.json
   for v in $variants; do
@@ -102,9 +104,9 @@ for r in $(seq 1 $rounds); do
   done
 done
 
-print
-print -r -- "| record | decode ms/token (median) | tok/s | prefill ms | submissions/token | tokens = baseline |"
-print -r -- "|---|---:|---:|---:|---:|---|"
+(( single )) && print
+(( single )) && print -r -- "| record | decode ms/token (median) | tok/s | prefill ms | submissions/token | tokens = baseline |"
+(( single )) && print -r -- "|---|---:|---:|---:|---:|---|"
 for f in $records; do
   python3 -I - $f <<'EOF'
 import json, sys
