@@ -1161,3 +1161,244 @@ Then the Vulkan Step 3a would be:
 
 It is accepted only if the wall clock beats Step 1a beyond the run-to-run spread (about
 0.7 ms).
+
+## 15. Harness checks before Step 3a: SwiGLU parity and expert weight binding (2026-11-11)
+
+Harness only, as approved:
+- No production shader changed.
+- Step 1a is unchanged.
+- Nothing was pushed.
+- Code: `spikes/vulkan-step2-metal-timing/{swiglu/, binding.m, fuse.py --binding, cpucheck/}`;
+  `run.sh swiglu-check | swiglu-time | binding-check | binding` reproduce everything.
+- Timings were taken on mains, 3 interleaved rounds. The exhaustive parity run was on
+  battery, which does not affect bits.
+
+### 15.1 Check 1: SwiGLU numerical parity
+
+**What was tested.** `swiglu/swiglu.comp` is a GLSL port of `ops::swiglu`
+(`g·u/(1+exp(−g))`, written `s = g/(1+exp(−g)); g = s·u`), with the `exp` port of
+`math::exp`.
+- It is compiled exactly as `matmul.comp`: `glslc -O`, then NoContraction on every add,
+  subtract and fma.
+- It is run as **MoltenVK's own MSL**, produced by creating the pipeline on MoltenVK
+  (`mvkmsl.c`), compiled as MoltenVK compiles it: MathMode Safe, floating-point functions
+  Precise.
+- It is bound through an argument buffer, as MoltenVK binds it.
+
+Variants:
+- `-O0`, the same source;
+- `precise`: `precise` on the `exp` intermediates, `-O`;
+- **control**: the native Metal backend's parity-tested `swiglu`/`qexp`, extracted from
+  `kernels.metal`.
+
+**Inputs: every f32 bit pattern of g (2³²), twice.**
+- Pass 1: u = 1.
+- Pass 2: u is a pseudo-random bit pattern per element, covering every class: zeros,
+  subnormals, normals, infinities, NaNs.
+- Reference: a C port in the harness. It is **proven equal to `ops::swiglu` itself over all
+  2 × 2³² inputs**: an order-independent hash of every output matches the Rust
+  implementation's (`cpucheck` `rusthash`): `68f49b9c9e53d30f` and `8cfbe379131474ec`.
+
+**Results.** Differences from the CPU, of 4 294 967 296 per pass:
+
+| Class | `-O` (as `build.sh` builds) | `-O0` | `precise` | control (Metal backend) |
+|---|---|---|---|---|
+| input g or u subnormal (pass 1 / 2) | 16 777 212 / 15 684 871 | same | same | same |
+| intermediate silu(g) subnormal | 16 777 214 / 10 003 426 | same | same | same |
+| reference output subnormal (pass 2) | 181 775 278 | same | same | same |
+| exact silu(g) subnormal, rounds up to `FLT_MIN` | (in "other") | 2 / 0 | 2 / 0 | 2 / 0 |
+| NaN vs NaN, other payload | 16 777 213 / 33 295 226 | same | same | same |
+| +0 vs −0 | 0 | 0 | 0 | 0 |
+| **other, unexplained** | **472 469 120 / 443 609 392** | **0** | **0** | **0** |
+
+1. **The `-O` build breaks parity: a shader-pipeline bug, not a GPU one.**
+   - `glslc -O` folds `exp`'s rounding step `(x·log2e + SHIFT) − SHIFT` into `x·log2e`,
+     and `int(kf)` then truncates instead of rounding.
+   - This happens because the optimiser runs *before* `build.sh` adds NoContraction, so it
+     treats float arithmetic as algebra.
+   - Result: 1-ulp errors on ordinary values. For example, g = 8.94e-8 gives `33400001`
+     where the CPU gives `33400002`.
+   - `matmul.comp` contains no such cancellation and is proven bit-exact. But **any new
+     shader using a rounding idiom must be built `-O0` or use `precise`**, and must be gated
+     by an exhaustive or targeted test.
+2. **`-O0`, `precise` and the control agree exactly with each other.** They differ from the
+   CPU only in:
+   - **Subnormals.** The GPU flushes them: ADR-011's exception. It includes the 2 values
+     g = ±`0x00ffffff`: the exact g/2 is 2⁻¹²⁶ − 2⁻¹⁵⁰, a subnormal midpoint that IEEE
+     rounding takes up to `FLT_MIN` but the GPU flushes before rounding.
+   - **NaN payloads.** The GPU returns `7fc00000`; the CPU propagates the payload, and NaN-ness
+     is always preserved. The native Metal backend already behaves this way. **The parity
+     contract (ADR-011 §1) does not say whether NaN payloads count; the owner should decide
+     on the wording.**
+3. **No other differences:**
+   - **Division** `g/(1+e)` is correctly rounded in MoltenVK's Safe mode on this device, so
+     §5's 2.5-ULP concern does not arise here. Other Vulkan drivers still need the probe.
+   - **`exp` overflow/underflow edges** are clean.
+   - **Signed zero:** 0 cases, including `precise`'s `spvFMul = fma(l, r, +0)` (a −0
+     product feeds `+ SHIFT`, so it never shows).
+
+**Performance** (mains):
+
+| n (= experts × tokens × 1024) | GPU, alone in a command buffer | host `ops::swiglu`, one thread |
+|---|---|---|
+| 1 024 | 3.5 µs | 4.5 µs |
+| 8 192 (8 × 1) | 3.0 µs | 11.7 µs |
+| 32 768 (8 × 4) | 4.0 µs | 27.3 µs |
+| 81 920 (8 × 10) | 5.9 µs | 67.0 µs |
+
+Inside the one-submission expert block, SwiGLU and its two encoder boundaries add at most
+about 3 µs of GPU time (SE against SF below).
+
+### 15.2 Check 2: expert weight binding
+
+**Setup** (`binding.m`):
+- Each layer has a pool of **64 resident experts**, OLMoE's count. The arena variant copies
+  them into one buffer; the other variants give each expert its own private buffer.
+- **Every call routes to a new random set** of e experts. Every shape in a round uses the
+  same set.
+- Shapes:
+  - **SA**: Step 1a's shape. Unfused, a thread per expert, at most 5 in flight, the expert's
+    own buffer bound at the matrix offset.
+  - **SF**: fused gate/up, then fused down, in 2 command buffers.
+  - **SE**: the expert block in one command buffer: fused gate/up → SwiGLU (the `-O0`
+    kernel) → fused down. 3 encoders, as MoltenVK splits at pipeline barriers.
+- Bindings (`fuse.py --binding`, same body):
+  - **arena**: one buffer, slot offsets.
+  - **array**: a pointer array indexed per matrix. This is what MoltenVK makes of a
+    descriptor array on Metal 3.
+  - **bda**: the buffer address in the matrix's table entry.
+  - **bda-all**: bda, encoded as MoltenVK encodes a pipeline that uses buffer device
+    addresses. `MVKDevice::encodeGPUAddressableBuffers` calls `useResource` on **every**
+    addressable buffer per encoder, here the 64-expert pool plus 960 stand-ins (16 layers × 64).
+
+**Correctness:**
+- All 45 comparisons are bit-identical:
+  - SF in every binding against SA (unfused, CPU-exact);
+  - SE in every binding against SE-arena.
+- `cpucheck` `blockcheck` checks the SE expert block against `CpuBackend::matmul` →
+  `ops::swiglu` → `CpuBackend::matmul`, for e = 1, 3, 8 × s = 1, 4, 10 with routed experts.
+  **0 of 9 configurations differ.** The positive control (one flipped bit) is detected.
+
+**Timing** (mains, ms; ranges over 3 interleaved rounds of 200 calls; "wall" is one layer's
+expert block with a host wait per command buffer):
+
+| e × s | | SA (Step 1a) | SF-arena | SF-array | SF-bda | SF-bda-all | SE-arena | SE-array | SE-bda | SE-bda-all |
+|---|---|---|---|---|---|---|---|---|---|---|
+| 1 × 1 | GPU | 0.116 | 0.111 | 0.112–0.113 | 0.110–0.111 | 0.110 | 0.111–0.115 | 0.116 | 0.114–0.115 | 0.114 |
+| | wall | 0.41–0.43 | 0.41–0.44 | 0.41–0.45 | 0.41–0.44 | 0.57 | **0.26–0.28** | 0.27–0.28 | 0.26–0.28 | 0.36–0.37 |
+| 1 × 4 | GPU | 0.397 | 0.398 | 0.401–0.405 | 0.399 | 0.398–0.399 | 0.401–0.402 | 0.405 | 0.403 | 0.402–0.403 |
+| | wall | 0.69–0.73 | 0.70–0.73 | 0.71–0.73 | 0.69–0.73 | 0.85–0.87 | **0.55–0.57** | 0.56–0.58 | 0.56–0.57 | 0.65–0.66 |
+| 1 × 10 | GPU | 0.961 | 0.975–0.976 | 0.983–0.986 | 0.977–0.978 | 0.977–0.978 | 0.976–0.977 | 0.985–0.986 | 0.980–0.981 | 0.979 |
+| | wall | 1.33–1.36 | 1.33–1.35 | 1.33–1.37 | 1.33–1.36 | 1.50–1.55 | **1.18** | 1.19–1.21 | 1.19–1.21 | 1.26–1.28 |
+| 3 × 1 | GPU | 0.346–0.347 | 0.301–0.305 | 0.305–0.309 | 0.302–0.306 | 0.302 | 0.301–0.304 | 0.304–0.308 | 0.302–0.305 | 0.302–0.305 |
+| | wall | 0.55–0.59 | 0.58–0.63 | 0.59–0.64 | 0.59–0.63 | 0.75–0.76 | **0.45–0.47** | 0.46–0.48 | 0.45–0.47 | 0.54–0.56 |
+| 3 × 4 | GPU | 1.190–1.192 | 1.165 | 1.177–1.180 | 1.169 | 1.169 | 1.168–1.169 | 1.180 | 1.172 | 1.172 |
+| | wall | 1.39–1.40 | 1.55–1.56 | 1.56–1.57 | 1.55–1.56 | 1.75 | **1.36–1.37** | 1.40 | 1.39 | 1.47–1.48 |
+| 3 × 10 | GPU | 2.885–2.888 | 2.894 | 2.922 | 2.904–2.905 | 2.904 | 2.897 | 2.925 | 2.907 | 2.907 |
+| | wall | **3.09** | 3.32 | 3.36–3.37 | 3.35 | 3.53 | 3.12 | 3.16 | 3.14 | 3.21 |
+| **8 × 1** | GPU | **0.927–0.929** | 0.784–0.785 | 0.792–0.793 | 0.786–0.787 | 0.786–0.787 | **0.786–0.787** | 0.795 | 0.789 | 0.789 |
+| | wall | 1.36–1.38 | 1.15–1.16 | 1.17 | 1.16 | 1.35–1.37 | **0.98** | 1.01 | 1.00 | 1.08–1.09 |
+| 8 × 4 | GPU | 3.175–3.176 | 3.085 | 3.115 | 3.095 | 3.095 | 3.088–3.089 | 3.118–3.119 | 3.099 | 3.099 |
+| | wall | 3.58 | 3.51–3.52 | 3.56–3.57 | 3.55 | 3.72–3.74 | **3.31–3.32** | 3.35–3.36 | 3.33–3.34 | 3.41–3.42 |
+| 8 × 10 | GPU | 7.693–7.698 | 7.695 | 7.769 | 7.722 | 7.722 | 7.698 | 7.774–7.775 | 7.726 | 7.726 |
+| | wall | 8.10–8.11 | 8.14 | 8.24–8.25 | 8.19–8.20 | 8.37–8.38 | **7.94** | 8.02–8.03 | 7.97–7.98 | 8.05 |
+
+Host encoding per call, µs:
+
+| Variant | 8 × 1 | 8 × 10 |
+|---|---|---|
+| SA | 71–79 (16 command buffers) | 134–143 |
+| SF / SE, arena | 4–20 | 4–23 |
+| SF / SE, array | 4–29 | 4–29 |
+| SF / SE, bda | 4–29 | 4–29 |
+| bda-all | **27–96** | **27–96** |
+
+**Binding overhead:**
+- GPU time, against arena:
+  - **bda: +0.3%**;
+  - **array: +1.0%**, one more dependent load per threadgroup.
+  - These are consistent across every size, and small next to fusion's −15% at 8 × 1.
+- Host and wall time: arena, array and bda are equal within noise (≤ 0.03 ms).
+- **bda-all costs +0.1 ms per SE call and +0.2 ms per SF call** (wall), with no GPU change:
+  this is the cost of MoltenVK making every addressable buffer resident per encoder. It
+  grows with the number of resident experts, not with routing. Through MoltenVK 1.4.2,
+  buffer device addresses would give back about 1.6 ms per token of what the expert block
+  gains.
+
+**GPU execution:**
+- Fusion pays at small token counts: 8 × 1 −15%; 3 × 1 −13%; 8 × 4 −3%.
+- It is neutral at 8 × 10 and **slightly worse at 1 × 10 and 3 × 10** (+0.3–1.5%). Below
+  4 tokens per expert the fused path should be used; above that, measure again for prefill.
+- The SE block's single submission removes 0.18 ms of wall per layer at 8 × 1 compared with SF
+  (0.98 against 1.16): one host round trip.
+
+### 15.3 Memory and the expert streaming architecture
+
+Facts:
+- **Expert sizes are not uniform across layers.** Layers 0, 1, 4, 7, 10, 13, 14 and 15 have
+  **Q6_K** down projections: 4 079 616 bytes per expert. The other 8 have Q4_K: 3 538 944
+  bytes.
+- Within a layer, every expert has the same size and dtypes. So a fused stage always has one
+  dtype: one pipeline per (stage, dtype).
+- The RAM cache already has **per-layer pools of fixed `slot_bytes`**. The device cache is
+  separate: a global LRU under its own budget, **one `VkBuffer` per expert**, uploaded on
+  first use, inclusive of the RAM cache (dropped when the slab is reused), and pinned by
+  cloning the buffer while in use.
+- Device limits: 4 GiB per storage binding (`maxStorageBufferRange`), 10.7 GB per buffer.
+  The bench's expert cache is 3.72 GB, all 1024 experts.
+
+| Binding | What the device cache becomes | Selective loading / changing residency | Memory | Risk |
+|---|---|---|---|---|
+| **arena** | Two slot-class arenas (3.54 MB and 4.08 MB slots), each one buffer: 1.81 GB and 2.09 GB for the whole model, so each fits one binding. LRU across layers within a class; an expert's address is (class, slot). | A load becomes a copy into a free slot (no allocation; today each load creates a `VkBuffer` on MoltenVK). Eviction frees a slot. Pins become per-slot counts. The arena's size is the budget, fixed at load, or grown in chunks (then up to a few bindings, as with `array`). | **No fragmentation** (uniform slots per class) and no padding. One allocation per class instead of up to 1024. | A real change to `qubivex-runtime::discrete`: a slot allocator and pin counts replace `Arc` buffer clones. The shader is unchanged from the harness. |
+| **array** | Unchanged: one buffer per expert. Each fused dispatch writes a descriptor array of the routed experts' buffers (descriptor indexing; `runtimeDescriptorArray` and non-uniform indexing are supported; the non-update-after-bind limit is 31 storage buffers per stage, so it needs update-after-bind). | As today. | As today: one allocation per expert. | +1% GPU. MoltenVK's residency handling for descriptor arrays is **not measured** here; a Vulkan-level check is needed. |
+| **bda** | Unchanged buffers; addresses go in the table. | As today. | As today, plus `VK_KHR_buffer_device_address`. | **Through MoltenVK, every resident expert buffer is made resident per encoder (+0.1–0.2 ms per call)**, growing with the cache. Not recommended on MoltenVK 1.4.2. |
+
+### 15.4 End-to-end projection (estimate, not a measurement)
+
+The harness wall does not translate directly to the bench. The harness put grouped (B, 2
+submissions) at 0.05–0.1 ms per layer *faster* than SA, while end to end it was 2–4 ms per
+token *slower* (§13). So I anchor on the measured grouped figure, the same in-flight
+structure, rather than on Step 1a:
+
+- end to end grouped: 37.0–38.7 ms per token;
+- harness wall, SE-arena against B at 8 × 1: 0.98 against 1.28–1.32 ms, which is
+  −0.30 to −0.34 ms per layer, × 16;
+- **SE-arena ≈ 31.6–33.9 ms per token (29.5–31.6 tok/s), against Step 1a's 35.1–35.7: a gain
+  of about 1.2–4.1 ms per token.**
+- With bda through MoltenVK (bda-all), take about 1.6 ms off that gain.
+
+Assumptions and gaps:
+- Q4_K down only: **the 8 Q6_K-down layers were not timed fused** (same body, so the bit
+  argument holds, but the speed is unmeasured).
+- The anchor assumes the harness-to-bench offset is the same for SE as for B.
+- Host combine and copies are unchanged.
+- The 43.5 tok/s target still needs Step 3b/3c (§14.7).
+
+### 15.5 Recommendation for Vulkan Step 3a (for review; not started)
+
+1. **Binding: arena, two slot-class arenas.**
+   - It is the fastest on every measured axis.
+   - It turns expert loads into slot copies.
+   - It uses no Vulkan feature beyond what Step 1a uses.
+   - It avoids MoltenVK's per-encoder residency cost.
+   - The work is in the device cache (slot allocator, pins), not in the shader.
+
+   If that cache change is judged too large for one step, `array` is the fallback (+1% GPU),
+   after a Vulkan-level check of MoltenVK's residency handling for descriptor arrays.
+   Not bda on MoltenVK 1.4.2.
+2. **SwiGLU shader: `-O0` (or `precise`), never `glslc -O`.**
+   - Keep `swiglu-check` (exhaustive, about 2.5 min) as its gate.
+   - Add a targeted parity test to the crate: the rounding boundaries of `exp`, the overflow
+     and underflow edges, ±0, subnormal boundaries, NaN.
+   - Give `build.sh` a per-shader optimisation flag.
+3. **Before the Vulkan change:**
+   - time the fused down on **Q6_K** in the harness;
+   - decide the NaN-payload wording of the parity contract.
+4. **Step 3a, as before:**
+   - fused entry in `matmul.comp` by specialisation constant;
+   - SwiGLU shader;
+   - arena device cache;
+   - enable the one-submission expert block for Vulkan, for ≤ 4 tokens per expert.
+
+   Separate commits, each revertible. Accept only on alternated, untimed mains wall-clock
+   beating Step 1a beyond the run-to-run spread (about 0.7 ms).
