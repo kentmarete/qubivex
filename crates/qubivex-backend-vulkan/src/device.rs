@@ -691,6 +691,22 @@ impl Allocation {
         Ok(a)
     }
 
+    /// The mapped memory of a host-visible allocation as floats.
+    fn floats_mut(&mut self) -> &mut [f32] {
+        match self.mapped {
+            // SAFETY: as `bytes_mut`; a mapping is aligned to at least
+            // `minMemoryMapAlignment` (64 or more), so to 4, and every host buffer is a
+            // power of two of at least 4096 bytes, so a whole number of floats.
+            Some(p) => unsafe {
+                std::slice::from_raw_parts_mut(
+                    p.as_ptr().cast(),
+                    usize::try_from(self.size / 4).unwrap_or(0),
+                )
+            },
+            None => &mut [],
+        }
+    }
+
     /// The mapped bytes of a host-visible allocation.
     fn bytes_mut(&mut self) -> &mut [u8] {
         match self.mapped {
@@ -1168,6 +1184,11 @@ impl Submitter {
         // Check every op and lay out the activations before touching the GPU.
         let mut plan = Vec::with_capacity(ops.len());
         let (mut xn, mut yn) = (0usize, 0usize);
+        // Ops that read the same activations (QKV, gate and up) share one copy: by
+        // address and length, so only an identical slice is shared. `Some(base)`: this
+        // op reads the copy an earlier op made; `None`: its inputs are copied here.
+        let mut shared_x: Vec<Option<usize>> = Vec::with_capacity(ops.len());
+        let mut x_bases: Vec<(*const f32, usize, usize)> = Vec::with_capacity(ops.len());
         for op in ops.iter() {
             let w = op.w;
             let Some(dt) = dtype_index(w.dtype()) else {
@@ -1237,7 +1258,24 @@ impl Submitter {
                 k: u32_of(k, "columns")?,
                 row_bytes: u32_of(row_bytes, "row bytes")?,
                 w_base: u32_of(off - base, "offset")?,
-                x_base: u32_of(xn, "activations")?,
+                x_base: u32_of(
+                    match x_bases
+                        .iter()
+                        .find(|(p, l, _)| *p == op.xs.as_ptr() && *l == op.xs.len())
+                    {
+                        Some(&(_, _, b)) => {
+                            shared_x.push(Some(b));
+                            b
+                        }
+                        None => {
+                            shared_x.push(None);
+                            x_bases.push((op.xs.as_ptr(), op.xs.len(), xn));
+                            xn += op.xs.len();
+                            xn - op.xs.len()
+                        }
+                    },
+                    "activations",
+                )?,
                 y_base: u32_of(yn, "outputs")?,
             };
             plan.push(Planned {
@@ -1249,7 +1287,6 @@ impl Submitter {
                 groups,
                 tokens,
             });
-            xn += op.xs.len();
             yn += op.ys.len();
         }
         let (xb, yb) = (4 * xn.max(1) as u64, 4 * yn.max(1) as u64);
@@ -1271,12 +1308,11 @@ impl Submitter {
         let usage = vk::BufferUsageFlags::STORAGE_BUFFER;
         let xbuf = {
             let x = Self::host_buffer(&shared, &mut self.xs, xb, usage)?;
-            let bytes = x.bytes_mut();
-            let mut at = 0;
-            for op in ops.iter() {
-                for v in op.xs {
-                    bytes[at..at + 4].copy_from_slice(&v.to_ne_bytes());
-                    at += 4;
+            let floats = x.floats_mut();
+            for ((op, p), shared) in ops.iter().zip(&plan).zip(&shared_x) {
+                if shared.is_none() {
+                    let base = p.params.x_base as usize;
+                    floats[base..base + op.xs.len()].copy_from_slice(op.xs);
                 }
             }
             x.buffer
@@ -1393,13 +1429,10 @@ impl Submitter {
         // Outputs back.
         let start = Instant::now();
         let y = self.ys.as_mut().ok_or_else(|| err("outputs", "missing"))?;
-        let bytes = y.bytes_mut();
-        let mut at = 0;
-        for op in ops.iter_mut() {
-            for v in op.ys.iter_mut() {
-                *v = f32::from_ne_bytes([bytes[at], bytes[at + 1], bytes[at + 2], bytes[at + 3]]);
-                at += 4;
-            }
+        let floats = y.floats_mut();
+        for (op, p) in ops.iter_mut().zip(&plan) {
+            let base = p.params.y_base as usize;
+            op.ys.copy_from_slice(&floats[base..base + op.ys.len()]);
         }
         counters.time(start);
         counters

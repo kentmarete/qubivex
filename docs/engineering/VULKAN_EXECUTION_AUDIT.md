@@ -541,3 +541,35 @@ Consequences for the sequence:
   dispatches it replaces. The kernel test's 24 matrices in one submission (1.26 ms)
   against ~16 × 64 µs ≈ 1.0 ms today says to measure that before building on it.
 - Steps 3–4 target the ~16–19 ms of idle time directly.
+
+## 11. Step 1a: bulk copies, one copy per shared input (2026-11-11)
+
+What changed:
+- `Submitter::matmul_many` copies each op's activations and outputs as whole slices,
+  not float by float.
+- Ops that read the same activation slice (same address and length: QKV, and
+  gate/up) share one copy on the device.
+- No shader change, so no bit change.
+- New test `a_shared_input_is_copied_once`: four ops, three sharing one slice and one
+  reading an equal but separate slice. It checks the CPU's bits and that two copies
+  were made.
+
+Bench: interleaved, base (a7bc0bf) then step 1a, twice, on mains power. Records:
+`baselines/2026-11-11-m3pro-vulkan-step1a-{base,step1a}-{1,2}.json`. Tokens equal the
+reference in all four.
+
+| | Run 1 ms/token | Run 2 ms/token | Copies per token | Bytes in per token |
+|---|---|---|---|---|
+| base | 36.16 | 35.44 | 0.91 ms | 3.13 MiB |
+| step 1a | 35.42 | 35.71 | 0.23 ms | 1.88 MiB |
+
+**Verdict: no end-to-end change that can be measured.** Copy time per token fell by
+0.7 ms and input bytes by 40%, but the medians differ by less than the run-to-run spread
+(~0.7 ms). The copies were spread across the expert threads, not on the critical path.
+No improvement is claimed. The change is kept because it does no harm, does less
+work and is simpler. Revert it with one commit.
+
+This confirms Step 0's bound for the rest of Step 1. The remaining host submission work
+is about 18 µs per submission. Push descriptors would remove only part of that, at most
+about 0.5 ms per token on the critical path, which is below the noise floor of a 3-run
+bench, and they would add a second descriptor path to maintain.

@@ -323,6 +323,75 @@ fn transfers_are_counted() {
     assert!(t.wait_ns > 0 && t.submit_ns > 0, "{t:?}");
 }
 
+/// Ops that read the same activation slice share one copy on the device (as QKV and
+/// gate/up do), an equal but separate slice gets its own, and every output keeps the
+/// CPU's bits.
+#[test]
+fn a_shared_input_is_copied_once() {
+    let Some(dev) = device() else { return };
+    let (rows, cols, s) = (24, 256, 2);
+    let dtypes = [
+        DType::Ggml(GgmlType::Q4_K),
+        DType::Ggml(GgmlType::Q6_K),
+        DType::F16,
+    ];
+    let hosts: Vec<_> = dtypes
+        .iter()
+        .enumerate()
+        .map(|(i, &d)| weights(d, rows, cols, 20 + i as u32))
+        .collect();
+    let dws: Vec<_> = dtypes
+        .iter()
+        .zip(&hosts)
+        .map(|(&d, h)| {
+            let wv = WeightView::new(d, rows, cols, h).unwrap();
+            DeviceWeights::like(dev.upload(h, None).unwrap(), 0, &wv).unwrap()
+        })
+        .collect();
+    let x = acts(s * cols, 7);
+    let other = x.clone();
+    let before = dev.transfers();
+    let mut ys = vec![vec![0.0; s * rows]; 4];
+    let (a, rest) = ys.split_at_mut(1);
+    let (b, rest) = rest.split_at_mut(1);
+    let (c, d) = rest.split_at_mut(1);
+    dev.matmul_many(&mut [
+        DeviceMatMul {
+            w: &dws[0],
+            xs: &x,
+            s,
+            ys: &mut a[0],
+        },
+        DeviceMatMul {
+            w: &dws[1],
+            xs: &x,
+            s,
+            ys: &mut b[0],
+        },
+        DeviceMatMul {
+            w: &dws[2],
+            xs: &other,
+            s,
+            ys: &mut c[0],
+        },
+        DeviceMatMul {
+            w: &dws[0],
+            xs: &x,
+            s,
+            ys: &mut d[0],
+        },
+    ])
+    .unwrap();
+    for (i, j) in [(0, 0), (1, 1), (2, 2), (3, 0)] {
+        let want = cpu(dtypes[j], rows, cols, &hosts[j], &x, s);
+        assert_bits(&ys[i], &want, &format!("op {i}"));
+    }
+    let t = dev.transfers().since(&before);
+    // Two copies of the input (x once, `other` once), four outputs.
+    assert_eq!(t.activations_in, 2 * 4 * (s * cols) as u64);
+    assert_eq!(t.activations_out, 4 * 4 * (s * rows) as u64);
+}
+
 /// With timestamps on, every matmul submission is timed on the GPU, the bits are
 /// unchanged, and the busy union is at most the sum (one submitter at a time here, so
 /// they are close) and at most the host's wait.
