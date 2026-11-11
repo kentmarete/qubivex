@@ -1,0 +1,66 @@
+// QUBIVEX Vulkan fused matmul (audit §14, §15): several independent matrices in one
+// dispatch, each output with the CPU backend's bits.
+//
+// The grid's x axis concatenates the matrices' row blocks: every matrix of a dispatch
+// has the same number of row blocks (`f.blocks`), so workgroup x belongs to matrix
+// x / blocks. That matrix's parameters (what `matmul.comp` takes as push constants) come
+// from a table, and the workgroup then runs `matmul.comp`'s body unchanged on its row
+// block of that matrix. Every output is computed by the same instructions on the same
+// operands as in its own dispatch, so it has the same bits: fusing changes only which
+// workgroup computes what. The grid's y axis is the token; a matrix with fewer tokens
+// than the dispatch skips the rest (the whole workgroup returns, before any barrier).
+//
+// Compiled like matmul.comp (`build.sh`: -O, then NoContraction on every add, subtract
+// and fma). The weight dtype is the same specialization constant.
+
+#version 450
+
+layout(local_size_x = 256) in;
+
+// Output rows per workgroup: 256 invocations / 32 per row.
+const uint ROWS = 8;
+
+// One table entry per matrix, 8 words: n, k, row_bytes, w_base, x_base, y_base,
+// tokens, unused. Must match `FusedEntry` in `device.rs`.
+layout(std430, set = 0, binding = 3) readonly buffer Table {
+    uint tab[];
+};
+
+#define MATMUL_PARAMS                                                              \
+    layout(push_constant) uniform Fused {                                          \
+        uint blocks;   /* row blocks per matrix */                                 \
+        uint count;    /* matrices in the dispatch */                              \
+        uint tab_base; /* word offset of the first entry */                        \
+        uint unused;                                                               \
+    } f;                                                                           \
+    uint q_n;                                                                      \
+    uint q_k;                                                                      \
+    uint q_row_bytes;                                                              \
+    uint q_w_base;                                                                 \
+    uint q_x_base;                                                                 \
+    uint q_y_base;                                                                 \
+    uint q_block;
+#define P_N q_n
+#define P_K q_k
+#define P_ROW_BYTES q_row_bytes
+#define P_W_BASE q_w_base
+#define P_X_BASE q_x_base
+#define P_Y_BASE q_y_base
+#define ROW_BLOCK q_block
+#define TOKEN gl_WorkGroupID.y
+// Uniform across the workgroup, so the body's barriers stay uniform.
+#define MATMUL_PROLOGUE                                                            \
+    uint qm = min(gl_WorkGroupID.x / f.blocks, f.count - 1u);                     \
+    uint qe = f.tab_base + 8u * qm;                                                \
+    if (gl_WorkGroupID.y >= tab[qe + 6u]) {                                        \
+        return;                                                                    \
+    }                                                                              \
+    q_n = tab[qe];                                                                 \
+    q_k = tab[qe + 1u];                                                            \
+    q_row_bytes = tab[qe + 2u];                                                    \
+    q_w_base = tab[qe + 3u];                                                       \
+    q_x_base = tab[qe + 4u];                                                       \
+    q_y_base = tab[qe + 5u];                                                       \
+    q_block = gl_WorkGroupID.x - qm * f.blocks;
+
+#include "matmul_body.glsl"
