@@ -3,6 +3,12 @@
 Last updated: 2026-11-11
 
 ## Current phase
+**Vulkan Step 3a: the expert block in one submission (2026-11-11, branch `vulkan-step3a`, not pushed).** See docs/engineering/VULKAN_EXECUTION_AUDIT.md §16.
+- Built: a generic gated-FFN block op chosen by shape (`fuses_gated_ffn`), the device expert cache in two fixed-slot arenas, a fused matmul entry (same body; `matmul.spv` byte-identical) and SwiGLU on the device (built -O0), one command buffer per layer's experts. `--vulkan-fuse-rows N` (default 8, 0 off).
+- Parity: the fused block equals the CPU for every dtype pairing (Q6_K down included) and OLMoE's shapes; device SwiGLU exhaustive over 2 × 2³²: 0 differences outside subnormals (ADR-011) and NaN payloads; a positive control (-O build) fails; real OLMoE gives the CPU's logits and Colibri's tokens.
+- Measured against the permanent Step 1a baseline (tag `bench/vulkan-step1a`, `scripts/bench-vulkan-baseline`), mains, alternated: decode 35.78 → 33.00 ms/token (27.95 → 30.30 tok/s; 305 → 65 submissions); concurrent +11% (1–2 sequences), +9.5% (4), +5.7% (8, at the 8-row default: 43.7–43.8 against 41.4); prefill unchanged (128-token prompt identical). Arenas alone: no change.
+- Open for the owner: NaN-payload wording of the parity contract; an ADR-019 amendment for the block op and the arena cache; next step 3b (routing in the same submission).
+
 **Vulkan submission plan, Step 0: measurement (2026-11-11, done, branch `vulkan-submission-audit`).** See docs/engineering/VULKAN_EXECUTION_AUDIT.md (§8 sequence, §9 decisions, §10 results).
 - Built: device counters and opt-in GPU timestamps (`--vulkan-timestamps`), and a per-phase `device` block in `qubivex bench` records. Behaviour is unchanged without the flag; the tests pass, timed runs included.
 - Measured on mains power (`baselines/2026-11-11-m3pro-vulkan-step0-*.json`, tokens identical to the reference):

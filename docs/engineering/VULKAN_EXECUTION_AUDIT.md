@@ -1402,3 +1402,88 @@ Assumptions and gaps:
 
    Separate commits, each revertible. Accept only on alternated, untimed mains wall-clock
    beating Step 1a beyond the run-to-run spread (about 0.7 ms).
+
+## 16. Step 3a: the expert block in one submission (2026-11-11)
+
+Built as the owner directed after §15 ("two-arena design and fused expert block").
+Nothing was pushed. Every number below is *recorded*: mains power, untimed, alternated
+with the permanent Step 1a baseline (tag `bench/vulkan-step1a`, driver
+`scripts/bench-vulkan-baseline`; BENCHMARKING.md "Vulkan baseline").
+
+### 16.1 What was built (separate commits, each revertible and each compiling alone)
+
+| Commit | What |
+|---|---|
+| Compute | `GatedFfn` and `ComputeBackend::{fuses_gated_ffn, gated_ffn_many}`; `DiscreteDevice::{fuses_gated_ffn, gated_ffn_many, alloc, write, max_arena}`. Defaults keep today's steps, so no backend changes until it opts in. `math::swiglu` moves into `qubivex-compute`, unchanged. The MoE stage asks the backend by shape (blocks, largest rows per expert) and, when every routed expert is resident, runs the layer's experts as one `gated_ffn_many`. Generic to any SwiGLU MoE; no model-specific path. |
+| Runtime | The device expert cache in fixed-slot arenas, one per expert size class (OLMoE: Q4_K-down 3 538 944 B and Q6_K-down 4 079 616 B). A copy is a write into a free slot; pins are per slot; slots follow the budget's distribution over layers, capped by the RAM cache (inclusive) and the device's largest addressable arena. No arenas when the device has none or the budget is below a slot per layer (the old per-expert buffers). `experts.used` is now arenas plus single copies (the ledger's charge); `experts.held` is the copies. The sim gets arenas and an opt-in fused block (`SimConfig::fuse_rows`). |
+| Shaders | `matmul.comp`'s body moved to `matmul_body.glsl`: **`matmul.spv` is byte-identical**, so the unfused pipeline did not change. `matmul_fused.comp`: the same body, each workgroup's matrix from a table (O(1) lookup, `wg.x / blocks`), rows beyond a matrix's tokens skipped uniformly. `swiglu.comp`: the harness-proven port, **built -O0** (`build.sh` has a per-shader level). |
+| Vulkan | `gated_ffn_many`: fused gate/up dispatch(es) → barrier → SwiGLU → barrier → fused down dispatch(es), one command buffer, intermediates in device-local memory. Matrices are grouped by (buffer, dtype, rows), so experts outside the arena or of mixed dtypes still run, as extra dispatches in the same submission. `alloc`/`write` give the cache its arenas. `--vulkan-fuse-rows N` (default 8, 0 off). |
+| Threshold | Default 8 rows per expert, measured (§16.4). |
+
+### 16.2 Correctness
+
+- **Fused block** (`tests/fused.rs`), against the CPU's separate steps, bit for bit: Q4_K/Q4_K, Q4_K/**Q6_K**, Q6_K/Q6_K, Q8_0, f32/f16, bf16/f32 × 1, 3, 8 experts × 1, 2, 4, 10 rows (mixed rows per expert), in an arena and in separate buffers, one submission each; OLMoE's real shapes (2048 × 1024, 8 experts, Q4_K and Q6_K down) at 1 and 4 rows; empty blocks and shared inputs. All equal.
+- **SwiGLU on the device, exhaustive** (`--ignored`, 27 s): all 2 × 2³² inputs (u = 1; u random). 8 298 858 322 equal, 240 810 096 subnormal (ADR-011), 50 266 174 NaN payload, **0 other**. The targeted test (every `exp` rounding boundary, overflow/underflow edges, ±0, subnormal and `FLT_MIN` boundaries, infinities, NaNs, 4 M random) runs in the normal suite.
+- **Positive control:** with SwiGLU built `-O`, the targeted test (914 162 other), the fused-block test and the shared-input test all fail.
+- **End to end:** `tests/vulkan.rs` with the real OLMoE (CPU prompt logits, Colibri's 12 tokens, a 64-expert device cache that evicts) passes with fusion on; every bench record's tokens equal the Step 1a reference (single-stream, 9 + 4 + 6 records) and every concurrent run's tokens are identical across modes.
+- Sim: `fused_expert_blocks_are_one_submission` (4 per layer + head; shape selection; concurrent sequences).
+
+### 16.3 Single stream (`qubivex bench`, 10-token prompt, 128 generated, 5 threads, 1 + 5 runs)
+
+Session 1, threshold 4 (records `2026-11-11-m3pro-vulkan-step3a-{base,fused,unfused}-{1,2,3}.json`):
+
+| Round | Step 1a, ms/token | Fused, ms/token | Arenas only (`--vulkan-fuse-rows 0`) |
+|---|---|---|---|
+| 1 | 35.88 | **33.02** | 35.40 |
+| 2 | 35.78 | **33.00** | 35.40 |
+| 3 | 35.59 | **32.99** | 35.57 |
+| tok/s | 27.9–28.1 | **30.28–30.31** | 28.1–28.3 |
+| submissions per decode token | 305 | **65** | 305 |
+| prefill, ms | 200.4–201.0 | 199.1–201.5 | 201.2–203.2 |
+
+Session 2, threshold 8 (`…-step3a-r8-*`; the machine was slower, swap above 9 GB): Step 1a
+38.36 / 38.54, fused **34.91 / 34.93** ms/token (−9%); prefill 214.4 / 214.9 → 207.4 /
+207.9 ms (the 10-token prompt now fuses some layers).
+
+**−2.8 ms per token (−7.8%) against Step 1a, four times the run-to-run spread; 30.3
+tok/s, past target 1.** The arenas alone change nothing: the gain is the single
+submission, not the binding.
+
+### 16.4 Concurrent inference (the batch example, 32 tokens per sequence, median of 3)
+
+Concurrent tok/s (N threads each calling `forward`, combined at the engine's turn).
+Rounds 2–3 of session 1 (round 1 ran before the machine settled: the baseline itself
+fell from 27.9 to 26.0 between rounds 1 and 2; log `…-step3a-concurrent.txt`):
+
+| N | Step 1a | Fused (≤ 4 rows) | Gain | Arenas only |
+|---|---|---|---|---|
+| 1 | 25.9–26.2 | 28.9–29.0 | +11% | 26.3–26.4 |
+| 2 | 31.9 | 35.5–35.7 | +11.5% | 31.9–32.0 |
+| 4 | 37.1–37.2 | 40.7–40.8 | +9.5% | 37.1–37.2 |
+| 8 | 41.4 | 43.3–43.4 | +4.8% | 41.3–41.4 |
+
+Threshold, 2 alternated rounds (`…-step3a-threshold.txt`): at N = 8, ≤ 4 gives 43.3–43.4,
+**≤ 8 gives 43.7–43.8**, ≤ 64 43.8 (with 8 sequences no expert exceeds 8 rows); below N = 8
+all equal. So the default is 8. A 128-token prompt (`…-step3a-p128-*`) never fuses: prefill
+2317–2322 ms in all three variants, 1615 submissions each; its decode is 35.2–35.3 ms fused
+against 38.7–39.3 for Step 1a.
+
+The gain narrows with N because a batched pass already amortises each round trip over
+N tokens; fusion removes round trips, not GPU work.
+
+### 16.5 What this shows
+
+Optimising the execution path, not the kernel: the fused block runs the same shader body
+with the same GPU work per output. It removes 240 submissions per token (305 → 65) and
+the host SwiGLU between the expert stages, and that alone is 2.8–3.5 ms per token.
+
+### 16.6 Not decided (owner)
+
+1. **NaN payloads in the parity contract** (§15.1, still open). The device's SwiGLU, like
+   Metal's, returns the canonical NaN; NaN-ness always matches. The tests count payload
+   differences separately and do not fail on them.
+2. **ADR-019 amendment** recording: the gated-FFN block op and its shape selection, the
+   arena cache and its accounting change (`used` vs `held`), and the per-shader `-O0` rule.
+   Not written yet; nothing is Proposed.
+3. **Next step.** §14.7's 3b (router and routing in the same submission, for resident
+   layers) is the next round trip to remove. Target 2 (35 tok/s) needs it or more.
