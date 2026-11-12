@@ -5,7 +5,9 @@
   were rerun on `main` at 9721f58 (§ Amendment 1, "Acceptance"). Amendment 2 (the shared
   GPU pass) is to be written separately. Amendment 3 (2026-11-11, the fused expert block,
   Step 3a) records the implementation the owner accepted on 2026-11-11, and the parity
-  contract's wording for NaNs.
+  contract's wording for NaNs. Amendment 4 (2026-11-12, routing and the prelude
+  on the device, Steps 3b and 3c) records the implementation the owner accepted on
+  2026-11-12, with both switches off by default.
 - Date: 2026-11-11
 - Related: ADR-007 (backends), ADR-010 (lossless by default), ADR-011 (device execution
   and parity), ADR-018 (discrete device memory).
@@ -357,3 +359,89 @@ Step 1a baseline (tag `bench/vulkan-step1a`, driver `scripts/bench-vulkan-baseli
   weights (Step 3b).
 - The working buffers are outside the ledger; a later step that keeps more on the device
   (activations, KV) must charge them.
+
+## Amendment 4 (2026-11-12): routing and the prelude on the device (Steps 3b and 3c)
+
+The owner accepted Steps 3b and 3c on 2026-11-12 on the reported correctness and
+performance results (audit `VULKAN_EXECUTION_AUDIT.md` §17 and §18; PRs #58 and #59). This
+amendment records what was built, the rules it adds, and the owner's decisions:
+
+1. `--vulkan-route` stays **off** by default.
+2. `--vulkan-route-o` stays **off** by default.
+3. The existing fallbacks stay: Step 3a (routing on the host) when routing on the device is
+   off or declined, and the CPU backend as the default backend (ADR-011).
+
+### Step 3b: a MoE layer routed on the device
+- **A generic layer op.** `qubivex-compute` gains `RoutedMoe` (router, every expert of the
+  layer by id, k, renormalisation, activations; outputs: combined rows, ids, weights) with
+  `ComputeBackend::{routes_moe, routed_moe}` and `DiscreteDevice`'s pair, declining by
+  default. `routed_moe_steps` is the reference: router matmul, `math::route` per token,
+  `gated_ffn_many`, rank-order combine. `softmax` and `route` moved into
+  `qubivex-compute::math` unchanged.
+- **One submission:** router (fused entry), `route.comp` (softmax and top-k, one workgroup
+  per token), every (token, rank) entry's gate and up, SwiGLU, down, and `combine.comp`:
+  6 dispatches, 5 barriers. The route kernel writes the dispatch table's routed entries
+  from per-expert templates, so the GPU chooses which expert each entry reads with no
+  descriptor indexing and no indirect dispatch.
+- **Residency rule.** The device routes a layer only when the device expert cache is
+  **fully provisioned** (an arena slot for every expert of every layer), so holding a layer
+  can never evict. The provider holds the layer's experts quietly (`with_layer_held`: no
+  heat, recency, hits or trace), then records the uses of the experts actually routed, so
+  store and device-cache counts equal Step 3a's. Missing experts are prefetched and that
+  layer runs Step 3a until they land.
+- **Limits.** At most 256 experts (`route.comp`'s shared arrays), `k ≤ experts`, tokens
+  up to `--vulkan-fuse-rows`; one buffer, dtype and shape per matrix kind. Otherwise the
+  layer runs Step 3a. A traced pass routes on the host.
+
+### Step 3c: the prelude in the routed submission
+- `MoePrelude` (O projection, attention outputs, residual stream, norm weights, eps) on
+  `RoutedMoe`, with `routes_moe_prelude` on both traits, declining by default. The MoE
+  stage offers it before the O matmul when nothing is traced and no lookahead wants the
+  residual on the host; declined, the layer runs as Step 3b.
+- On Vulkan: the O projection as a fused entry, then `resnorm.comp` (the residual add, the
+  shared 64-lane sum of squares, `1 / sqrt(ss / n + eps)` from `rms.glsl`, two
+  multiplies), then Step 3b's dispatches: 8 dispatches, one command buffer, **two
+  submissions per MoE layer**. The norm weights travel in the table buffer.
+  `rms_norm`, `rms_scale` and `rms_scale_of` moved into `qubivex-compute::math` unchanged.
+
+### Order and rounding rules added
+- **Routing order.** The device reproduces `math::route`: max by Rust's `f32::max`
+  (NaN-ignoring), `math::exp`, a sequential sum from +0 and one division per value, then
+  top-k in `total_cmp` order with ties to the lower id (the order the CPU's stable sort
+  defines), and renormalisation as a sequential sum from −0. Sums stay sequential in one
+  invocation; only order-independent steps run in parallel.
+- **Square root and division.** The norm's scale needs a correctly rounded `sqrt` and
+  division. Vulkan does not promise either; on MoltenVK with fast math off both were
+  proven over **every f32 input** (6 × 2³² at six (n, eps) shapes, 0 differences outside
+  the ADR-011 classes). `rms.glsl` is built `-O0` so no optimiser forms `inversesqrt`, which
+  fails the test (positive control). Other drivers are not assumed to be correctly
+  rounded: the conformance tests are the check on each, and a device-open probe is not
+  built (Not decided here).
+- **`-O0`** applies to `route.comp`, `combine.comp`, `resnorm.comp` and `rms_scale.comp`,
+  as amendment 3's rule requires.
+- The parity contract is unchanged (amendment 3, ADR-011 amendment 7). For a token with a
+  NaN logit, only NaN-ness of its weights is compared: `total_cmp` orders NaNs by payload,
+  which is outside the contract.
+
+### Measured (mains, alternated with the permanent Step 1a baseline)
+
+| | Step 1a | Step 3a | Step 3b | Step 3c |
+|---|---|---|---|---|
+| decode ms/token | 35.2–36.2 | 33.06–33.15 | 30.82–31.28 | 28.95–29.18 |
+| tok/s | 27.6–28.4 | 30.2–30.3 | 32.0–32.5 | 34.3–34.5 |
+| submissions/token | 305 | 65 | 49 | 33 |
+
+Step 3b against 3a: −6.4%; Step 3c against 3b: −6.2%; Step 3c against Step 1a: −18%.
+Prefill unchanged at every step. Concurrent gains at every batch size (3c over 3b: +6.6%,
++4.7%, +2.4%, +1.8% at 1, 2, 4 and 8 sequences). Tokens equal the Step 1a reference in
+every record. 35 tok/s was a target and was not reached.
+
+### Consequences
+- Step 1a stays the permanent baseline; Step 3c with both switches on is the reference for
+  the next Vulkan steps.
+- Per-submitter working buffers grow by under 1 MiB at the 8-token limit, from the 256 MiB
+  device reserve; they stay outside the ledger (amendment 3). A step that keeps KV on the
+  device must charge it.
+- What remains per layer on the host is QKV → attention → O: the KV cache is in host
+  memory. Attention on the device is the next investigation.
+
