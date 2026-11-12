@@ -1,0 +1,25 @@
+// Scores: one invocation per (position, head, token); q·k as a sequential fma chain over
+// d, times 1 / sqrt(d). Grid: (ceil(span / 256), heads, tokens).
+#version 450
+layout(local_size_x = 256) in;
+#include "attn_split.glsl"
+void main() {
+    uint j = gl_GlobalInvocationID.x;
+    uint h = gl_WorkGroupID.y;
+    uint t = gl_WorkGroupID.z;
+    uint s = gl_NumWorkGroups.z;
+    uint span = p.p0 + s;
+    if (j > p.p0 + t) {
+        return;
+    }
+    uint d = D;
+    uint g = h / GROUP;
+    uint qb = (t * HEADS + h) * d;
+    uint kb = g * d * span + j;
+    float scale = 1.0 / sqrt(float(d));
+    float acc = 0.0;
+    for (uint i = 0u; i < d; i++) {
+        acc = fma(q[qb + i], kv[kb + i * span], acc);
+    }
+    sc[(t * HEADS + h) * span + j] = acc * scale;
+}

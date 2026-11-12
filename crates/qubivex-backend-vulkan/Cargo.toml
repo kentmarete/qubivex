@@ -13,7 +13,13 @@ ash = { workspace = true }
 qubivex-compute = { workspace = true }
 qubivex-core = { workspace = true }
 
+[features]
+# Experimental kernels run on the fused layout (spike/, audit §19). Off by default; no
+# production path uses it.
+spike = []
+
 [dev-dependencies]
+qubivex-arch = { workspace = true }
 qubivex-backend-cpu = { workspace = true }
 
 [lints]

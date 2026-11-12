@@ -58,6 +58,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, TryLockError};
 
 pub use device::{PhysicalInfo, list};
+#[cfg(feature = "spike")]
+pub use device::{SpikeKernel, SpikeStep, SpikeTiming};
 use qubivex_compute::ComputeError;
 use qubivex_compute::discrete::{
     DeviceBuffer, DeviceGatedFfn, DeviceMatMul, DeviceRoutedMoe, DeviceUsage, DiscreteDevice,
@@ -258,6 +260,31 @@ impl VulkanDevice {
         y: &mut [f32],
     ) -> Result<(), ComputeError> {
         self.submitter().rms_scale(a, n, eps, y)
+    }
+
+    /// Experimental (feature `spike`, audit §19): builds `spv` as a pipeline on the
+    /// fused layout (4 storage bindings, 16 bytes of push constants).
+    ///
+    /// # Errors
+    /// [`ComputeError::Device`] when the driver fails or there is no fused layout.
+    #[cfg(feature = "spike")]
+    pub fn spike_kernel(&self, spv: &[u8]) -> Result<SpikeKernel, ComputeError> {
+        self.submitter().spike_kernel(spv)
+    }
+
+    /// Experimental (feature `spike`): runs `steps` `repeat` times in one submission
+    /// over four host buffers (bindings 0 to 3), copied in and back.
+    ///
+    /// # Errors
+    /// [`ComputeError::Device`] when the driver fails.
+    #[cfg(feature = "spike")]
+    pub fn spike_run(
+        &self,
+        steps: &[SpikeStep<'_>],
+        bufs: [&mut [f32]; 4],
+        repeat: u32,
+    ) -> Result<SpikeTiming, ComputeError> {
+        self.submitter().spike_run(steps, bufs, repeat)
     }
 
     /// Whether submissions are timed on the GPU (asked for, and the queue supports it).

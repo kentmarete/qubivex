@@ -2002,3 +2002,235 @@ is QKV → attention on the host (the KV cache in host memory, §8 Step 4).
 **Decided 2026-11-12 (owner):** Steps 3b and 3c accepted; `--vulkan-route` and
 `--vulkan-route-o` stay off by default; the fallbacks stay. Recorded as ADR-019
 amendment 4. Next: the GPU attention investigation (§19).
+
+## 19. GPU attention: investigation and initial harness (2026-11-12)
+
+Owner brief (2026-11-12): investigate a GPU-resident KV cache and attention on the device
+(Q projection, RoPE, KV updates, QKᵀ, causal masking, softmax, AV), tiled attention and
+online softmax, KV against expert residency, concurrent sequences, exact parity with the
+CPU. Target: no CPU attention round trip, eventually one submission per layer. Accepted
+production shaders untouched; experiments reversible and committed separately; nothing
+pushed. Base: `main` at c1fcd1b (Step 3c merged).
+
+### 19.1 Where attention runs today (Step 3c, decode)
+
+Per layer: **QKV** submission → host: clip, Q/K norm (OLMoE: full width, 2048), RoPE (host
+table, f64-evaluated, rounded once), KV store into the host cache, `ops::attend` per (token,
+head) on the rayon pool → **O + residual + norm + routed MoE** submission → host `hs += y`.
+So 2 submissions per layer + the head = 33 per token. Removing the host attention merges
+both into **one per layer (17 per token)**.
+
+Prior art in this repository: Metal's whole-layer and token modes (ADR-011 amendments 2
+and 4) already run this block on the GPU with the CPU's bits: `rms_norm`, `rope`,
+`kv_store`, `attn_scores`, `attn_softmax`, `attn_values`; device KV position-major per
+sequence in the `KvCache`'s device slot (`DeviceKv`), grown in 256-position chunks by a
+prefix copy, charged to the ledger's KV owner; batched passes record one attention set per
+sequence in the same submission. The Vulkan design below follows it and changes only what
+the measurements below require.
+
+### 19.2 The parity constraint, and what it rules out
+
+`ops::attend` fixes the order of three reductions:
+- each score: `dot_seq(q, k)`, a sequential fma chain over d from 0, then `· (1 / sqrt(d))`;
+- the softmax: max by `f32::max` (order-free: exact, NaN-ignoring; a ±0 maximum gives the
+  same `v − m` for every v), `exp(v − m)`, a **sequential sum over positions** from +0,
+  one division per position;
+- each output dimension: a **sequential fma chain over positions** from 0, `o = fma(p_j,
+  v_j[i], o)`.
+
+Everything else is parallel: positions for the scores, exp and division; heads; dimensions;
+tokens. Causal masking is the loop bound (`j ≤ p0 + t`), not −∞ scores, as on the CPU.
+
+**Tiled attention with an online softmax (FlashAttention's order) cannot give these
+bits**: it rescales partial sums by `exp(m_old − m_new)` and divides once at the end.
+Simulated on the CPU with the same `math::exp` and fma (harness
+`online_softmax_is_not_bit_exact`), at OLMoE's shape and one token:
+
+| positions | tile | outputs that differ | max difference |
+|---|---|---|---|
+| 64 | 64 (one tile) | 1567 of 2048 (77%) | 1332 ulp |
+| 138 | 64 | 1686 (82%) | 611 ulp |
+| 1001 | 64 | 1873 (91%) | 1757 ulp |
+| 4096 | 64 | 1978 (97%) | 3249 ulp |
+| 4096 | 256 | 1986 (97%) | 3249 ulp |
+
+(Large ulp counts are on outputs near zero; this is ordinary rounding drift, not an error
+in the algorithm.) Even a single tile differs, because the division moves. So split-K
+attention, flash decoding and online softmax are **out under the current contract**;
+using them would be a lossy opt-in under ADR-010, an owner decision. The investigation
+keeps exact attention and makes it fast within the fixed order.
+
+### 19.3 The harness (feature `spike`, not production)
+
+- `qubivex-backend-vulkan` gains a `spike` cargo feature (off by default): `VulkanDevice::
+  {spike_kernel, spike_run}` build experimental SPIR-V on the fused layout (4 storage
+  bindings, 16-byte push) and run steps in one submission over host buffers, timed with
+  timestamps (`repeat` runs per submission, to amortise MoltenVK's late TOP timestamp,
+  §13). Nothing in the default build changes; production shaders and `build.sh` are
+  untouched.
+- `spike/`: `attn_exact.comp` (one workgroup of 128 per (token, head), scores in a device
+  buffer), `attn_exact_sh.comp` (scores in shared memory, ≤ 4096 positions),
+  `attn_scores_t.comp` + `attn_softmax.comp` + `attn_values.comp` (three dispatches, keys
+  stored dimension-major `[kv_head][d][pos]` so the scores read coalesced), their
+  unrolled softmax and values (`*_u.comp`: eight loads issued, then the eight adds or fmas
+  in the same order), and `rope.comp`. All built -O0 with NoContraction (`spike/build.sh`,
+  the production recipe).
+- `tests/attention_spike.rs` compares with `qubivex_arch::ops::{attend, Rope::rotate}`
+  (the CPU reference itself, a new dev-dependency).
+
+### 19.4 Numerical parity (measured)
+
+- **Exact attention, every variant: 379,376 of 379,376 outputs bit-identical** to
+  `ops::attend`: OLMoE (16 × 16 heads, d 128), grouped-query (8 heads on 2, d 64), d 96 and
+  d 200 (more than a workgroup), contexts 1, 2, 64, 65, 138, 1001, 4096 positions, 1, 4, 8
+  and 10 new tokens (prefill shapes, the causal bound per token), score spreads past
+  `exp`'s underflow (inputs ±30), a NaN key and an infinite key.
+- **RoPE: 25,165,824 of 25,165,824 bit-identical** with the host table at every position
+  0–4095, magnitudes 10⁻³ to 10³.
+- **Positive controls** (each restored after): the softmax sum pairwise instead of
+  sequential fails attention (1000+ differences); RoPE's `x1·c − x2·s` written as
+  `fma(x1, c, −x2·s)` fails RoPE.
+- Already proven and reusable: the norm's `1 / sqrt` (every f32 input, §18.8), `exp`
+  (SwiGLU, §15.1), the 64-lane sum of squares (`resnorm.comp`). Q/K norm is `resnorm`
+  without the residual.
+
+### 19.5 Kernel time (measured; GPU µs per layer call, OLMoE shape, mains)
+
+| positions | tokens | one workgroup | 3 dispatches | **3, unrolled** | CPU attend, 5 threads | CPU, 1 thread |
+|---|---|---|---|---|---|---|
+| 138 | 1 | 140 | 120 | **52** | 100 | 196 |
+| 512 | 1 | 218 | 244 | **106** | 243 | 658 |
+| 1024 | 1 | 484 | 482 | **189** | 413 | 1296 |
+| 2048 | 1 | 977 | 919 | **350** | 870 | 2588 |
+| 4096 | 1 | 1918 | 1827 | **725** | 1656 | 5269 |
+| 138 | 8 | 88 | 77 | **57** | | |
+| 1024 | 8 | 605 | 526 | **288** | | |
+| 4096 | 8 | 2475 | 1997 | **1333** | | |
+
+- By phase (3 dispatches, not unrolled, 4096 positions): scores 281 µs (32 MB of keys,
+  about 117 GB/s: near bandwidth), softmax 406 µs (one invocation's sequential sum from
+  device memory), values 1188 µs (2048 sequential chains, one dependent load per step,
+  about 27 GB/s). **The fixed-order chains are latency-bound, not bandwidth-bound**;
+  issuing loads ahead (unrolling) took the whole kernel from 1827 to 725 µs with the same
+  bits. More of the same (deeper unrolling, scores and probabilities staged in shared
+  memory for the chains) is the next lever.
+- The CPU's 5-thread figures include `std::thread::scope` start-up (about 40–60 µs per
+  call); rayon's pool in the real pass costs less, so the true CPU figure lies between the
+  1-thread time ÷ 5 and the 5-thread time. Host Q/K norms, RoPE and the KV store copy:
+  about 1 µs.
+- The 8-token rows share one sequence's keys (prefill-like). 8 independent sequences read
+  8 caches: the chains stay parallel, but the key and value bytes are 8×; at 4096
+  positions that is 512 MB per layer, which is bandwidth-bound on any device (and on the
+  CPU).
+
+### 19.6 KV cache design (proposed)
+
+- **Device KV as a mirror; the host cache stays authoritative.** The host cache
+  (ADR-009) keeps being written: in the routed layer submission the new K and V rows come
+  back with the outputs (16 KiB per token per layer), the host copies them in. Any pass the
+  device declines (prefill above the row limit, a traced pass, lookahead, a sequence whose
+  device KV could not be allocated) runs today's host attention unchanged, then uploads its
+  new rows to the device mirror at the start of the next submission (a copy, no extra
+  submission). So prefill and every fallback keep their current path and bits, and a
+  sequence can drop to host attention at any step without losing state.
+- **Layout:** paged blocks of 256 positions per layer, in one device pool: keys
+  dimension-major within a block (`[kv_head][d][256]`, coalesced scores), values
+  position-major (`[256][kv_head][d]`, coalesced chains). A sequence's block table (one
+  word per block) travels in the table buffer, so several sequences' attention runs in one
+  dispatch with no buffer per sequence, no prefix copy on growth, and no descriptor
+  indexing (the arena pattern of Step 3a). A block is allocated when a sequence crosses
+  its boundary; freed when the sequence ends.
+- **Kernels in the layer submission** (decode, s ≤ 8): QKV fused entries → Q/K norm and
+  RoPE and KV store fused into one kernel → scores → softmax → values → then Step 3c's O,
+  residual, norm, routing, experts and combine: about 12 dispatches, **one submission per
+  layer**.
+- **Concurrent sequences:** each token carries its sequence's position and block table;
+  every (token, head) chain is independent, so a batched pass of 8 sequences is one set of
+  dispatches; the 8 submitters keep independent passes in flight as today.
+
+### 19.7 Memory (OLMoE; f32 KV, as the CPU; ADR-010 rules out f16 KV)
+
+Per token: 16 layers × (K + V) × 16 heads × 128 × 4 bytes = **256 KiB** (16 KiB per layer).
+
+| context | per sequence | 8 sequences |
+|---|---|---|
+| 138 (the bench) | 35 MiB | 276 MiB |
+| 512 | 128 MiB | 1 GiB |
+| 1024 | 256 MiB | 2 GiB |
+| 4096 (the model's maximum) | 1 GiB | 8 GiB |
+
+Device memory already used with routing on (fully provisioned, §17.4): **4.21 GB** (expert
+arenas 1.81 + 2.09 GB, dense weights the rest) plus the 256 MiB reserve. KV pool room on a
+device of: 8 GB → about 3.5 GB (about 14,000 positions: 3 full contexts, or 27 sequences
+of 512); 12 GB → about 7.5 GB (30,000); 24 GB → about 19.5 GB (78,000). On this Mac the
+device is the same 18 GB as RAM, which already holds the host expert cache (3.7 GB) and
+the host KV, so the practical pool is a few GB.
+
+**Competition with experts:** routing on the device needs every expert resident (§17.4), so
+KV must never evict experts; a full pool must instead (a) refuse admission at the
+scheduler (KV blocks as a resource, as the ledger already does for host KV), or (b) leave
+that sequence on host attention (the mirror makes this free). Proposed: the plan reserves
+the pool after the experts (`--vulkan-kv-pool SIZE`, default: what the budget leaves after
+the experts and the reserve), the pool is charged to the ledger's KV owner on the `Vram`
+tier, and a sequence that cannot get a block runs host attention.
+
+### 19.8 Performance estimate (decode; an estimate, not a measurement)
+
+Per layer, moving the attention block to the device:
+- saves one hand-off: **about 125 µs** (Step 3c removed 16 for 2.0 ms, §18.9);
+- saves the host attention block: the CPU attend at that context (1-thread ÷ 5 to the
+  5-thread figure) plus about 1 µs;
+- adds the GPU attention (unrolled) and about 4 more encoder boundaries after fusing
+  (about 10 µs each on MoltenVK, §17.13: 40–60 µs).
+
+| context | gain per layer | per token (16 layers) | decode estimate |
+|---|---|---|---|
+| ~138 (the bench) | +53 to +133 µs | 0.9–2.1 ms | 29.0 → 26.9–28.1 ms (**35.6–37.2 tok/s**) |
+| 1024 | +145 to +299 µs | 2.3–4.8 ms | |
+| 4096 | +404 to +1006 µs | 6.5–16 ms | about 46–55 → about 40 ms |
+
+The gain grows with context because CPU attention grows faster than the device's.
+Concurrent: at 8 sequences the CPU's attention is 8× the work on 5 threads while the
+device runs the chains in parallel; Step 3c gained only 1.8% at N = 8, so attention may be
+a larger share there, but **nothing here measures it**. Prefill: unchanged by design (the
+host path runs it; uploading a 128-token prompt's rows is 32 MiB, a few ms). As the brief
+says, one submission per layer does not by itself guarantee a gain: at short context the
+estimate rests on the 52 µs kernel staying below the hand-off it replaces, and the
+encoder boundaries could eat half of it. The end-to-end bench decides.
+
+### 19.9 Risks
+
+1. **Fixed-order latency.** Exact parity forbids splitting the softmax sum and the value
+   chains across workgroups, so a token's attention latency is O(context) per layer
+   (725 µs at 4096 even unrolled). It beats the CPU here, but a faster CPU or a slower
+   GPU memory latency can flip it; the long-context case must be measured on each target.
+2. **Dispatch and encoder overhead on MoltenVK** (about 10 µs per boundary) can cancel
+   the short-context gain; fusing norm, RoPE and the store into one kernel, and scores
+   into the same workgroup as softmax where context allows, is required, not optional.
+3. **Online softmax / flash attention** would be several times faster at long context,
+   but changes the bits (77–97% of outputs). Using it is a contract change (ADR-010 /
+   ADR-011), the owner's call.
+4. **Memory:** the fully provisioned rule plus f32 KV leaves little room on 8 GB devices
+   and on this Mac (swap was already 7 GB in use during §18.9); a pool policy and the
+   ledger charge are needed before anything ships.
+5. **Driver correctness:** division, `sqrt` and `exp` are proven on MoltenVK only; the
+   attention adds divisions (softmax) and `1 / sqrt(d)`. A device-open probe is still not
+   built (§18.10).
+6. **Two copies of KV** (host authoritative, device mirror) cost host RAM equal to today's
+   and keep fallbacks trivial; dropping the host copy later saves 256 KiB per token but
+   makes every fallback need a download.
+7. **Compiler sensitivity:** the unrolled chains rely on the Metal compiler keeping the
+   order; -O0 and NoContraction plus the parity tests are the guard, as for every shader.
+8. **Measurement artefacts:** MoltenVK's timestamps under-count short submissions (§13);
+   the harness amortises them, and acceptance must be wall-clock end to end.
+
+### 19.10 Proposed next steps (for review; nothing started)
+
+1. Shared-memory staging and deeper unrolling in the harness (target: under 40 µs at 138
+   positions, under 600 at 4096), and a fused norm-RoPE-store kernel, with parity.
+2. A harness measurement of a whole layer's GPU time with attention in the routed
+   submission (all dispatches, one command buffer) against Step 3c's two submissions, at
+   1 and 8 sequences, before any production code.
+3. Then, behind its own switch and with the pool, ledger charge and fallbacks of §19.6–7:
+   the production path, measured alternated against Step 1a and Step 3c, single-stream,
+   concurrent and prefill.

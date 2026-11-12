@@ -1,0 +1,33 @@
+// RoPE for the harness (audit §19): `qubivex_arch::ops::Rope::rotate` on every head of
+// every token, in place, from the host's table (token t uses row t: [cos..., sin...]).
+// h[i] = x1·c − x2·s, h[i + half] = x2·c + x1·s: two products, each rounded, then one
+// add or subtract (NoContraction, build.sh).
+// Bindings: 0 x ([token][head][2·half]), 1 the table ([token][2·half]).
+// Push: half, heads per token, tokens. Grid: ceil(tokens·heads·half / 256).
+#version 450
+layout(local_size_x = 256) in;
+layout(std430, set = 0, binding = 0) buffer X { float x[]; };
+layout(std430, set = 0, binding = 1) readonly buffer CS { float cs[]; };
+layout(push_constant) uniform P { uint half_; uint heads; uint rows; uint unused; } p;
+void main() {
+    uint gid = gl_GlobalInvocationID.x;
+    uint per_token = p.heads * p.half_;
+    if (gid >= p.rows * per_token) {
+        return;
+    }
+    uint t = gid / per_token;
+    uint hd = (gid % per_token) / p.half_;
+    uint i = gid % p.half_;
+    uint b = (t * p.heads + hd) * 2u * p.half_;
+    uint c = t * 2u * p.half_;
+    float x1 = x[b + i];
+    float x2 = x[b + i + p.half_];
+    float co = cs[c + i];
+    float si = cs[c + p.half_ + i];
+    float a = x1 * co;
+    float bb = x2 * si;
+    float e = x2 * co;
+    float f = x1 * si;
+    x[b + i] = a - bb;
+    x[b + i + p.half_] = e + f;
+}
