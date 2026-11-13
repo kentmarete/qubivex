@@ -2403,3 +2403,183 @@ threads. Spawning those threads costs tens of µs, so the true figure lies betwe
   - whether the mirror stays host-authoritative (§19.6, §19.9 risk 6);
   - the 4096-position cap per dispatch, or chunking above it;
   - whether to measure prefill before step 3 or within it.
+- **Decided by the owner (2026-11-13)**, each the proposal of §19.6–§19.7:
+  - **KV pool:** `--vulkan-kv-pool SIZE`, default what the device budget leaves after the
+    expert cache (and the reserve), never more than one buffer the device addresses at
+    once; allocated on first use and charged whole to the ledger's KV owner on the VRAM
+    tier. KV never evicts experts. A pass that cannot get a block runs attention on the
+    host.
+  - **Mirror:** the host KV cache stays authoritative; the device holds a mirror.
+  - **Above 4096 positions:** the device declines and attention runs on the host through
+    the mirror. No chunking.
+  - **Prefill:** stays on the host path (its rows copied into the pool), and is measured
+    within step 3.
+
+## 21. Step 3 of §19.10: decode attention in the routed submission (2026-11-13)
+
+Behind `--vulkan-attn on|off` (default **off**; needs `--vulkan-route-o on`). Base: `main`
+at 4eb2c93. Step 3c is the fallback, and with the switch off nothing changes: the
+default build's submissions, shaders and bits are as before.
+
+### 21.1 What was built
+
+- **One submission per decode layer.** With the switch on, a decode step (every
+  sequence in the pass has exactly one new token, no trace, no lookahead) offers each
+  MoE layer to the device whole. The routed command buffer records, in order:
+  1. `kv_sync`: the host rows the device does not hold yet are copied into the pool
+     (copies only);
+  2. the Q, K and V projections, as fused-matmul dispatches into a device-local buffer
+     (one per run of matrices with one dtype and one row-block count: Q and K together,
+     then V, for OLMoE);
+  3. `attn_prelude`: the clip, the full-width Q and K norms, RoPE, and the store of the
+     new key and value into the token's block. A copy of both goes back for the host;
+  4. `attn_decode`: attention in one dispatch per (head, token) over the token's own
+     sequence;
+  5. Step 3c's steps unchanged: O, residual and FFN norm, router, routing, experts,
+     combine.
+
+  So a decode layer makes one submission instead of Step 3c's two, and attention no longer
+  runs on the host between them.
+- **Kernels.** `attn_prelude` is the harness's `qk_prelude` (§20.1) and `attn_decode` is
+  `attn_oneb_u16` (§20.1), with the same operations in the same order. Only the
+  addressing changed:
+  - the KV store and reads go through a block table;
+  - each token has its own position;
+  - the norms are optional (a model without Q and K norms skips them).
+
+  `kv_sync` has no arithmetic, so `shaders/build.sh` validates it without the
+  NoContraction pass. The three are checked by `spirv_is_current`, and every existing
+  SPIR-V file rebuilt byte for byte.
+- **The KV pool** (runtime, `discrete.rs`): one arena of 256-position blocks. Each block
+  holds one layer's keys, dimension-major (`[kv_head][d][256]`, coalesced scores), and
+  its values, position-major (`[256][kv_head][d]`, coalesced value chains). That is
+  4 MiB per block for OLMoE. Blocks are taken as a sequence grows and given back when its
+  cache is dropped.
+- **The mirror** lives in the sequence's KV cache's device slot (`KvCache::device_mut`).
+  For each layer it holds the sequence's blocks and how many positions they hold.
+  - Before a device pass, every position the host computed and the device does not hold
+    is listed to copy in: prefill, and any layer or pass that ran on the host.
+  - A mirror counts no further than the host's position count, so a pass that failed
+    after the device stored its row is written again.
+  - `KvCache` gains an epoch, bumped by `clear` and `restore_from`. A mirror from another
+    epoch gives its blocks back and starts again.
+  - The device returns the new keys and values, and the host stores them as before, so
+    the host cache is always complete.
+- **Declines (host attention, nothing written):**
+  - prefill or a mixed pass;
+  - a traced pass, or lookahead;
+  - per-head Q and K norms (Qwen3), which the prelude does not implement;
+  - a position at or past 4096;
+  - a head dimension over 512;
+  - QKV weights the fused kernels cannot read;
+  - no free block. The other layers of that pass still run on the device, and a block
+    the sequence already took stays with it.
+
+  A declined layer runs today's host path and then Step 3c, unchanged.
+- **Interface:** `MoeAttention` / `DeviceMoeAttention` at the head of a
+  `RoutedMoe` / `DeviceRoutedMoe` with a prelude; `routes_moe_attention`; and
+  `DiscreteDevice::kv_pool`. `attend` and the RoPE rotation moved into
+  `qubivex-compute::math` unchanged, so the simulated device runs the same operations.
+- **The simulated device** implements the stage over its own pool (`SimConfig::route_attention`,
+  `kv_pool`). So the runtime's pool, mirror, sync and epoch logic is tested without a GPU.
+- **Reports:** `DeviceReport::kv_pool` gives the pool's bytes, whether it is allocated,
+  blocks in all and free, layers run on the device, rows copied in, and layers declined
+  for lack of a block.
+
+### 21.2 Parity (measured)
+
+- **Simulated device** (`tests/discrete.rs`):
+  - every decode step's logits equal the CPU's on the three MoE fixtures (12 steps);
+  - every decode layer ran on the device, the prompt's rows were copied in exactly once
+    per layer, and every block was back in the pool after the cache was dropped;
+  - a pool one block short of the model runs one layer per step on the host, with the
+    CPU's bits;
+  - a cache cleared and refilled with another prompt gives the CPU's bits;
+  - 4 concurrent requests give the CPU's tokens.
+  - **Positive controls:** without the row copy-in, all three tests fail; without the
+    epoch reset, the clear-and-refill test fails.
+- **Vulkan, MoltenVK** (`tests/vulkan.rs`):
+  - every decode step's logits equal the CPU's on `olmoe-tiny` and `olmoe-tiny-gguf`.
+    `qwen3-moe-tiny` declines to the host, as designed, and also matches;
+  - one decode step makes one submission per layer plus the head;
+  - 4 concurrent requests give the CPU's tokens;
+  - a 250-token prompt decodes 20 steps past position 256, into a second block, with the
+    CPU's logits at every step (250 × layers rows copied in).
+  - **Positive controls** (shader restored and rebuilt after each): reading every key
+    from the first block fails the block-crossing test only; the softmax sum reordered
+    (`sum += a1 + a2; sum −= a2`) fails both.
+- **The real OLMoE** (`olmoe_routed_on_vulkan_matches_the_cpu`, `QUBIVEX_OLMOE_GGUF_DIR`,
+  256 MiB pool): with decode attention on the device it gives the CPU's prompt logits and
+  Colibri's 12 greedy tokens. At least 11 × 16 decode layers ran attention on the device.
+
+### 21.3 Measured on mains
+
+`scripts/bench-vulkan-baseline --tag step3d --variant routedo='--vulkan-route on --vulkan-route-o on' --variant attn='--vulkan-route on --vulkan-route-o on --vulkan-attn on --vulkan-kv-pool 512MiB'`:
+AC power, untimed, 3 alternated rounds (records
+`2026-11-13-m3pro-vulkan-step3d-{base,routedo,attn}-{1,2,3}.json`, log
+`…-step3d-mains.txt`). Every record's tokens equal the Step 1a reference.
+
+**Memory pressure:** swap was 3.4 GB at the start and 10.5 GB at the end, with the IDE
+open. Round 2's Step 1a and Step 3c medians are far off their other rounds (43.4 and
+36.8 ms), and every record has slow outlier steps (maxima of 34–150 ms). So the medians
+below carry that noise. The per-step minimum is shown too: interference cannot make a
+step faster. A quieter rerun would tighten the single-stream range.
+
+| Round | Step 1a ms/token | Step 3c | **Step 3c + attention** | Step 1a prefill ms | Step 3c | + attention |
+|---|---|---|---|---|---|---|
+| 1 | 37.24 | 30.19 | **27.59** | 199.7 | 205.8 | 207.6 |
+| 2 | 43.42 (disturbed) | 36.82 (disturbed) | **27.58** | 210.5 | 231.7 | 205.5 |
+| 3 | 35.21 | 29.17 | **25.82** | 201.8 | 200.6 | 198.5 |
+| fastest step | 30.29–32.21 | 26.58–27.60 | **24.75–24.88** | | | |
+| tok/s (median) | 23.0–28.4 | 27.2–34.3 | **36.2–38.7** | | | |
+| submissions/token | 305 | 33 | **17** | | | |
+
+- Against Step 3c in the same round (rounds 1 and 3): **−2.6 and −3.3 ms per token
+  (−8.6%, −11.5%)**. The fastest steps are 1.8–2.8 ms apart. That is within §20.4's
+  estimate of 1.8–4.5 ms. The fence waits per token fell from 26.4–27.3 ms (33 waits) to
+  24.2–24.7 ms (17 waits).
+- **35 tok/s: reached** (36.2–38.7 tok/s by median; the batch example's single stream
+  measures 37.3–38.0, below).
+- **Prefill:** no regression visible (198.5–207.6 ms against 200.6–231.7 for Step 3c and
+  199.7–210.5 for Step 1a). The 10-token prompt is neither routed nor on the device. Its
+  rows are copied into the pool by the first decode step, whose time is in the decode
+  median.
+
+Concurrent tok/s (batch example, 32 tokens per sequence, median of 3 per round; tokens
+identical in every mode; ranges over the three rounds):
+
+| N | Step 1a | Step 3c | **+ attention** | Gain over Step 3c (rounds 2–3) |
+|---|---|---|---|---|
+| 1 | 27.93–30.59 | 31.90–34.85 | **37.34–37.96** | +8.8% to +9.0% |
+| 2 | 33.09–34.91 | 40.34–41.19 | **43.63–44.04** | +6.9% to +7.0% |
+| 4 | 38.78–40.32 | 43.99–45.72 | **47.72–47.92** | +4.8% to +5.2% |
+| 8 | 42.57–44.27 | 48.27–49.18 | **50.00–50.30** | +2.3% to +2.7% |
+
+Round 1's Step 3c single-sequence figure (31.90) is low against its other rounds
+(34.71–34.85), so the gains use rounds 2 and 3. The attention rows agree across all
+three rounds within 1.7%.
+
+**Gates:**
+- identical tokens: yes, in every record and mode;
+- numerical correctness: yes (§21.2);
+- no prefill regression: none visible;
+- no concurrent regression: a gain at every N, smaller as N grows;
+- a single-stream gain over Step 3c: yes.
+
+The pool was 512 MiB here: 128 blocks, enough for 8 sequences of up to 256 positions. The
+default (what the budget leaves after the experts) was not measured. On this machine it
+would be the largest buffer MoltenVK addresses, about 4 GB of unified memory, which the
+pressure above argues against as a default here.
+
+### 21.4 Open for the owner
+
+- Accept Step 3 with the switch default off, as Steps 3b and 3c were (ADR-019 amendment
+  5), or ask for a quieter single-stream rerun first.
+- The default pool size. As decided it is what the budget leaves, up to one addressable
+  buffer. On unified memory that can be about 4 GB taken from RAM at the first decode
+  step; a cap (for example 1 GiB) or a size derived from the context and the
+  concurrency limit may suit this machine better.
+- Per-head Q and K norms (Qwen3) are declined to the host. Supporting them is a change to
+  the prelude's reduction (one RMSNorm per head), with its own parity tests.
+- Not built: chunked attention past 4096 positions; device attention for prefill
+  (measured unchanged, as decided).

@@ -381,3 +381,16 @@ Warm reads never saturate here, so `bench --disk-mbps N` (with `--disk-latency-u
 reads behind a simulated disk with one shared bandwidth. Use `--ram-budget 1GiB` for the
 tight regime (2–3 slots per layer). `--expert-cache-mb 1024` is a different regime: it
 gives the experts the whole GiB (17–18 slots). Results: ADR-008 amendment 3.
+
+## 2026-11-13: Vulkan decode attention on the device (audit §21)
+
+`--vulkan-attn on` (with `--vulkan-route on --vulkan-route-o on`, a 512 MiB
+`--vulkan-kv-pool`), alternated with Step 1a and Step 3c by `scripts/bench-vulkan-baseline
+--tag step3d`; records `2026-11-13-m3pro-vulkan-step3d-*.json`, log `…-step3d-mains.txt`.
+Mains, but under memory pressure (swap 3.4 → 10.5 GB): round 2's Step 1a and Step 3c
+medians are disturbed. Decode medians: Step 1a 35.21–43.42 ms, Step 3c 29.17–36.82 ms, with
+device attention **25.82–27.59 ms (36.2–38.7 tok/s)**. Fastest steps: 30.3–32.2, 26.6–27.6
+and 24.8–24.9 ms. Submissions per token: 305, 33, 17. Prefill unchanged. Concurrent
+(batch example, N = 1, 2, 4, 8): 37.3–38.0, 43.6–44.0, 47.7–47.9 and 50.0–50.3 tok/s, a gain
+over Step 3c at every N (+9% at 1 to +2.5% at 8). Tokens identical in every record and mode.
+Details in docs/engineering/VULKAN_EXECUTION_AUDIT.md §21.3.
