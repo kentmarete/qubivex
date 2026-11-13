@@ -59,7 +59,7 @@ use std::sync::{Arc, Mutex, MutexGuard, TryLockError};
 
 pub use device::{PhysicalInfo, list};
 #[cfg(feature = "spike")]
-pub use device::{SpikeKernel, SpikeStep, SpikeTiming};
+pub use device::{SpikeKernel, SpikePrefix, SpikeStep, SpikeTiming};
 use qubivex_compute::ComputeError;
 use qubivex_compute::discrete::{
     DeviceBuffer, DeviceGatedFfn, DeviceMatMul, DeviceRoutedMoe, DeviceUsage, DiscreteDevice,
@@ -285,6 +285,43 @@ impl VulkanDevice {
         repeat: u32,
     ) -> Result<SpikeTiming, ComputeError> {
         self.submitter().spike_run(steps, bufs, repeat)
+    }
+
+    /// Experimental (feature `spike`, audit §20): `steps` over copies of four host
+    /// buffers, to be recorded ahead of a later submission's own dispatches
+    /// ([`VulkanDevice::spike_arm`]).
+    ///
+    /// # Errors
+    /// [`ComputeError::Device`] when the driver fails or there is no fused layout.
+    #[cfg(feature = "spike")]
+    pub fn spike_prefix(
+        &self,
+        steps: &[SpikeStep<'_>],
+        bufs: [&[f32]; 4],
+    ) -> Result<SpikePrefix, ComputeError> {
+        self.submitter().spike_prefix(steps, bufs)
+    }
+
+    /// Experimental (feature `spike`): records `prefix` at the head of the next
+    /// submission of any kind, in the same command buffer.
+    #[cfg(feature = "spike")]
+    pub fn spike_arm(&self, prefix: SpikePrefix) {
+        self.submitter().spike_arm(prefix);
+    }
+
+    /// Experimental (feature `spike`): the armed prefix, once a submission has recorded
+    /// it, to read its buffers back.
+    #[cfg(feature = "spike")]
+    #[must_use]
+    pub fn spike_done(&self) -> Option<SpikePrefix> {
+        self.submitter().spike_done()
+    }
+
+    /// Experimental (feature `spike`): the last submission's fence wait and GPU time.
+    #[cfg(feature = "spike")]
+    #[must_use]
+    pub fn spike_last(&self) -> Option<SpikeTiming> {
+        self.submitter().spike_last()
     }
 
     /// Whether submissions are timed on the GPU (asked for, and the queue supports it).

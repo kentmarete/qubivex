@@ -198,6 +198,21 @@ pub(crate) struct Shared {
     /// Routing and combine on the device (Step 3b), on the fused layout; `None` without
     /// fused pipelines or if the driver could not build them.
     pub(crate) routed: Option<Routed>,
+    /// Experimental (feature `spike`, audit §20): steps the next submission records ahead
+    /// of its own, and the last submission's timing.
+    #[cfg(feature = "spike")]
+    spike: Mutex<SpikeHook>,
+}
+
+/// The `spike` feature's hook into every submission (audit §20).
+#[cfg(feature = "spike")]
+#[derive(Default)]
+struct SpikeHook {
+    /// Recorded at the head of the next command buffer, then moved to `done`.
+    pending: Option<SpikePrefix>,
+    done: Option<SpikePrefix>,
+    /// The last submission's (fence wait, GPU) nanoseconds.
+    last: Option<SpikeTiming>,
 }
 
 /// The routed layer's own pipelines, on [`Fused`]'s layout.
@@ -554,6 +569,8 @@ impl Shared {
             pipelines,
             fused,
             routed,
+            #[cfg(feature = "spike")]
+            spike: Mutex::default(),
         });
         Ok(Opened { shared, info })
     }
@@ -1394,6 +1411,12 @@ impl Submitter {
                 d.cmd_reset_query_pool(self.cmd, q, 0, 2);
                 d.cmd_write_timestamp(self.cmd, vk::PipelineStageFlags::TOP_OF_PIPE, q, 0);
             }
+            #[cfg(feature = "spike")]
+            let prefix = lock_hook(&self.shared.spike).pending.take();
+            #[cfg(feature = "spike")]
+            if let Some(p) = &prefix {
+                p.record(d, self.cmd);
+            }
             record(d, self.cmd);
             if let Some(q) = queries {
                 d.cmd_write_timestamp(self.cmd, vk::PipelineStageFlags::BOTTOM_OF_PIPE, q, 1);
@@ -1438,6 +1461,17 @@ impl Submitter {
                     Some((start, end.max(start)))
                 }
             };
+            #[cfg(feature = "spike")]
+            {
+                let mut hook = lock_hook(&self.shared.spike);
+                hook.last = Some(SpikeTiming {
+                    wait_ns,
+                    gpu_ns: gpu.map(|(a, b)| b - a),
+                });
+                if prefix.is_some() {
+                    hook.done = prefix;
+                }
+            }
             Ok(Ran {
                 submitted,
                 wait_ns,
@@ -3315,6 +3349,173 @@ impl Submitter {
             wait_ns: ran.wait_ns,
             gpu_ns: ran.gpu.map(|(a, b)| b - a),
         })
+    }
+}
+
+#[cfg(feature = "spike")]
+fn lock_hook(m: &Mutex<SpikeHook>) -> MutexGuard<'_, SpikeHook> {
+    m.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// Experimental steps (feature `spike`, audit §20) over their own four host-visible
+/// buffers, recorded at the head of the next submission (whatever records it), then a
+/// barrier, so that submission's own dispatches follow them in one command buffer.
+#[cfg(feature = "spike")]
+pub struct SpikePrefix {
+    shared: Arc<Shared>,
+    pool: vk::DescriptorPool,
+    set: vk::DescriptorSet,
+    allocs: Vec<Allocation>,
+    steps: Vec<(vk::Pipeline, [u32; 4], [u32; 3])>,
+}
+
+#[cfg(feature = "spike")]
+impl Drop for SpikePrefix {
+    fn drop(&mut self) {
+        // SAFETY: a prefix is only recorded into a submission that is waited for before
+        // it is handed back, so its set is not in use.
+        unsafe { self.shared.device.destroy_descriptor_pool(self.pool, None) };
+    }
+}
+
+#[cfg(feature = "spike")]
+impl std::fmt::Debug for SpikePrefix {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SpikePrefix")
+            .field("steps", &self.steps.len())
+            .finish_non_exhaustive()
+    }
+}
+
+#[cfg(feature = "spike")]
+impl SpikePrefix {
+    /// Binding `i`'s contents now (after the submission that recorded the prefix).
+    pub fn read(&mut self, i: usize, len: usize) -> Vec<f32> {
+        self.allocs[i].floats_mut()[..len].to_vec()
+    }
+
+    /// Records the steps, a barrier between every two, and one after the last.
+    ///
+    /// # Safety
+    /// `cmd` is recording, and is waited for before the prefix is dropped.
+    unsafe fn record(&self, d: &ash::Device, cmd: vk::CommandBuffer) {
+        let Some(fused) = self.shared.fused.as_ref() else {
+            return;
+        };
+        let between = [vk::MemoryBarrier::default()
+            .src_access_mask(vk::AccessFlags::SHADER_WRITE)
+            .dst_access_mask(vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE)];
+        // SAFETY: as the caller promises; the set and pipelines outlive the submission.
+        unsafe {
+            for (pipeline, words, [x, y, z]) in &self.steps {
+                let mut push = [0u8; 16];
+                for (j, w) in words.iter().enumerate() {
+                    push[4 * j..4 * j + 4].copy_from_slice(&w.to_ne_bytes());
+                }
+                d.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, *pipeline);
+                d.cmd_bind_descriptor_sets(
+                    cmd,
+                    vk::PipelineBindPoint::COMPUTE,
+                    fused.layout,
+                    0,
+                    &[self.set],
+                    &[],
+                );
+                d.cmd_push_constants(cmd, fused.layout, vk::ShaderStageFlags::COMPUTE, 0, &push);
+                d.cmd_dispatch(cmd, *x, *y, *z);
+                d.cmd_pipeline_barrier(
+                    cmd,
+                    vk::PipelineStageFlags::COMPUTE_SHADER,
+                    vk::PipelineStageFlags::COMPUTE_SHADER,
+                    vk::DependencyFlags::empty(),
+                    &between,
+                    &[],
+                    &[],
+                );
+            }
+        }
+    }
+}
+
+#[cfg(feature = "spike")]
+impl Submitter {
+    /// A [`SpikePrefix`] of `steps` over copies of `bufs`.
+    pub(crate) fn spike_prefix(
+        &self,
+        steps: &[SpikeStep<'_>],
+        bufs: [&[f32]; 4],
+    ) -> Result<SpikePrefix, ComputeError> {
+        let shared = Arc::clone(&self.shared);
+        if shared.fused.is_none() {
+            return Err(err("spike", "no fused layout"));
+        }
+        let mut allocs = Vec::with_capacity(4);
+        for b in bufs {
+            let mut a = Allocation::new(
+                &shared,
+                (4 * b.len() as u64).max(16),
+                vk::BufferUsageFlags::STORAGE_BUFFER,
+                true,
+            )?;
+            a.floats_mut()[..b.len()].copy_from_slice(b);
+            allocs.push(a);
+        }
+        let d = &shared.device;
+        let pool = descriptor_pool_of(d, 1, 4)?;
+        let layouts = [shared
+            .fused
+            .as_ref()
+            .map_or(vk::DescriptorSetLayout::null(), |f| f.set_layout)];
+        // SAFETY: a new pool with room for one set of this layout.
+        let set = unsafe {
+            d.allocate_descriptor_sets(
+                &vk::DescriptorSetAllocateInfo::default()
+                    .descriptor_pool(pool)
+                    .set_layouts(&layouts),
+            )
+        };
+        let set = match set {
+            Ok(v) => v[0],
+            Err(e) => {
+                // SAFETY: nothing was allocated from it.
+                unsafe { d.destroy_descriptor_pool(pool, None) };
+                return Err(err("descriptor sets", e));
+            }
+        };
+        let whole = |a: &Allocation| (a.buffer, 0, None);
+        self.write_set(
+            set,
+            [
+                whole(&allocs[0]),
+                whole(&allocs[1]),
+                whole(&allocs[2]),
+                whole(&allocs[3]),
+            ],
+        );
+        Ok(SpikePrefix {
+            shared: Arc::clone(&shared),
+            pool,
+            set,
+            allocs,
+            steps: steps.iter().map(|(k, w, g)| (k.pipeline, *w, *g)).collect(),
+        })
+    }
+
+    /// Arms `prefix` for the next submission.
+    pub(crate) fn spike_arm(&self, prefix: SpikePrefix) {
+        let mut hook = lock_hook(&self.shared.spike);
+        hook.pending = Some(prefix);
+        hook.done = None;
+    }
+
+    /// The prefix the last armed submission recorded, if it has run.
+    pub(crate) fn spike_done(&self) -> Option<SpikePrefix> {
+        lock_hook(&self.shared.spike).done.take()
+    }
+
+    /// The last submission's timing.
+    pub(crate) fn spike_last(&self) -> Option<SpikeTiming> {
+        lock_hook(&self.shared.spike).last
     }
 }
 
