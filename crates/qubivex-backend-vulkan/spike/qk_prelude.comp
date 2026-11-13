@@ -1,0 +1,145 @@
+// The attention prelude in one dispatch for the harness (audit §20): what the CPU's
+// forward pass does between the QKV projections and attention (`qubivex-arch`
+// lib.rs), with its bits:
+//   1. clip: z = z.clamp(-c, c) on q, k and v when the model clips (Rust's clamp: a NaN
+//      stays NaN, -0 stays -0);
+//   2. Q and K norms over the full width (QkNorm::Full, OLMoE): `math::rms_norm` per
+//      token, the sum of squares the 64-lane reduction of resnorm.comp, the scale
+//      rms.glsl, each output (x · r) · w;
+//   3. RoPE on every head of q and k (`Rope::rotate`, two products each rounded, then one
+//      add or subtract), from the host's table row for the token's position;
+//   4. the KV store: k into K^T [kv_head][d][span] at column p0 + t, v into
+//      [pos][kv_head][d] at v_base, as attn_split.glsl lays them out.
+// q is rotated in place.
+//
+// One workgroup of 64 per (part, token): part 0 is q, 1 is k, 2 is v. Grid: (3, tokens).
+// Bindings: 0 q, k and v, region-major as the QKV submission writes them ([token][q_out]
+// for every token, then [token][kv_out] for k, then for v), so q is attention's input as
+// it stands; 1 the KV
+// buffer; 2 the table: header words, then the q norm weight, the k norm weight and one
+// RoPE row ([cos..., sin...], 2·half) per token, as f32 bits; 3 unused.
+// Header (uint): d, heads, kv_heads, p0, span, v_base, eps bits, clip bits (0: no clip),
+// qn_base, kn_base, cs_base, k_base (K^T's first word).
+// Push: the header's first word, and a stride. Stride 0: every token reads that header and
+// is one sequence's (prefill): token t at position p0 + t, RoPE row cs_base + t·d. Stride
+// non-zero (batched decode): token t reads the header at first + t·stride, is its own
+// sequence's token at p0, RoPE row cs_base.
+#version 450
+#extension GL_GOOGLE_include_directive : require
+layout(local_size_x = 64) in;
+const uint LANES = 64u;
+layout(std430, set = 0, binding = 0) buffer Qkv { float x[]; };
+layout(std430, set = 0, binding = 1) buffer KV { float kv[]; };
+layout(std430, set = 0, binding = 2) readonly buffer Table { uint tab[]; };
+layout(std430, set = 0, binding = 3) buffer Unused { float unused_[]; };
+layout(push_constant) uniform P { uint a; uint b; uint c; uint e; } p;
+shared float red[LANES];
+shared float scale;
+#include "rms.glsl"
+
+float clip(float z, float c) {
+    return z < -c ? -c : (z > c ? c : z);
+}
+
+float wt(uint i) {
+    return uintBitsToFloat(tab[i]);
+}
+
+void main() {
+    uint part = gl_WorkGroupID.x;
+    uint t = gl_WorkGroupID.y;
+    uint l = gl_LocalInvocationID.x;
+    bool batch = p.b != 0u;
+    uint hb = p.a + t * p.b;
+    uint d = tab[hb];
+    uint heads = tab[hb + 1u];
+    uint kvh = tab[hb + 2u];
+    uint p0 = tab[hb + 3u];
+    uint span = tab[hb + 4u];
+    uint v_base = tab[hb + 5u];
+    float eps = uintBitsToFloat(tab[hb + 6u]);
+    uint clip_bits = tab[hb + 7u];
+    uint k_base = tab[hb + 11u];
+    float cl = uintBitsToFloat(clip_bits);
+    uint q_out = heads * d;
+    uint kv_out = kvh * d;
+    uint toks = gl_NumWorkGroups.y;
+    uint q_at = t * q_out;
+    uint k_at = toks * q_out + t * kv_out;
+    uint v_at = toks * (q_out + kv_out) + t * kv_out;
+    uint pos = batch ? p0 : p0 + t;
+    if (part == 2u) {
+        uint vb = v_at;
+        for (uint i = l; i < kv_out; i += LANES) {
+            float z = x[vb + i];
+            if (clip_bits != 0u) {
+                z = clip(z, cl);
+            }
+            kv[v_base + pos * kv_out + i] = z;
+        }
+        return;
+    }
+    uint n = part == 0u ? q_out : kv_out;
+    uint base = part == 0u ? q_at : k_at;
+    uint w_base = part == 0u ? tab[hb + 8u] : tab[hb + 9u];
+    float acc = 0.0;
+    for (uint i = l; i < n; i += LANES) {
+        float z = x[base + i];
+        if (clip_bits != 0u) {
+            z = clip(z, cl);
+            x[base + i] = z;
+        }
+        acc = fma(z, z, acc);
+    }
+    red[l] = acc;
+    memoryBarrierShared();
+    memoryBarrierBuffer();
+    barrier();
+    for (uint w = 32u; w >= 4u; w /= 2u) {
+        float v = 0.0;
+        if (l < w) {
+            v = red[l] + red[l + w];
+        }
+        memoryBarrierShared();
+        barrier();
+        if (l < w) {
+            red[l] = v;
+        }
+        memoryBarrierShared();
+        barrier();
+    }
+    if (l == 0u) {
+        float ss = (red[0] + red[1]) + (red[2] + red[3]);
+        scale = rms_scale_of(ss, float(n), eps);
+    }
+    memoryBarrierShared();
+    barrier();
+    float r = scale;
+    uint half_ = d / 2u;
+    uint cs = tab[hb + 10u] + (batch ? 0u : t * d);
+    uint pairs = (n / d) * half_;
+    for (uint u = l; u < pairs; u += LANES) {
+        uint hd = u / half_;
+        uint i = u % half_;
+        uint i1 = hd * d + i;
+        uint i2 = i1 + half_;
+        float x1 = (x[base + i1] * r) * wt(w_base + i1);
+        float x2 = (x[base + i2] * r) * wt(w_base + i2);
+        float co = wt(cs + i);
+        float si = wt(cs + half_ + i);
+        float a = x1 * co;
+        float bb = x2 * si;
+        float e = x2 * co;
+        float f = x1 * si;
+        float y1 = a - bb;
+        float y2 = e + f;
+        if (part == 0u) {
+            x[base + i1] = y1;
+            x[base + i2] = y2;
+        } else {
+            // K^T: [kv_head][d][span], column pos.
+            kv[k_base + (hd * d + i) * span + pos] = y1;
+            kv[k_base + (hd * d + i + half_) * span + pos] = y2;
+        }
+    }
+}

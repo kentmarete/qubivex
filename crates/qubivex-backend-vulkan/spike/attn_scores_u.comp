@@ -1,0 +1,47 @@
+// Scores, unrolled (audit §20): as attn_scores_t.comp (q·k as a sequential fma chain over
+// d from 0, then times 1 / sqrt(d)), with U dimensions' key loads issued before their U
+// fmas, and q staged in shared memory. Grid: (ceil(span / 256), heads, tokens).
+#version 450
+#extension GL_GOOGLE_include_directive : require
+layout(local_size_x = 256) in;
+#include "attn_split.glsl"
+#ifndef U
+#define U 8
+#endif
+const uint MAXD = 512u;
+shared float qs[MAXD];
+void main() {
+    uint j = gl_GlobalInvocationID.x;
+    uint h = gl_WorkGroupID.y;
+    uint t = gl_WorkGroupID.z;
+    uint s = gl_NumWorkGroups.z;
+    uint span = p.p0 + s;
+    uint d = D;
+    uint qb = (t * HEADS + h) * d;
+    for (uint i = gl_LocalInvocationID.x; i < d; i += 256u) {
+        qs[i] = q[qb + i];
+    }
+    memoryBarrierShared();
+    barrier();
+    if (j > p.p0 + t) {
+        return;
+    }
+    uint g = h / GROUP;
+    uint kb = g * d * span + j;
+    float scale = 1.0 / sqrt(float(d));
+    float acc = 0.0;
+    uint i = 0u;
+    for (; i + U <= d; i += U) {
+        float k[U];
+        for (uint u = 0u; u < U; u++) {
+            k[u] = kv[kb + (i + u) * span];
+        }
+        for (uint u = 0u; u < U; u++) {
+            acc = fma(qs[i + u], k[u], acc);
+        }
+    }
+    for (; i < d; i++) {
+        acc = fma(qs[i], kv[kb + i * span], acc);
+    }
+    sc[(t * HEADS + h) * span + j] = acc * scale;
+}

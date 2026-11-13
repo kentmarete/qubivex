@@ -1,0 +1,207 @@
+// Softmax and values in one dispatch for the harness (audit §20), the same operations and
+// order as attn_softmax.comp followed by attn_values.comp: per (token, head), a
+// NaN-ignoring tree maximum over the visible scores, exp(v - m) in parallel into shared
+// memory, the sum sequential from +0 in one invocation (reading shared memory), one
+// division per position into shared memory, then each output dimension's fma chain over
+// positions from 0, the probabilities read from shared memory and the values from the
+// device, U positions' loads issued before their U fmas.
+//
+// VEC4 (built as attn_sv4_*): each invocation runs four dimensions' chains (i, i+1, i+2,
+// i+3) side by side from one vec4 load per position; each chain is still its own
+// sequential fma chain in position order. Needs d % 4 == 0 and v_base % 4 == 0.
+//
+// ONE (built as attn_one_*): the scores are computed here too (attn_scores_u.comp's
+// chain, 16 key loads issued before their fmas), so attention is one dispatch.
+//
+// BATCH (with ONE; built as attn_oneb_*): each token is its own sequence (batched decode):
+// token t sees p0 + 1 positions of its own cache, K^T for sequence t at t·KVH·d·(p0 + 1),
+// V for sequence t at v_base + t·(p0 + 1)·KVH·d.
+//
+// Positions visible to one token: at most MAXP (shared memory). Bindings and push as
+// attn_split.glsl; binding 3 holds the scores from attn_scores_t.comp (read only here).
+// Grid: (heads, tokens).
+#version 450
+#extension GL_GOOGLE_include_directive : require
+layout(local_size_x = 128) in;
+#include "attn_split.glsl"
+#ifdef VEC4
+layout(std430, set = 0, binding = 1) readonly buffer KV4 { vec4 kv4[]; };
+layout(std430, set = 0, binding = 2) writeonly buffer Out4 { vec4 out4[]; };
+#endif
+#ifndef U
+#define U 8
+#endif
+const uint LOCAL = 128u;
+const uint MAXP = 4096u;
+shared float red[LOCAL];
+shared float stot;
+shared float pr[MAXP];
+#ifdef ONE
+shared float qs[512];
+#endif
+#include "exp.glsl"
+float fmax_rust(float a, float b) {
+    return isnan(a) ? b : (isnan(b) ? a : max(a, b));
+}
+void main() {
+    uint h = gl_WorkGroupID.x;
+    uint t = gl_WorkGroupID.y;
+    uint s = gl_NumWorkGroups.y;
+#ifdef BATCH
+    uint span = p.p0 + 1u;
+    uint n = span;
+    uint seq_kv = t * KVH * D * span;
+#else
+    uint span = p.p0 + s;
+    uint n = p.p0 + t + 1u;
+    uint seq_kv = 0u;
+#endif
+    uint l = gl_LocalInvocationID.x;
+    uint sb = (t * HEADS + h) * span;
+    float m = uintBitsToFloat(0xff800000u);
+#ifdef ONE
+    uint dd = D;
+    uint qb = (t * HEADS + h) * dd;
+    for (uint i = l; i < dd; i += LOCAL) {
+        qs[i] = q[qb + i];
+    }
+    memoryBarrierShared();
+    barrier();
+    uint kb0 = seq_kv + (h / GROUP) * dd * span;
+    float scale = 1.0 / sqrt(float(dd));
+#endif
+    for (uint j = l; j < n; j += LOCAL) {
+#ifdef ONE
+        uint kb = kb0 + j;
+        float acc = 0.0;
+        uint i = 0u;
+        for (; i + 16u <= dd; i += 16u) {
+            float k[16];
+            for (uint u = 0u; u < 16u; u++) {
+                k[u] = kv[kb + (i + u) * span];
+            }
+            for (uint u = 0u; u < 16u; u++) {
+                acc = fma(qs[i + u], k[u], acc);
+            }
+        }
+        for (; i < dd; i++) {
+            acc = fma(qs[i], kv[kb + i * span], acc);
+        }
+        float v = acc * scale;
+#else
+        float v = sc[sb + j];
+#endif
+        pr[j] = v;
+        m = fmax_rust(m, v);
+    }
+    red[l] = m;
+    memoryBarrierShared();
+    barrier();
+    for (uint w = LOCAL / 2u; w > 0u; w /= 2u) {
+        float v = 0.0;
+        if (l < w) {
+            v = fmax_rust(red[l], red[l + w]);
+        }
+        memoryBarrierShared();
+        barrier();
+        if (l < w) {
+            red[l] = v;
+        }
+        memoryBarrierShared();
+        barrier();
+    }
+    m = red[0];
+    for (uint j = l; j < n; j += LOCAL) {
+        pr[j] = qexp(pr[j] - m);
+    }
+    memoryBarrierShared();
+    barrier();
+    if (l == 0u) {
+        float sum = 0.0;
+        uint j = 0u;
+        for (; j + 8u <= n; j += 8u) {
+            float a0 = pr[j];
+            float a1 = pr[j + 1u];
+            float a2 = pr[j + 2u];
+            float a3 = pr[j + 3u];
+            float a4 = pr[j + 4u];
+            float a5 = pr[j + 5u];
+            float a6 = pr[j + 6u];
+            float a7 = pr[j + 7u];
+            sum += a0;
+            sum += a1;
+            sum += a2;
+            sum += a3;
+            sum += a4;
+            sum += a5;
+            sum += a6;
+            sum += a7;
+        }
+        for (; j < n; j++) {
+            sum += pr[j];
+        }
+        stot = sum;
+    }
+    memoryBarrierShared();
+    barrier();
+    float sum = stot;
+    for (uint j = l; j < n; j += LOCAL) {
+        pr[j] = pr[j] / sum;
+    }
+    memoryBarrierShared();
+    barrier();
+    uint d = D;
+    uint g = h / GROUP;
+    uint stride = KVH * d;
+#ifdef VEC4
+    uint c = l;
+    if (4u * c >= d) {
+        return;
+    }
+    uint stride4 = stride / 4u;
+    uint vb4 = (p.v_base + seq_kv + g * d) / 4u + c;
+    vec4 o = vec4(0.0);
+    uint j = 0u;
+    for (; j + U <= n; j += U) {
+        vec4 v[U];
+        for (uint k = 0u; k < U; k++) {
+            v[k] = kv4[vb4 + (j + k) * stride4];
+        }
+        for (uint k = 0u; k < U; k++) {
+            float pk = pr[j + k];
+            o.x = fma(pk, v[k].x, o.x);
+            o.y = fma(pk, v[k].y, o.y);
+            o.z = fma(pk, v[k].z, o.z);
+            o.w = fma(pk, v[k].w, o.w);
+        }
+    }
+    for (; j < n; j++) {
+        vec4 vv = kv4[vb4 + j * stride4];
+        float pk = pr[j];
+        o.x = fma(pk, vv.x, o.x);
+        o.y = fma(pk, vv.y, o.y);
+        o.z = fma(pk, vv.z, o.z);
+        o.w = fma(pk, vv.w, o.w);
+    }
+    out4[((t * HEADS + h) * d) / 4u + c] = o;
+#else
+    for (uint i = l; i < d; i += LOCAL) {
+        uint vb = p.v_base + seq_kv + g * d + i;
+        float o = 0.0;
+        uint j = 0u;
+        for (; j + U <= n; j += U) {
+            float v[U];
+            for (uint k = 0u; k < U; k++) {
+                v[k] = kv[vb + (j + k) * stride];
+            }
+            for (uint k = 0u; k < U; k++) {
+                o = fma(pr[j + k], v[k], o);
+            }
+        }
+        for (; j < n; j++) {
+            o = fma(pr[j], kv[vb + j * stride], o);
+        }
+        out_[(t * HEADS + h) * d + i] = o;
+    }
+#endif
+}
