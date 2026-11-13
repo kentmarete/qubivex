@@ -2234,3 +2234,172 @@ encoder boundaries could eat half of it. The end-to-end bench decides.
 3. Then, behind its own switch and with the pool, ledger charge and fallbacks of §19.6–7:
    the production path, measured alternated against Step 1a and Step 3c, single-stream,
    concurrent and prefill.
+
+## 20. GPU attention: faster exact kernels and a whole-layer measurement (2026-11-13)
+
+Steps 1 and 2 of §19.10, harness only (feature `spike`, off by default). Production
+shaders, `shaders/build.sh` and every default-build path are unchanged; the new SPIR-V is
+under `spike/` and rebuilds byte for byte from `spike/build.sh`. Base: `main` at 7e536ad.
+Measured on mains, GPU time from the queue's timestamps.
+
+### 20.1 What was built
+
+- `spike/attn_sv.comp`: softmax and values fused into one dispatch per (token, head).
+  Scores are read once into shared memory (at most 4096 positions), then the tree maximum,
+  `exp`, the sequential sum by one invocation and the divisions all stay in shared
+  memory, followed by each output dimension's fma chain over positions. That chain issues
+  `U` value loads before its `U` fmas, in the same order. Build options: `U` is 8, 16 or
+  32; `VEC4` runs four dimensions' chains per invocation from one vec4 load; `ONE`
+  computes the scores in the same workgroup, giving attention in **one dispatch**;
+  `BATCH` makes each token its own sequence with its own cache (batched decode).
+- `spike/attn_scores_u.comp`: the scores with q in shared memory and `U` key loads
+  issued ahead of their fmas.
+- `spike/qk_prelude.comp`: everything the CPU does between the QKV projections and
+  attention, in one dispatch:
+  - the clip (Rust's `clamp`);
+  - the full-width Q and K norms (resnorm's 64-lane sum of squares and `rms.glsl`);
+  - RoPE on every head, from the host's table;
+  - the store of k into the dimension-major K^T and of v into the position-major V.
+
+  q, k and v are read region-major, as the QKV submission writes them, so q is
+  attention's input as it stands. Through a header stride in the push constants, one
+  dispatch serves one sequence's tokens (prefill) or one token for each of several
+  sequences (batched decode).
+- A `spike`-only hook in `device.rs`: `VulkanDevice::spike_prefix` / `spike_arm` record
+  experimental steps at the head of the next submission's command buffer, whatever
+  records it, with a barrier after each step. `spike_last` returns the last submission's
+  wait and GPU time. Without the feature nothing is compiled in.
+
+### 20.2 Parity (measured)
+
+- **Attention:** every variant matches `ops::attend` bit for bit: 16 kernels (6
+  softmax-values after the plain scores, 6 pairings of the unrolled scores, 4 one-dispatch).
+  Each gave **379,376 of 379,376 outputs** on §19.4's cases: OLMoE, grouped-query, d 96
+  and 200, contexts 1–4096, 1–10 new tokens, spreads past `exp`'s underflow, a NaN key and
+  an infinite key.
+- **Prelude:** 1,225,728 written outputs (q and the stored k and v) bit-identical to the
+  CPU's `clamp`, `rms_norm`, `Rope::rotate` and store. Every other word of the KV buffer
+  was left unchanged; 347,296,768 words were compared in all. The cases covered:
+  - OLMoE and two grouped-query shapes;
+  - 1 and 8 tokens, positions up to 4095;
+  - with and without the clip, magnitudes 10⁻³ to 10³;
+  - a NaN, an infinity and a -0 in the inputs.
+- **In the routed submission:** the prelude and one-dispatch attention ran as a prefix of
+  Step 3c's routed command buffer for 1 and 8 sequences (138 to 1024 positions). They
+  gave **36,864 of 36,864** outputs equal to the CPU's prelude followed by `attend`.
+- **Positive controls** (each restored after, and the SPIR-V rebuilt identically):
+  - the softmax sum pairwise instead of sequential: fails (125,672 differences in the
+    first kernel checked);
+  - each values block's fmas in reverse order: fails;
+  - RoPE's `x1·c − x2·s` as `fma(x1, c, −x2·s)` in the prelude: fails.
+
+### 20.3 Kernel time (measured; GPU µs per layer call, OLMoE shape)
+
+Each cell is the median of 5 samples after a one-second warm-up; each sample is 50 runs in
+one submission. Two runs are shown as ranges; a single figure means they agreed. "Tokens"
+here share one sequence's cache (prefill-like), as in §19.5.
+
+| positions | tokens | §19 best (3 dispatches, unrolled) | scores u16 + softmax-values u16 | **one dispatch, u16** | one dispatch, vec4 u16 |
+|---:|---:|---:|---:|---:|---:|
+| 138 | 1 | 45–50 | 32–35 | **17** | 18 |
+| 138 | 8 | 60–61 | 60 | **50** | 51 |
+| 512 | 1 | 110 | 79 | **62** | 64 |
+| 512 | 8 | 150–153 | 160 | **142–144** | 150–152 |
+| 1024 | 1 | 186–187 | 172–174 | **152–158** | 156 |
+| 1024 | 8 | 286 | 310–315 | 301 | 327–340 |
+| 2048 | 1 | 349–350 | 321–324 | **304–307** | 306–310 |
+| 2048 | 8 | 599–602 | 592–598 | 589–591 | 630–632 |
+| 4096 | 1 | 674–676 | 620–627 | 625–652 | 641–677 |
+| 4096 | 8 | 1305–1396 | 1155–1197 | 1189–1195 | 1275–1296 |
+
+- §19.10's targets: **under 40 µs at 138 positions: met (17 µs)**. Under 600 at 4096:
+  **not met (620–652 µs)**. At 4096 positions one layer reads 67 MB of f32 keys and
+  values, so 625 µs is about 107 GB/s, near this machine's bandwidth. What remains there
+  is the bytes (f32 KV; ADR-010 rules out f16 KV), not the order of operations.
+- The one-dispatch kernel gains most at short context because it removes a dispatch
+  boundary and the scores' round trip through device memory. Its scores use 128
+  invocations per head instead of one per position, which is enough at decode.
+- One run of the per-phase timing (`attention_two_phase_timings`; one run only, not
+  repeated): at 138 positions, unrolling the scores took them from 37 to 12–15 µs.
+- More unrolling of the value chains (32 instead of 16) and four chains per invocation
+  (vec4) gained nothing or lost time; 16 scalar is the best of those measured.
+- **Prelude:** 16.2–16.8 µs for 1 or 8 tokens. Most of that is the fixed cost of a
+  dispatch; the host does the same work in about 1 µs (§19.5).
+
+### 20.4 A whole layer (measured, composed where stated)
+
+`tests/layer_spike.rs`: OLMoE's layer shape on synthetic weights, with Q and K Q4_K, V
+Q6_K, O Q4_K, an f32 router, and 64 experts (Q4_K gate and up, Q6_K down) in one arena.
+Three calls alternate 23 times per cell; the medians of the last 21 are shown. The
+prefix is the prelude plus one-dispatch attention (`attn_oneb_u16`: each sequence reads
+its own cache, so 8 sequences read 8 caches, unlike the 8-token rows above). Host
+attention is the CPU's prelude and `attend` per (sequence, head) on `std::thread::scope`
+threads. Spawning those threads costs tens of µs, so the true figure lies between the
+1-thread time ÷ 5 and the 5-thread time, as in §19.5. Two runs, as ranges.
+
+| sequences | positions | QKV submission: wall / GPU µs | routed (Step 3c): wall / GPU | host attention: 5 threads / 1 thread | routed with attention at its head: wall / GPU | GPU added by attention |
+|---:|---:|---:|---:|---:|---:|---:|
+| 1 | 138 | 504–532 / 225 | 1298–1302 / 969–970 | 163–213 / 244–277 | 1349–1360 / 1026–1029 | 57–59 |
+| 1 | 1024 | 455–482 / 225 | 1247–1281 / 969 | 668–727 / 1509–1523 | 1435–1499 / 1165–1171 | 196–202 |
+| 1 | 4096 | 537–643 / 225–227 | 1286–1486 / 970–978 | 2880–2992 / 6581–7854 | 2081–2306 / 1681–1752 | 711–775 |
+| 8 | 138 | 1911–2032 / 1591 | 7431–7535 / 7059–7065 | 664–803 / 1676–1879 | 7673–7790 / 7264–7284 | 205–219 |
+| 8 | 1024 | 1931–1985 / 1590–1591 | 7452–7467 / 7060–7061 | 4136–4306 / 11732–12739 | 8650–8724 / 8236–8276 | 1176–1215 |
+| 8 | 4096 | 1922–1952 / 1591 | 7415–7473 / 7059–7063 | 14622–15187 / 47974–48442 | 11932–12130 / 11516–11672 | 4457–4609 |
+
+- **The layer's GPU time.** Step 3c's two submissions take 225 + 969 = 1194 µs of GPU
+  time at 1 × 138. With attention in the routed submission it is 1026–1029 µs, plus the
+  QKV dispatches (225 µs) and about 10 µs for one more encoder boundary (§17.13). That
+  composes to **about 1260 µs**, but the QKV dispatches were not recorded into the same
+  command buffer: their GPU time is added, not measured there.
+- **Per layer, wall.** "Today" is the QKV call, the host attention and the routed call.
+  The one-submission layer is composed as the measured routed-with-attention call plus
+  QKV's GPU time:
+
+  | sequences | positions | today µs | one submission µs (composed) | saved per layer µs |
+  |---:|---:|---:|---:|---:|
+  | 1 | 138 | 1855–2043 | 1574–1585 | 270–469 |
+  | 1 | 1024 | 2004–2431 | 1660–1724 | 280–771 |
+  | 1 | 4096 | 3139–5009 | 2306–2533 | 606–2703 |
+  | 8 | 138 | 9677–10370 | 9264–9381 | 296–1106 |
+  | 8 | 1024 | 11798–13758 | 10241–10314 | 1484–3517 |
+  | 8 | 4096 | 19020–24524 | 13523–13721 | 5299–11001 |
+
+  In this harness a QKV call's wall minus its GPU time is about 230–420 µs, more than the
+  125 µs per hand-off derived from the real pass (§18.9). With §18.9's figure instead, at
+  1 × 138 the saving is **115–281 µs per layer, 1.8–4.5 ms per token**. Applied to Step
+  3c's 28.95–29.18 ms that gives **24.5–27.3 ms, 36.6–40.9 tok/s**. That is an
+  estimate, not a measurement. The low end assumes rayon's attention costs about the
+  1-thread time ÷ 5, which is the likelier case.
+- **Concurrent (8 sequences).** This is the first measurement of it (§19.8 had none).
+  Attention on the device adds 205–219 µs of GPU time at 138 positions, against
+  664–803 µs (5 threads) of host attention. At 4096 positions it adds 4.5–4.6 ms against
+  14.6–15.2 ms on the host (48 ms on one thread). The device reads 537 MB per layer there,
+  which is bandwidth-bound. The concurrent gain therefore grows with context, as §19.8
+  expected.
+- **What this does not show.**
+  - The armed steps use their own buffers: the O projection reads the host's attention
+    outputs. So the GPU does a chained layer's work, with a barrier in between, but
+    without the data dependency. A chained layer would not overlap them either: the
+    barrier already serialises them.
+  - Synthetic weights; the expert choice is fixed by the synthetic router.
+  - MoltenVK records the first timestamp late (§13), so the GPU times may be slightly
+    under-counted. The walls are not affected.
+  - Prefill is not measured.
+  - No end-to-end tokens per second: that needs the production path (§19.10 step 3).
+
+### 20.5 What this changes in §19's plan
+
+- §19.8's estimate for 1 × 138 positions (35.6–37.2 tok/s) rested on a 52 µs kernel. The
+  kernel is now 17 µs, and attention adds 57–59 µs of GPU time in the routed submission
+  (prelude included). The estimate is now 36.6–40.9 tok/s. Wall-clock acceptance is
+  still owed (§19.9 risk 8).
+- The kernels to carry forward are `qk_prelude` and `attn_one` (u16): one dispatch per
+  layer for decode, `BATCH` for concurrent sequences. The two-dispatch path (unrolled
+  scores, then fused softmax-values) is the fallback for more positions than shared
+  memory holds: `MAXP` = 4096. Contexts beyond that need the paged layout of §19.6 and a
+  chunked score buffer, which are not built.
+- Open for the owner before step 3 (production, behind its own switch):
+  - the KV pool policy and its ledger charge (§19.7);
+  - whether the mirror stays host-authoritative (§19.6, §19.9 risk 6);
+  - the 4096-position cap per dispatch, or chunking above it;
+  - whether to measure prefill before step 3 or within it.

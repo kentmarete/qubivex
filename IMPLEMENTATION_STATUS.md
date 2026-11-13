@@ -1,8 +1,14 @@
 # QUBIVEX Implementation Status
 
-Last updated: 2026-11-12
+Last updated: 2026-11-13
 
 ## Current phase
+**GPU attention, faster exact kernels and a whole-layer measurement (2026-11-13, branch `vulkan-attention-harness`; harness only, feature `spike`).** See docs/engineering/VULKAN_EXECUTION_AUDIT.md §20 (steps 1 and 2 of §19.10).
+- Built under `spike/`: attention in one dispatch per (token, head) (scores, softmax and values in one workgroup; a per-sequence build for batched decode); softmax and values fused; unrolled scores; and the clip, Q/K norm, RoPE and KV store prelude in one kernel. A `spike`-only hook records experimental steps at the head of any submission's command buffer. Nothing changes in the default build.
+- Parity: every attention variant 379,376 of 379,376 against `ops::attend`; the prelude 1,225,728 written outputs against the CPU; the prelude and attention inside Step 3c's routed command buffer 36,864 of 36,864. Positive controls (pairwise softmax sum, reversed value chains, RoPE as fma) fail.
+- Kernel time, OLMoE, 1 token: 138 positions 45–50 → **17 µs** (target under 40: met); 4096 positions 674–676 → 625–652 µs (target under 600: not met; 67 MB of f32 KV at about 107 GB/s, near the bandwidth). Prelude 16 µs.
+- Whole layer (synthetic OLMoE weights): attention in the routed submission adds 57–59 µs of GPU time at 1 × 138 (205–219 at 8 sequences; 4.5–4.6 ms at 8 × 4096, against 14.6–15.2 ms of host attention). Estimate, not measured: 1.8–4.5 ms per token saved at the bench's context, 36.6–40.9 tok/s from Step 3c's 34.3–34.5. No production code; the open owner decisions for step 3 are listed in §20.5.
+
 **Vulkan Step 3c: the O projection and FFN norm in the routed submission (2026-11-12, PR #59; accepted by the owner 2026-11-12; ADR-019 amendment 4).** See docs/engineering/VULKAN_EXECUTION_AUDIT.md §18.
 - Built behind `--vulkan-route-o on|off` (default off; needs `--vulkan-route on`): the attention output projection (a fused entry), the residual and the FFN RMSNorm (`resnorm.comp`, the CPU's 64-lane sum of squares, `1 / sqrt(ss / n + eps)`) at the head of Step 3b's routed submission: two submissions per MoE layer. `rms_norm` moved into `qubivex-compute::math` unchanged. Step 3b is the fallback.
 - Parity: the scale on the device equals the CPU for every f32 input at six (n, eps) shapes (6 × 2³², 0 differences outside subnormals and NaN payloads), so MoltenVK's `sqrt` is correctly rounded here; the whole layer with its prelude bit for bit for every dtype pairing and OLMoE's shape; sim and Vulkan fixtures, concurrent, and real OLMoE (the CPU's logits, Colibri's tokens). Positive controls (`inversesqrt`, another tree, reordered multiplies, the norm before the residual) fail.
