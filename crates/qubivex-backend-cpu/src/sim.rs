@@ -32,9 +32,10 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
+use qubivex_compute::discrete::KV_BLOCK;
 use qubivex_compute::discrete::{
-    DeviceBuffer, DeviceGatedFfn, DeviceMatMul, DeviceRoutedMoe, DeviceUsage, DiscreteDevice,
-    Guard, TransferStats,
+    DeviceBuffer, DeviceGatedFfn, DeviceMatMul, DeviceMoeAttention, DeviceRoutedMoe, DeviceUsage,
+    DiscreteDevice, Guard, TransferStats, kv_block_words, kv_key_word, kv_value_word,
 };
 use qubivex_compute::host::PageAligned;
 use qubivex_compute::{ComputeBackend, ComputeError, WeightView};
@@ -62,6 +63,12 @@ pub struct SimConfig {
     /// Route those layers with their prelude, the O projection, residual and norm, in
     /// the same submission ([`DiscreteDevice::routes_moe_prelude`], Step 3c).
     pub route_prelude: bool,
+    /// Route those layers with their decode attention too
+    /// ([`DiscreteDevice::routes_moe_attention`], audit §21); needs `route_prelude`.
+    pub route_attention: bool,
+    /// The KV pool's size for device attention ([`DiscreteDevice::kv_pool`]); `None`:
+    /// what the budget leaves.
+    pub kv_pool: Option<u64>,
 }
 
 impl SimConfig {
@@ -80,6 +87,8 @@ impl SimConfig {
             fuse_rows: 0,
             route_rows: 0,
             route_prelude: false,
+            route_attention: false,
+            kv_pool: None,
         }
     }
 
@@ -283,6 +292,165 @@ impl SimDevice {
     }
 }
 
+impl SimDevice {
+    /// Decode attention on the device (audit §21) with the CPU forward pass's
+    /// operations: the projections, the clip, the full-width Q and K norms, RoPE, the
+    /// store into the pool (after the host rows to copy in), and `attend` over each
+    /// token's own sequence. Returns the attention outputs and the bytes moved in and
+    /// out.
+    fn attention(
+        &self,
+        a: &mut DeviceMoeAttention<'_>,
+        s: usize,
+    ) -> Result<(Vec<f32>, u64, u64), ComputeError> {
+        use qubivex_compute::math::{attend, rms_norm, rope_rotate};
+        let (d, heads, kvh) = (a.head_dim, a.heads, a.kv_heads);
+        let (q_out, kv_out) = (heads * d, kvh * d);
+        let bad = |detail: String| ComputeError::Shape {
+            op: "routed moe attention",
+            detail,
+        };
+        if a.pos.len() != s
+            || a.table_at.len() != s
+            || a.rope.len() != s * d
+            || a.sync.len() != a.sync_to.len() * 2 * kv_out
+            || a.k_new.len() != s * kv_out
+            || a.v_new.len() != s * kv_out
+            || heads % kvh.max(1) != 0
+        {
+            return Err(bad(format!(
+                "{s} tokens, {heads} heads, {kvh} KV heads of {d}"
+            )));
+        }
+        let mut q = vec![0f32; s * q_out];
+        for (w, ys) in [
+            (a.q, &mut q[..]),
+            (a.k, &mut *a.k_new),
+            (a.v, &mut *a.v_new),
+        ] {
+            self.matmul_one(&mut DeviceMatMul { w, xs: a.xs, s, ys })?;
+        }
+        if let Some(c) = a.clip {
+            for z in q
+                .iter_mut()
+                .chain(a.k_new.iter_mut())
+                .chain(a.v_new.iter_mut())
+            {
+                *z = z.clamp(-c, c);
+            }
+        }
+        if let Some((qn, kn)) = a.qk_norm {
+            q.chunks_exact_mut(q_out)
+                .for_each(|r| rms_norm(r, qn, a.eps));
+            a.k_new
+                .chunks_exact_mut(kv_out)
+                .for_each(|r| rms_norm(r, kn, a.eps));
+        }
+        for t in 0..s {
+            let cs = &a.rope[t * d..(t + 1) * d];
+            q[t * q_out..(t + 1) * q_out]
+                .chunks_exact_mut(d)
+                .for_each(|hd| rope_rotate(hd, cs));
+            a.k_new[t * kv_out..(t + 1) * kv_out]
+                .chunks_exact_mut(d)
+                .for_each(|hd| rope_rotate(hd, cs));
+        }
+        // Token t's pool position p.
+        let at = |t: usize, p: usize| -> Result<usize, ComputeError> {
+            let i = a.table_at[t] as usize + p / KV_BLOCK;
+            let b = *a
+                .blocks
+                .get(i)
+                .ok_or_else(|| bad(format!("token {t} has no block for position {p}")))?;
+            Ok(b as usize * KV_BLOCK + p % KV_BLOCK)
+        };
+        let b = self.buffer_of(a.pool)?;
+        let Memory::Arena(lock) = &b.bytes else {
+            return Err(bad("the KV pool is not an arena".into()));
+        };
+        let held = b.len / 4 / kv_block_words(kv_out).max(1);
+        if a.blocks.iter().any(|&b| b as usize >= held)
+            || a.sync_to.iter().any(|&p| p as usize / KV_BLOCK >= held)
+        {
+            return Err(bad(format!("a block past the pool's {held}")));
+        }
+        let put = |pool: &mut [f32], to: usize, k: &[f32], v: &[f32]| {
+            for g in 0..kvh {
+                for i in 0..d {
+                    pool[kv_key_word(kv_out, d, to, g, i)] = k[g * d + i];
+                    pool[kv_value_word(kv_out, d, to, g, i)] = v[g * d + i];
+                }
+            }
+        };
+        // The host rows first, then the new keys and values.
+        {
+            let mut bytes = lock
+                .write()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let pool = floats_mut(bytes.as_mut_slice());
+            for (row, &to) in a.sync.chunks_exact(2 * kv_out).zip(a.sync_to) {
+                put(pool, to as usize, &row[..kv_out], &row[kv_out..]);
+            }
+            for t in 0..s {
+                let to = at(t, a.pos[t] as usize)?;
+                let rows = t * kv_out..(t + 1) * kv_out;
+                put(pool, to, &a.k_new[rows.clone()], &a.v_new[rows]);
+            }
+        }
+        // Each token's keys and values, gathered per KV head, then `attend`.
+        let mut att = vec![0f32; s * q_out];
+        let group = heads / kvh;
+        let mut scores = Vec::new();
+        for t in 0..s {
+            let n = a.pos[t] as usize + 1;
+            let mut ks = vec![vec![0f32; n * d]; kvh];
+            let mut vs = vec![vec![0f32; n * d]; kvh];
+            {
+                let bytes = lock
+                    .read()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                let pool = floats(bytes.as_slice());
+                for p in 0..n {
+                    let to = at(t, p)?;
+                    for g in 0..kvh {
+                        for i in 0..d {
+                            ks[g][p * d + i] = pool[kv_key_word(kv_out, d, to, g, i)];
+                            vs[g][p * d + i] = pool[kv_value_word(kv_out, d, to, g, i)];
+                        }
+                    }
+                }
+            }
+            for hd in 0..heads {
+                let g = hd / group;
+                let qs = &q[t * q_out + hd * d..t * q_out + (hd + 1) * d];
+                let out = &mut att[t * q_out + hd * d..t * q_out + (hd + 1) * d];
+                attend(qs, &ks[g], &vs[g], n - 1, out, &mut scores);
+            }
+        }
+        let inb = size_of_val(a.xs)
+            + size_of_val(a.rope)
+            + size_of_val(a.sync)
+            + 4 * (2 * s + a.blocks.len() + a.sync_to.len());
+        let outb = size_of_val(&*a.k_new) + size_of_val(&*a.v_new);
+        Ok((att, inb as u64, outb as u64))
+    }
+}
+
+/// A page-aligned allocation's bytes as f32 words.
+fn floats(b: &[u8]) -> &[f32] {
+    debug_assert_eq!(b.as_ptr().align_offset(4), 0);
+    // SAFETY: the memory is page aligned (so f32 aligned) and holds at least
+    // `4 · (len / 4)` bytes; every bit pattern is a valid f32.
+    unsafe { std::slice::from_raw_parts(b.as_ptr().cast::<f32>(), b.len() / 4) }
+}
+
+/// As [`floats`], mutable.
+fn floats_mut(b: &mut [u8]) -> &mut [f32] {
+    debug_assert_eq!(b.as_ptr().align_offset(4), 0);
+    // SAFETY: as `floats`, and the borrow is exclusive.
+    unsafe { std::slice::from_raw_parts_mut(b.as_mut_ptr().cast::<f32>(), b.len() / 4) }
+}
+
 impl DiscreteDevice for SimDevice {
     fn name(&self) -> &'static str {
         "sim"
@@ -420,6 +588,14 @@ impl DiscreteDevice for SimDevice {
         self.config.route_prelude && self.routes_moe(experts, k, s)
     }
 
+    fn routes_moe_attention(&self, experts: usize, k: usize, s: usize) -> bool {
+        self.config.route_attention && self.routes_moe_prelude(experts, k, s)
+    }
+
+    fn kv_pool(&self) -> Option<u64> {
+        self.config.kv_pool
+    }
+
     /// One submission: the router logits, the routing and the expert intermediates stay
     /// on the device; the inputs, the combined outputs and the routes are copied.
     fn routed_moe(&self, op: &mut DeviceRoutedMoe<'_>) -> Result<bool, ComputeError> {
@@ -427,6 +603,9 @@ impl DiscreteDevice for SimDevice {
             return Ok(false);
         }
         if op.prelude.is_some() && !self.config.route_prelude {
+            return Ok(false);
+        }
+        if op.attention.is_some() && !self.config.route_attention {
             return Ok(false);
         }
         let (ne, cols, s, k) = (op.router.rows(), op.router.cols(), op.s, op.k);
@@ -437,7 +616,12 @@ impl DiscreteDevice for SimDevice {
             || op.ids.len() != s * k
             || op.prelude.as_ref().is_some_and(|p| {
                 p.o.rows() != cols
-                    || p.att.len() != s * p.o.cols()
+                    || p.att.len()
+                        != if op.attention.is_some() {
+                            0
+                        } else {
+                            s * p.o.cols()
+                        }
                     || p.hs.len() != s * cols
                     || p.norm.len() != cols
             })
@@ -448,13 +632,21 @@ impl DiscreteDevice for SimDevice {
             });
         }
         self.counters.submissions.fetch_add(1, Ordering::Relaxed);
+        // Decode attention (audit §21), in the same submission.
+        let (att, att_in, att_out) = match op.attention.as_mut() {
+            Some(a) => {
+                let (att, inb, outb) = self.attention(a, s)?;
+                (Some(att), inb, outb)
+            }
+            None => (None, 0, 0),
+        };
         // The prelude: the O projection, residual and norm, in the same submission.
         let (normed, pre_in, pre_out) = match op.prelude.as_mut() {
             Some(p) => {
                 let mut o = vec![0f32; s * cols];
                 self.matmul_one(&mut DeviceMatMul {
                     w: p.o,
-                    xs: p.att,
+                    xs: att.as_deref().unwrap_or(p.att),
                     s,
                     ys: &mut o,
                 })?;
@@ -494,8 +686,10 @@ impl DiscreteDevice for SimDevice {
         }
         qubivex_compute::combine_ranks(&contrib, op.weights, k, op.ys);
         self.moved(
-            size_of_val(op.xs) as u64 + pre_in,
-            (size_of_val(op.ys) + size_of_val(op.ids) + size_of_val(op.weights)) as u64 + pre_out,
+            size_of_val(op.xs) as u64 + pre_in + att_in,
+            (size_of_val(op.ys) + size_of_val(op.ids) + size_of_val(op.weights)) as u64
+                + pre_out
+                + att_out,
         );
         Ok(true)
     }

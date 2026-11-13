@@ -390,6 +390,14 @@ impl ComputeBackend for Placed {
             .is_some_and(|d| d.routes_moe_prelude(experts, k, s))
     }
 
+    /// Whether it routes this shape with decode attention, the O projection, residual
+    /// and norm in the same submission (audit §21).
+    fn routes_moe_attention(&self, experts: usize, k: usize, s: usize) -> bool {
+        self.device
+            .as_ref()
+            .is_some_and(|d| d.routes_moe_attention(experts, k, s))
+    }
+
     fn routed_moe(&self, op: &mut RoutedMoe<'_>) -> Result<bool, ComputeError> {
         match &self.device {
             Some(d) => d.routed_moe(op),

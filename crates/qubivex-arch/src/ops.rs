@@ -63,14 +63,7 @@ impl Rope {
     /// Rotates one head in place with a [`Rope::table`] (NeoX layout: pairs `i` and
     /// `i + d/2`).
     pub fn rotate(head: &mut [f32], cs: &[f32]) {
-        let half = cs.len() / 2;
-        debug_assert_eq!(head.len(), 2 * half);
-        let (c, s) = cs.split_at(half);
-        for i in 0..half {
-            let (x1, x2) = (head[i], head[i + half]);
-            head[i] = x1 * c[i] - x2 * s[i];
-            head[i + half] = x2 * c[i] + x1 * s[i];
-        }
+        qubivex_compute::math::rope_rotate(head, cs);
     }
 
     /// Rotates one head in place at position `pos`.
@@ -89,29 +82,9 @@ pub use qubivex_compute::math::swiglu;
 /// checked against them without depending on this crate).
 pub use qubivex_compute::math::{route, softmax};
 
-/// Sequential f32 dot product.
-#[inline]
-fn dot_seq(a: &[f32], b: &[f32]) -> f32 {
-    a.iter().zip(b).fold(0f32, |s, (x, y)| x.mul_add(*y, s))
-}
-
-/// Causal attention of one query head over positions `0..=pos` of one KV head.
-/// `k` and `v` hold `head_dim` values per position. `scores` is scratch of at
-/// least `pos + 1`.
-pub fn attend(q: &[f32], k: &[f32], v: &[f32], pos: usize, out: &mut [f32], scores: &mut Vec<f32>) {
-    let d = q.len();
-    #[allow(clippy::cast_precision_loss)]
-    let scale = 1.0 / (d as f32).sqrt();
-    scores.clear();
-    scores.extend((0..=pos).map(|t| dot_seq(q, &k[t * d..(t + 1) * d]) * scale));
-    softmax(scores);
-    out.fill(0.0);
-    for (t, p) in scores.iter().enumerate() {
-        for (o, x) in out.iter_mut().zip(&v[t * d..(t + 1) * d]) {
-            *o = p.mul_add(*x, *o);
-        }
-    }
-}
+/// Causal attention of one query head (defined in `qubivex-compute`, so a device
+/// backend can give the same bits without depending on this crate).
+pub use qubivex_compute::math::attend;
 
 #[cfg(test)]
 mod tests {

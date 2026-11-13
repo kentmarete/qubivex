@@ -382,6 +382,7 @@ fn routed(dev: &VulkanDevice, w: &Weights, s: usize) -> bool {
             norm: &w.norm,
             eps: f64::from(EPS),
         }),
+        attention: None,
     })
     .unwrap()
 }

@@ -244,6 +244,90 @@ pub struct DeviceMoePrelude<'a> {
     pub eps: f64,
 }
 
+/// Positions per block of a device KV pool (audit §21).
+pub const KV_BLOCK: usize = 256;
+
+/// The f32 words of one KV pool block for `kv_out = kv_heads · head_dim`: the keys
+/// dimension-major (`[kv_head][d][KV_BLOCK]`), then the values position-major
+/// (`[KV_BLOCK][kv_head][d]`). Block `b` starts at word `b · kv_block_words(kv_out)`.
+#[must_use]
+pub const fn kv_block_words(kv_out: usize) -> usize {
+    2 * KV_BLOCK * kv_out
+}
+
+/// [`crate::MoeAttention`] on a device (audit §21): the projections in device memory,
+/// each sequence's keys and values in blocks of one KV pool. Token `t` is its own
+/// sequence's token at position `pos[t]`, whose blocks are
+/// `blocks[table_at[t]..table_at[t] + pos[t] / KV_BLOCK + 1]` in position order.
+///
+/// Before anything else the submission writes the `sync` rows into the pool: the host
+/// cache's keys and values of positions the device did not hold. Then the new token's
+/// key and value are stored at `pos[t]`, and attention reads positions `0..=pos[t]`.
+#[derive(Debug)]
+pub struct DeviceMoeAttention<'a> {
+    /// `heads·head_dim × cols` query projection.
+    pub q: &'a DeviceWeights,
+    /// `kv_heads·head_dim × cols` key projection.
+    pub k: &'a DeviceWeights,
+    /// `kv_heads·head_dim × cols` value projection.
+    pub v: &'a DeviceWeights,
+    /// `s × cols` attention-normed activations.
+    pub xs: &'a [f32],
+    /// Query heads.
+    pub heads: usize,
+    /// KV heads.
+    pub kv_heads: usize,
+    /// Values per head.
+    pub head_dim: usize,
+    /// `z.clamp(-c, c)` on q, k and v.
+    pub clip: Option<f32>,
+    /// Full-width q and k norm weights.
+    pub qk_norm: Option<(&'a [f32], &'a [f32])>,
+    /// The norms' epsilon.
+    pub eps: f64,
+    /// `s × head_dim` RoPE rows.
+    pub rope: &'a [f32],
+    /// The KV pool (an arena from [`DiscreteDevice::alloc`]).
+    pub pool: &'a DeviceBuffer,
+    /// `s` positions.
+    pub pos: &'a [u32],
+    /// Block tables, concatenated.
+    pub blocks: &'a [u32],
+    /// `s` starts in `blocks`.
+    pub table_at: &'a [u32],
+    /// Rows to write first: each `2 · kv_out` words, the key row then the value row,
+    /// as the host cache holds them (rotated, clipped).
+    pub sync: &'a [f32],
+    /// Each sync row's pool position: `block · KV_BLOCK + position in the block`.
+    pub sync_to: &'a [u32],
+    /// `s × kv_out` new keys, written.
+    pub k_new: &'a mut [f32],
+    /// `s × kv_out` new values, written.
+    pub v_new: &'a mut [f32],
+}
+
+impl DeviceMoeAttention<'_> {
+    /// `kv_heads · head_dim`.
+    #[must_use]
+    pub const fn kv_out(&self) -> usize {
+        self.kv_heads * self.head_dim
+    }
+}
+
+/// The pool word of key `(g, i)` at pool position `at` (`block · KV_BLOCK + slot`).
+#[must_use]
+pub const fn kv_key_word(kv_out: usize, d: usize, at: usize, g: usize, i: usize) -> usize {
+    let (b, slot) = (at / KV_BLOCK, at % KV_BLOCK);
+    b * kv_block_words(kv_out) + (g * d + i) * KV_BLOCK + slot
+}
+
+/// The pool word of value `(g, i)` at pool position `at`.
+#[must_use]
+pub const fn kv_value_word(kv_out: usize, d: usize, at: usize, g: usize, i: usize) -> usize {
+    let (b, slot) = (at / KV_BLOCK, at % KV_BLOCK);
+    b * kv_block_words(kv_out) + KV_BLOCK * kv_out + slot * kv_out + g * d + i
+}
+
 /// A mixture-of-experts layer as one submission, as [`crate::RoutedMoe`] with the
 /// weights in device memory. `experts` holds every expert of the layer by id; the
 /// caller keeps all of them on the device until the call returns.
@@ -269,6 +353,9 @@ pub struct DeviceRoutedMoe<'a> {
     pub weights: &'a mut [f32],
     /// The O projection, residual and norm before the layer (Step 3c).
     pub prelude: Option<DeviceMoePrelude<'a>>,
+    /// Decode attention before the prelude (audit §21); the prelude's `att` is then
+    /// empty.
+    pub attention: Option<DeviceMoeAttention<'a>>,
 }
 
 /// A device's memory.
@@ -454,6 +541,20 @@ pub trait DiscreteDevice: Send + Sync {
     fn routes_moe_prelude(&self, experts: usize, k: usize, s: usize) -> bool {
         let _ = (experts, k, s);
         false
+    }
+
+    /// Whether callers should offer such a layer with its prelude and decode attention
+    /// ([`DeviceMoeAttention`]) as one [`DiscreteDevice::routed_moe`]. The default is
+    /// `false`.
+    fn routes_moe_attention(&self, experts: usize, k: usize, s: usize) -> bool {
+        let _ = (experts, k, s);
+        false
+    }
+
+    /// Bytes the KV pool for device attention may take, when configured; `None`: what
+    /// the device budget leaves after the expert cache (audit §21).
+    fn kv_pool(&self) -> Option<u64> {
+        None
     }
 
     /// Runs the layer as one submission if this device can (routing on the device), and

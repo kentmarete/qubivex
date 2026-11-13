@@ -317,6 +317,7 @@ fn cpu_layer(
             ids: &mut ids,
             weights: &mut ws,
             prelude: None,
+            attention: None,
         },
     )
     .unwrap();
@@ -396,6 +397,7 @@ fn gpu_layer(
             ids: &mut ids,
             weights: &mut ws,
             prelude: None,
+            attention: None,
         })
         .unwrap();
     ran.then_some((ys, ids, ws))
@@ -622,6 +624,7 @@ fn cpu_layer_pre(l: Layer, h: &Host, p: &Pre, s: usize, norm: bool) -> WithPre {
                 norm: &p.norm,
                 eps: p.eps,
             }),
+            attention: None,
         },
     )
     .unwrap();
@@ -664,6 +667,7 @@ fn gpu_layer_pre(
                 norm: &p.norm,
                 eps: p.eps,
             }),
+            attention: None,
         })
         .unwrap();
     if !ran {

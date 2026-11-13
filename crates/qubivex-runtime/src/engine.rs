@@ -1259,6 +1259,10 @@ impl Engine {
                     budget,
                     &layers,
                     &ram_slots,
+                    model
+                        .moe_config()
+                        .and_then(|c| usize::try_from(c.kv_heads * c.head_dim).ok())
+                        .unwrap_or(0),
                 )
                 .map_err(|e| RuntimeError::Model(format!("cannot place on the device: {e}")))?;
                 Some(Arc::new(on))
