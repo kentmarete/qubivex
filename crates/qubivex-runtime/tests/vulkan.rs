@@ -347,7 +347,7 @@ fn olmoe_routed_on_vulkan_matches_the_cpu() {
     .unwrap();
     let want = logits(&cpu);
     drop(cpu);
-    for route_o in [false, true] {
+    for (route_o, attention) in [(false, false), (true, false), (true, true)] {
         let Some(e) = load(
             meta(),
             EngineOptions {
@@ -355,6 +355,8 @@ fn olmoe_routed_on_vulkan_matches_the_cpu() {
                 vulkan: VulkanConfig {
                     route: true,
                     route_o,
+                    attention,
+                    kv_pool: attention.then_some(256 << 20),
                     ..VulkanConfig::default()
                 },
                 expert_cache_bytes: Some(4 << 30),
@@ -376,5 +378,159 @@ fn olmoe_routed_on_vulkan_matches_the_cpu() {
         let r = e.device_report().unwrap();
         eprintln!("{r:?}");
         assert!(r.routed_layers - before >= 12 * layers, "{r:?}");
+        if attention {
+            assert!(
+                r.kv_pool.layers >= 11 * layers,
+                "decode attention on the device: {r:?}"
+            );
+        }
     }
+}
+
+/// A prompt short enough to route on the device (at most `fuse_rows` tokens), to warm
+/// the device expert cache.
+const WARM: &[u32] = &[72, 101, 108, 108, 111];
+
+/// A Vulkan engine routing with the prelude and decode attention on the device (audit
+/// §21), with a 64 MiB KV pool and room for `context` positions.
+fn vulkan_attention(id: &str, context: usize) -> Option<Engine> {
+    load(
+        meta(id),
+        EngineOptions {
+            backend: BackendKind::Vulkan,
+            vulkan: VulkanConfig {
+                capacity: Some(1 << 30),
+                route: true,
+                route_o: true,
+                attention: true,
+                kv_pool: Some(64 << 20),
+                ..VulkanConfig::default()
+            },
+            expert_cache_bytes: Some(1 << 30),
+            max_context: Some(context),
+            ..EngineOptions::default()
+        },
+    )
+}
+
+fn cpu_context(id: &str, context: usize) -> Engine {
+    Engine::load(
+        meta(id),
+        EngineOptions {
+            expert_cache_bytes: Some(1 << 30),
+            max_context: Some(context),
+            ..EngineOptions::default()
+        },
+    )
+    .unwrap()
+}
+
+/// The prompt's last logits, then `steps` greedy decode steps' logits on one cache.
+fn decode_logits(e: &Engine, prompt: &[u32], steps: usize) -> Vec<Vec<u32>> {
+    let mut c = e.new_cache();
+    let mut out = Vec::with_capacity(steps + 1);
+    let mut logits = e.forward(prompt, &mut c, Logits::Last, None).unwrap();
+    for _ in 0..steps {
+        out.push(bits(&logits));
+        let next = logits
+            .iter()
+            .enumerate()
+            .max_by(|a, b| a.1.total_cmp(b.1).then(b.0.cmp(&a.0)))
+            .map(|(i, _)| u32::try_from(i).unwrap())
+            .unwrap();
+        logits = e.forward(&[next], &mut c, Logits::Last, None).unwrap();
+    }
+    out.push(bits(&logits));
+    out
+}
+
+/// Decode attention on Vulkan (audit §21): every decode step's logits are the CPU's on
+/// every MoE fixture (Qwen3's per-head Q and K norms decline to the host), a decode
+/// layer is one submission, and concurrent requests keep the CPU's tokens.
+#[test]
+fn decode_attention_on_vulkan_matches_the_cpu_bits() {
+    for id in MOE {
+        let c = cpu_context(id, 256);
+        let want = decode_logits(&c, PROMPT, 12);
+        let prompts: [&[u32]; 4] = [&[72, 101], &[108, 108, 111], &[44, 32, 101], &[120]];
+        let want_conc: Vec<_> = prompts
+            .iter()
+            .map(|p| c.generate(p, 12, Sampling::default(), |_| true).unwrap())
+            .collect();
+        drop(c);
+        let Some(e) = vulkan_attention(id, 256) else {
+            return;
+        };
+        let layers = u64::from(meta(id).config.dims.layers);
+        let _ = when_routed(&e, layers, || {
+            let mut cache = e.new_cache();
+            bits(&e.forward(WARM, &mut cache, Logits::All, None).unwrap())
+        });
+        let before = e.device_report().unwrap();
+        assert_eq!(decode_logits(&e, PROMPT, 12), want, "{id}");
+        let after = e.device_report().unwrap();
+        let ran = after.kv_pool.layers - before.kv_pool.layers;
+        if id == "qwen3-moe-tiny" {
+            assert_eq!(ran, 0, "{id}: per-head norms run on the host");
+        } else {
+            assert_eq!(ran, 12 * layers, "{id}: {after:?}");
+            assert_eq!(after.kv_pool.free, after.kv_pool.blocks, "{id}");
+            // One decode step: one submission per layer, then the head.
+            let mut cache = e.new_cache();
+            let _ = e.forward(PROMPT, &mut cache, Logits::Last, None).unwrap();
+            let n = e.device_report().unwrap().transfers.submissions;
+            let _ = e.forward(&[101], &mut cache, Logits::Last, None).unwrap();
+            assert_eq!(
+                e.device_report().unwrap().transfers.submissions - n,
+                layers + 1,
+                "{id}"
+            );
+            assert!(
+                e.placement()
+                    .device
+                    .as_deref()
+                    .unwrap()
+                    .contains("decode attention"),
+                "{id}"
+            );
+        }
+        let got: Vec<_> = std::thread::scope(|s| {
+            let hs: Vec<_> = prompts
+                .iter()
+                .map(|p| {
+                    let e = &e;
+                    s.spawn(move || e.generate(p, 12, Sampling::default(), |_| true).unwrap())
+                })
+                .collect();
+            hs.into_iter().map(|h| h.join().unwrap()).collect()
+        });
+        assert_eq!(got, want_conc, "{id}: concurrent");
+    }
+}
+
+/// Decode across KV pool blocks: a 250-token prompt (prefill on the host, its rows copied
+/// into the pool) then decode steps past position 256, into a second block, with the
+/// CPU's logits at every step.
+#[test]
+fn decode_attention_on_vulkan_crosses_blocks() {
+    let id = "olmoe-tiny";
+    let prompt: Vec<u32> = (0..250u32).map(|i| 32 + (i * 7) % 90).collect();
+    let want = decode_logits(&cpu_context(id, 600), &prompt, 20);
+    let Some(e) = vulkan_attention(id, 600) else {
+        return;
+    };
+    let layers = u64::from(meta(id).config.dims.layers);
+    let _ = when_routed(&e, layers, || {
+        let mut cache = e.new_cache();
+        bits(&e.forward(WARM, &mut cache, Logits::All, None).unwrap())
+    });
+    let before = e.device_report().unwrap().kv_pool;
+    assert_eq!(decode_logits(&e, &prompt, 20), want);
+    let after = e.device_report().unwrap().kv_pool;
+    assert_eq!(after.layers - before.layers, 20 * layers, "{after:?}");
+    assert_eq!(
+        after.synced_rows - before.synced_rows,
+        250 * layers,
+        "{after:?}"
+    );
 }

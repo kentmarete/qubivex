@@ -51,3 +51,9 @@ build route -O0
 build combine -O0
 build resnorm -O0
 build rms_scale -O0
+# kv_sync copies words and has no arithmetic to decorate: validated and kept as built.
+glslc --target-env=vulkan1.1 -O0 -o "$tmp/kv_sync.spv" "$here/kv_sync.comp"
+spirv-val --target-env vulkan1.1 "$tmp/kv_sync.spv"
+cp "$tmp/kv_sync.spv" "$out/kv_sync.spv"
+build attn_prelude -O0
+build attn_decode -O0

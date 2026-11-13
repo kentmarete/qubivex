@@ -536,6 +536,17 @@ pub(crate) struct DeviceArgs {
     /// off), so a MoE layer is two submissions instead of three.
     #[arg(long, value_name = "on|off")]
     vulkan_route_o: Option<String>,
+    /// With --backend vulkan and --vulkan-route-o on: put decode attention in the same
+    /// submission too (on|off, default off): the QKV projections, Q and K norms, RoPE
+    /// and attention over a paged KV pool on the device, so a decode layer is one
+    /// submission. The host KV cache stays authoritative; prefill, contexts past 4096
+    /// positions and a full pool run attention on the host.
+    #[arg(long, value_name = "on|off")]
+    vulkan_attn: Option<String>,
+    /// With --vulkan-attn on: the device memory for the KV pool, for example 1GiB
+    /// (default: what the VRAM budget leaves after the expert cache, up to 4 GiB).
+    #[arg(long, value_name = "SIZE")]
+    vulkan_kv_pool: Option<String>,
     /// With a discrete device: an explicit VRAM budget, for example 6GiB; replaces the
     /// profile's fraction of the device's memory.
     #[arg(long)]
@@ -569,11 +580,14 @@ impl DeviceArgs {
                 || self.vulkan_timestamps
                 || self.vulkan_fuse_rows.is_some()
                 || self.vulkan_route.is_some()
-                || self.vulkan_route_o.is_some())
+                || self.vulkan_route_o.is_some()
+                || self.vulkan_attn.is_some()
+                || self.vulkan_kv_pool.is_some())
         {
             return Err(
                 "--vulkan-device, --vulkan-vram, --vulkan-timestamps, --vulkan-fuse-rows, \
-                 --vulkan-route and --vulkan-route-o need --backend vulkan"
+                 --vulkan-route, --vulkan-route-o, --vulkan-attn and --vulkan-kv-pool need \
+                 --backend vulkan"
                     .to_owned(),
             );
         }
@@ -587,6 +601,13 @@ impl DeviceArgs {
         if route_o && !route {
             return Err("--vulkan-route-o on needs --vulkan-route on".to_owned());
         }
+        let attention = on_off("--vulkan-attn", self.vulkan_attn.as_deref())?;
+        if attention && !route_o {
+            return Err("--vulkan-attn on needs --vulkan-route-o on".to_owned());
+        }
+        if self.vulkan_kv_pool.is_some() && !attention {
+            return Err("--vulkan-kv-pool needs --vulkan-attn on".to_owned());
+        }
         let vulkan = qubivex_runtime::VulkanConfig {
             device: self.vulkan_device,
             capacity: self
@@ -599,6 +620,13 @@ impl DeviceArgs {
             fuse_rows: self.vulkan_fuse_rows,
             route,
             route_o,
+            attention,
+            kv_pool: self
+                .vulkan_kv_pool
+                .as_deref()
+                .map(plan::parse_bytes)
+                .transpose()?
+                .map(|b| b.0),
         };
         let sim = backend == qubivex_runtime::BackendKind::Sim;
         if !sim && (self.sim_vram.is_some() || self.sim_bandwidth.is_some() || self.sim_delay) {

@@ -1,0 +1,51 @@
+// QUBIVEX Vulkan KV pool copy-in (audit §21): host rows into the device KV pool before
+// device attention reads them. Row r of the rows buffer is 2·kv_out words, the key row
+// then the value row as the host cache holds them (rotated, clipped); it goes to pool
+// position tab[at + r] (block · 256 + slot), keys dimension-major ([kv_head][d][256])
+// and values position-major ([256][kv_head][d]) within the block, as
+// `qubivex_compute::discrete::kv_key_word` and `kv_value_word` lay them out. Copies only,
+// so every word keeps its bits.
+//
+// One workgroup of 64 per row. Bindings (the fused layout): 0 the rows, 1 the pool,
+// 2 unused, 3 the table. Push: kv_out, the table word of the first position.
+#version 450
+
+layout(local_size_x = 64) in;
+
+const uint BLOCK = 256u;
+
+layout(std430, set = 0, binding = 0) readonly buffer Rows {
+    float rows[];
+};
+
+layout(std430, set = 0, binding = 1) buffer Kv {
+    float kv[];
+};
+
+layout(std430, set = 0, binding = 2) buffer Unused {
+    float unused_[];
+};
+
+layout(std430, set = 0, binding = 3) readonly buffer Table {
+    uint tab[];
+};
+
+layout(push_constant) uniform Params {
+    uint kv_out;
+    uint at;
+    uint unused0;
+    uint unused1;
+} p;
+
+void main() {
+    uint r = gl_WorkGroupID.x;
+    uint to = tab[p.at + r];
+    uint slot = to % BLOCK;
+    uint kb = (to / BLOCK) * (2u * BLOCK * p.kv_out);
+    uint vb = kb + BLOCK * p.kv_out + slot * p.kv_out;
+    uint src = r * 2u * p.kv_out;
+    for (uint i = gl_LocalInvocationID.x; i < p.kv_out; i += 64u) {
+        kv[kb + i * BLOCK + slot] = rows[src + i];
+        kv[vb + i] = rows[src + p.kv_out + i];
+    }
+}

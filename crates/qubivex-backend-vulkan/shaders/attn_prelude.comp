@@ -1,0 +1,176 @@
+// QUBIVEX Vulkan attention prelude for decode (audit §21; the harness's qk_prelude.comp,
+// audit §20, with the paged KV pool): what the CPU's forward pass does between the QKV
+// projections and attention (`qubivex-arch` lib.rs), with its bits:
+//   1. the clip: z = z.clamp(-c, c) on q, k and v when the model clips (Rust's clamp: a
+//      NaN stays NaN, -0 stays -0);
+//   2. the full-width Q and K norms when the model has them (`math::rms_norm` per token:
+//      the 64-lane sum of squares of resnorm.comp, the scale of rms.glsl, each output
+//      (x · r) · w);
+//   3. RoPE on every head of q and k (`math::rope_rotate`: two products each rounded,
+//      then one add or subtract), from the host's table row for the token's position;
+//   4. the store of the new key and value at the token's position in its sequence's
+//      block, and a copy of both for the host cache.
+// q is rotated in place.
+//
+// Each token is its own sequence's next token (decode). One workgroup of 64 per (part,
+// token): part 0 is q, 1 is k, 2 is v. Grid: (3, tokens).
+// Bindings (the fused layout): 0 q, k and v region-major as the QKV dispatches write
+// them ([token][q_out] for every token, then [token][kv_out] for k, then for v); 1 the
+// KV pool; 2 the new keys (tokens × kv_out) then the new values, for the host; 3 the
+// table.
+// Header at the table word in the push constants (uint): d, heads, kv_heads, eps bits,
+// clip bits (0: no clip), q norm base (NONE: no Q and K norms), k norm base, RoPE base
+// (one row of d values, [cos…, sin…], per token), token base. At the token base, two
+// words per token: its position and the table word of its block ids.
+#version 450
+#extension GL_GOOGLE_include_directive : require
+
+layout(local_size_x = 64) in;
+
+const uint LANES = 64u;
+const uint BLOCK = 256u;
+const uint NONE = 0xFFFFFFFFu;
+
+layout(std430, set = 0, binding = 0) buffer Qkv {
+    float x[];
+};
+
+layout(std430, set = 0, binding = 1) buffer Kv {
+    float kv[];
+};
+
+layout(std430, set = 0, binding = 2) writeonly buffer New {
+    float knew[];
+};
+
+layout(std430, set = 0, binding = 3) readonly buffer Table {
+    uint tab[];
+};
+
+layout(push_constant) uniform Params {
+    uint hdr;
+    uint unused0;
+    uint unused1;
+    uint unused2;
+} p;
+
+shared float red[LANES];
+shared float scale;
+
+#include "rms.glsl"
+
+float clip(float z, float c) {
+    return z < -c ? -c : (z > c ? c : z);
+}
+
+float wt(uint i) {
+    return uintBitsToFloat(tab[i]);
+}
+
+void main() {
+    uint part = gl_WorkGroupID.x;
+    uint t = gl_WorkGroupID.y;
+    uint l = gl_LocalInvocationID.x;
+    uint d = tab[p.hdr];
+    uint heads = tab[p.hdr + 1u];
+    uint kvh = tab[p.hdr + 2u];
+    float eps = uintBitsToFloat(tab[p.hdr + 3u]);
+    uint clip_bits = tab[p.hdr + 4u];
+    float cl = uintBitsToFloat(clip_bits);
+    uint qn = tab[p.hdr + 5u];
+    uint kn = tab[p.hdr + 6u];
+    uint cs = tab[p.hdr + 7u] + t * d;
+    uint tb = tab[p.hdr + 8u] + 2u * t;
+    uint pos = tab[tb];
+    uint ta = tab[tb + 1u];
+    uint q_out = heads * d;
+    uint kv_out = kvh * d;
+    uint toks = gl_NumWorkGroups.y;
+    uint q_at = t * q_out;
+    uint k_at = toks * q_out + t * kv_out;
+    uint v_at = toks * (q_out + kv_out) + t * kv_out;
+    uint slot = pos % BLOCK;
+    uint kb = tab[ta + pos / BLOCK] * (2u * BLOCK * kv_out);
+    uint vb = kb + BLOCK * kv_out + slot * kv_out;
+    if (part == 2u) {
+        for (uint i = l; i < kv_out; i += LANES) {
+            float z = x[v_at + i];
+            if (clip_bits != 0u) {
+                z = clip(z, cl);
+            }
+            kv[vb + i] = z;
+            knew[toks * kv_out + t * kv_out + i] = z;
+        }
+        return;
+    }
+    uint n = part == 0u ? q_out : kv_out;
+    uint base = part == 0u ? q_at : k_at;
+    uint w_base = part == 0u ? qn : kn;
+    // Uniform across the workgroup (one table word), so the barriers below stay
+    // uniform.
+    bool norm = qn != NONE;
+    float acc = 0.0;
+    for (uint i = l; i < n; i += LANES) {
+        float z = x[base + i];
+        if (clip_bits != 0u) {
+            z = clip(z, cl);
+            x[base + i] = z;
+        }
+        acc = fma(z, z, acc);
+    }
+    red[l] = acc;
+    memoryBarrierShared();
+    memoryBarrierBuffer();
+    barrier();
+    for (uint w = 32u; w >= 4u; w /= 2u) {
+        float v = 0.0;
+        if (l < w) {
+            v = red[l] + red[l + w];
+        }
+        memoryBarrierShared();
+        barrier();
+        if (l < w) {
+            red[l] = v;
+        }
+        memoryBarrierShared();
+        barrier();
+    }
+    if (l == 0u) {
+        float ss = (red[0] + red[1]) + (red[2] + red[3]);
+        scale = rms_scale_of(ss, float(n), eps);
+    }
+    memoryBarrierShared();
+    barrier();
+    float r = scale;
+    uint half_ = d / 2u;
+    uint pairs = (n / d) * half_;
+    for (uint u = l; u < pairs; u += LANES) {
+        uint hd = u / half_;
+        uint i = u % half_;
+        uint i1 = hd * d + i;
+        uint i2 = i1 + half_;
+        float x1 = x[base + i1];
+        float x2 = x[base + i2];
+        if (norm) {
+            x1 = (x1 * r) * wt(w_base + i1);
+            x2 = (x2 * r) * wt(w_base + i2);
+        }
+        float co = wt(cs + i);
+        float si = wt(cs + half_ + i);
+        float a = x1 * co;
+        float bb = x2 * si;
+        float e = x2 * co;
+        float f = x1 * si;
+        float y1 = a - bb;
+        float y2 = e + f;
+        if (part == 0u) {
+            x[base + i1] = y1;
+            x[base + i2] = y2;
+        } else {
+            kv[kb + i1 * BLOCK + slot] = y1;
+            kv[kb + i2 * BLOCK + slot] = y2;
+            knew[t * kv_out + i1] = y1;
+            knew[t * kv_out + i2] = y2;
+        }
+    }
+}

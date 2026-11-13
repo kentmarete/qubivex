@@ -104,6 +104,14 @@ pub struct VulkanConfig {
     /// submission (Step 3c, audit §18): the attention output projection, the residual
     /// and the FFN RMSNorm. Off by default; Step 3b is the fallback.
     pub route_o: bool,
+    /// With [`VulkanConfig::route_o`], put decode attention at the head of the same
+    /// submission (audit §21): the QKV projections, the clip, Q and K norms, RoPE, the
+    /// store into a paged KV pool and attention, so a decode layer is one submission.
+    /// The host KV cache stays authoritative. Off by default; Step 3c is the fallback.
+    pub attention: bool,
+    /// Bytes of device memory for the KV pool attention reads. `None`: what the device
+    /// budget leaves after the expert cache, up to one buffer the device addresses.
+    pub kv_pool: Option<u64>,
 }
 
 /// A Vulkan GPU as a discrete device. See the crate documentation.
@@ -127,6 +135,9 @@ pub struct VulkanDevice {
     route_rows: usize,
     /// Route them with their prelude (the O projection, residual and norm).
     route_o: bool,
+    /// And with decode attention (audit §21).
+    attention: bool,
+    kv_pool: Option<u64>,
 }
 
 impl std::fmt::Debug for VulkanDevice {
@@ -184,6 +195,11 @@ impl VulkanDevice {
             max_arena,
             route_rows,
             route_o: config.route_o && route_rows > 0,
+            attention: config.attention
+                && config.route_o
+                && route_rows > 0
+                && opened.shared.attn.is_some(),
+            kv_pool: config.kv_pool,
         })
     }
 
@@ -384,6 +400,10 @@ impl DiscreteDevice for VulkanDevice {
         let experts = match (self.fuse_rows, self.route_rows) {
             (0, _) => "experts unfused".to_owned(),
             (n, 0) => format!("experts fused up to {n} rows"),
+            (n, _) if self.attention => format!(
+                "experts fused and routed on the device with decode attention, the O \
+                 projection and FFN norm up to {n} rows"
+            ),
             (n, _) if self.route_o => format!(
                 "experts fused and routed on the device with the O projection and FFN norm \
                  up to {n} rows"
@@ -446,11 +466,21 @@ impl DiscreteDevice for VulkanDevice {
         self.route_o && self.routes_moe(experts, k, s)
     }
 
+    fn routes_moe_attention(&self, experts: usize, k: usize, s: usize) -> bool {
+        self.attention && self.routes_moe_prelude(experts, k, s)
+    }
+
+    fn kv_pool(&self) -> Option<u64> {
+        self.kv_pool
+    }
+
     /// One submission when the layer's experts sit in one buffer per matrix kind (the
     /// arenas); otherwise `Ok(false)`, and the caller routes on the host. A prelude is
     /// run only with [`VulkanConfig::route_o`].
     fn routed_moe(&self, op: &mut DeviceRoutedMoe<'_>) -> Result<bool, ComputeError> {
-        if !self.routes_moe(op.experts.len(), op.k, op.s) || (op.prelude.is_some() && !self.route_o)
+        if !self.routes_moe(op.experts.len(), op.k, op.s)
+            || (op.prelude.is_some() && !self.route_o)
+            || (op.attention.is_some() && !self.attention)
         {
             return Ok(false);
         }
@@ -519,6 +549,21 @@ mod tests {
                 "rms_scale.spv",
                 built("rms_scale.spv"),
                 crate::device::RMS_SCALE_SPV,
+            ),
+            (
+                "kv_sync.spv",
+                built("kv_sync.spv"),
+                crate::device::KV_SYNC_SPV,
+            ),
+            (
+                "attn_prelude.spv",
+                built("attn_prelude.spv"),
+                crate::device::ATTN_PRELUDE_SPV,
+            ),
+            (
+                "attn_decode.spv",
+                built("attn_decode.spv"),
+                crate::device::ATTN_DECODE_SPV,
             ),
         ];
         let _ = std::fs::remove_dir_all(&out);

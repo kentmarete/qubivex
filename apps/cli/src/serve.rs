@@ -314,6 +314,8 @@ impl ServeFlags {
             vulkan_fuse_rows: None,
             vulkan_route: None,
             vulkan_route_o: None,
+            vulkan_attn: None,
+            vulkan_kv_pool: None,
             vram_budget: None,
         };
         let profile = self
