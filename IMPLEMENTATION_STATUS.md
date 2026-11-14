@@ -8,6 +8,12 @@ Last updated: 2026-11-15
 - New fixture `qwen2-tiny` matches transformers per layer and passes every backend, batching and prefix test. `Qwen/Qwen2.5-0.5B-Instruct` bf16: greedy tokens, logits (1.05e-5), chat template and reply equal transformers'; Metal, Vulkan and Sim give the CPU's tokens.
 - **Next:** P2, JSON mode and JSON Schema constrained decoding (ADR first).
 
+**Step 5, first production commit: each scale product once per block (2026-11-14, branch `vulkan-kernel-port`; PR #67 merged into the spike's branch after the spike had reached `main`, so it was re-raised onto `main` on 2026-11-15).** See docs/engineering/VULKAN_EXECUTION_AUDIT.md §24.
+- `shaders/matmul_body.glsl`: Q4_K and Q6_K compute each block's `d · sc` and `dmin · m` once per row, in a few lanes, and share them through shared memory (two barriers per block, no subgroup operations). Rows past `n` run the loop on row `n − 1` and write nothing. The CPU's bits; every gate passes, the real OLMoE included.
+- Mains, 3 alternated rounds against `main` in the same rounds: decode −3.2 to −3.8 ms per token (−10% to −12.5%); with attention on the device 23.17–23.30 ms, **43 tok/s** (was 37.7). Prefill 197 → 166 ms. Concurrent at 8 sequences +20% (attention 50.0 → 60.1 tok/s). Tokens identical everywhere.
+- `scripts/bench-vulkan-baseline --prior REV`: runs each variant built from REV just before the working tree's, in every round.
+- **Next (for review):** token tiles on this kernel, as a harness spike first.
+
 **Step 5 spike: where the matmul kernel's instructions go (2026-11-14, branch `vulkan-kernel-throughput`; harness only, feature `spike`).** See docs/engineering/VULKAN_EXECUTION_AUDIT.md §23.
 - `spike/mm.comp` and `tests/matmul_spike.rs`: the production matmul's Q8_0, Q4_K and Q6_K bodies in variants, each bit for bit against the CPU (positive controls included), and an ignored timing test.
 - The reduction tree, rows per group and workgroup size move each format by 1–4%. Removing the decoding makes Q4_K 2.9× and Q6_K 3.9× faster: the decoding is 65–75% of the time, and its largest part is every lane recomputing the block's scale and min products.
