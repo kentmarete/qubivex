@@ -636,3 +636,211 @@ fn olmoe_on_the_sim_matches_the_cpu() {
     eprintln!("{r:?}");
     assert!(r.experts.evictions > 0, "{r:?}");
 }
+
+/// As [`sim_routed_with`] with the prelude, and decode attention on the device too
+/// (audit §21), with a KV pool of `pool` bytes (`None`: what the budget leaves).
+fn sim_attention(id: &str, pool: Option<u64>) -> Engine {
+    let mut config = SimConfig::new(1 << 30);
+    config.fuse_rows = 64;
+    config.route_rows = 64;
+    config.route_prelude = true;
+    config.route_attention = true;
+    config.kv_pool = pool;
+    Engine::load(
+        meta(id),
+        EngineOptions {
+            backend: BackendKind::Sim,
+            sim: Some(config),
+            vram_budget: Some(1 << 29),
+            expert_cache_bytes: Some(1 << 30),
+            max_context: Some(256),
+            ..EngineOptions::default()
+        },
+    )
+    .unwrap()
+}
+
+/// The prompt's logits on a fresh cache, then `steps` greedy decode steps' logits, one
+/// token at a time on the same cache.
+fn decode_logits(
+    e: &Engine,
+    prompt: &[u32],
+    steps: usize,
+    c: &mut qubivex_runtime::KvCache,
+) -> Vec<Vec<u32>> {
+    let mut out = Vec::with_capacity(steps + 1);
+    let mut logits = e.forward(prompt, c, Logits::Last, None).unwrap();
+    for _ in 0..steps {
+        out.push(bits(&logits));
+        let next = logits
+            .iter()
+            .enumerate()
+            .max_by(|a, b| a.1.total_cmp(b.1).then(b.0.cmp(&a.0)))
+            .map(|(i, _)| u32::try_from(i).unwrap())
+            .unwrap();
+        logits = e.forward(&[next], c, Logits::Last, None).unwrap();
+    }
+    out.push(bits(&logits));
+    out
+}
+
+/// Decode attention on the sim (audit §21): every decode step's logits are the CPU's,
+/// prefill stays on the host and its rows are copied into the pool, and with per-head Q
+/// and K norms (Qwen3) the layer is declined to the host.
+#[test]
+fn decode_attention_on_the_device_has_the_cpu_bits() {
+    for id in MOE {
+        let cpu_e = cpu(id, Some(1 << 30));
+        let want = decode_logits(&cpu_e, PROMPT, 12, &mut cpu_e.new_cache());
+        let want_run = run(&cpu_e);
+        let e = sim_attention(id, None);
+        let _ = routed_logits(&e, id);
+        let before = e.device_report().unwrap().kv_pool;
+        assert_eq!(
+            decode_logits(&e, PROMPT, 12, &mut e.new_cache()),
+            want,
+            "{id}"
+        );
+        let after = e.device_report().unwrap().kv_pool;
+        if id == "qwen3-moe-tiny" {
+            assert_eq!(
+                after.layers, before.layers,
+                "{id}: per-head norms stay on the host"
+            );
+            continue;
+        }
+        assert!(after.allocated, "{id}");
+        assert_eq!(
+            after.layers - before.layers,
+            12 * layers(id),
+            "{id}: every decode step's every layer on the device"
+        );
+        assert_eq!(
+            after.synced_rows - before.synced_rows,
+            PROMPT.len() as u64 * layers(id),
+            "{id}: the prompt's rows copied in once per layer, nothing else"
+        );
+        assert_eq!(
+            after.free, after.blocks,
+            "{id}: the dropped cache gave its blocks back"
+        );
+        assert_eq!(run(&e), want_run, "{id}");
+    }
+}
+
+/// A pool too small for every layer declines the layers it cannot hold to the host,
+/// with the CPU's bits; a cache cleared and refilled with another prompt starts its
+/// mirror again (its epoch changed) and keeps the CPU's bits.
+#[test]
+fn decode_attention_falls_back_and_follows_the_host_cache() {
+    let id = "olmoe-tiny";
+    let probe = sim_attention(id, None);
+    let pool = probe.device_report().unwrap().kv_pool;
+    let block = pool.bytes / pool.blocks;
+    drop(probe);
+    let cpu_e = cpu(id, Some(1 << 30));
+    let want = decode_logits(&cpu_e, PROMPT, 8, &mut cpu_e.new_cache());
+
+    // Room for all but one layer: that layer always runs on the host.
+    let small = sim_attention(id, Some(block * (layers(id) - 1)));
+    let _ = routed_logits(&small, id);
+    assert_eq!(
+        decode_logits(&small, PROMPT, 8, &mut small.new_cache()),
+        want
+    );
+    let r = small.device_report().unwrap().kv_pool;
+    assert_eq!(r.layers, 8 * (layers(id) - 1));
+    assert_eq!(r.full, 8);
+    assert_eq!(r.free, r.blocks);
+
+    // One cache, two prompts.
+    let other: Vec<u32> = PROMPT.iter().rev().map(|&t| t + 3).collect();
+    let want_other = decode_logits(&cpu_e, &other, 8, &mut cpu_e.new_cache());
+    let e = sim_attention(id, None);
+    let _ = routed_logits(&e, id);
+    let mut c = e.new_cache();
+    assert_eq!(decode_logits(&e, PROMPT, 8, &mut c), want);
+    c.clear();
+    assert_eq!(decode_logits(&e, &other, 8, &mut c), want_other);
+    assert!(e.device_report().unwrap().kv_pool.layers >= 16 * layers(id));
+}
+
+/// Concurrent requests with decode attention on the device: each gets the CPU's
+/// tokens, and their decode steps share passes.
+#[test]
+fn concurrent_requests_with_decode_attention() {
+    let id = "olmoe-tiny";
+    let prompts: Vec<Vec<u32>> = (0..4)
+        .map(|i| PROMPT.iter().map(|&t| t + i).collect())
+        .collect();
+    let c = cpu(id, Some(1 << 30));
+    let want: Vec<_> = prompts
+        .iter()
+        .map(|p| c.generate(p, 16, Sampling::default(), |_| true).unwrap())
+        .collect();
+    let e = sim_attention(id, None);
+    let _ = routed_logits(&e, id);
+    let before = e.device_report().unwrap().kv_pool.layers;
+    let got: Vec<_> = std::thread::scope(|s| {
+        let hs: Vec<_> = prompts
+            .iter()
+            .map(|p| {
+                let e = &e;
+                s.spawn(move || e.generate(p, 16, Sampling::default(), |_| true).unwrap())
+            })
+            .collect();
+        hs.into_iter().map(|h| h.join().unwrap()).collect()
+    });
+    assert_eq!(got, want);
+    let r = e.device_report().unwrap().kv_pool;
+    assert!(r.layers > before);
+    assert_eq!(r.free, r.blocks);
+}
+
+/// The KV pool's size (ADR-019 amendment 5): 512 MiB by default, a configured size
+/// otherwise, never more than 1 GiB nor than the budget leaves after the experts.
+#[test]
+fn the_kv_pool_is_512_mib_by_default_and_capped() {
+    let id = "olmoe-tiny";
+    let pool = |config: Option<u64>, budget: u64| {
+        let mut sim = SimConfig::new(8 << 30);
+        sim.fuse_rows = 64;
+        sim.route_rows = 64;
+        sim.route_prelude = true;
+        sim.route_attention = true;
+        sim.kv_pool = config;
+        let e = Engine::load(
+            meta(id),
+            EngineOptions {
+                backend: BackendKind::Sim,
+                sim: Some(sim),
+                vram_budget: Some(budget),
+                expert_cache_bytes: Some(1 << 30),
+                max_context: Some(256),
+                ..EngineOptions::default()
+            },
+        )
+        .unwrap();
+        e.device_report().unwrap().kv_pool
+    };
+    let p = pool(None, 4 << 30);
+    let block = p.bytes / p.blocks;
+    assert!(!p.allocated, "allocated on first use");
+    assert!(
+        p.bytes <= qubivex_runtime::DEFAULT_KV_POOL
+            && p.bytes + block > qubivex_runtime::DEFAULT_KV_POOL,
+        "{p:?}"
+    );
+    let q = pool(Some(256 << 20), 4 << 30);
+    assert!(q.bytes <= 256 << 20 && q.bytes + block > 256 << 20, "{q:?}");
+    let big = pool(Some(3 << 30), 4 << 30);
+    assert!(
+        big.bytes <= qubivex_runtime::MAX_KV_POOL
+            && big.bytes + block > qubivex_runtime::MAX_KV_POOL,
+        "{big:?}"
+    );
+    // A budget with little room after the dense copy, the reserve and the experts.
+    let tight = dense_arena(id) + VRAM_ACTIVATION_RESERVE.0 + (64 << 20);
+    let t = pool(None, tight);
+    assert!(t.bytes < 64 << 20, "{t:?}");
+}

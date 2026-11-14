@@ -1,0 +1,176 @@
+// QUBIVEX Vulkan decode attention over the paged KV pool (audit §21; the harness's
+// one-dispatch attn_oneb_u16, audit §20, with block tables): `math::attend` for one
+// query head of one token, bit for bit:
+//   scores: each position's sequential fma chain over d from +0 (q from shared memory,
+//     16 key loads issued before their 16 fmas), times 1 / sqrt(d);
+//   softmax: a NaN-ignoring tree maximum (Rust's f32::max), exp(v − m) (exp.glsl), the
+//     sum sequential from +0 in one invocation, one division per position;
+//   values: each output dimension's fma chain over positions from +0 in position order,
+//     16 value loads issued before their 16 fmas.
+// Each token is its own sequence's next token: it sees positions 0..=pos, at most MAXP.
+//
+// One workgroup of 128 per (head, token). Grid: (heads, tokens).
+// Bindings (the fused layout): 0 q, as the prelude leaves it ([token][head][d] at the
+// head of the QKV buffer); 1 the KV pool; 2 the outputs ([token][head][d]); 3 the table,
+// with attn_prelude.comp's header at the push constant's word.
+#version 450
+#extension GL_GOOGLE_include_directive : require
+
+layout(local_size_x = 128) in;
+
+const uint LOCAL = 128u;
+const uint MAXP = 4096u;
+const uint BLOCK = 256u;
+const uint U = 16u;
+
+layout(std430, set = 0, binding = 0) readonly buffer Q {
+    float q[];
+};
+
+layout(std430, set = 0, binding = 1) readonly buffer Kv {
+    float kv[];
+};
+
+layout(std430, set = 0, binding = 2) writeonly buffer Out {
+    float out_[];
+};
+
+layout(std430, set = 0, binding = 3) readonly buffer Table {
+    uint tab[];
+};
+
+layout(push_constant) uniform Params {
+    uint hdr;
+    uint unused0;
+    uint unused1;
+    uint unused2;
+} p;
+
+shared float red[LOCAL];
+shared float stot;
+shared float pr[MAXP];
+shared float qs[512];
+
+#include "exp.glsl"
+
+float fmax_rust(float a, float b) {
+    return isnan(a) ? b : (isnan(b) ? a : max(a, b));
+}
+
+void main() {
+    uint h = gl_WorkGroupID.x;
+    uint t = gl_WorkGroupID.y;
+    uint l = gl_LocalInvocationID.x;
+    uint d = tab[p.hdr];
+    uint heads = tab[p.hdr + 1u];
+    uint kvh = tab[p.hdr + 2u];
+    uint tb = tab[p.hdr + 8u] + 2u * t;
+    uint n = tab[tb] + 1u;
+    uint ta = tab[tb + 1u];
+    uint g = h / (heads / kvh);
+    uint kv_out = kvh * d;
+    uint bw = 2u * BLOCK * kv_out;
+    uint qb = (t * heads + h) * d;
+    for (uint i = l; i < d; i += LOCAL) {
+        qs[i] = q[qb + i];
+    }
+    memoryBarrierShared();
+    barrier();
+    float scale = 1.0 / sqrt(float(d));
+    float m = uintBitsToFloat(0xff800000u);
+    for (uint j = l; j < n; j += LOCAL) {
+        uint kb = tab[ta + j / BLOCK] * bw + g * d * BLOCK + j % BLOCK;
+        float acc = 0.0;
+        uint i = 0u;
+        for (; i + U <= d; i += U) {
+            float k[U];
+            for (uint u = 0u; u < U; u++) {
+                k[u] = kv[kb + (i + u) * BLOCK];
+            }
+            for (uint u = 0u; u < U; u++) {
+                acc = fma(qs[i + u], k[u], acc);
+            }
+        }
+        for (; i < d; i++) {
+            acc = fma(qs[i], kv[kb + i * BLOCK], acc);
+        }
+        float v = acc * scale;
+        pr[j] = v;
+        m = fmax_rust(m, v);
+    }
+    red[l] = m;
+    memoryBarrierShared();
+    barrier();
+    for (uint w = LOCAL / 2u; w > 0u; w /= 2u) {
+        float v = 0.0;
+        if (l < w) {
+            v = fmax_rust(red[l], red[l + w]);
+        }
+        memoryBarrierShared();
+        barrier();
+        if (l < w) {
+            red[l] = v;
+        }
+        memoryBarrierShared();
+        barrier();
+    }
+    m = red[0];
+    for (uint j = l; j < n; j += LOCAL) {
+        pr[j] = qexp(pr[j] - m);
+    }
+    memoryBarrierShared();
+    barrier();
+    if (l == 0u) {
+        float sum = 0.0;
+        uint j = 0u;
+        for (; j + 8u <= n; j += 8u) {
+            float a0 = pr[j];
+            float a1 = pr[j + 1u];
+            float a2 = pr[j + 2u];
+            float a3 = pr[j + 3u];
+            float a4 = pr[j + 4u];
+            float a5 = pr[j + 5u];
+            float a6 = pr[j + 6u];
+            float a7 = pr[j + 7u];
+            sum += a0;
+            sum += a1;
+            sum += a2;
+            sum += a3;
+            sum += a4;
+            sum += a5;
+            sum += a6;
+            sum += a7;
+        }
+        for (; j < n; j++) {
+            sum += pr[j];
+        }
+        stot = sum;
+    }
+    memoryBarrierShared();
+    barrier();
+    float sum = stot;
+    for (uint j = l; j < n; j += LOCAL) {
+        pr[j] = pr[j] / sum;
+    }
+    memoryBarrierShared();
+    barrier();
+    uint vo = BLOCK * kv_out + g * d;
+    for (uint i = l; i < d; i += LOCAL) {
+        float o = 0.0;
+        uint j = 0u;
+        for (; j + U <= n; j += U) {
+            float v[U];
+            for (uint k = 0u; k < U; k++) {
+                uint jj = j + k;
+                v[k] = kv[tab[ta + jj / BLOCK] * bw + vo + (jj % BLOCK) * kv_out + i];
+            }
+            for (uint k = 0u; k < U; k++) {
+                o = fma(pr[j + k], v[k], o);
+            }
+        }
+        for (; j < n; j++) {
+            o = fma(pr[j], kv[tab[ta + j / BLOCK] * bw + vo + (j % BLOCK) * kv_out + i], o);
+        }
+        out_[(t * heads + h) * d + i] = o;
+    }
+}

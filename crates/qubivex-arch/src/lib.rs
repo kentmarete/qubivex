@@ -18,7 +18,8 @@ pub mod ops;
 
 use qubivex_compute::tensor::{Tensor, TensorView, TensorViewMut};
 use qubivex_compute::{
-    ComputeBackend, ComputeError, GatedFfn, MatMul, MoePrelude, RoutedMoe, WeightView,
+    AttnSeq, ComputeBackend, ComputeError, GatedFfn, MatMul, MoeAttention, MoePrelude, RoutedMoe,
+    WeightView,
 };
 use qubivex_core::{DType, Shape};
 use qubivex_core::{ExpertIdx, LayerIdx};
@@ -290,6 +291,10 @@ pub struct KvCache {
     max: usize,
     device: Option<DeviceKv>,
     device_bytes: u64,
+    /// Changes whenever filled positions may come to hold other keys and values
+    /// ([`KvCache::clear`], [`KvCache::restore_from`]), so a device mirror of them
+    /// knows to start again.
+    epoch: u64,
 }
 
 impl std::fmt::Debug for KvCache {
@@ -315,6 +320,7 @@ impl Default for KvCache {
             max: 0,
             device: None,
             device_bytes: 0,
+            epoch: 0,
         }
     }
 }
@@ -421,12 +427,34 @@ impl KvCache {
             }
         }
         self.len = positions;
+        self.epoch = self.epoch.wrapping_add(1);
         Ok(())
     }
 
     /// Forgets every position.
     pub const fn clear(&mut self) {
         self.len = 0;
+        self.epoch = self.epoch.wrapping_add(1);
+    }
+
+    /// The cache's epoch (see [`qubivex_compute::AttnSeq::epoch`]).
+    #[must_use]
+    pub const fn epoch(&self) -> u64 {
+        self.epoch
+    }
+
+    /// Layer `l`'s host keys and values of positions `0..positions` per KV head, and
+    /// the device mirror, for device attention with a host-authoritative cache.
+    #[allow(clippy::type_complexity)]
+    fn device_parts(
+        &mut self,
+        l: usize,
+        positions: usize,
+    ) -> Result<(Vec<&[f32]>, Vec<&[f32]>, &mut Option<DeviceKv>), ArchError> {
+        let n = positions as u64;
+        let k = head_rows(&self.k[l], self.kv_heads, n)?;
+        let v = head_rows(&self.v[l], self.kv_heads, n)?;
+        Ok((k, v, &mut self.device))
     }
 
     /// An empty layer tensor with room for `positions`.
@@ -567,6 +595,8 @@ struct RoutedLayer<'a> {
     /// The O projection, residual and norm, computed in the same operation (Step 3c);
     /// `xs` is then empty.
     prelude: Option<MoePrelude<'a>>,
+    /// Decode attention before the prelude (audit §21).
+    attention: Option<MoeAttention<'a>>,
 }
 
 /// Each layer's FFN.
@@ -838,6 +868,7 @@ impl Transformer {
             max: max_positions,
             device: None,
             device_bytes: 0,
+            epoch: 0,
         };
         // Zero-sized, so the layers can share it; the first step replaces each.
         if let Ok(empty) = cache.layer_tensor(0) {
@@ -956,6 +987,7 @@ impl Transformer {
         let mut ids = vec![0u32; l.s * l.k];
         let mut weights = vec![0f32; l.s * l.k];
         let mut prelude = l.prelude;
+        let mut attention = l.attention;
         experts.with_layer_held(LayerIdx(l.layer), ne, &mut |ws| {
             let views: Vec<[WeightView<'_>; 3]> =
                 ws.iter().map(|w| [w.gate, w.up, w.down]).collect();
@@ -970,6 +1002,7 @@ impl Transformer {
                 ids: &mut ids,
                 weights: &mut weights,
                 prelude: prelude.take(),
+                attention: attention.take(),
             })?;
             if !ran {
                 return Ok(None);
@@ -1072,6 +1105,21 @@ impl Transformer {
             Vec::new()
         };
         let mut ahead_x = if lookahead { vec![0f32; h] } else { Vec::new() };
+        // Audit §21: attention on the device, for decode steps only (every sequence one
+        // new token): prefill and every declined pass run attention on the host, whose
+        // cache stays authoritative.
+        let dev_attn = !tracing
+            && !lookahead
+            && layout.iter().all(|&(_, n, _)| n == 1)
+            && match &self.ffn {
+                Ffn::Moe { .. } => be.routes_moe_attention(ne, k_top, s),
+                Ffn::Dense { .. } => false,
+            };
+        let mut rope_rows = if dev_attn {
+            vec![0f32; s * d]
+        } else {
+            Vec::new()
+        };
 
         for (l, norms) in self.norms.iter().enumerate() {
             let li = u32::try_from(l).map_err(|_| ArchError::Input("too many layers".into()))?;
@@ -1082,114 +1130,197 @@ impl Transformer {
             for xt in x.chunks_exact_mut(h) {
                 rms_norm(xt, &norms.attn, c.rms_eps);
             }
-            // One submission: the three projections share their input.
-            be.matmul_many(&mut [
-                MatMul {
-                    w: dense.view(&n(&c.names.q))?,
-                    xs: &x,
-                    s,
-                    ys: &mut q,
-                },
-                MatMul {
-                    w: dense.view(&n(&c.names.k))?,
-                    xs: &x,
-                    s,
-                    ys: &mut k,
-                },
-                MatMul {
-                    w: dense.view(&n(&c.names.v))?,
-                    xs: &x,
-                    s,
-                    ys: &mut v,
-                },
-            ])?;
-            if let Some(clip) = c.clip_qkv {
+            // Audit §21: a decode step's attention, its prelude and the routed layer as one
+            // backend operation. Declined, nothing is written and attention runs on the
+            // host below; the host cache stays authoritative either way.
+            let mut whole = false;
+            let qk_ok = !matches!(
+                (c.qk_norm, &norms.q, &norms.k),
+                (QkNorm::PerHead, Some(_), Some(_))
+            );
+            if let (true, true, Ffn::Moe { router, .. }) = (dev_attn, qk_ok, &self.ffn) {
+                for (t, row) in rope_rows.chunks_exact_mut(d).enumerate() {
+                    self.rope.table(pos[t], row);
+                }
+                for g in segments.iter_mut() {
+                    let p0 = g.cache.len;
+                    g.cache.reserve(l, p0 + 1)?;
+                }
+                let seqs = segments
+                    .iter_mut()
+                    .map(|g| {
+                        let (p0, epoch) = (g.cache.len, g.cache.epoch);
+                        let (host_k, host_v, mirror) = g.cache.device_parts(l, p0)?;
+                        Ok(AttnSeq {
+                            mirror,
+                            host_k,
+                            host_v,
+                            pos: p0,
+                            epoch,
+                        })
+                    })
+                    .collect::<Result<Vec<_>, ArchError>>()?;
+                let qk_norm = match (c.qk_norm, &norms.q, &norms.k) {
+                    (QkNorm::Full, Some(qn), Some(kn)) => Some((qn.as_slice(), kn.as_slice())),
+                    _ => None,
+                };
                 #[allow(clippy::cast_possible_truncation)]
-                let clip = clip as f32;
-                for z in q.iter_mut().chain(k.iter_mut()).chain(v.iter_mut()) {
-                    *z = z.clamp(-clip, clip);
+                let clip = c.clip_qkv.map(|v| v as f32);
+                whole = self.routed_on_device(
+                    RoutedLayer {
+                        layer: li,
+                        router: dense.view(&n(router))?,
+                        k: k_top,
+                        renormalise: norm_topk_prob,
+                        xs: &[],
+                        s,
+                        prelude: Some(MoePrelude {
+                            o: dense.view(&n(&c.names.o))?,
+                            att: &[],
+                            hs: &mut hs,
+                            norm: &norms.ffn,
+                            eps: c.rms_eps,
+                        }),
+                        attention: Some(MoeAttention {
+                            layer: l,
+                            q: dense.view(&n(&c.names.q))?,
+                            k: dense.view(&n(&c.names.k))?,
+                            v: dense.view(&n(&c.names.v))?,
+                            xs: &x,
+                            heads,
+                            kv_heads: kvh,
+                            head_dim: d,
+                            clip,
+                            qk_norm,
+                            eps: c.rms_eps,
+                            rope: &rope_rows,
+                            seqs,
+                            k_new: &mut k,
+                            v_new: &mut v,
+                        }),
+                    },
+                    experts,
+                    be,
+                    &mut o,
+                )?;
+                if whole {
+                    for (i, g) in segments.iter_mut().enumerate() {
+                        let rows = i * kv_out..(i + 1) * kv_out;
+                        g.cache.store(l, 1, &k[rows.clone()], &v[rows])?;
+                    }
                 }
             }
-            match (c.qk_norm, &norms.q, &norms.k) {
-                (QkNorm::Full, Some(qn), Some(kn)) => {
-                    q.chunks_exact_mut(q_out)
-                        .for_each(|r| rms_norm(r, qn, c.rms_eps));
-                    k.chunks_exact_mut(kv_out)
-                        .for_each(|r| rms_norm(r, kn, c.rms_eps));
+            if !whole {
+                // One submission: the three projections share their input.
+                be.matmul_many(&mut [
+                    MatMul {
+                        w: dense.view(&n(&c.names.q))?,
+                        xs: &x,
+                        s,
+                        ys: &mut q,
+                    },
+                    MatMul {
+                        w: dense.view(&n(&c.names.k))?,
+                        xs: &x,
+                        s,
+                        ys: &mut k,
+                    },
+                    MatMul {
+                        w: dense.view(&n(&c.names.v))?,
+                        xs: &x,
+                        s,
+                        ys: &mut v,
+                    },
+                ])?;
+                if let Some(clip) = c.clip_qkv {
+                    #[allow(clippy::cast_possible_truncation)]
+                    let clip = clip as f32;
+                    for z in q.iter_mut().chain(k.iter_mut()).chain(v.iter_mut()) {
+                        *z = z.clamp(-clip, clip);
+                    }
                 }
-                (QkNorm::PerHead, Some(qn), Some(kn)) => {
-                    q.chunks_exact_mut(d)
-                        .for_each(|r| rms_norm(r, qn, c.rms_eps));
-                    k.chunks_exact_mut(d)
-                        .for_each(|r| rms_norm(r, kn, c.rms_eps));
+                match (c.qk_norm, &norms.q, &norms.k) {
+                    (QkNorm::Full, Some(qn), Some(kn)) => {
+                        q.chunks_exact_mut(q_out)
+                            .for_each(|r| rms_norm(r, qn, c.rms_eps));
+                        k.chunks_exact_mut(kv_out)
+                            .for_each(|r| rms_norm(r, kn, c.rms_eps));
+                    }
+                    (QkNorm::PerHead, Some(qn), Some(kn)) => {
+                        q.chunks_exact_mut(d)
+                            .for_each(|r| rms_norm(r, qn, c.rms_eps));
+                        k.chunks_exact_mut(d)
+                            .for_each(|r| rms_norm(r, kn, c.rms_eps));
+                    }
+                    _ => {}
                 }
-                _ => {}
+                for t in 0..s {
+                    self.rope.table(pos[t], &mut rope_cs);
+                    q[t * q_out..(t + 1) * q_out]
+                        .chunks_exact_mut(d)
+                        .for_each(|hd| Rope::rotate(hd, &rope_cs));
+                    k[t * kv_out..(t + 1) * kv_out]
+                        .chunks_exact_mut(d)
+                        .for_each(|hd| Rope::rotate(hd, &rope_cs));
+                }
+                for (g, &(first, n, p0)) in segments.iter_mut().zip(&layout) {
+                    if n > 0 {
+                        let rows = first * kv_out..(first + n) * kv_out;
+                        g.cache.reserve(l, p0 + n)?;
+                        g.cache.store(l, n, &k[rows.clone()], &v[rows])?;
+                    }
+                }
+                // Every (token, head) pair is independent once each cache holds its
+                // segment, so they run in parallel; each is the same sequential `attend`
+                // over its own sequence's keys and values.
+                let kv = segments
+                    .iter()
+                    .zip(&layout)
+                    .map(|(g, &(_, n, p0))| g.cache.heads(l, p0 + n))
+                    .collect::<Result<Vec<_>, _>>()?;
+                att.par_chunks_mut(d)
+                    .enumerate()
+                    .for_each_init(Vec::new, |scores, (i, out)| {
+                        let (t, hd) = (i / heads, i % heads);
+                        let g = hd / group;
+                        let (kl, vl) = &kv[seg_of[t]];
+                        let qs = &q[t * q_out + hd * d..t * q_out + (hd + 1) * d];
+                        attend(qs, kl[g], vl[g], pos[t], out, scores);
+                    });
+                drop(kv);
+                // Step 3c: the O projection, the residual and the FFN norm at the head of the
+                // routed submission, when the backend routes this shape with them, no trace is
+                // taken and no lookahead wants `hs` on the host before the router. Declined,
+                // nothing is written and the layer runs below as before.
+                whole = match &self.ffn {
+                    Ffn::Moe { router, .. }
+                        if !tracing && !lookahead && be.routes_moe_prelude(ne, k_top, s) =>
+                    {
+                        self.routed_on_device(
+                            RoutedLayer {
+                                layer: li,
+                                router: dense.view(&n(router))?,
+                                k: k_top,
+                                renormalise: norm_topk_prob,
+                                xs: &[],
+                                s,
+                                prelude: Some(MoePrelude {
+                                    o: dense.view(&n(&c.names.o))?,
+                                    att: &att,
+                                    hs: &mut hs,
+                                    norm: &norms.ffn,
+                                    eps: c.rms_eps,
+                                }),
+                                attention: None,
+                            },
+                            experts,
+                            be,
+                            &mut o,
+                        )?
+                    }
+                    _ => false,
+                };
             }
-            for t in 0..s {
-                self.rope.table(pos[t], &mut rope_cs);
-                q[t * q_out..(t + 1) * q_out]
-                    .chunks_exact_mut(d)
-                    .for_each(|hd| Rope::rotate(hd, &rope_cs));
-                k[t * kv_out..(t + 1) * kv_out]
-                    .chunks_exact_mut(d)
-                    .for_each(|hd| Rope::rotate(hd, &rope_cs));
-            }
-            for (g, &(first, n, p0)) in segments.iter_mut().zip(&layout) {
-                if n > 0 {
-                    let rows = first * kv_out..(first + n) * kv_out;
-                    g.cache.reserve(l, p0 + n)?;
-                    g.cache.store(l, n, &k[rows.clone()], &v[rows])?;
-                }
-            }
-            // Every (token, head) pair is independent once each cache holds its
-            // segment, so they run in parallel; each is the same sequential `attend`
-            // over its own sequence's keys and values.
-            let kv = segments
-                .iter()
-                .zip(&layout)
-                .map(|(g, &(_, n, p0))| g.cache.heads(l, p0 + n))
-                .collect::<Result<Vec<_>, _>>()?;
-            att.par_chunks_mut(d)
-                .enumerate()
-                .for_each_init(Vec::new, |scores, (i, out)| {
-                    let (t, hd) = (i / heads, i % heads);
-                    let g = hd / group;
-                    let (kl, vl) = &kv[seg_of[t]];
-                    let qs = &q[t * q_out + hd * d..t * q_out + (hd + 1) * d];
-                    attend(qs, kl[g], vl[g], pos[t], out, scores);
-                });
-            drop(kv);
-            // Step 3c: the O projection, the residual and the FFN norm at the head of the
-            // routed submission, when the backend routes this shape with them, no trace is
-            // taken and no lookahead wants `hs` on the host before the router. Declined,
-            // nothing is written and the layer runs below as before.
-            let whole = match &self.ffn {
-                Ffn::Moe { router, .. }
-                    if !tracing && !lookahead && be.routes_moe_prelude(ne, k_top, s) =>
-                {
-                    self.routed_on_device(
-                        RoutedLayer {
-                            layer: li,
-                            router: dense.view(&n(router))?,
-                            k: k_top,
-                            renormalise: norm_topk_prob,
-                            xs: &[],
-                            s,
-                            prelude: Some(MoePrelude {
-                                o: dense.view(&n(&c.names.o))?,
-                                att: &att,
-                                hs: &mut hs,
-                                norm: &norms.ffn,
-                                eps: c.rms_eps,
-                            }),
-                        },
-                        experts,
-                        be,
-                        &mut o,
-                    )?
-                }
-                _ => false,
-            };
             if !whole {
                 be.matmul(&dense.view(&n(&c.names.o))?, &att, s, &mut o)?;
                 for t in 0..s {
@@ -1235,6 +1366,7 @@ impl Transformer {
                                 xs: &x,
                                 s,
                                 prelude: None,
+                                attention: None,
                             },
                             experts,
                             be,

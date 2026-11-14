@@ -15,7 +15,7 @@ mod placement;
 mod request;
 
 pub use combine::BatchStats;
-pub use discrete::{DeviceCacheStats, DeviceReport};
+pub use discrete::{DEFAULT_KV_POOL, DeviceCacheStats, DeviceReport, KvPoolStats, MAX_KV_POOL};
 pub use engine::{
     DEFAULT_BATCH_TOKENS, DEFAULT_BATCH_WAIT_US, DEFAULT_IO_THREADS, DEFAULT_READ_RETRIES,
     DEFAULT_SIM_VRAM, Engine, EngineOptions, Finish, GenerateOptions, Generation, KvReservation,

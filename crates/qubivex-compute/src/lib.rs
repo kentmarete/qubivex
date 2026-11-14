@@ -331,6 +331,139 @@ pub struct MoePrelude<'a> {
     pub eps: f64,
 }
 
+/// A device's mirror of one sequence's keys and values (see [`AttnSeq::mirror`]): its
+/// contents belong to the backend that made it.
+pub type KvMirror = Box<dyn std::any::Any + Send + Sync>;
+
+/// One decode sequence of a [`MoeAttention`]: one new token at position `pos`.
+pub struct AttnSeq<'a> {
+    /// The backend's mirror of the sequence's keys and values on the device, kept
+    /// between passes (the sequence's KV cache holds it). The host cache stays
+    /// authoritative: a backend fills the mirror from `host_k` and `host_v` for any
+    /// position it does not hold.
+    pub mirror: &'a mut Option<KvMirror>,
+    /// Per KV head, the host's keys of positions `0..pos`, `pos × head_dim` each.
+    pub host_k: Vec<&'a [f32]>,
+    /// Per KV head, the host's values of positions `0..pos`.
+    pub host_v: Vec<&'a [f32]>,
+    /// The new token's position: positions `0..pos` are filled.
+    pub pos: usize,
+    /// The cache's epoch: it changes whenever positions already filled may hold other
+    /// keys and values (the cache was cleared or restored), so a mirror made in another
+    /// epoch holds nothing valid.
+    pub epoch: u64,
+}
+
+impl std::fmt::Debug for AttnSeq<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AttnSeq")
+            .field("pos", &self.pos)
+            .field("mirror", &self.mirror.is_some())
+            .finish_non_exhaustive()
+    }
+}
+
+/// A decode step's attention at the head of a [`RoutedMoe`] with a [`MoePrelude`]
+/// (audit §21): each token is its own sequence's next token. From the attention-normed
+/// activations, the Q, K and V projections; the clip; the full-width Q and K norms;
+/// RoPE; the store of the new key and value; and causal attention over each sequence's
+/// positions. The prelude's `att` is then empty: attention computes it.
+///
+/// Every output has the bits of the CPU's forward pass: the matmuls, `clamp`,
+/// [`math::rms_norm`], [`math::rope_rotate`] and [`math::attend`] in that order.
+#[derive(Debug)]
+pub struct MoeAttention<'a> {
+    /// The layer: which of each sequence's mirrored layers this is.
+    pub layer: usize,
+    /// `heads·head_dim × cols` query projection.
+    pub q: WeightView<'a>,
+    /// `kv_heads·head_dim × cols` key projection.
+    pub k: WeightView<'a>,
+    /// `kv_heads·head_dim × cols` value projection.
+    pub v: WeightView<'a>,
+    /// `s × cols` attention-normed activations.
+    pub xs: &'a [f32],
+    /// Query heads.
+    pub heads: usize,
+    /// KV heads (dividing `heads`).
+    pub kv_heads: usize,
+    /// Values per head (even).
+    pub head_dim: usize,
+    /// `z.clamp(-c, c)` on q, k and v.
+    pub clip: Option<f32>,
+    /// Full-width RMSNorm weights for q (`heads·head_dim`) and k
+    /// (`kv_heads·head_dim`): both or neither.
+    pub qk_norm: Option<(&'a [f32], &'a [f32])>,
+    /// The norms' epsilon.
+    pub eps: f64,
+    /// `s × head_dim`: each token's RoPE table row at its position (`[cos…, sin…]`).
+    pub rope: &'a [f32],
+    /// One per token, in token order.
+    pub seqs: Vec<AttnSeq<'a>>,
+    /// `s × kv_heads·head_dim`: the new keys, written (rotated), for the host cache.
+    pub k_new: &'a mut [f32],
+    /// `s × kv_heads·head_dim`: the new values, written (clipped).
+    pub v_new: &'a mut [f32],
+}
+
+impl MoeAttention<'_> {
+    /// Checks the shapes for `s` tokens of `cols` activations and `att_cols` attention
+    /// outputs.
+    ///
+    /// # Errors
+    /// [`ComputeError::Shape`] when they do not fit.
+    pub fn check(&self, s: usize, cols: usize, att_cols: usize) -> Result<(), ComputeError> {
+        let (d, h, kvh) = (self.head_dim, self.heads, self.kv_heads);
+        let (q_out, kv_out) = (h * d, kvh * d);
+        let ok = d > 0
+            && d % 2 == 0
+            && kvh > 0
+            && h % kvh == 0
+            && q_out == att_cols
+            && self.q.rows() == q_out
+            && self.k.rows() == kv_out
+            && self.v.rows() == kv_out
+            && [&self.q, &self.k, &self.v].iter().all(|w| w.cols() == cols)
+            && self.xs.len() == s * cols
+            && self.rope.len() == s * d
+            && self.seqs.len() == s
+            && self.k_new.len() == s * kv_out
+            && self.v_new.len() == s * kv_out
+            && self
+                .qk_norm
+                .is_none_or(|(qn, kn)| qn.len() == q_out && kn.len() == kv_out)
+            && self.seqs.iter().all(|q| {
+                q.host_k.len() == kvh
+                    && q.host_v.len() == kvh
+                    && q.host_k
+                        .iter()
+                        .chain(&q.host_v)
+                        .all(|r| r.len() == q.pos * d)
+            });
+        if ok {
+            Ok(())
+        } else {
+            Err(ComputeError::Shape {
+                op: "routed moe attention",
+                detail: format!(
+                    "{h} heads of {d}, {kvh} KV heads, Q {} x {}, K {} x {}, V {} x {}, \
+                     {} activations, {} RoPE values, {} sequences, for {s} tokens of \
+                     {cols} and {att_cols} attention outputs",
+                    self.q.rows(),
+                    self.q.cols(),
+                    self.k.rows(),
+                    self.k.cols(),
+                    self.v.rows(),
+                    self.v.cols(),
+                    self.xs.len(),
+                    self.rope.len(),
+                    self.seqs.len()
+                ),
+            })
+        }
+    }
+}
+
 /// The residual and norm of a prelude given the projection's outputs `o` (`s × cols`):
 /// `hs += o`, then each token's row of `hs` through [`math::rms_norm`]. Returns the
 /// normed activations.
@@ -394,6 +527,9 @@ pub struct RoutedMoe<'a> {
     /// The O projection, residual and norm before the layer, in the same operation
     /// (Step 3c); `None`: `xs` holds the activations.
     pub prelude: Option<MoePrelude<'a>>,
+    /// Attention before the prelude, in the same operation (audit §21): needs the
+    /// prelude, whose `att` is then empty.
+    pub attention: Option<MoeAttention<'a>>,
 }
 
 impl RoutedMoe<'_> {
@@ -438,7 +574,12 @@ impl RoutedMoe<'_> {
             None => self.s * cols,
             Some(p) => {
                 if p.o.rows() != cols
-                    || p.att.len() != self.s * p.o.cols()
+                    || p.att.len()
+                        != if self.attention.is_some() {
+                            0
+                        } else {
+                            self.s * p.o.cols()
+                        }
                     || p.hs.len() != self.s * cols
                     || p.norm.len() != cols
                 {
@@ -453,9 +594,15 @@ impl RoutedMoe<'_> {
                         self.s
                     )));
                 }
+                if let Some(a) = &self.attention {
+                    a.check(self.s, cols, p.o.cols())?;
+                }
                 0
             }
         };
+        if self.attention.is_some() && self.prelude.is_none() {
+            return Err(bad("attention without a prelude".into()));
+        }
         if self.xs.len() != xs
             || self.ys.len() != self.s * rows
             || self.ids.len() != self.s * self.k
@@ -661,6 +808,14 @@ pub trait ComputeBackend: Send + Sync {
     /// projection, residual and norm, Step 3c) as one [`ComputeBackend::routed_moe`].
     /// Implies [`ComputeBackend::routes_moe`]. The default is `false`.
     fn routes_moe_prelude(&self, experts: usize, k: usize, s: usize) -> bool {
+        let _ = (experts, k, s);
+        false
+    }
+
+    /// Whether callers should offer such a layer with its prelude and its decode
+    /// attention ([`MoeAttention`], audit §21) as one [`ComputeBackend::routed_moe`].
+    /// Implies [`ComputeBackend::routes_moe_prelude`]. The default is `false`.
+    fn routes_moe_attention(&self, experts: usize, k: usize, s: usize) -> bool {
         let _ = (experts, k, s);
         false
     }

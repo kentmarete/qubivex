@@ -8,7 +8,7 @@
 //! ```text
 //! cargo run --release -p qubivex-runtime --example batch -- \
 //!     <MODEL_DIR> <TOKENIZER_JSON> [--cache-mb N] [--steps N] [--runs N] [--sizes 1,2,4,8] \
-//!     [--metal layers|token] [--vulkan on] [--vulkan-fuse-rows N] [--vulkan-route on|off] [--vulkan-route-o on|off] [--threads N]
+//!     [--metal layers|token] [--vulkan on] [--vulkan-fuse-rows N] [--vulkan-route on|off] [--vulkan-route-o on|off] [--vulkan-attn on|off] [--vulkan-kv-pool-mb N] [--threads N]
 //! ```
 //!
 //! `--metal` runs whole layers on Metal, routed on the host (`layers`) or on the GPU
@@ -17,7 +17,8 @@
 //! `--vulkan-fuse-rows N` as `qubivex --vulkan-fuse-rows` (0: experts unfused);
 //! `--vulkan-route on` as `qubivex --vulkan-route on` (routing on the device), and
 //! `--vulkan-route-o on` as `qubivex --vulkan-route-o on` (with the O projection and FFN
-//! norm in the routed submission).
+//! norm in the routed submission), `--vulkan-attn on` as `qubivex --vulkan-attn on`
+//! (decode attention too) and `--vulkan-kv-pool-mb N` as `--vulkan-kv-pool NMiB`.
 
 use std::error::Error;
 use std::path::PathBuf;
@@ -164,7 +165,7 @@ fn median(mut v: Vec<Duration>) -> Duration {
 }
 
 fn main() -> Result<(), Box<dyn Error>> {
-    let usage = "usage: batch <MODEL_DIR> <TOKENIZER_JSON> [--cache-mb N] [--steps N] [--runs N] [--sizes 1,2,4,8] [--metal layers|token] [--vulkan on] [--vulkan-fuse-rows N] [--vulkan-route on|off] [--vulkan-route-o on|off] [--threads N] [--prefetch on|off]";
+    let usage = "usage: batch <MODEL_DIR> <TOKENIZER_JSON> [--cache-mb N] [--steps N] [--runs N] [--sizes 1,2,4,8] [--metal layers|token] [--vulkan on] [--vulkan-fuse-rows N] [--vulkan-route on|off] [--vulkan-route-o on|off] [--vulkan-attn on|off] [--vulkan-kv-pool-mb N] [--threads N] [--prefetch on|off]";
     let mut args = std::env::args().skip(1);
     let dir = PathBuf::from(args.next().ok_or(usage)?);
     let tok = Tokenizer::from_hf_dir(&PathBuf::from(args.next().ok_or(usage)?))?;
@@ -185,6 +186,10 @@ fn main() -> Result<(), Box<dyn Error>> {
             "--vulkan-fuse-rows" => vulkan.fuse_rows = Some(value.parse()?),
             "--vulkan-route" => vulkan.route = value == "on",
             "--vulkan-route-o" => vulkan.route_o = value == "on",
+            "--vulkan-attn" => vulkan.attention = value == "on",
+            "--vulkan-kv-pool-mb" => {
+                vulkan.kv_pool = Some(value.parse::<u64>()? << 20);
+            }
             "--vulkan" => {
                 on_vulkan = match value.as_str() {
                     "on" => true,

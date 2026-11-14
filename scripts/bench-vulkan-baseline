@@ -130,12 +130,16 @@ if (( concurrent )); then
     for v in $variants; do
       vname=${v%%=*}
       vargs=(${(z)${v#*=}})
-      # The batch example takes --vulkan-fuse-rows, --vulkan-route and
-      # --vulkan-route-o; other bench flags do not apply.
+      # The batch example takes --vulkan-fuse-rows, --vulkan-route, --vulkan-route-o
+      # and --vulkan-attn, and --vulkan-kv-pool NMiB as --vulkan-kv-pool-mb N; other
+      # bench flags do not apply.
       bargs=()
-      for flag in --vulkan-fuse-rows --vulkan-route --vulkan-route-o; do
+      for flag in --vulkan-fuse-rows --vulkan-route --vulkan-route-o --vulkan-attn; do
         (( ${vargs[(I)$flag]} )) && bargs+=($flag ${vargs[${vargs[(I)$flag]}+1]})
       done
+      if (( ${vargs[(I)--vulkan-kv-pool]} )); then
+        bargs+=(--vulkan-kv-pool-mb ${${vargs[${vargs[(I)--vulkan-kv-pool]}+1]}%MiB})
+      fi
       print -r -- "concurrent, round $r: $vname"
       $head_batch $batch_args $bargs
     done

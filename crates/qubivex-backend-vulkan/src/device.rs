@@ -25,8 +25,8 @@ use std::time::Instant;
 use ash::vk;
 use qubivex_compute::ComputeError;
 use qubivex_compute::discrete::{
-    DeviceBuffer, DeviceGatedFfn, DeviceMatMul, DeviceRoutedMoe, DeviceUsage, DeviceWeights, Guard,
-    TransferStats,
+    DeviceBuffer, DeviceGatedFfn, DeviceMatMul, DeviceMoeAttention, DeviceRoutedMoe, DeviceUsage,
+    DeviceWeights, Guard, KV_BLOCK, TransferStats, kv_block_words,
 };
 use qubivex_core::{DType, GgmlType};
 
@@ -58,6 +58,20 @@ pub(crate) const RESNORM_SPV: &[u8] = include_bytes!("resnorm.spv");
 
 /// `shaders/rms_scale.comp`: the RMSNorm scale alone, for the conformance tests.
 pub(crate) const RMS_SCALE_SPV: &[u8] = include_bytes!("rms_scale.spv");
+
+/// `shaders/kv_sync.comp`: host rows into the device KV pool (audit §21).
+pub(crate) const KV_SYNC_SPV: &[u8] = include_bytes!("kv_sync.spv");
+
+/// `shaders/attn_prelude.comp`: the clip, Q and K norms, RoPE and KV store for decode
+/// (audit §21).
+pub(crate) const ATTN_PRELUDE_SPV: &[u8] = include_bytes!("attn_prelude.spv");
+
+/// `shaders/attn_decode.comp`: decode attention over the paged KV pool (audit §21).
+pub(crate) const ATTN_DECODE_SPV: &[u8] = include_bytes!("attn_decode.spv");
+
+/// The most positions one token's attention sees on the device (`attn_decode.comp`'s
+/// `MAXP`: its shared scores); past it, attention runs on the host.
+pub(crate) const ATTN_POSITIONS: usize = 4096;
 
 /// Invocations per SwiGLU workgroup. Must equal `local_size_x` in the shader.
 const SWIGLU_GROUP: u32 = 256;
@@ -198,6 +212,9 @@ pub(crate) struct Shared {
     /// Routing and combine on the device (Step 3b), on the fused layout; `None` without
     /// fused pipelines or if the driver could not build them.
     pub(crate) routed: Option<Routed>,
+    /// Decode attention on the device (audit §21), on the fused layout; `None` without
+    /// the routed pipelines or if the driver could not build them.
+    pub(crate) attn: Option<Attn>,
     /// Experimental (feature `spike`, audit §20): steps the next submission records ahead
     /// of its own, and the last submission's timing.
     #[cfg(feature = "spike")]
@@ -222,6 +239,13 @@ pub(crate) struct Routed {
     /// The residual and RMSNorm (audit §18) and the scale probe.
     resnorm: vk::Pipeline,
     rms_scale: vk::Pipeline,
+}
+
+/// Decode attention's pipelines (audit §21), on [`Fused`]'s layout.
+pub(crate) struct Attn {
+    kv_sync: vk::Pipeline,
+    prelude: vk::Pipeline,
+    decode: vk::Pipeline,
 }
 
 /// The fused matmul (one pipeline per dtype) and SwiGLU, on one layout: binding 0 the
@@ -257,6 +281,11 @@ impl Drop for Shared {
         // submission waits for its fence). Objects are destroyed child first.
         unsafe {
             let _ = self.device.device_wait_idle();
+            if let Some(a) = &self.attn {
+                self.device.destroy_pipeline(a.kv_sync, None);
+                self.device.destroy_pipeline(a.prelude, None);
+                self.device.destroy_pipeline(a.decode, None);
+            }
             if let Some(r) = &self.routed {
                 self.device.destroy_pipeline(r.route, None);
                 self.device.destroy_pipeline(r.combine, None);
@@ -554,6 +583,21 @@ impl Shared {
         let routed = fused
             .as_ref()
             .and_then(|f| create_routed(&device, f.layout).ok());
+        let attn = match (&fused, &routed) {
+            (Some(f), Some(_)) => create_on(
+                &device,
+                f.layout,
+                &[KV_SYNC_SPV, ATTN_PRELUDE_SPV, ATTN_DECODE_SPV],
+                "attention pipelines",
+            )
+            .ok()
+            .map(|p| Attn {
+                kv_sync: p[0],
+                prelude: p[1],
+                decode: p[2],
+            }),
+            _ => None,
+        };
         let shared = Arc::new(Self {
             entry,
             instance: instance.clone(),
@@ -569,6 +613,7 @@ impl Shared {
             pipelines,
             fused,
             routed,
+            attn,
             #[cfg(feature = "spike")]
             spike: Mutex::default(),
         });
@@ -820,15 +865,33 @@ fn create_fused(device: &ash::Device) -> Result<Fused, ComputeError> {
 
 /// The route, combine, residual-norm and scale-probe pipelines on the fused `layout`.
 fn create_routed(device: &ash::Device, layout: vk::PipelineLayout) -> Result<Routed, ComputeError> {
-    let spv = |b: &[u8]| {
-        ash::util::read_spv(&mut std::io::Cursor::new(b)).map_err(|e| err("bad SPIR-V", e))
-    };
-    let codes = [
-        spv(ROUTE_SPV)?,
-        spv(COMBINE_SPV)?,
-        spv(RESNORM_SPV)?,
-        spv(RMS_SCALE_SPV)?,
-    ];
+    let p = create_on(
+        device,
+        layout,
+        &[ROUTE_SPV, COMBINE_SPV, RESNORM_SPV, RMS_SCALE_SPV],
+        "routed pipelines",
+    )?;
+    Ok(Routed {
+        route: p[0],
+        combine: p[1],
+        resnorm: p[2],
+        rms_scale: p[3],
+    })
+}
+
+/// Compute pipelines from `spvs`, in order, on `layout`; all or none.
+fn create_on(
+    device: &ash::Device,
+    layout: vk::PipelineLayout,
+    spvs: &[&[u8]],
+    what: &str,
+) -> Result<Vec<vk::Pipeline>, ComputeError> {
+    let codes = spvs
+        .iter()
+        .map(|b| {
+            ash::util::read_spv(&mut std::io::Cursor::new(b)).map_err(|e| err("bad SPIR-V", e))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
     // SAFETY: each create-info and what it points to live until its call returns;
     // modules are destroyed after pipeline creation, pipelines on failure.
     unsafe {
@@ -864,17 +927,12 @@ fn create_routed(device: &ash::Device, layout: vk::PipelineLayout) -> Result<Rou
             device.destroy_shader_module(m, None);
         }
         match made {
-            Ok(p) if p.len() == 4 => Ok(Routed {
-                route: p[0],
-                combine: p[1],
-                resnorm: p[2],
-                rms_scale: p[3],
-            }),
+            Ok(p) if p.len() == codes.len() => Ok(p),
             Ok(p) | Err((p, _)) => {
                 for p in p.into_iter().filter(|p| *p != vk::Pipeline::null()) {
                     device.destroy_pipeline(p, None);
                 }
-                Err(err("routed pipelines", "not created"))
+                Err(err(what, "not created"))
             }
         }
     }
@@ -1213,6 +1271,13 @@ pub(crate) struct Submitter {
     att: Option<Allocation>,
     hs: Option<Allocation>,
     oproj: Option<Allocation>,
+    /// Decode attention (audit §21): the attention-normed activations, the rows to copy
+    /// into the KV pool and the new keys and values (host-visible), and q, k and v
+    /// (device-local).
+    axs: Option<Allocation>,
+    sync: Option<Allocation>,
+    knew: Option<Allocation>,
+    qkv: Option<Allocation>,
 }
 
 // SAFETY: the handles are plain identifiers, used only through `&mut self`.
@@ -1351,6 +1416,10 @@ impl Submitter {
                 att: None,
                 hs: None,
                 oproj: None,
+                axs: None,
+                sync: None,
+                knew: None,
+                qkv: None,
             })
         }
     }
@@ -2449,6 +2518,264 @@ struct Kind {
     row_bytes: usize,
 }
 
+/// Decode attention's shape, checked against the device (audit §21).
+struct AttnShape {
+    d: usize,
+    heads: usize,
+    kv_heads: usize,
+    q_out: usize,
+    kv_out: usize,
+    sync_rows: usize,
+    pool: vk::Buffer,
+    /// The QKV weights' buffer, the binding's base and range, and each matrix's dtype,
+    /// rows, row bytes and offset from the base.
+    wbuf: vk::Buffer,
+    w_base: u64,
+    w_range: u64,
+    mats: [(usize, usize, usize, u64); 3],
+}
+
+/// Decode attention's section of the routed layer's table (audit §21), from word `start`:
+/// the QKV entries (8 words each, as `FusedEntry`), the header `attn_prelude.comp` and
+/// `attn_decode.comp` read, the Q and K norm weights, the RoPE rows, two words per token
+/// (position, the table word of its block ids), the block ids, and each sync row's pool
+/// position.
+struct AttnTable {
+    entries: usize,
+    hdr: usize,
+    qn: usize,
+    kn: usize,
+    cs: usize,
+    tok: usize,
+    blk: usize,
+    sync_at: usize,
+    end: usize,
+    /// QKV dispatches: dtype, row blocks per matrix, the first entry's word, matrices.
+    groups: Vec<(usize, usize, usize, usize)>,
+}
+
+/// The header's marker for "no Q and K norms".
+const NO_NORM: u32 = u32::MAX;
+
+impl AttnTable {
+    fn new(a: &DeviceMoeAttention<'_>, sh: &AttnShape, s: usize, start: usize) -> Self {
+        let entries = start;
+        let hdr = entries + 24;
+        let qn = hdr + 9;
+        let (kn, cs) = if a.qk_norm.is_some() {
+            (qn + sh.q_out, qn + sh.q_out + sh.kv_out)
+        } else {
+            (qn, qn)
+        };
+        let tok = cs + s * sh.d;
+        let blk = tok + 2 * s;
+        let sync_at = blk + a.blocks.len();
+        let end = sync_at + a.sync_to.len();
+        // Consecutive matrices with one dtype and one row-block count share a dispatch.
+        let rows_of = |n: usize| n.div_ceil(ROWS as usize);
+        let mut groups: Vec<(usize, usize, usize, usize)> = Vec::new();
+        for (i, &(dt, n, _, _)) in sh.mats.iter().enumerate() {
+            match groups.last_mut() {
+                Some(g) if g.0 == dt && g.1 == rows_of(n) => g.3 += 1,
+                _ => groups.push((dt, rows_of(n), entries + 8 * i, 1)),
+            }
+        }
+        Self {
+            entries,
+            hdr,
+            qn,
+            kn,
+            cs,
+            tok,
+            blk,
+            sync_at,
+            end,
+            groups,
+        }
+    }
+
+    fn fill(
+        &self,
+        table: &mut [u32],
+        a: &DeviceMoeAttention<'_>,
+        sh: &AttnShape,
+        s: usize,
+    ) -> Result<(), ComputeError> {
+        let w32 = |v: usize, what: &str| u32_of(v, what);
+        let cols = a.xs.len() / s;
+        let y_base = [0, s * sh.q_out, s * (sh.q_out + sh.kv_out)];
+        for (i, &(_, n, row_bytes, off)) in sh.mats.iter().enumerate() {
+            let e = self.entries + 8 * i;
+            table[e..e + 8].copy_from_slice(&[
+                w32(n, "rows")?,
+                w32(cols, "columns")?,
+                w32(row_bytes, "row bytes")?,
+                u32_of(off, "offset")?,
+                0,
+                w32(y_base[i], "outputs")?,
+                w32(s, "tokens")?,
+                0,
+            ]);
+        }
+        // `eps as f32`, as `math::rms_norm` converts it.
+        #[allow(clippy::cast_possible_truncation)]
+        let eps = a.eps as f32;
+        let (qn, kn) = match a.qk_norm {
+            Some(_) => (w32(self.qn, "table")?, w32(self.kn, "table")?),
+            None => (NO_NORM, NO_NORM),
+        };
+        table[self.hdr..self.hdr + 9].copy_from_slice(&[
+            w32(sh.d, "head dim")?,
+            w32(sh.heads, "heads")?,
+            w32(sh.kv_heads, "KV heads")?,
+            eps.to_bits(),
+            a.clip.map_or(0, f32::to_bits),
+            qn,
+            kn,
+            w32(self.cs, "table")?,
+            w32(self.tok, "table")?,
+        ]);
+        if let Some((qw, kw)) = a.qk_norm {
+            for (dst, w) in table[self.qn..].iter_mut().zip(qw.iter().chain(kw)) {
+                *dst = w.to_bits();
+            }
+        }
+        for (dst, v) in table[self.cs..self.tok].iter_mut().zip(a.rope) {
+            *dst = v.to_bits();
+        }
+        for t in 0..s {
+            table[self.tok + 2 * t] = a.pos[t];
+            table[self.tok + 2 * t + 1] = w32(self.blk + a.table_at[t] as usize, "table")?;
+        }
+        table[self.blk..self.sync_at].copy_from_slice(a.blocks);
+        table[self.sync_at..self.end].copy_from_slice(a.sync_to);
+        Ok(())
+    }
+}
+
+impl Submitter {
+    /// Decode attention's shape on this device: `Ok(None)` when the kernels cannot run
+    /// it (the caller then runs attention on the host), an error when the inputs do not
+    /// fit together.
+    fn attention_shape(
+        &self,
+        a: &DeviceMoeAttention<'_>,
+        s: usize,
+        cols: usize,
+        att_cols: usize,
+    ) -> Result<Option<AttnShape>, ComputeError> {
+        let lim = self.shared.limits;
+        let (d, heads, kvh) = (a.head_dim, a.heads, a.kv_heads);
+        let (q_out, kv_out) = (heads * d, kvh * d);
+        let rows = a.sync_to.len();
+        let bad = |detail: String| ComputeError::Shape {
+            op: "routed moe attention",
+            detail,
+        };
+        if d == 0
+            || d % 2 != 0
+            || kvh == 0
+            || heads % kvh != 0
+            || q_out != att_cols
+            || a.q.rows() != q_out
+            || a.k.rows() != kv_out
+            || a.v.rows() != kv_out
+            || [a.q, a.k, a.v].iter().any(|w| w.cols() != cols)
+            || a.xs.len() != s * cols
+            || a.rope.len() != s * d
+            || a.pos.len() != s
+            || a.table_at.len() != s
+            || a.k_new.len() != s * kv_out
+            || a.v_new.len() != s * kv_out
+            || a.sync.len() != rows * 2 * kv_out
+            || a.qk_norm
+                .is_some_and(|(qn, kn)| qn.len() != q_out || kn.len() != kv_out)
+        {
+            return Err(bad(format!(
+                "{heads} heads of {d}, {kvh} KV heads, {s} tokens of {cols}, {att_cols} \
+                 attention outputs"
+            )));
+        }
+        for t in 0..s {
+            let need = a.pos[t] as usize / KV_BLOCK + 1;
+            if a.table_at[t] as usize + need > a.blocks.len() {
+                return Err(bad(format!(
+                    "token {t} has no block for position {}",
+                    a.pos[t]
+                )));
+            }
+        }
+        let pa = self.allocation_of(a.pool)?;
+        let held = pa.size / (4 * kv_block_words(kv_out) as u64).max(1);
+        if a.blocks.iter().any(|&b| u64::from(b) >= held)
+            || a.sync_to
+                .iter()
+                .any(|&p| u64::from(p) / KV_BLOCK as u64 >= held)
+        {
+            return Err(bad(format!("a block past the pool's {held}")));
+        }
+        let maxx = u64::from(lim.max_compute_work_group_count[0]);
+        if d > 512
+            || a.pos.iter().any(|&p| p as usize >= ATTN_POSITIONS)
+            || heads as u64 > maxx
+            || rows as u64 > maxx
+            || pa.size > u64::from(lim.max_storage_buffer_range)
+        {
+            return Ok(None);
+        }
+        // The three projections: kernels for their dtypes, one buffer, one binding.
+        let mut mats = [(0usize, 0usize, 0usize, 0u64); 3];
+        let mut buf = None;
+        for (i, w) in [a.q, a.k, a.v].into_iter().enumerate() {
+            let Some(dt) = dtype_index(w.dtype()) else {
+                return Ok(None);
+            };
+            let wa = self.allocation_of(w.buffer())?;
+            if buf.is_some_and(|(b, _)| b != wa.buffer) {
+                return Ok(None);
+            }
+            buf = Some((wa.buffer, wa.size));
+            mats[i] = (dt, w.rows(), w.len() / w.rows().max(1), w.offset() as u64);
+        }
+        let Some((wbuf, wsize)) = buf else {
+            return Ok(None);
+        };
+        let align = lim.min_storage_buffer_offset_alignment.max(4);
+        let (lo, hi) = [a.q, a.k, a.v].iter().fold((u64::MAX, 0), |(lo, hi), w| {
+            (
+                lo.min(w.offset() as u64),
+                hi.max((w.offset() + w.len()) as u64),
+            )
+        });
+        let w_base = lo / align * align;
+        let w_range = (hi.next_multiple_of(4).min(wsize) - w_base).max(4);
+        if w_range > u64::from(lim.max_storage_buffer_range)
+            || (ROWS as usize) == 0
+            || mats
+                .iter()
+                .any(|&(_, n, _, _)| (n.div_ceil(ROWS as usize) as u64) * 3 > maxx)
+        {
+            return Ok(None);
+        }
+        for m in &mut mats {
+            m.3 -= w_base;
+        }
+        Ok(Some(AttnShape {
+            d,
+            heads,
+            kv_heads: kvh,
+            q_out,
+            kv_out,
+            sync_rows: rows,
+            pool: pa.buffer,
+            wbuf,
+            w_base,
+            w_range,
+            mats,
+        }))
+    }
+}
+
 impl Submitter {
     /// The kind of matrix `i` of every expert, if they all share a buffer, dtype and
     /// shape; `None` otherwise (the layer is then routed on the host).
@@ -2559,7 +2886,7 @@ impl Submitter {
                 let (on, ok) = (p.o.rows(), p.o.cols());
                 if on != cols
                     || ok == 0
-                    || p.att.len() != s * ok
+                    || p.att.len() != if op.attention.is_some() { 0 } else { s * ok }
                     || p.hs.len() != s * cols
                     || p.norm.len() != cols
                 {
@@ -2620,6 +2947,17 @@ impl Submitter {
             _ => None,
         };
 
+        // Decode attention (audit §21): its pipelines, the prelude, and shapes its kernels
+        // take; past `ATTN_POSITIONS` positions it runs on the host.
+        let attn = match (&op.attention, pre) {
+            (None, _) => None,
+            (Some(_), None) => return Ok(false),
+            (Some(a), Some((_, ok, ..))) => match self.attention_shape(a, s, cols, ok)? {
+                Some(shape) => Some(shape),
+                None => return Ok(false),
+            },
+        };
+
         // Dispatch sizes, all known here: the GPU only picks which expert each entry
         // reads.
         let rows_of = |n: usize| (n as u64).div_ceil(u64::from(ROWS));
@@ -2666,8 +3004,17 @@ impl Submitter {
         let ent = tpl + 24 * ne;
         // With a prelude: the O projection's entry, then the norm weights as bits.
         let (o_at, norm_at) = (ent + 24 * sk, ent + 24 * sk + 8);
-        let words = if pre.is_some() { norm_at + cols } else { o_at };
+        let pre_end = if pre.is_some() { norm_at + cols } else { o_at };
+        // With attention, its section follows (`AttnTable`).
+        let at = match (&op.attention, &attn) {
+            (Some(a), Some(sh)) => Some(AttnTable::new(a, sh, s, pre_end)),
+            _ => None,
+        };
+        let words = at.as_ref().map_or(pre_end, |t| t.end);
         let mut table = vec![0u32; words];
+        if let (Some(a), Some(sh), Some(t)) = (&op.attention, &attn, &at) {
+            t.fill(&mut table, a, sh, s)?;
+        }
         let w32 = |v: u64, what: &str| u32_of(v, what);
         if let (Some(p), Some((_, ok, orb, ..)), Some((o_base, _))) = (&op.prelude, pre, o_bind) {
             table[o_at..o_at + 8].copy_from_slice(&[
@@ -2744,6 +3091,48 @@ impl Submitter {
             }
             None => None,
         };
+        // Attention's inputs: the activations and the rows to copy in; q, k and v stay
+        // on the device; the new keys and values come back.
+        let attn_bufs = match (&op.attention, &attn) {
+            (Some(a), Some(sh)) => {
+                let axbuf = {
+                    let x =
+                        Self::host_buffer(&shared, &mut self.axs, 4 * a.xs.len() as u64, storage)?;
+                    x.floats_mut()[..a.xs.len()].copy_from_slice(a.xs);
+                    x.buffer
+                };
+                let sybuf = {
+                    let y = Self::host_buffer(
+                        &shared,
+                        &mut self.sync,
+                        4 * a.sync.len().max(1) as u64,
+                        storage,
+                    )?;
+                    y.floats_mut()[..a.sync.len()].copy_from_slice(a.sync);
+                    y.buffer
+                };
+                let knbuf = Self::host_buffer(
+                    &shared,
+                    &mut self.knew,
+                    8 * (s * sh.kv_out) as u64,
+                    storage,
+                )?
+                .buffer;
+                let qkvbuf = Self::scratch(
+                    &shared,
+                    &mut self.qkv,
+                    4 * (s * (sh.q_out + 2 * sh.kv_out)) as u64,
+                    storage,
+                    false,
+                )?
+                .buffer;
+                counters
+                    .activations_in
+                    .fetch_add(4 * (a.xs.len() + a.sync.len()) as u64, Ordering::Relaxed);
+                Some((axbuf, sybuf, knbuf, qkvbuf))
+            }
+            _ => None,
+        };
         let tbuf = {
             let t = Self::host_buffer(&shared, &mut self.table, 4 * words as u64, storage)?;
             for (dst, &v) in t.floats_mut().iter_mut().zip(&table) {
@@ -2762,7 +3151,11 @@ impl Submitter {
             .fetch_add(if pre.is_some() { ab + hb } else { xb }, Ordering::Relaxed);
 
         let prepared = Instant::now();
-        let sets = self.fused_sets(if pre.is_some() { 7 } else { 5 })?;
+        let sets = self.fused_sets(match (pre.is_some(), attn.is_some()) {
+            (_, true) => 11,
+            (true, false) => 7,
+            (false, false) => 5,
+        })?;
         let whole = |b: vk::Buffer| (b, 0, None);
         // Router, route, gate/up (and SwiGLU, which reads binding 2), down, combine.
         self.write_set(
@@ -2818,7 +3211,71 @@ impl Submitter {
         let (hdr32, ent32) = (n32(hdr, "table")?, n32(ent, "table")?);
         // The prelude (Step 3c, audit §18.3): the O projection, then the residual and
         // norm, which writes the activations the router and the experts read.
-        let mut steps: Vec<Step> = Vec::with_capacity(8);
+        let mut steps: Vec<Step> = Vec::with_capacity(14);
+        // Decode attention (audit §21): the host rows into the pool, the QKV projections,
+        // the prelude (clip, Q and K norms, RoPE, the store) and attention, whose outputs
+        // the O projection below reads.
+        if let (
+            Some(sh),
+            Some(t),
+            Some((axbuf, sybuf, knbuf, qkvbuf)),
+            Some(ap),
+            Some((abuf, _, _)),
+        ) = (&attn, &at, attn_bufs, shared.attn.as_ref(), pre_bufs)
+        {
+            let n32 = |v: usize, what: &str| u32_of(v, what);
+            if sh.sync_rows > 0 {
+                self.write_set(
+                    sets[7],
+                    [whole(sybuf), (sh.pool, 0, None), whole(sybuf), whole(tbuf)],
+                );
+                steps.push((
+                    ap.kv_sync,
+                    sets[7],
+                    [n32(sh.kv_out, "KV width")?, n32(t.sync_at, "table")?, 0, 0],
+                    (n32(sh.sync_rows, "rows")?, 1),
+                ));
+            }
+            self.write_set(
+                sets[8],
+                [
+                    (sh.wbuf, sh.w_base, Some(sh.w_range)),
+                    whole(axbuf),
+                    whole(qkvbuf),
+                    whole(tbuf),
+                ],
+            );
+            for &(dt, blocks, first, count) in &t.groups {
+                let b = n32(blocks, "row blocks")?;
+                let c = n32(count, "matrices")?;
+                steps.push((
+                    fused.matmul[dt],
+                    sets[8],
+                    [b, c, n32(first, "table")?, 0],
+                    (b * c, n32(s, "tokens")?),
+                ));
+            }
+            self.write_set(
+                sets[9],
+                [whole(qkvbuf), (sh.pool, 0, None), whole(knbuf), whole(tbuf)],
+            );
+            steps.push((
+                ap.prelude,
+                sets[9],
+                [n32(t.hdr, "table")?, 0, 0, 0],
+                (3, n32(s, "tokens")?),
+            ));
+            self.write_set(
+                sets[10],
+                [whole(qkvbuf), (sh.pool, 0, None), whole(abuf), whole(tbuf)],
+            );
+            steps.push((
+                ap.decode,
+                sets[10],
+                [n32(t.hdr, "table")?, 0, 0, 0],
+                (n32(sh.heads, "heads")?, n32(s, "tokens")?),
+            ));
+        }
         if let (
             Some((odt, _, _, wbuf, _)),
             Some((o_base, o_range)),
@@ -2959,6 +3416,19 @@ impl Submitter {
                 .as_mut()
                 .ok_or_else(|| err("residuals", "missing"))?;
             p.hs.copy_from_slice(&h.floats_mut()[..p.hs.len()]);
+        }
+        if let (Some(a), Some(sh)) = (op.attention.as_mut(), &attn) {
+            let n = s * sh.kv_out;
+            let kn = self
+                .knew
+                .as_mut()
+                .ok_or_else(|| err("new keys", "missing"))?;
+            let f = kn.floats_mut();
+            a.k_new.copy_from_slice(&f[..n]);
+            a.v_new.copy_from_slice(&f[n..2 * n]);
+            counters
+                .activations_out
+                .fetch_add(8 * n as u64, Ordering::Relaxed);
         }
         counters.time(start);
         counters

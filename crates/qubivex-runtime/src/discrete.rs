@@ -34,11 +34,12 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, PoisonError, Weak};
 
 use qubivex_compute::discrete::{
-    DeviceBuffer, DeviceGatedFfn, DeviceMatMul, DeviceMoePrelude, DeviceRoutedMoe, DeviceUsage,
-    DeviceWeights, DiscreteDevice, TransferStats,
+    DeviceBuffer, DeviceGatedFfn, DeviceMatMul, DeviceMoeAttention, DeviceMoePrelude,
+    DeviceRoutedMoe, DeviceUsage, DeviceWeights, DiscreteDevice, KV_BLOCK, TransferStats,
+    kv_block_words,
 };
 use qubivex_compute::host::PageAligned;
-use qubivex_compute::{ComputeError, GatedFfn, MatMul, RoutedMoe, WeightView};
+use qubivex_compute::{AttnSeq, ComputeError, GatedFfn, MatMul, RoutedMoe, WeightView};
 use qubivex_core::Bytes;
 use qubivex_expert_stream::{ExpertKey, Slab};
 use qubivex_memory::{LayerExperts, MemoryLedger, Owner, Tier};
@@ -83,6 +84,27 @@ pub struct DeviceReport {
     /// MoE layers routed on the device (Step 3b): router, routing, experts and combine
     /// in one submission.
     pub routed_layers: u64,
+    /// The KV pool for device attention (audit §21).
+    pub kv_pool: KvPoolStats,
+}
+
+/// The device KV pool's counters (audit §21).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct KvPoolStats {
+    /// Bytes of the pool (allocated on first use, charged whole).
+    pub bytes: u64,
+    /// Whether it is allocated.
+    pub allocated: bool,
+    /// Blocks in all, and free now.
+    pub blocks: u64,
+    /// Blocks free now.
+    pub free: u64,
+    /// Layers whose attention ran on the device.
+    pub layers: u64,
+    /// Rows copied from the host cache into the pool (positions the host computed).
+    pub synced_rows: u64,
+    /// Layers declined to the host because the pool had no free block.
+    pub full: u64,
 }
 
 /// Arena slots start at multiples of this many bytes (any storage-buffer offset
@@ -184,6 +206,89 @@ pub(crate) struct Pin {
     _pin: Arc<()>,
 }
 
+/// The KV pool's size when none is configured (owner, 2026-11-14).
+pub const DEFAULT_KV_POOL: u64 = 512 << 20;
+
+/// The most a KV pool takes, configured or not: it never takes the whole device.
+pub const MAX_KV_POOL: u64 = 1 << 30;
+
+/// The free blocks of a KV pool, shared with the mirrors that hold the others.
+struct KvFree {
+    free: Mutex<Vec<u32>>,
+}
+
+impl KvFree {
+    fn lock(&self) -> std::sync::MutexGuard<'_, Vec<u32>> {
+        // Every update pushes or pops whole block ids.
+        self.free.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+}
+
+/// The device KV pool for attention on the device (audit §21, ADR-019 amendment 5): one
+/// arena of
+/// [`KV_BLOCK`]-position blocks (keys and values of one layer each), allocated on first
+/// use and charged whole to the ledger's KV owner on the VRAM tier. Sequences take
+/// blocks as they grow and give them back when their cache is dropped. A pass that
+/// cannot get a block runs attention on the host.
+struct KvPool {
+    /// Words of one block.
+    block_words: usize,
+    blocks: usize,
+    /// Allocated on first use; `None` inside when the device refused it.
+    buffer: OnceLock<Option<DeviceBuffer>>,
+    free: Arc<KvFree>,
+    layers: AtomicU64,
+    synced: AtomicU64,
+    full: AtomicU64,
+}
+
+/// One layer of a sequence's mirror: its blocks in position order, and how many of its
+/// positions hold the host cache's keys and values.
+#[derive(Default)]
+struct LayerMirror {
+    blocks: Vec<u32>,
+    synced: usize,
+}
+
+/// A sequence's keys and values in the device KV pool, kept in its KV cache's device
+/// slot. The host cache stays authoritative: positions the device did not compute or
+/// copy are copied in before the device reads them, and a mirror of another epoch (the
+/// cache was cleared or restored) starts again.
+struct Mirror {
+    /// The pool's identity: a mirror made for another engine's pool is replaced.
+    pool: Weak<KvFree>,
+    free: Arc<KvFree>,
+    epoch: u64,
+    layers: Vec<LayerMirror>,
+}
+
+impl Mirror {
+    /// Gives every block back.
+    fn release(&mut self) {
+        let mut f = self.free.lock();
+        for l in &mut self.layers {
+            f.append(&mut l.blocks);
+            l.synced = 0;
+        }
+    }
+}
+
+impl Drop for Mirror {
+    fn drop(&mut self) {
+        self.release();
+    }
+}
+
+/// One pass's attention inputs for the device ([`DeviceMoeAttention`]).
+#[derive(Default)]
+struct AttnPlan {
+    pos: Vec<u32>,
+    blocks: Vec<u32>,
+    table_at: Vec<u32>,
+    sync: Vec<f32>,
+    sync_to: Vec<u32>,
+}
+
 /// The dense weights on a discrete device, and its expert cache.
 pub(crate) struct OnDevice {
     device: Arc<dyn DiscreteDevice>,
@@ -204,6 +309,8 @@ pub(crate) struct OnDevice {
     /// holding a whole layer on the device never evicts (routing on the device).
     provisioned: bool,
     routed: AtomicU64,
+    /// The KV pool, when the device runs attention and the budget leaves room.
+    kv: Option<KvPool>,
 }
 
 impl std::fmt::Debug for OnDevice {
@@ -297,6 +404,7 @@ impl OnDevice {
         budget: u64,
         layers: &[LayerExperts],
         ram_slots: &[u32],
+        kv_out: usize,
     ) -> Result<Self, ComputeError> {
         let host = arena.as_slice();
         let charge = ledger.charge(Tier::Vram(0), Owner::Dense, Bytes(host.len() as u64));
@@ -318,6 +426,33 @@ impl OnDevice {
             .iter()
             .map(|a| (0..a.slots).rev().collect())
             .collect();
+        // The KV pool (owner, 2026-11-14): as configured, else `DEFAULT_KV_POOL`; never
+        // more than `MAX_KV_POOL`, than the budget leaves after the expert arenas, or
+        // than one buffer the device addresses at once.
+        let expert_bytes: u64 = arenas.iter().map(|a| (a.stride * a.slots) as u64).sum();
+        let block_words = kv_block_words(kv_out);
+        let kv = (kv_out > 0 && provisioned)
+            .then(|| {
+                let room = device
+                    .kv_pool()
+                    .unwrap_or(DEFAULT_KV_POOL)
+                    .min(MAX_KV_POOL)
+                    .min(budget.saturating_sub(expert_bytes))
+                    .min(device.max_arena());
+                let blocks = u32::try_from(room / (4 * block_words as u64)).unwrap_or(u32::MAX);
+                (blocks > 0).then(|| KvPool {
+                    block_words,
+                    blocks: blocks as usize,
+                    buffer: OnceLock::new(),
+                    free: Arc::new(KvFree {
+                        free: Mutex::new((0..blocks).rev().collect()),
+                    }),
+                    layers: AtomicU64::new(0),
+                    synced: AtomicU64::new(0),
+                    full: AtomicU64::new(0),
+                })
+            })
+            .flatten();
         Ok(Self {
             device,
             ledger,
@@ -339,6 +474,7 @@ impl OnDevice {
             over_budget: AtomicU64::new(0),
             provisioned,
             routed: AtomicU64::new(0),
+            kv,
         })
     }
 
@@ -353,6 +489,26 @@ impl OnDevice {
     /// residual and norm) in the same submission (Step 3c); as [`Self::routes_moe`].
     pub(crate) fn routes_moe_prelude(&self, experts: usize, k: usize, s: usize) -> bool {
         self.provisioned && self.device.routes_moe_prelude(experts, k, s)
+    }
+
+    /// Whether such a layer should be routed with decode attention in the same
+    /// submission (audit §21): as [`Self::routes_moe_prelude`], with a KV pool.
+    pub(crate) fn routes_moe_attention(&self, experts: usize, k: usize, s: usize) -> bool {
+        self.provisioned && self.kv.is_some() && self.device.routes_moe_attention(experts, k, s)
+    }
+
+    /// The KV pool's buffer, allocated now if this is its first use; `None` when the
+    /// device refused the memory.
+    fn kv_buffer(&self, pool: &KvPool) -> Option<DeviceBuffer> {
+        pool.buffer
+            .get_or_init(|| {
+                let len = pool.blocks.checked_mul(4 * pool.block_words)?;
+                let charge = self
+                    .ledger
+                    .charge(Tier::Vram(0), Owner::Kv, Bytes(len as u64));
+                self.device.alloc(len, Some(Box::new(charge))).ok()
+            })
+            .clone()
     }
 
     pub(crate) fn describe(&self) -> String {
@@ -703,6 +859,60 @@ impl OnDevice {
             }),
             _ => None,
         };
+        // Decode attention: each sequence's blocks for this layer, and the host rows the
+        // device does not hold yet.
+        let mut plan = None;
+        let attn_ws;
+        let pool_buf;
+        let attention = match op.attention.as_mut() {
+            None => None,
+            Some(a) => {
+                let Some(pool) = self.kv.as_ref() else {
+                    return Ok(false);
+                };
+                let Some(buf) = self.kv_buffer(pool) else {
+                    return Ok(false);
+                };
+                pool_buf = buf;
+                attn_ws = [
+                    self.weights(&a.q)?,
+                    self.weights(&a.k)?,
+                    self.weights(&a.v)?,
+                ];
+                let Some(p) = self.attention_plan(
+                    pool,
+                    &mut a.seqs,
+                    a.kv_heads * a.head_dim,
+                    a.head_dim,
+                    a.layer,
+                ) else {
+                    pool.full.fetch_add(1, Ordering::Relaxed);
+                    return Ok(false);
+                };
+                let p = plan.insert(p);
+                Some(DeviceMoeAttention {
+                    q: &attn_ws[0],
+                    k: &attn_ws[1],
+                    v: &attn_ws[2],
+                    xs: a.xs,
+                    heads: a.heads,
+                    kv_heads: a.kv_heads,
+                    head_dim: a.head_dim,
+                    clip: a.clip,
+                    qk_norm: a.qk_norm,
+                    eps: a.eps,
+                    rope: a.rope,
+                    pool: &pool_buf,
+                    pos: &p.pos,
+                    blocks: &p.blocks,
+                    table_at: &p.table_at,
+                    sync: &p.sync,
+                    sync_to: &p.sync_to,
+                    k_new: &mut *a.k_new,
+                    v_new: &mut *a.v_new,
+                })
+            }
+        };
         let ran = self.device.routed_moe(&mut DeviceRoutedMoe {
             router: &router,
             experts: &experts,
@@ -714,11 +924,88 @@ impl OnDevice {
             ids: &mut *op.ids,
             weights: &mut *op.weights,
             prelude,
+            attention,
         })?;
         if ran {
             self.routed.fetch_add(1, Ordering::Relaxed);
+            if let (Some(a), Some(p), Some(pool)) = (op.attention.as_mut(), plan, self.kv.as_ref())
+            {
+                // Every sequence's mirror now holds positions 0..=pos of this layer.
+                for q in &mut a.seqs {
+                    if let Some(m) = q.mirror.as_mut().and_then(|m| m.downcast_mut::<Mirror>()) {
+                        m.layers[a.layer].synced = q.pos + 1;
+                    }
+                }
+                pool.layers.fetch_add(1, Ordering::Relaxed);
+                pool.synced
+                    .fetch_add(p.sync_to.len() as u64, Ordering::Relaxed);
+            }
         }
         Ok(ran)
+    }
+
+    /// Each sequence's mirror made ready for layer `layer`: in this pool's epoch, with
+    /// blocks for positions `0..=pos`, and the host rows it does not hold listed to copy
+    /// in. `None` when the pool has no free block (blocks already taken stay with their
+    /// sequence).
+    fn attention_plan(
+        &self,
+        pool: &KvPool,
+        seqs: &mut [AttnSeq<'_>],
+        kv_out: usize,
+        d: usize,
+        layer: usize,
+    ) -> Option<AttnPlan> {
+        let mut plan = AttnPlan::default();
+        for q in seqs.iter_mut() {
+            let mine = q
+                .mirror
+                .as_ref()
+                .and_then(|m| m.downcast_ref::<Mirror>())
+                .is_some_and(|m| m.pool.ptr_eq(&Arc::downgrade(&pool.free)));
+            if !mine {
+                *q.mirror = Some(Box::new(Mirror {
+                    pool: Arc::downgrade(&pool.free),
+                    free: Arc::clone(&pool.free),
+                    epoch: q.epoch,
+                    layers: Vec::new(),
+                }));
+            }
+            let m = q.mirror.as_mut()?.downcast_mut::<Mirror>()?;
+            if m.epoch != q.epoch {
+                m.release();
+                m.epoch = q.epoch;
+            }
+            if m.layers.len() <= layer {
+                m.layers.resize_with(layer + 1, LayerMirror::default);
+            }
+            let lm = &mut m.layers[layer];
+            // Rows past the host's count may be from a pass that failed after the device
+            // stored them: they are written again.
+            lm.synced = lm.synced.min(q.pos);
+            let need = q.pos / KV_BLOCK + 1;
+            if lm.blocks.len() < need {
+                let mut f = pool.free.lock();
+                while lm.blocks.len() < need {
+                    lm.blocks.push(f.pop()?);
+                }
+            }
+            plan.pos.push(u32::try_from(q.pos).ok()?);
+            plan.table_at.push(u32::try_from(plan.blocks.len()).ok()?);
+            plan.blocks.extend_from_slice(&lm.blocks[..need]);
+            for p in lm.synced..q.pos {
+                let b = lm.blocks[p / KV_BLOCK] as usize;
+                plan.sync_to
+                    .push(u32::try_from(b * KV_BLOCK + p % KV_BLOCK).ok()?);
+                for rows in [&q.host_k, &q.host_v] {
+                    for r in rows.iter() {
+                        plan.sync.extend_from_slice(&r[p * d..(p + 1) * d]);
+                    }
+                }
+            }
+            debug_assert_eq!(plan.sync.len(), plan.sync_to.len() * 2 * kv_out);
+        }
+        Some(plan)
     }
 
     pub(crate) fn report(&self) -> DeviceReport {
@@ -749,6 +1036,18 @@ impl OnDevice {
                 over_budget: self.over_budget.load(Ordering::Relaxed),
             },
             routed_layers: self.routed.load(Ordering::Relaxed),
+            kv_pool: self
+                .kv
+                .as_ref()
+                .map_or_else(KvPoolStats::default, |p| KvPoolStats {
+                    bytes: (p.blocks * 4 * p.block_words) as u64,
+                    allocated: p.buffer.get().is_some_and(Option::is_some),
+                    blocks: p.blocks as u64,
+                    free: p.free.lock().len() as u64,
+                    layers: p.layers.load(Ordering::Relaxed),
+                    synced_rows: p.synced.load(Ordering::Relaxed),
+                    full: p.full.load(Ordering::Relaxed),
+                }),
         }
     }
 }
