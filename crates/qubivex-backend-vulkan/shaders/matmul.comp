@@ -25,6 +25,12 @@
 // through shared memory with barriers, not subgroup shuffles, so the result does not
 // depend on the driver's subgroup size (MoltenVK has 32, lavapipe 4 to 16).
 //
+// Q4_K and Q6_K compute each block's scale products (d * sc, dmin * m) once per block,
+// in a few lanes of the row's group, and share them through shared memory, two
+// barriers per block (audit §23, §24): the same products of the same operands, so the
+// same bits. Every invocation therefore runs the block loop; a row past `n` recomputes
+// row n - 1 and writes nothing.
+//
 // The weight dtype is a specialization constant, so one module gives six pipelines.
 
 #version 450

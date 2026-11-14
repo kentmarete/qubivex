@@ -168,18 +168,33 @@ float weight(uint row, uint j) {
     }
 }
 
+// Q4_K and Q6_K: the block's scale products, each computed once per block by one lane
+// of the row's group and read by all 32 (audit §23). Group g's products start at 16g:
+// Q4_K's d * sc_j at kd[16g + j] and dmin * m_j at km[8g + j], j < 8; Q6_K's
+// d * sc_j at kd[16g + j], j < 16. Each is the same product of the same operands as
+// `weight` computes per weight, so the bits are unchanged; shared memory rather than
+// subgroup shuffles, so the result does not depend on the subgroup size.
+shared float kd[ROWS * 16u];
+shared float km[ROWS * 8u];
+
 void main() {
     MATMUL_PROLOGUE
+    // Uniform across the workgroup (as P_K is), so the barriers below stay uniform.
+    if (P_N == 0u) {
+        return;
+    }
     uint t = gl_LocalInvocationID.x;
     uint lane = t % 32u;
-    uint r = ROW_BLOCK * ROWS + t / 32u;
+    uint grp = t / 32u;
+    uint r = ROW_BLOCK * ROWS + grp;
     uint tok = TOKEN;
 
     float a0 = 0.0;
     float a1 = 0.0;
-    // Every invocation reaches the barriers below; rows past `n` compute nothing.
-    if (r < P_N) {
-        uint row = P_W_BASE + r * P_ROW_BYTES;
+    // Every invocation runs the whole loop, so every one reaches every barrier: a row
+    // past `n` computes row n - 1 again and writes nothing.
+    {
+        uint row = P_W_BASE + min(r, P_N - 1u) * P_ROW_BYTES;
         uint x = P_X_BASE + tok * P_K;
         uint full = P_K / 64u * 64u;
         // The quantised formats decode a block at a time: the block's scales once, and
@@ -188,59 +203,80 @@ void main() {
         uint c = 0u;
         if (DTYPE == DT_Q4_K) {
             // A chunk of 64 is one group g: lane l's two weights are the low and high
-            // nibbles of the same byte.
+            // nibbles of the same byte, sub-blocks 2g and 2g + 1.
+            // y = t - m as fma(t, 1, -m): the same single rounding, without the call
+            // SPIRV-Cross makes for a NoContraction subtract. `opaque` keeps the product
+            // rounded on its own.
+#define K4G(G)                                                                     \
+    {                                                                              \
+        float d0 = kd[16u * grp + 2u * (G)];                                       \
+        float m0 = km[8u * grp + 2u * (G)];                                        \
+        float d1 = kd[16u * grp + 2u * (G) + 1u];                                  \
+        float m1 = km[8u * grp + 2u * (G) + 1u];                                   \
+        uint v = byte_at(blk + 16u + 32u * (G) + lane);                            \
+        float y0 = fma(opaque(d0 * float(v & 0xFu)), 1.0, -m0);                    \
+        float y1 = fma(opaque(d1 * float(v >> 4)), 1.0, -m1);                      \
+        uint j = x + c + 64u * (G) + lane;                                         \
+        a0 = fma(y0, xs[j], a0);                                                   \
+        a1 = fma(y1, xs[j + 32u], a1);                                             \
+    }
             for (; c + 256u <= full; c += 256u) {
                 uint blk = row + 144u * (c / 256u);
-                // The header in four words: d and dmin, then the 12 scale bytes.
-                uint h0 = word_at(blk);
-                uvec3 sw = uvec3(word_at(blk + 4u), word_at(blk + 8u), word_at(blk + 12u));
-                float d = f16_bits(h0 & 0xFFFFu);
-                float dmin = f16_bits(h0 >> 16);
-                for (uint g = 0u; g < 4u; g++) {
-                    uvec2 s0 = scale_min_k4w(2u * g, sw);
-                    uvec2 s1 = scale_min_k4w(2u * g + 1u, sw);
-                    float d0 = d * float(s0.x);
-                    float m0 = dmin * float(s0.y);
-                    float d1 = d * float(s1.x);
-                    float m1 = dmin * float(s1.y);
-                    uint v = byte_at(blk + 16u + 32u * g + lane);
-                    // y = t - m as fma(t, 1, -m): the same single rounding, without the
-                    // call SPIRV-Cross makes for a NoContraction subtract. `opaque`
-                    // keeps the product rounded on its own.
-                    float y0 = fma(opaque(d0 * float(v & 0xFu)), 1.0, -m0);
-                    float y1 = fma(opaque(d1 * float(v >> 4)), 1.0, -m1);
-                    uint j = x + c + 64u * g + lane;
-                    a0 = fma(y0, xs[j], a0);
-                    a1 = fma(y1, xs[j + 32u], a1);
+                if (lane < 8u) {
+                    // The header in four words: d and dmin, then the 12 scale bytes.
+                    uint h0 = word_at(blk);
+                    uvec3 sw = uvec3(word_at(blk + 4u), word_at(blk + 8u), word_at(blk + 12u));
+                    uvec2 s = scale_min_k4w(lane, sw);
+                    kd[16u * grp + lane] = f16_bits(h0 & 0xFFFFu) * float(s.x);
+                    km[8u * grp + lane] = f16_bits(h0 >> 16) * float(s.y);
                 }
+                memoryBarrierShared();
+                barrier();
+                K4G(0u)
+                K4G(1u)
+                K4G(2u)
+                K4G(3u)
+                // No lane overwrites a product before every lane has read it.
+                memoryBarrierShared();
+                barrier();
             }
+#undef K4G
         } else if (DTYPE == DT_Q6_K) {
             // A half of 128 is two chunks: lane l's four weights share qh[32h + l] and
             // take ql[64h + l] and ql[64h + l + 32], low nibbles in the first chunk and
-            // high nibbles in the second.
+            // high nibbles in the second; quarter qq has scale 8h + l / 16 + 2qq.
+#define K6Q(H, QQ, LO, A)                                                          \
+    {                                                                              \
+        int q = int((LO) | (((hb >> (2u * (QQ))) & 3u) << 4)) - 32;                \
+        float s = kd[16u * grp + 8u * (H) + lane / 16u + 2u * (QQ)];               \
+        float y = s * float(q);                                                    \
+        A = fma(y, xs[j + 32u * (QQ)], A);                                         \
+    }
+#define K6H(H)                                                                     \
+    {                                                                              \
+        uint la = byte_at(blk + 64u * (H) + lane);                                 \
+        uint lb = byte_at(blk + 64u * (H) + lane + 32u);                           \
+        uint hb = byte_at(blk + 128u + 32u * (H) + lane);                          \
+        uint j = x + c + 128u * (H) + lane;                                        \
+        K6Q(H, 0u, la & 0xFu, a0)                                                  \
+        K6Q(H, 1u, lb & 0xFu, a1)                                                  \
+        K6Q(H, 2u, la >> 4, a0)                                                    \
+        K6Q(H, 3u, lb >> 4, a1)                                                    \
+    }
             for (; c + 256u <= full; c += 256u) {
                 uint blk = row + 210u * (c / 256u);
-                float d = f16_at(blk + 208u);
-                for (uint h = 0u; h < 2u; h++) {
-                    uint la = byte_at(blk + 64u * h + lane);
-                    uint lb = byte_at(blk + 64u * h + lane + 32u);
-                    uint hb = byte_at(blk + 128u + 32u * h + lane);
-                    uint sc = blk + 192u + 8u * h + lane / 16u;
-                    uint j = x + c + 128u * h + lane;
-                    for (uint qq = 0u; qq < 4u; qq++) {
-                        uint lo = qq >= 2u ? ((qq & 1u) == 0u ? la : lb) >> 4
-                                           : ((qq & 1u) == 0u ? la : lb) & 0xFu;
-                        int q = int(lo | (((hb >> (2u * qq)) & 3u) << 4)) - 32;
-                        float s = d * float(i8_at(sc + 2u * qq));
-                        float y = s * float(q);
-                        if ((qq & 1u) == 0u) {
-                            a0 = fma(y, xs[j + 32u * qq], a0);
-                        } else {
-                            a1 = fma(y, xs[j + 32u * qq], a1);
-                        }
-                    }
+                if (lane < 16u) {
+                    kd[16u * grp + lane] = f16_at(blk + 208u) * float(i8_at(blk + 192u + lane));
                 }
+                memoryBarrierShared();
+                barrier();
+                K6H(0u)
+                K6H(1u)
+                memoryBarrierShared();
+                barrier();
             }
+#undef K6H
+#undef K6Q
         } else if (DTYPE == DT_Q8_0) {
             // A chunk of 64 is two blocks of 32: lane l takes weight l of each.
             for (; c < full; c += 64u) {
