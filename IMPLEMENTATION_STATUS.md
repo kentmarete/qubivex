@@ -3,6 +3,12 @@
 Last updated: 2026-11-14
 
 ## Current phase
+**Step 5 spike: where the matmul kernel's instructions go (2026-11-14, branch `vulkan-kernel-throughput`; harness only, feature `spike`).** See docs/engineering/VULKAN_EXECUTION_AUDIT.md §23.
+- `spike/mm.comp` and `tests/matmul_spike.rs`: the production matmul's Q8_0, Q4_K and Q6_K bodies in variants, each bit for bit against the CPU (positive controls included), and an ignored timing test.
+- The reduction tree, rows per group and workgroup size move each format by 1–4%. Removing the decoding makes Q4_K 2.9× and Q6_K 3.9× faster: the decoding is 65–75% of the time, and its largest part is every lane recomputing the block's scale and min products.
+- Computing each product once per block and sharing it through shared memory (no subgroup operations; same bits): Q4_K 710 → 541 µs and Q6_K 874 → 598 µs on 24576 × 2048; on OLMoE's shapes at one token −19% to −32%. Estimate, not a result: about −4.5 ms of GPU time per token (~45 tok/s).
+- **Next (for review):** port the shared-memory form into `shaders/matmul_body.glsl` for Q4_K and Q6_K, then the §8 gates and the mains bench.
+
 **Where a decode token's time goes after Step 3 (2026-11-14, branch `vulkan-decode-profile`; measurement only).** See docs/engineering/VULKAN_EXECUTION_AUDIT.md §22.
 - OLMoE, attention on the device, mains: 26.56 ms per token untimed; timed, the GPU is busy 21.94 ms (79–83%), submit latency 3.1–4.2 ms over 17 submissions, host work about 1.5 ms. Timestamps add about 1.4 ms per token.
 - 740 MB of weights per token in 21.94 ms: 34 GB/s. New test `tests/decode_profile.rs`: Q4_K 37.4 GB/s, Q6_K 47.7, Q8_0 39.3 at one row; F16 98, F32 82. Every quantized format costs the same per row at 1, 2, 4 and 8 rows: the kernels are bound by per-element instructions, not memory.
