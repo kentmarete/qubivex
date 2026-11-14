@@ -2625,3 +2625,120 @@ pool), and recovered between rounds.
 - Prefill: unchanged (194.4–200.9 ms across all three modes).
 - Gates as in §21.3: identical tokens, no prefill regression, a single-stream gain over
   Step 3c in every round. 35 tok/s reached in every round (38.0–38.3).
+
+
+## 22. Where a decode token's time goes after Step 3 (2026-11-14)
+
+Branch `vulkan-decode-profile`. Measurement only: no production code changes. The question:
+with §19.10 done (17 submissions per token, 38 tok/s), which of the open items — one
+submission per token (§8 Step 4), kernel throughput (§8 Step 5), long-context attention —
+binds the most time? AC power, untimed unless stated.
+
+### 22.1 The token, end to end
+
+`qubivex bench`, OLMoE Q4_K_M, the §21.6 attention configuration (`--vulkan-route on
+--vulkan-route-o on --vulkan-attn on --vulkan-kv-pool 512MiB`), 3 measured runs, once
+without and once with `--vulkan-timestamps` (records
+`2026-11-14-m3pro-vulkan-profile-attn{,-timed}.json`; tokens equal the Step 1a reference
+in both).
+
+| per decode token | untimed | timed |
+|---|---:|---:|
+| wall (mean of steps) | 26.56 ms | 27.96 ms |
+| fence waits (17) | 24.99 | 26.14 |
+| GPU busy (timestamp union) | — | **21.94** |
+| submit (record, descriptors, submit call) | 0.56 | 0.83 |
+| activation copies | 0.11 | 0.10 |
+| other host work (wall − waits − submit − copies) | 0.90 | 0.89 |
+
+- The timestamp queries cost about 1.4 ms per token (two per submission plus their
+  readback), so the timed run is the one to split, and the untimed one the one to quote.
+- Waits minus GPU time: **about 3.1–4.2 ms per token, 0.18–0.25 ms per submission**: the
+  submit → start and end → fence-signal latency. §13's late TOP sample under-counts GPU
+  time by 3–19 µs per submission, at most 0.3 ms here, so the latency is not an artefact.
+- GPU time is **79–83% of the token**; latency 12–15%; host work outside the waits 6%.
+
+### 22.2 The bytes, and the rate the GPU reaches
+
+From the GGUF's tensor table, the weights a decode token reads (8 of 64 experts per
+layer; the embedding is one row):
+
+| weights | MB per token | dtype |
+|---|---:|---|
+| experts down | 185.6 | Q6_K in 8 layers, Q4_K in 8 |
+| experts gate + up | 302.0 | Q4_K |
+| LM head | 84.5 | Q6_K |
+| attention Q, K, V, O | 159.7 | Q4_K (V: Q6_K in 8 layers) |
+| router | 8.4 | f32 |
+| **total** | **740** | |
+
+740 MB in 21.94 ms of GPU time is **34 GB/s**. §20 measured exact attention at about 107 GB/s
+on the same GPU, so the bytes are not what binds.
+
+### 22.3 The matmul kernel's rate (new test `tests/decode_profile.rs`)
+
+One large matrix per dtype, k = 2048, one op per submission, GPU time from timestamps,
+median of 15 after 3 warm-ups (`cargo test --release -p qubivex-backend-vulkan --test
+decode_profile -- --ignored --nocapture`):
+
+| matrix | MB | GB/s at s = 1 | GPU µs per row at s = 1 / 2 / 4 / 8 |
+|---|---:|---:|---|
+| F32 8192 × 2048 | 67.1 | 81.8 | 820 / 551 / 318 / 316 |
+| F16 16384 × 2048 | 67.1 | 98.2 | 683 / 661 / 655 / 672 |
+| Q8_0 24576 × 2048 | 53.5 | 39.3 | 1360 / 1350 / 1384 / 1342 |
+| **Q4_K 24576 × 2048** | 28.3 | **37.4** | 756 / 749 / 746 / 745 |
+| **Q6_K 24576 × 2048** | 41.3 | **47.7** | 866 / 860 / 856 / 854 |
+| **Q6_K 50304 × 2048 (the LM head)** | 84.5 | 48.0 | 1761 / 1753 / 1749 / 1782 |
+
+- Q4_K reproduces §13's 37.6 GB/s (measured there by Metal's clock), so these timestamps
+  agree with it for large single dispatches.
+- **Every quantized format costs the same per row whatever the row count**: 8 rows take
+  8× one row with the same weight bytes. The kernels are bound by their per-element
+  instructions (dequantisation, the 64-lane fixed-order reduction, the `NoContraction`
+  helpers §13 names), not by memory. Only F32 amortises across rows.
+- The whole-layer harness (§20's `layer_timings`, rerun today) agrees: at 1 sequence × 138
+  positions the QKV submission takes 235 µs of GPU time for 8.2 MB (35 GB/s) and the
+  routed submission 985 µs for 35.5 MB (36 GB/s); at 8 sequences QKV takes 1597 µs, 6.8×
+  for the same weights.
+
+### 22.4 The split (estimated from §22.2–3; sums to the measured 21.94 ms within 3%)
+
+| stage, per token | GPU ms | share |
+|---|---:|---:|
+| expert matmuls (gate, up, down; 8 per layer) | ~12.4 | 56% |
+| Q, K, V and O projections | ~4.8 | 22% |
+| LM head | 1.76 | 8% |
+| attention prelude and attention (138 positions) | ~1.1 | 5% |
+| router, routing, norms, SwiGLU, combine | ~1.0 | 5% |
+| **GPU total** | **~21.1 (measured 21.94)** | |
+| plus submit latency (17 submissions) | 3.1–4.2 | |
+| plus host work | 1.5 | |
+
+### 22.5 What each open item can save (estimates, for review)
+
+1. **Kernel throughput (§8 Step 5): the largest.** The quantized matmuls are about 19 of the
+   22 GPU ms. At Metal's 45 GB/s on the same chip (§8): about −3.5 ms per token (~43 tok/s).
+   At F16's 98 GB/s rate (what the reduction reaches when the dequantisation is cheap):
+   GPU time ≈ 740 MB / 98 GB/s + attention ≈ 8.7 ms, about −12 ms per token (~69 tok/s), an upper bound.
+   Parity constrains how: the 64-lane order and the fma placement stay. Candidates, each
+   with its positive controls: (a) whether `NoContraction` and its `optnone` helpers are
+   still needed with fast math off through `VK_EXT_layer_settings`, or can be replaced by
+   explicit `fma` where the CPU fuses and plain operations elsewhere; (b) decoding a
+   K-quant word into several weights with fewer integer operations; (c) occupancy and
+   rows per workgroup.
+2. **Token tiles (rows that share one dequantisation).** Today every extra row costs a whole
+   row. Dequantising once for s rows would make batched decode and prefill (65
+   submissions, 194 ms for 10 tokens) much cheaper; single-stream decode unchanged. The
+   bits stay if each row keeps its own 64-lane order. §8 Step 5 lists it; amendment 1's
+   "four rows per group, slower" predates timestamps.
+3. **One submission per token (§8 Step 4): at most −3 to −4 ms**, the submit latency, plus
+   part of the 0.9 ms host work. It needs the LM head and the per-layer KV copy-back in
+   the same command buffer, and sampling stays on the host. Smaller than item 1 and
+   larger engineering.
+4. **Long-context attention:** 5% at the bench's 138 positions; at 4096 positions §20
+   measured 621 µs per layer (~10 ms per token), which would then matter. Chunked
+   attention past 4096 is unbuilt (§21.4).
+
+**Recommendation:** item 1 first, as a harness spike on the matmul kernel alone (no
+production change), bit for bit against the CPU on `parity.rs`'s shapes and dtypes, with
+the per-row rates above as the baseline. Then item 2 on the same kernel.
