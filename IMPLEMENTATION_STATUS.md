@@ -3,6 +3,12 @@
 Last updated: 2026-11-14
 
 ## Current phase
+**Where a decode token's time goes after Step 3 (2026-11-14, branch `vulkan-decode-profile`; measurement only).** See docs/engineering/VULKAN_EXECUTION_AUDIT.md §22.
+- OLMoE, attention on the device, mains: 26.56 ms per token untimed; timed, the GPU is busy 21.94 ms (79–83%), submit latency 3.1–4.2 ms over 17 submissions, host work about 1.5 ms. Timestamps add about 1.4 ms per token.
+- 740 MB of weights per token in 21.94 ms: 34 GB/s. New test `tests/decode_profile.rs`: Q4_K 37.4 GB/s, Q6_K 47.7, Q8_0 39.3 at one row; F16 98, F32 82. Every quantized format costs the same per row at 1, 2, 4 and 8 rows: the kernels are bound by per-element instructions, not memory.
+- Split (estimated, within 3% of measured): experts 56%, Q/K/V/O 22%, LM head 8%, attention 5%, the rest 5%.
+- **Next (for review):** §8 Step 5, kernel throughput, as a harness spike on the matmul kernel, bit for bit; then token tiles on the same kernel. One submission per token can save at most 3–4 ms.
+
 **Vulkan decode attention on the device (2026-11-13, branch `vulkan-attention-step3`; step 3 of audit §19.10, behind `--vulkan-attn`, default off).** See docs/engineering/VULKAN_EXECUTION_AUDIT.md §21.
 - Owner decisions (2026-11-13): a KV pool sized by `--vulkan-kv-pool` (default: what the budget leaves after the experts), charged whole to the ledger's KV owner on the VRAM tier; the host KV cache stays authoritative, with a device mirror; above 4096 positions attention runs on the host; prefill stays on the host and is measured within the step.
 - Built: a decode layer is one submission. The host rows are copied into a paged pool (256-position blocks), then the QKV projections, the clip, the Q and K norms, RoPE and the KV store, one-dispatch attention, and Step 3c's O, norm, routing, experts and combine. The new keys and values come back to the host cache. Declined to the host: prefill, traced or lookahead passes, per-head Q/K norms (Qwen3), 4096 positions or more, no free block. The simulated device implements the same stage.
