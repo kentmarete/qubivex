@@ -394,3 +394,10 @@ and 24.8–24.9 ms. Submissions per token: 305, 33, 17. Prefill unchanged. Concu
 (batch example, N = 1, 2, 4, 8): 37.3–38.0, 43.6–44.0, 47.7–47.9 and 50.0–50.3 tok/s, a gain
 over Step 3c at every N (+9% at 1 to +2.5% at 8). Tokens identical in every record and mode.
 Details in docs/engineering/VULKAN_EXECUTION_AUDIT.md §21.3.
+
+Rerun 2026-11-14 (`--tag step3d-rerun --no-concurrent`; records
+`2026-11-14-m3pro-vulkan-step3d-rerun-*.json`, log `…-step3d-rerun-mains.txt`), mains, no
+swap at any point: decode medians Step 1a 35.58–36.43 ms, Step 3c 28.79–29.12 ms, with
+device attention **26.11–26.30 ms (38.0–38.3 tok/s)**, −9.0% to −10.3% against Step 3c
+in the same round. Fastest steps 32.5–33.5, 27.6–27.9 and 24.7–25.5 ms; slowest 43.3, 34.2
+and 27.1. Prefill 194.4–200.9 ms in every mode. Tokens identical. Audit §21.6.

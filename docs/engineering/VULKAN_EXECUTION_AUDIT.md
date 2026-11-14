@@ -2592,3 +2592,36 @@ Accepted and merged behind `--vulkan-attn`, default off (ADR-019 amendment 5):
 - **Qwen3's per-head norms:** stay on the host until a demonstrated gain.
 - **The single-stream rerun:** to follow the merge, with memory pressure recorded.
 
+
+### 21.6 The single-stream rerun (2026-11-14)
+
+As decided in §21.5: the §21.3 command without the concurrent part (`--tag step3d-rerun
+--no-concurrent`), AC power, untimed, 3 alternated rounds (records
+`2026-11-14-m3pro-vulkan-step3d-rerun-{base,routedo,attn}-{1,2,3}.json`, log
+`…-step3d-rerun-mains.txt`). Every record's tokens equal the Step 1a reference. The
+driver now logs swap used and system-wide free memory before and after each run.
+
+**Memory pressure:** no swap at any point (0.00 MB before and after all nine runs, against
+3.4 → 10.5 GB in §21.3). Free memory was 73–79% before each Step 1a run and 48–52% after
+each Step 3c and attention run (the device expert arenas and, for attention, the 512 MiB
+pool), and recovered between rounds.
+
+| Round | Step 1a ms/token | Step 3c | **Step 3c + attention** | Step 1a prefill ms | Step 3c | + attention |
+|---|---|---|---|---|---|---|
+| 1 | 36.43 | 29.12 | **26.12** | 200.9 | 196.3 | 194.5 |
+| 2 | 35.66 | 28.79 | **26.11** | 200.2 | 195.0 | 194.4 |
+| 3 | 35.58 | 28.90 | **26.30** | 200.0 | 195.2 | 195.2 |
+| fastest step | 32.50–33.51 | 27.60–27.92 | **24.74–25.48** | | | |
+| slowest step | 37.29–43.27 | 31.03–34.20 | **26.87–27.10** | | | |
+| tok/s (median) | 27.45–28.10 | 34.34–34.73 | **38.02–38.30** | | | |
+| submissions/token | 305 | 33 | **17** | | | |
+
+- Against Step 3c in the same round: **−3.00, −2.68 and −2.60 ms per token (−10.3%,
+  −9.3%, −9.0%)**, within §20.4's estimate of 1.8–4.5 ms. Fence waits per token: 26.57–26.93
+  ms (33 waits) for Step 3c, 24.46–24.86 ms (17 waits) with attention.
+- The attention medians now span 0.19 ms (26.11–26.30) instead of 1.77 ms (25.82–27.59),
+  and no step exceeds 27.1 ms (§21.3: maxima up to 150 ms). §21.3's undisturbed rounds
+  (1 and 3) lie within or next to these ranges, so its conclusions stand.
+- Prefill: unchanged (194.4–200.9 ms across all three modes).
+- Gates as in §21.3: identical tokens, no prefill regression, a single-stream gain over
+  Step 3c in every round. 35 tok/s reached in every round (38.0–38.3).

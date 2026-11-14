@@ -16,7 +16,8 @@
 #     record of this session);
 #   - concurrent (unless --no-concurrent): the batch example at 1, 2, 4 and 8
 #     sequences, sequential, batched and concurrent, tokens checked identical.
-# Refuses to run on battery. Prints a median table at the end.
+# Logs swap used and free memory before and after each single-stream run. Refuses to
+# run on battery. Prints a median table at the end.
 #
 # Env: QUBIVEX_MODELS (default ~/.qubivex/models), QUBIVEX_OLMOE_TOKENIZER_JSON (default
 # ~/.qubivex/tokenizers/olmoe-0125-instruct/tokenizer.json).
@@ -63,6 +64,7 @@ base_tree=$SCRATCH/tree
 base_target=$SCRATCH/target
 if [[ ! -d $base_tree ]]; then
   mkdir -p $SCRATCH
+  git -C $ROOT worktree prune  # a scratch clean-up leaves the worktree registered
   git -C $ROOT worktree add -q --detach $base_tree $TAG
 fi
 if [[ $(git -C $base_tree rev-parse HEAD) != $(git -C $ROOT rev-parse "$TAG^{commit}") ]]; then
@@ -84,14 +86,22 @@ common=(bench --model $MODEL --backend vulkan --threads 5 --prompt-tokens 10
   --decode-tokens 128 --warmup 1 --runs 5 --expert-cache-mb 3720)
 records=()
 
+memory() { # swap used and system-wide free memory, for the log
+  local swap=$(sysctl -n vm.swapusage | sed -E 's/.*used = ([0-9.]+M).*/\1/')
+  local free=$(memory_pressure | sed -nE 's/.*free percentage: ([0-9]+%).*/\1/p')
+  print -r -- "swap used $swap, memory free $free"
+}
+
 bench() { # label binary record extra...
   local label=$1 bin=$2 record=$3; shift 3
   local ref=()
   [[ -n $reference ]] && ref=(--reference $reference)
+  local before=$(memory)
   $bin $common --label $label --out $record $ref "$@" > /dev/null
   [[ -z $reference ]] && reference=$record
   records+=($record)
   print -r -- "  $label: $record"
+  print -r -- "    before: $before; after: $(memory)"
 }
 
 for r in $( (( single )) && seq 1 $rounds); do
