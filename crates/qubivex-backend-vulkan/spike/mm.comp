@@ -1,0 +1,459 @@
+// Kernel-throughput spike (audit §23): the production matmul's K-quant and Q8_0 bodies
+// (`shaders/matmul_body.glsl`), with the CPU's bits, in variants built from defines:
+//
+// - DT     dtype: 3 Q8_0, 4 Q4_K, 5 Q6_K (as `Dtype` in device.rs).
+// - TREE   0: the halving tree through shared memory with barriers (production);
+//          1: the same adds in the same order through subgroup shuffles, which needs a
+//          32-wide subgroup (checked: a different width writes NaN, so parity fails).
+// - NR     output rows per 32-lane group: each activation chunk is loaded once for NR
+//          rows. Every row keeps its own two lanes' accumulators, its fma order and its
+//          tree, so the bits are the one-row kernel's.
+// - WG     invocations per workgroup (a multiple of 32).
+// - K4V2   Q4_K with its four 64-element groups written out (constant scale indices).
+// - K4Q    with K4V2: a block's 128 quant bytes loaded as one word per lane, each lane's
+//          byte fetched from the word's lane by subgroup shuffle (32-wide subgroups).
+// - K4S    with K4V2: lane j < 8 computes sub-block j's d * sc and dmin * m once per
+//          block; the other lanes take them by subgroup shuffle.
+// - K6V2   Q6_K with its halves and quarters written out; K6S: lane j computes scale
+//          j % 16's d * sc once per block, the others take it by shuffle.
+// - SH     with K4S or K6S: the products shared through shared memory with two
+//          workgroup barriers per block instead of shuffles (any subgroup width).
+// - NODEQ  timing control only (not the CPU's bits): every weight is the block's d, so
+//          the loop keeps its loads and fmas but loses the decoding.
+//
+// Whole blocks only (k a multiple of 256, or of 64 for Q8_0), weights at offset 0 of
+// binding 0: the spike's test shapes satisfy both. Bindings: 0 weights (words), 1 xs,
+// 2 ys, 3 unused. Push: n, k, row_bytes. Dispatch: (ceil(n / ((WG / 32) * NR)), s, 1).
+
+#version 450
+#if TREE == 1 || defined(K4Q) || ((defined(K4S) || defined(K6S)) && !defined(SH))
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_shuffle_relative : require
+#extension GL_KHR_shader_subgroup_shuffle : require
+#endif
+
+#ifndef NR
+#define NR 1
+#endif
+#ifndef WG
+#define WG 256
+#endif
+
+layout(local_size_x = WG) in;
+
+layout(std430, set = 0, binding = 0) readonly buffer Weights {
+    uint w[];
+};
+layout(std430, set = 0, binding = 1) readonly buffer Xs {
+    float xs[];
+};
+layout(std430, set = 0, binding = 2) writeonly buffer Ys {
+    float ys[];
+};
+layout(std430, set = 0, binding = 3) buffer Unused {
+    float unused[];
+};
+
+layout(push_constant) uniform Params {
+    uint n;
+    uint k;
+    uint row_bytes;
+    uint pad;
+} p;
+
+const uint GROUPS = WG / 32u;
+
+#if TREE == 0
+shared float red[WG * NR];
+#endif
+#ifdef SH
+shared float sds[GROUPS * NR * 8u];
+shared float sms[GROUPS * NR * 8u];
+shared float sss[GROUPS * NR * 16u];
+#endif
+
+uint byte_at(uint i) {
+    return (w[i >> 2] >> ((i & 3u) * 8u)) & 0xFFu;
+}
+
+int i8_at(uint i) {
+    return int(byte_at(i) << 24) >> 24;
+}
+
+// Exactly `formats::f16_to_f32`.
+float f16_bits(uint h) {
+    uint sign = (h & 0x8000u) << 16;
+    uint e = (h >> 10) & 0x1Fu;
+    uint m = h & 0x3FFu;
+    uint bits;
+    if (e == 0u) {
+        if (m == 0u) {
+            bits = sign;
+        } else {
+            uint ex = 127u - 15u + 1u;
+            while ((m & 0x400u) == 0u) {
+                m <<= 1;
+                ex -= 1u;
+            }
+            bits = sign | (ex << 23) | ((m & 0x3FFu) << 13);
+        }
+    } else if (e == 0x1Fu) {
+        bits = sign | 0x7F800000u | (m << 13);
+    } else {
+        bits = sign | ((e + 127u - 15u) << 23) | (m << 13);
+    }
+    return uintBitsToFloat(bits);
+}
+
+float f16_at(uint i) {
+    return f16_bits(byte_at(i) | (byte_at(i + 1u) << 8));
+}
+
+float opaque(float v) {
+    return uintBitsToFloat(floatBitsToUint(v) | (p.n >> 31));
+}
+
+uint sbyte(uvec3 sw, uint i) {
+    return (sw[i >> 2] >> ((i & 3u) * 8u)) & 0xFFu;
+}
+
+uvec2 scale_min_k4w(uint j, uvec3 sw) {
+    if (j < 4u) {
+        return uvec2(sbyte(sw, j) & 63u, sbyte(sw, j + 4u) & 63u);
+    }
+    return uvec2((sbyte(sw, j + 4u) & 0xFu) | ((sbyte(sw, j - 4u) >> 6) << 4),
+                 (sbyte(sw, j + 4u) >> 4) | ((sbyte(sw, j) >> 6) << 4));
+}
+
+void main() {
+    uint t = gl_LocalInvocationID.x;
+    uint lane = t % 32u;
+    uint grp = t / 32u;
+    uint tok = gl_WorkGroupID.y;
+    // Rows r0 .. r0 + NR of this group; a row past n repeats the last row and is not
+    // written.
+    uint r0 = (gl_WorkGroupID.x * GROUPS + grp) * NR;
+    uint x = tok * p.k;
+
+    float a0[NR];
+    float a1[NR];
+    uint row[NR];
+    for (uint i = 0u; i < NR; i++) {
+        a0[i] = 0.0;
+        a1[i] = 0.0;
+        row[i] = min(r0 + i, p.n - 1u) * p.row_bytes;
+    }
+
+#if DT == 4 && defined(K4V2)
+#ifdef K4Q
+#define K4BYTE(G, I) ((subgroupShuffle(qw[I], 8u * (G) + lane / 4u) >> ((lane & 3u) * 8u)) & 0xFFu)
+#else
+#define K4BYTE(G, I) byte_at(row[I] + b + 16u + 32u * (G) + lane)
+#endif
+#if defined(K4S) && defined(SH)
+#define K4SCALES(G, I)                                                             \
+    float d0 = sds[(grp * NR + (I)) * 8u + 2u * (G)];                              \
+    float m0 = sms[(grp * NR + (I)) * 8u + 2u * (G)];                              \
+    float d1 = sds[(grp * NR + (I)) * 8u + 2u * (G) + 1u];                         \
+    float m1 = sms[(grp * NR + (I)) * 8u + 2u * (G) + 1u];
+#elif defined(K4S)
+#define K4SCALES(G, I)                                                             \
+    float d0 = subgroupShuffle(ds[I], 2u * (G));                                   \
+    float m0 = subgroupShuffle(ms[I], 2u * (G));                                   \
+    float d1 = subgroupShuffle(ds[I], 2u * (G) + 1u);                              \
+    float m1 = subgroupShuffle(ms[I], 2u * (G) + 1u);
+#else
+#define K4SCALES(G, I)                                                             \
+    uvec2 s0 = scale_min_k4w(2u * (G), sw[I]);                                     \
+    uvec2 s1 = scale_min_k4w(2u * (G) + 1u, sw[I]);                                \
+    float d0 = d[I] * float(s0.x);                                                 \
+    float m0 = dmin[I] * float(s0.y);                                              \
+    float d1 = d[I] * float(s1.x);                                                 \
+    float m1 = dmin[I] * float(s1.y);
+#endif
+#define K4G(G)                                                                     \
+    {                                                                              \
+        uint j = x + c + 64u * (G) + lane;                                         \
+        float x0 = xs[j];                                                          \
+        float x1 = xs[j + 32u];                                                    \
+        for (uint i = 0u; i < NR; i++) {                                           \
+            K4SCALES(G, i)                                                         \
+            uint v = K4BYTE(G, i);                                                 \
+            float y0 = fma(opaque(d0 * float(v & 0xFu)), 1.0, -m0);                \
+            float y1 = fma(opaque(d1 * float(v >> 4)), 1.0, -m1);                  \
+            a0[i] = fma(y0, x0, a0[i]);                                            \
+            a1[i] = fma(y1, x1, a1[i]);                                            \
+        }                                                                          \
+    }
+    for (uint c = 0u; c < p.k; c += 256u) {
+        uint b = 144u * (c / 256u);
+        float d[NR];
+        float dmin[NR];
+        uvec3 sw[NR];
+#ifdef K4Q
+        uint qw[NR];
+#endif
+#ifdef K4S
+        float ds[NR];
+        float ms[NR];
+#endif
+        for (uint i = 0u; i < NR; i++) {
+            uint q = (row[i] + b) >> 2;
+            uint h0 = w[q];
+            sw[i] = uvec3(w[q + 1u], w[q + 2u], w[q + 3u]);
+            d[i] = f16_bits(h0 & 0xFFFFu);
+            dmin[i] = f16_bits(h0 >> 16);
+#ifdef K4Q
+            qw[i] = w[q + 4u + lane];
+#endif
+#if defined(K4S) && defined(SH)
+            if (lane < 8u) {
+                uvec2 sm = scale_min_k4w(lane, sw[i]);
+                sds[(grp * NR + i) * 8u + lane] = d[i] * float(sm.x);
+                sms[(grp * NR + i) * 8u + lane] = dmin[i] * float(sm.y);
+            }
+#elif defined(K4S)
+            // Lane j < 8 computes sub-block j's scale and min products (lanes 8..31
+            // compute sub-block j % 8's, unused).
+            uvec2 sm = scale_min_k4w(lane & 7u, sw[i]);
+            ds[i] = d[i] * float(sm.x);
+            ms[i] = dmin[i] * float(sm.y);
+#endif
+        }
+#ifdef SH
+        memoryBarrierShared();
+        barrier();
+#endif
+        K4G(0u)
+        K4G(1u)
+        K4G(2u)
+        K4G(3u)
+#ifdef SH
+        barrier();
+#endif
+    }
+#elif DT == 4
+    for (uint c = 0u; c < p.k; c += 256u) {
+        uint b = 144u * (c / 256u);
+        float d[NR];
+        float dmin[NR];
+        uvec3 sw[NR];
+        for (uint i = 0u; i < NR; i++) {
+            uint q = (row[i] + b) >> 2;
+            uint h0 = w[q];
+            sw[i] = uvec3(w[q + 1u], w[q + 2u], w[q + 3u]);
+            d[i] = f16_bits(h0 & 0xFFFFu);
+            dmin[i] = f16_bits(h0 >> 16);
+        }
+        for (uint g = 0u; g < 4u; g++) {
+            uint j = x + c + 64u * g + lane;
+            float x0 = xs[j];
+            float x1 = xs[j + 32u];
+            for (uint i = 0u; i < NR; i++) {
+#ifdef NODEQ
+                float y0 = d[i];
+                float y1 = dmin[i];
+#else
+#ifdef ABL_SCALE
+                uvec2 s0 = uvec2(sw[i].x & 63u, sw[i].y & 63u);
+                uvec2 s1 = uvec2((sw[i].x >> 8) & 63u, (sw[i].y >> 8) & 63u);
+#else
+                uvec2 s0 = scale_min_k4w(2u * g, sw[i]);
+                uvec2 s1 = scale_min_k4w(2u * g + 1u, sw[i]);
+#endif
+                float d0 = d[i] * float(s0.x);
+                float m0 = dmin[i] * float(s0.y);
+                float d1 = d[i] * float(s1.x);
+                float m1 = dmin[i] * float(s1.y);
+#ifdef ABL_BYTE
+                uint v = (lane * 37u + g) & 0xFFu;
+#else
+                uint v = byte_at(row[i] + b + 16u + 32u * g + lane);
+#endif
+#ifdef ABL_OPAQUE
+                float y0 = fma(d0 * float(v & 0xFu), 1.0, -m0);
+                float y1 = fma(d1 * float(v >> 4), 1.0, -m1);
+#else
+                float y0 = fma(opaque(d0 * float(v & 0xFu)), 1.0, -m0);
+                float y1 = fma(opaque(d1 * float(v >> 4)), 1.0, -m1);
+#endif
+#endif
+                a0[i] = fma(y0, x0, a0[i]);
+                a1[i] = fma(y1, x1, a1[i]);
+            }
+        }
+    }
+#elif DT == 5 && defined(K6V2)
+#if defined(K6S) && defined(SH)
+#define K6SC(H, QQ, I, BLK) sss[(grp * NR + (I)) * 16u + 8u * (H) + lane / 16u + 2u * (QQ)]
+#elif defined(K6S)
+#define K6SC(H, QQ, I, BLK) subgroupShuffle(ss[I], 8u * (H) + lane / 16u + 2u * (QQ))
+#else
+#define K6SC(H, QQ, I, BLK) (d[I] * float(i8_at((BLK) + 192u + 8u * (H) + lane / 16u + 2u * (QQ))))
+#endif
+#define K6Q(H, QQ, LO, I, BLK, A)                                                  \
+    {                                                                              \
+        int q = int((LO) | (((hb >> (2u * (QQ))) & 3u) << 4)) - 32;                \
+        float sc = K6SC(H, QQ, I, BLK);                                            \
+        float y = sc * float(q);                                                   \
+        A[I] = fma(y, xq[QQ], A[I]);                                               \
+    }
+#define K6H(H)                                                                     \
+    {                                                                              \
+        uint j = x + c + 128u * (H) + lane;                                        \
+        float xq[4];                                                               \
+        xq[0] = xs[j];                                                             \
+        xq[1] = xs[j + 32u];                                                       \
+        xq[2] = xs[j + 64u];                                                       \
+        xq[3] = xs[j + 96u];                                                       \
+        for (uint i = 0u; i < NR; i++) {                                           \
+            uint blk = row[i] + b;                                                 \
+            uint la = byte_at(blk + 64u * (H) + lane);                             \
+            uint lb = byte_at(blk + 64u * (H) + lane + 32u);                       \
+            uint hb = byte_at(blk + 128u + 32u * (H) + lane);                      \
+            K6Q(H, 0u, la & 0xFu, i, blk, a0)                                      \
+            K6Q(H, 1u, lb & 0xFu, i, blk, a1)                                      \
+            K6Q(H, 2u, la >> 4, i, blk, a0)                                        \
+            K6Q(H, 3u, lb >> 4, i, blk, a1)                                        \
+        }                                                                          \
+    }
+    for (uint c = 0u; c < p.k; c += 256u) {
+        uint b = 210u * (c / 256u);
+        float d[NR];
+#ifdef K6S
+        float ss[NR];
+#endif
+        for (uint i = 0u; i < NR; i++) {
+            d[i] = f16_at(row[i] + b + 208u);
+#if defined(K6S) && defined(SH)
+            if (lane < 16u) {
+                sss[(grp * NR + i) * 16u + lane] = d[i] * float(i8_at(row[i] + b + 192u + lane));
+            }
+#elif defined(K6S)
+            // Lane j computes scale j % 16's product.
+            ss[i] = d[i] * float(i8_at(row[i] + b + 192u + (lane & 15u)));
+#endif
+        }
+#ifdef SH
+        memoryBarrierShared();
+        barrier();
+#endif
+        K6H(0u)
+        K6H(1u)
+#ifdef SH
+        barrier();
+#endif
+    }
+#elif DT == 5
+    for (uint c = 0u; c < p.k; c += 256u) {
+        uint b = 210u * (c / 256u);
+        float d[NR];
+        for (uint i = 0u; i < NR; i++) {
+            d[i] = f16_at(row[i] + b + 208u);
+        }
+        for (uint h = 0u; h < 2u; h++) {
+            uint j = x + c + 128u * h + lane;
+            float xq[4];
+            for (uint qq = 0u; qq < 4u; qq++) {
+                xq[qq] = xs[j + 32u * qq];
+            }
+            for (uint i = 0u; i < NR; i++) {
+                uint blk = row[i] + b;
+                uint la = byte_at(blk + 64u * h + lane);
+                uint lb = byte_at(blk + 64u * h + lane + 32u);
+                uint hb = byte_at(blk + 128u + 32u * h + lane);
+                uint sc = blk + 192u + 8u * h + lane / 16u;
+                for (uint qq = 0u; qq < 4u; qq++) {
+#ifdef NODEQ
+                    float y = d[i];
+#else
+                    uint lo = qq >= 2u ? ((qq & 1u) == 0u ? la : lb) >> 4
+                                       : ((qq & 1u) == 0u ? la : lb) & 0xFu;
+                    int q = int(lo | (((hb >> (2u * qq)) & 3u) << 4)) - 32;
+                    float s = d[i] * float(i8_at(sc + 2u * qq));
+                    float y = s * float(q);
+#endif
+                    if ((qq & 1u) == 0u) {
+                        a0[i] = fma(y, xq[qq], a0[i]);
+                    } else {
+                        a1[i] = fma(y, xq[qq], a1[i]);
+                    }
+                }
+            }
+        }
+    }
+#elif DT == 3
+    for (uint c = 0u; c < p.k; c += 64u) {
+        float x0 = xs[x + c + lane];
+        float x1 = xs[x + c + lane + 32u];
+        for (uint i = 0u; i < NR; i++) {
+            uint b0 = row[i] + 34u * (c / 32u);
+            uint b1 = b0 + 34u;
+            float d0 = f16_at(b0);
+            float d1 = f16_at(b1);
+#ifdef NODEQ
+            float y0 = d0;
+            float y1 = d1;
+#else
+            float y0 = float(i8_at(b0 + 2u + lane)) * d0;
+            float y1 = float(i8_at(b1 + 2u + lane)) * d1;
+#endif
+            a0[i] = fma(y0, x0, a0[i]);
+            a1[i] = fma(y1, x1, a1[i]);
+        }
+    }
+#else
+#error "DT must be 3, 4 or 5"
+#endif
+
+#if TREE == 0
+    for (uint i = 0u; i < NR; i++) {
+        red[i * WG + t] = a0[i] + a1[i];
+    }
+    memoryBarrierShared();
+    barrier();
+    for (uint wd = 16u; wd >= 4u; wd /= 2u) {
+        float v[NR];
+        for (uint i = 0u; i < NR; i++) {
+            v[i] = 0.0;
+            if (lane < wd) {
+                v[i] = red[i * WG + t] + red[i * WG + t + wd];
+            }
+        }
+        memoryBarrierShared();
+        barrier();
+        for (uint i = 0u; i < NR; i++) {
+            if (lane < wd) {
+                red[i * WG + t] = v[i];
+            }
+        }
+        memoryBarrierShared();
+        barrier();
+    }
+    if (lane == 0u) {
+        for (uint i = 0u; i < NR; i++) {
+            uint o = i * WG + t;
+            float b0 = red[o] + red[o + 1u];
+            float b1 = red[o + 2u] + red[o + 3u];
+            if (r0 + i < p.n) {
+                ys[tok * p.n + r0 + i] = b0 + b1;
+            }
+        }
+    }
+#else
+    for (uint i = 0u; i < NR; i++) {
+        float s = a0[i] + a1[i];
+        s = s + subgroupShuffleDown(s, 16u);
+        s = s + subgroupShuffleDown(s, 8u);
+        s = s + subgroupShuffleDown(s, 4u);
+        float b = s + subgroupShuffleDown(s, 1u);
+        float y = b + subgroupShuffleDown(b, 2u);
+        if (gl_SubgroupSize != 32u) {
+            y = uintBitsToFloat(0x7FC00000u);
+        }
+        if (lane == 0u && r0 + i < p.n) {
+            ys[tok * p.n + r0 + i] = y;
+        }
+    }
+#endif
+}

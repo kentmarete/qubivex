@@ -2742,3 +2742,119 @@ decode_profile -- --ignored --nocapture`):
 **Recommendation:** item 1 first, as a harness spike on the matmul kernel alone (no
 production change), bit for bit against the CPU on `parity.rs`'s shapes and dtypes, with
 the per-row rates above as the baseline. Then item 2 on the same kernel.
+
+## 23. Step 5 spike: where the matmul kernel's instructions go (2026-11-14)
+
+Branch `vulkan-kernel-throughput`. Harness only (feature `spike`): no production code
+changes. §22.5 item 1: why the quantized matmul runs at 37–48 GB/s, and what can be
+removed without changing a bit. AC power.
+
+### 23.1 Method
+
+- `spike/mm.comp` is the production kernel's Q8_0, Q4_K and Q6_K bodies
+  (`shaders/matmul_body.glsl`): the same weights from the same operations in the same
+  order, the same 64-lane fma order and halving tree, built `-O` with `NoContraction` on
+  every add, subtract and fma, as production. Defines select the variant: the reduction
+  (shared memory, or subgroup shuffles), rows per 32-lane group (1, 2, 4), workgroup size,
+  and the rewrites below. Whole blocks only, weights at offset 0.
+- `tests/matmul_spike.rs`: every exact variant against `CpuBackend::matmul`, bit for bit,
+  at k = 256, 1024, 2048 (64, 576, 2048 for Q8_0) × (rows, tokens) = (1, 1), (9, 3),
+  (33, 8), (1027, 2). Positive controls: a one-ulp change in one output is caught; the
+  timing-only `_nd` variant (decoding removed) is not exact. An ignored test times each
+  variant on the GPU (timestamps; 10–50 runs in one submission, median of 5).
+- The harness's buffers are host-visible: its production-equivalent variant runs Q4_K at
+  710 µs on the 24576 × 2048 matrix against 756 µs through the production path (§22.3).
+  Compare variants with each other, not with §22.
+
+### 23.2 What does not matter
+
+24576 × 2048, one token, GPU µs:
+
+| variant | Q8_0 | Q4_K | Q6_K |
+|---|---:|---:|---:|
+| production shape: shared-memory tree, 1 row per group, 256 invocations | 1368 | 710 | 874 |
+| subgroup-shuffle tree | 1350 | 702 | 870 |
+| shuffle tree, 2 rows per group (activations loaded once for both) | 1309 | 695 | 866 |
+| shuffle tree, 1 row per group, 64 invocations | 1334 | 701 | 869 |
+| **no decoding** (every weight = the block's d; timing only) | 1045 | **249** | **222** |
+
+- The reduction, rows per group and workgroup size move each format by 1–4%. Neither
+  barriers nor activation loads bind.
+- **The decoding is 65–75% of Q4_K's and Q6_K's time.** Without it Q4_K runs at 114 GB/s
+  and Q6_K at 186. (Q8_0 keeps its per-block f16 conversion in the control, so its
+  control says less; OLMoE's Q4_K_M has no Q8_0 matrix.)
+- The kernels stay per-token linear at 8 tokens even without decoding: each token is its
+  own workgroup and reloads the row (§22.5 item 2, token tiles).
+
+### 23.3 Q4_K, ablated (2 rows per group, shuffle tree; timing only except the last)
+
+| removed | GPU µs | saved |
+|---|---:|---:|
+| nothing | 695 | — |
+| the 6-bit scale/min unpacking and its products (fixed bytes, so hoisted) | 430 | 265 |
+| the quant byte's load (a computed byte instead) | 514 | 181 |
+| `opaque` (exact here: ADR-019 found it unneeded with fast math off) | 694 | 0 |
+
+The scale/min work is the largest single cost, and it is redundant: every lane computes
+the same eight `d · sc` and `dmin · m` products of the block, at every row.
+
+### 23.4 The rewrite: each product once per block (bit for bit)
+
+Lanes 0..7 compute sub-block j's `d · sc_j` and `dmin · m_j` (Q4_K), lanes 0..15 scale
+j's `d · sc_j` (Q6_K), once per block; the other lanes read them. Each weight is still
+`(d · sc) · q − dmin · m` (Q4_K) or `(d · sc) · q` (Q6_K) from the same operands, each
+product rounded on its own: the CPU's bits, which every variant reproduces. Two ways to
+share:
+
+- **by subgroup shuffle** — needs 32-wide subgroups (MoltenVK has 32; lavapipe 4–16);
+- **through shared memory**, two workgroup barriers per block — no subgroup operation at
+  all, so it runs anywhere the production kernel does.
+
+24576 × 2048, GPU µs (1 token / 8 tokens):
+
+| variant | Q4_K | Q6_K |
+|---|---:|---:|
+| production shape | 710 / 5598 | 874 / 6917 |
+| shared by shuffle, 2 rows per group | 483 / 3761 | 632 / 4948 |
+| shared by shuffle, 4 rows per group | 487 / 3722 | 617 / 4757 |
+| **shared memory, shared-memory tree, 1 row per group** | **541 / 4214** | **598 / 4522** |
+| shared memory, shared-memory tree, 2 rows per group | 518 / 3933 | 613 / 4414 |
+
+- Q4_K 40 → 52–59 GB/s, Q6_K 47 → 62–69 GB/s: past Metal's 45 GB/s on the same chip.
+- The quant bytes loaded as one coalesced word per lane and handed out by shuffle save
+  another 2–4% (Q4_K, 695 → 675 µs); with scale sharing, nothing. Not pursued.
+
+OLMoE's shapes, one token (the decode case), GPU µs, production shape → shared memory with
+1 row per group (the best at these sizes):
+
+| matrix | Q4_K | Q6_K |
+|---|---:|---:|
+| expert gate/up, 1024 × 2048 | 38.5 → 29.5 (−23%) | 45.2 → 33.0 (−27%) |
+| expert down, 2048 × 1024 | 36.3 → 29.3 (−19%) | 42.6 → 32.3 (−24%) |
+| Q/K/V/O, 2048 × 2048 | 68.2 → 52.0 (−24%) | 81.0 → 55.4 (−32%) |
+| 24576 × 2048 (LM-head-like) | 710 → 541 (−24%) | 874 → 598 (−32%) |
+
+At 8 tokens the gains are 23–37%.
+
+### 23.5 What it could give end to end (estimate, not a result)
+
+Applying these ratios to §22.4's split: expert matmuls 12.4 → ~9.5 ms, Q/K/V/O 4.8 →
+~3.6, LM head 1.76 → ~1.2: **about −4.5 ms of GPU time per token**, so about 22 ms per
+token untimed (~45 tok/s) from 26.56. Only `qubivex bench` can say (§8, §9.6).
+
+### 23.6 Recommendation (for review)
+
+Port the shared-memory form (no subgroup operations, one row per group) into
+`shaders/matmul_body.glsl` for Q4_K and Q6_K, as Step 5's first production commit: no bit
+changes, no new device feature, no switch needed beyond the bench gate. What the port
+must handle that the spike does not:
+- the barriers need every invocation in the block loop, so rows past `n` must run it
+  (clamped, as the spike does) instead of skipping it behind `r < P_N`;
+- `matmul_fused.comp` includes the same body: its workgroups are one matrix each (k is
+  uniform per workgroup) and return early only as a whole workgroup, so the barriers are
+  legal there too;
+- unaligned weight offsets (`word_at`), which the spike does not exercise.
+
+Then the gates of §8 (parity, `tests/vulkan.rs`, fixtures, the OLMoE test, every dtype,
+bench tokens identical, no prefill regression) and the alternated mains bench against
+§21.6. Token tiles (§22.5 item 2) after that, on the ported kernel.

@@ -58,3 +58,47 @@ for u in 8 16; do
 done
 build attn_oneb_u16 -O0 attn_sv -DU=16 -DONE -DBATCH
 build qk_prelude -O0
+# Audit §23. The matmul's K-quant and Q8_0 bodies (mm.comp) by dtype, reduction (t0 shared
+# memory, t1 subgroup shuffles), rows per group and workgroup size, built -O as
+# production's matmul is; `_nd` variants drop the decoding (timing controls only).
+for dt in 3:q8 4:q4k 5:q6k; do
+    n="${dt#*:}"
+    v="${dt%%:*}"
+    for spec in t0_r1_w256 t1_r1_w256 t1_r2_w256 t1_r4_w256 t1_r1_w64 t1_r2_w128 t0_r2_w256; do
+        tr="${spec%%_*}"
+        rest="${spec#*_}"
+        r="${rest%%_*}"
+        wg="${rest#*_}"
+        build "mm_${n}_$spec" -O mm -DDT="$v" -DTREE="${tr#t}" -DNR="${r#r}" -DWG="${wg#w}"
+    done
+    build "mm_${n}_t0_r1_w256_nd" -O mm -DDT="$v" -DTREE=0 -DNR=1 -DWG=256 -DNODEQ
+    build "mm_${n}_t1_r2_w256_nd" -O mm -DDT="$v" -DTREE=1 -DNR=2 -DWG=256 -DNODEQ
+done
+# Q4_K decode ablations (timing only): scales from fixed bytes, quant byte not loaded,
+# no `opaque`.
+for a in SCALE BYTE OPAQUE; do
+    l="$(echo "$a" | tr 'A-Z' 'a-z')"
+    build "mm_q4k_t1_r2_w256_a$l" -O mm -DDT=4 -DTREE=1 -DNR=2 -DWG=256 -DABL_$a
+done
+# Q4_K rewrites: groups written out (u), and quant bytes by shuffle (q).
+build mm_q4k_t1_r2_w256_u -O mm -DDT=4 -DTREE=1 -DNR=2 -DWG=256 -DK4V2
+build mm_q4k_t1_r2_w256_uq -O mm -DDT=4 -DTREE=1 -DNR=2 -DWG=256 -DK4V2 -DK4Q
+build mm_q4k_t1_r1_w256_uq -O mm -DDT=4 -DTREE=1 -DNR=1 -DWG=256 -DK4V2 -DK4Q
+build mm_q4k_t1_r4_w256_uq -O mm -DDT=4 -DTREE=1 -DNR=4 -DWG=256 -DK4V2 -DK4Q
+# Scales once per block by lanes 0..7, shared by shuffle (s).
+build mm_q4k_t1_r2_w256_us -O mm -DDT=4 -DTREE=1 -DNR=2 -DWG=256 -DK4V2 -DK4S
+build mm_q4k_t1_r2_w256_uqs -O mm -DDT=4 -DTREE=1 -DNR=2 -DWG=256 -DK4V2 -DK4Q -DK4S
+build mm_q4k_t1_r4_w256_uqs -O mm -DDT=4 -DTREE=1 -DNR=4 -DWG=256 -DK4V2 -DK4Q -DK4S
+build mm_q4k_t1_r1_w256_uqs -O mm -DDT=4 -DTREE=1 -DNR=1 -DWG=256 -DK4V2 -DK4Q -DK4S
+# Q6_K rewrites: written out (u), scales once per block shared by shuffle (s).
+build mm_q6k_t1_r2_w256_u -O mm -DDT=5 -DTREE=1 -DNR=2 -DWG=256 -DK6V2
+build mm_q6k_t1_r2_w256_us -O mm -DDT=5 -DTREE=1 -DNR=2 -DWG=256 -DK6V2 -DK6S
+build mm_q6k_t1_r4_w256_us -O mm -DDT=5 -DTREE=1 -DNR=4 -DWG=256 -DK6V2 -DK6S
+build mm_q6k_t1_r1_w256_us -O mm -DDT=5 -DTREE=1 -DNR=1 -DWG=256 -DK6V2 -DK6S
+# The shared products through shared memory (h): no subgroup operation at all with t0.
+for r in 1 2 4; do
+    build "mm_q4k_t0_r${r}_w256_ush" -O mm -DDT=4 -DTREE=0 -DNR=$r -DWG=256 -DK4V2 -DK4S -DSH
+    build "mm_q6k_t0_r${r}_w256_ush" -O mm -DDT=5 -DTREE=0 -DNR=$r -DWG=256 -DK6V2 -DK6S -DSH
+done
+build mm_q4k_t1_r2_w256_ush -O mm -DDT=4 -DTREE=1 -DNR=2 -DWG=256 -DK4V2 -DK4S -DSH
+build mm_q6k_t1_r2_w256_ush -O mm -DDT=5 -DTREE=1 -DNR=2 -DWG=256 -DK6V2 -DK6S -DSH
