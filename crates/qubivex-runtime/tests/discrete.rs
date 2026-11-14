@@ -796,3 +796,51 @@ fn concurrent_requests_with_decode_attention() {
     assert!(r.layers > before);
     assert_eq!(r.free, r.blocks);
 }
+
+/// The KV pool's size (ADR-019 amendment 5): 512 MiB by default, a configured size
+/// otherwise, never more than 1 GiB nor than the budget leaves after the experts.
+#[test]
+fn the_kv_pool_is_512_mib_by_default_and_capped() {
+    let id = "olmoe-tiny";
+    let pool = |config: Option<u64>, budget: u64| {
+        let mut sim = SimConfig::new(8 << 30);
+        sim.fuse_rows = 64;
+        sim.route_rows = 64;
+        sim.route_prelude = true;
+        sim.route_attention = true;
+        sim.kv_pool = config;
+        let e = Engine::load(
+            meta(id),
+            EngineOptions {
+                backend: BackendKind::Sim,
+                sim: Some(sim),
+                vram_budget: Some(budget),
+                expert_cache_bytes: Some(1 << 30),
+                max_context: Some(256),
+                ..EngineOptions::default()
+            },
+        )
+        .unwrap();
+        e.device_report().unwrap().kv_pool
+    };
+    let p = pool(None, 4 << 30);
+    let block = p.bytes / p.blocks;
+    assert!(!p.allocated, "allocated on first use");
+    assert!(
+        p.bytes <= qubivex_runtime::DEFAULT_KV_POOL
+            && p.bytes + block > qubivex_runtime::DEFAULT_KV_POOL,
+        "{p:?}"
+    );
+    let q = pool(Some(256 << 20), 4 << 30);
+    assert!(q.bytes <= 256 << 20 && q.bytes + block > 256 << 20, "{q:?}");
+    let big = pool(Some(3 << 30), 4 << 30);
+    assert!(
+        big.bytes <= qubivex_runtime::MAX_KV_POOL
+            && big.bytes + block > qubivex_runtime::MAX_KV_POOL,
+        "{big:?}"
+    );
+    // A budget with little room after the dense copy, the reserve and the experts.
+    let tight = dense_arena(id) + VRAM_ACTIVATION_RESERVE.0 + (64 << 20);
+    let t = pool(None, tight);
+    assert!(t.bytes < 64 << 20, "{t:?}");
+}

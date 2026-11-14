@@ -109,8 +109,9 @@ pub struct VulkanConfig {
     /// store into a paged KV pool and attention, so a decode layer is one submission.
     /// The host KV cache stays authoritative. Off by default; Step 3c is the fallback.
     pub attention: bool,
-    /// Bytes of device memory for the KV pool attention reads. `None`: what the device
-    /// budget leaves after the expert cache, up to one buffer the device addresses.
+    /// Bytes of device memory for the KV pool attention reads. `None`: 512 MiB. Either
+    /// way at most 1 GiB and what the device budget leaves after the expert cache
+    /// (ADR-019 amendment 5).
     pub kv_pool: Option<u64>,
 }
 

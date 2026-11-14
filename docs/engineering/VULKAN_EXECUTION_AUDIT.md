@@ -2583,3 +2583,12 @@ pressure above argues against as a default here.
   the prelude's reduction (one RMSNorm per head), with its own parity tests.
 - Not built: chunked attention past 4096 positions; device attention for prefill
   (measured unchanged, as decided).
+
+### 21.5 Decided by the owner (2026-11-14)
+
+Accepted and merged behind `--vulkan-attn`, default off (ADR-019 amendment 5):
+- **The KV pool:** 512 MiB by default, configurable, never more than 1 GiB or what the
+  budget leaves after the experts.
+- **Qwen3's per-head norms:** stay on the host until a demonstrated gain.
+- **The single-stream rerun:** to follow the merge, with memory pressure recorded.
+

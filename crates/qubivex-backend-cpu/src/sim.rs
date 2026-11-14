@@ -67,7 +67,7 @@ pub struct SimConfig {
     /// ([`DiscreteDevice::routes_moe_attention`], audit §21); needs `route_prelude`.
     pub route_attention: bool,
     /// The KV pool's size for device attention ([`DiscreteDevice::kv_pool`]); `None`:
-    /// what the budget leaves.
+    /// the runtime's default (512 MiB), within what the budget leaves.
     pub kv_pool: Option<u64>,
 }
 

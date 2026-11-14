@@ -543,8 +543,9 @@ pub(crate) struct DeviceArgs {
     /// positions and a full pool run attention on the host.
     #[arg(long, value_name = "on|off")]
     vulkan_attn: Option<String>,
-    /// With --vulkan-attn on: the device memory for the KV pool, for example 1GiB
-    /// (default: what the VRAM budget leaves after the expert cache, up to 4 GiB).
+    /// With --vulkan-attn on: the device memory for the KV pool, for example 256MiB
+    /// (default 512MiB; never more than 1GiB or than the VRAM budget leaves after the
+    /// expert cache).
     #[arg(long, value_name = "SIZE")]
     vulkan_kv_pool: Option<String>,
     /// With a discrete device: an explicit VRAM budget, for example 6GiB; replaces the

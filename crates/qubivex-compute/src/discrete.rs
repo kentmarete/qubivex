@@ -551,8 +551,9 @@ pub trait DiscreteDevice: Send + Sync {
         false
     }
 
-    /// Bytes the KV pool for device attention may take, when configured; `None`: what
-    /// the device budget leaves after the expert cache (audit §21).
+    /// Bytes the KV pool for device attention may take, when configured; `None`: the
+    /// runtime's default. The runtime caps either by what the device budget leaves
+    /// after the expert cache (audit §21, ADR-019 amendment 5).
     fn kv_pool(&self) -> Option<u64> {
         None
     }

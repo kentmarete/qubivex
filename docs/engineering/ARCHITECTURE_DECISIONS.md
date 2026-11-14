@@ -5,7 +5,7 @@
   §2.6 (Metal first, ADR-007 amendment), §3 (keep `MIGRATION_PLAN.md`, fold the EIP in)
   and the tensor scope (ADR-009, implemented). The ADR status changes proposed in §1
   for ADR-003, 004 and 006 were accepted on 2026-11-08; ADR-001 was accepted on 2026-11-06;
-  ADR-005, 008, 011 and 014 were accepted on 2026-11-10; ADR-018 and ADR-019 on 2026-11-11; ADR-019 amendment 4 (Vulkan Steps 3b and 3c, defaults off) on 2026-11-12.
+  ADR-005, 008, 011 and 014 were accepted on 2026-11-10; ADR-018 and ADR-019 on 2026-11-11; ADR-019 amendment 4 (Vulkan Steps 3b and 3c, defaults off) on 2026-11-12. ADR-019 amendment 5 (decode attention on the device behind `--vulkan-attn`, default off; KV pool 512 MiB by default, 1 GiB cap) on 2026-11-14.
 - Inputs: ADR-001 to ADR-008 (`docs/decisions/`), `QUBIVEX_DESIGN.md`,
   `MIGRATION_PLAN.md`, `IMPROVEMENTS_EVALUATION.md`, and the Engineering Improvement Plan
   (EIP).

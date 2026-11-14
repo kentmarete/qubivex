@@ -7,7 +7,9 @@
   Step 3a) records the implementation the owner accepted on 2026-11-11, and the parity
   contract's wording for NaNs. Amendment 4 (2026-11-12, routing and the prelude
   on the device, Steps 3b and 3c) records the implementation the owner accepted on
-  2026-11-12, with both switches off by default.
+  2026-11-12, with both switches off by default. Amendment 5 (2026-11-14, decode attention on the
+  device, step 3 of the audit's §19.10) records the implementation the owner accepted on
+  2026-11-14, with `--vulkan-attn` off by default.
 - Date: 2026-11-11
 - Related: ADR-007 (backends), ADR-010 (lossless by default), ADR-011 (device execution
   and parity), ADR-018 (discrete device memory).
@@ -444,4 +446,94 @@ every record. 35 tok/s was a target and was not reached.
   device must charge it.
 - What remains per layer on the host is QKV → attention → O: the KV cache is in host
   memory. Attention on the device is the next investigation.
+
+## Amendment 5 (2026-11-14): decode attention on the device (opt-in)
+
+The owner accepted decode attention on the device on 2026-11-14 (PR #63; audit
+`VULKAN_EXECUTION_AUDIT.md` §21), on the reported correctness evidence and concurrent
+results. Another single-stream benchmark was not a merge condition; it is to be rerun
+after the merge with less memory pressure. The owner's decisions:
+
+1. `--vulkan-attn` (`VulkanConfig::attention`) stays **off** by default. It needs
+   `--vulkan-route-o on`.
+2. **KV pool:** 512 MiB by default, configurable with `--vulkan-kv-pool SIZE`
+   (`VulkanConfig::kv_pool`). Any size, default or configured, is capped at **1 GiB** and
+   at what the device budget leaves after the expert arenas. The pool never takes all of
+   the device's memory.
+3. **Qwen3's per-head Q and K norms** stay on the host. GPU support waits for a
+   demonstrated end-to-end gain.
+4. The CPU fallback paths and the bit-identical guarantee are kept: everything the device
+   declines runs today's host path unchanged.
+
+Decided earlier (2026-11-13, audit §20.5): the host KV cache is authoritative, with a
+device mirror; above 4096 positions attention runs on the host (no chunking); prefill stays
+on the host.
+
+### Architecture
+- **One submission per decode layer.** A decode pass offers each MoE layer to the device
+  whole (`MoeAttention` / `DeviceMoeAttention` at the head of a routed layer with its
+  prelude; `routes_moe_attention` on both traits, declining by default). A decode pass is
+  one where every sequence has one new token, nothing is traced and there is no lookahead.
+- The command buffer runs, in order:
+  - `kv_sync.comp`: the host rows the device lacks are copied into the pool;
+  - the Q, K and V projections, as fused-matmul entries;
+  - `attn_prelude.comp`: the clip, the full-width Q and K norms, RoPE, and the store into
+    the token's block, with a copy back for the host;
+  - `attn_decode.comp`: one-dispatch attention per (head, token);
+  - Step 3c's dispatches.
+
+  That is 17 submissions per OLMoE token instead of 33.
+- **KV pool.** One arena of 256-position blocks. Each block holds one layer's keys,
+  dimension-major, and its values, position-major. The pool is allocated on first use and
+  charged whole to the ledger's KV owner on the VRAM tier. Sequences take blocks as they
+  grow and give them back when their cache drops. Experts are never evicted for KV: a
+  pass that cannot get a block runs that layer's attention on the host.
+- **Mirror.** It lives in the sequence's `KvCache` device slot and records the blocks and
+  synced positions of each layer.
+  - Positions the host computed (prefill, any declined layer) are copied in before the
+    device reads them.
+  - The mirror never counts past the host's position count.
+  - `KvCache`'s epoch (bumped by `clear` and `restore_from`) restarts it.
+  - The device returns each new key and value, and the host stores them, so the host
+    cache is always complete.
+- **Declines** (nothing written; the host path then runs as before):
+  - prefill and mixed passes;
+  - traced or lookahead passes;
+  - per-head Q/K norms;
+  - 4096 positions or more (`attn_decode.comp`'s shared scores);
+  - a head dimension over 512;
+  - QKV weights the fused kernels cannot read;
+  - no free block.
+- `attend` and the RoPE rotation moved into `qubivex-compute::math` unchanged. The
+  simulated device implements the stage over its own pool, so the runtime's pool, mirror
+  and epoch logic is tested without a GPU.
+
+### Rules added
+- The attention kernels keep `math::attend`'s order (audit §20.2, unchanged by the
+  block-table addressing):
+  - each score a sequential fma chain over d from +0, times `1 / sqrt(d)`;
+  - a NaN-ignoring tree maximum;
+  - `math::exp`;
+  - the softmax sum sequential in one invocation, then one division per position;
+  - each output a sequential fma chain over positions from +0.
+
+  They are built `-O0` with NoContraction like the other shaders. `kv_sync.comp` only
+  copies words, so it is validated without the NoContraction pass.
+- Parity is checked with positive controls at every new stage (audit §21.2): no copy-in,
+  no epoch reset, a wrong block, a reordered sum.
+
+### Measured, and its limits
+Mains, alternated with Step 1a and Step 3c (audit §21.3; records
+`2026-11-13-m3pro-vulkan-step3d-*`):
+- **Single stream:** decode medians 25.82–27.59 ms (36.2–38.7 tok/s), against Step 3c's
+  29.17–30.19 in the two undisturbed rounds. Prefill is unchanged.
+- **Concurrent:** +9% at 1 sequence to +2.5% at 8 over Step 3c.
+- Tokens were identical everywhere.
+
+**Limitations:**
+- Swap rose from 3.4 to 10.5 GB during the run and disturbed one round of the baseline
+  and of Step 3c, so the single-stream range is wide. A quieter rerun is planned after the
+  merge.
+- The pool was 512 MiB in that run.
+- Not built: chunked attention past 4096 positions, and device attention for prefill.
 

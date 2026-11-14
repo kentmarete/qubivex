@@ -206,6 +206,12 @@ pub(crate) struct Pin {
     _pin: Arc<()>,
 }
 
+/// The KV pool's size when none is configured (owner, 2026-11-14).
+pub const DEFAULT_KV_POOL: u64 = 512 << 20;
+
+/// The most a KV pool takes, configured or not: it never takes the whole device.
+pub const MAX_KV_POOL: u64 = 1 << 30;
+
 /// The free blocks of a KV pool, shared with the mirrors that hold the others.
 struct KvFree {
     free: Mutex<Vec<u32>>,
@@ -218,7 +224,8 @@ impl KvFree {
     }
 }
 
-/// The device KV pool for attention on the device (audit §21): one arena of
+/// The device KV pool for attention on the device (audit §21, ADR-019 amendment 5): one
+/// arena of
 /// [`KV_BLOCK`]-position blocks (keys and values of one layer each), allocated on first
 /// use and charged whole to the ledger's KV owner on the VRAM tier. Sequences take
 /// blocks as they grow and give them back when their cache is dropped. A pass that
@@ -419,15 +426,18 @@ impl OnDevice {
             .iter()
             .map(|a| (0..a.slots).rev().collect())
             .collect();
-        // The KV pool: as configured, else what the budget leaves after the expert
-        // arenas; never more than one buffer the device addresses at once.
+        // The KV pool (owner, 2026-11-14): as configured, else `DEFAULT_KV_POOL`; never
+        // more than `MAX_KV_POOL`, than the budget leaves after the expert arenas, or
+        // than one buffer the device addresses at once.
         let expert_bytes: u64 = arenas.iter().map(|a| (a.stride * a.slots) as u64).sum();
         let block_words = kv_block_words(kv_out);
         let kv = (kv_out > 0 && provisioned)
             .then(|| {
                 let room = device
                     .kv_pool()
-                    .unwrap_or_else(|| budget.saturating_sub(expert_bytes))
+                    .unwrap_or(DEFAULT_KV_POOL)
+                    .min(MAX_KV_POOL)
+                    .min(budget.saturating_sub(expert_bytes))
                     .min(device.max_arena());
                 let blocks = u32::try_from(room / (4 * block_words as u64)).unwrap_or(u32::MAX);
                 (blocks > 0).then(|| KvPool {
