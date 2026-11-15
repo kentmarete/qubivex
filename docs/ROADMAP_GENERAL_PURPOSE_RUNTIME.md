@@ -97,7 +97,7 @@ a file-format identifier needs one) and `cargo deny`.
 
 | Area | State |
 |---|---|
-| Q/K/V projection biases | Refused at config validation (`arch/common.rs:230`); Qwen2 and Qwen2.5 (and Qwen2.5-VL's decoder) cannot load |
+| ~~Q/K/V projection biases~~ | **Done in milestone 1 (§5)**: `transformer_dense` option `qkv_bias` |
 | RoPE scaling variants | Only `default` accepted: no `linear`, `dynamic`, `yarn`, `llama3`, `mrope` |
 | Sliding-window attention | Refused (`use_sliding_window`) |
 | Non-SwiGLU FFNs, LayerNorm, attention/MLP biases other than q/k/v, learned positions | Refused or absent |
@@ -199,10 +199,10 @@ State: ✅ implemented and tested, ◐ partial, ✗ missing.
 
 | Feature | Now | Target | Depends on | Cx | Acceptance |
 |---|---|---|---|---|---|
-| Configurable decoder components | ◐ (q/k norm, clip) | bias on q/k/v (and o, FFN), norm kind, activation, tied/untied, position scheme | — | M | Each option checked vs transformers on a fixture |
+| Configurable decoder components | ◐ (q/k norm, clip, q/k/v bias) | bias on o and FFN, norm kind, activation, position scheme | — | M | Each option checked vs transformers on a fixture |
 | Llama 1/2-style | ◐ fixture | real checkpoint verified | — | S | Real-model tokens vs transformers |
 | Llama 3.x | ✗ | `llama3` RoPE scaling, `llama-bpe` GGUF tokenizer | RoPE variants | M | Llama-3.2-1B tokens vs transformers |
-| Qwen2 / Qwen2.5 | ✗ | full support | q/k/v bias | S–M | **P1**: Qwen2.5-0.5B-Instruct greedy tokens and logits vs transformers, CPU and Vulkan/Metal |
+| Qwen2 / Qwen2.5 | ✅ SafeTensors (milestone 1); ◐ GGUF needs `tokenizer.json` | + GGUF `qwen2` pre-tokenizer | q/k/v bias | S | **Met for SafeTensors**: Qwen2.5-0.5B-Instruct greedy tokens, logits, chat template and reply vs transformers; Metal, Vulkan, Sim give the CPU's tokens |
 | Qwen3 dense | ✅ | ✅ | — | — | — |
 | Qwen3-MoE, OLMoE | ✅ | ✅ | — | — | — |
 | Qwen2.5-VL | ✗ | full | multimodal foundation, M-RoPE | L | **P4** criteria (brief §6) |
@@ -273,7 +273,8 @@ brief's priorities, with dependencies resolved inside them.
 ## 4. Lists
 
 ### Completed
-- P0 audit (this document), 2026-11-15.
+- P0 audit (this document), 2026-11-15 (PR #68).
+- Milestone 1, P1: Qwen2/Qwen2.5 text models (§5), 2026-11-15.
 
 ### Partially completed
 - See §1.3.
@@ -303,8 +304,49 @@ brief's priorities, with dependencies resolved inside them.
 
 ## 5. Milestone reports
 
-(Appended at the end of each milestone: what was implemented, files changed, decisions,
-tests and results, performance impact, remaining work, next milestone.)
+### Milestone 1 (2026-11-15): Qwen2 and Qwen2.5 text models (P1, roadmap step 2)
+
+**Implemented.** Q/K/V projection biases as a configurable attention option of the shared
+decoder, detected from the tensors at import, with no code path that names a model family.
+Plain RoPE is now enforced in `rope_parameters` as well as `rope_scaling` (a defect found
+on the way: a transformers-5 config could carry a scaled RoPE there unchecked).
+
+**Files.** `qubivex-model`: `registry.rs` (roles `QBias`, `KBias`, `VBias`),
+`arch/common.rs` (bias specs, RoPE check), `arch/transformer_dense.rs` (option, names,
+version 1.1), `import.rs` (detection). `qubivex-arch/src/lib.rs` (bias vectors loaded
+once, added after the projections; device-fused attention declined with biases).
+`xtask/src/fixtures.rs` (fixture `qwen2-tiny`). Tests: `qubivex-model/tests/{fixtures,metadata}.rs`,
+`qubivex-runtime/tests/{real_dense,batch,discrete,invariants,prefix,vulkan}.rs`. Oracles:
+`fixtures/oracle/forward.py` (+ `qwen2-tiny`), `dense_real.py` (`--chat`),
+`qwen2_real.json`.
+
+**Decisions.** ADR-003 amendment 3.
+
+**Tests.**
+- `qwen2-tiny` vs transformers per layer: pass. Positive control: the oracle test fails
+  with the bias add disabled.
+- `qwen2-tiny` on CPU, Sim, Metal and Vulkan, batching, prefix reuse and the invariants:
+  `cargo test -p qubivex-runtime` all pass.
+- Real `Qwen/Qwen2.5-0.5B-Instruct` (bf16, revision `7ae5576`, sha256 checked), release
+  build: prompt ids, 32 greedy tokens, top-32 logits at every prompt position (worst
+  1.05e-5 relative), prefill = token by token bit for bit, 1 thread = 4 threads, chat
+  template text and ids, greedy chat reply ("Three primary colours are red, yellow, and
+  blue.") stopping at `<|im_end|>`; Metal, Vulkan and Sim give the CPU's 16 tokens.
+- Regressions: Qwen3-0.6B real test (1.15e-5), OLMoE real-model and tokenizer tests,
+  `cargo test -p qubivex-model`, `cargo xtask check` (deps, embeddable, model names,
+  fixtures): pass. Full workspace run: see the PR.
+
+**Performance.** No change for existing models (one branch per layer when there are no
+biases). Indicative only, on battery (does not meet BENCHMARKING.md): Qwen2.5-0.5B decode
+85.5 tok/s on the CPU and 40.3 tok/s on Metal (per-matmul placement), prefill ~310 tok/s
+on both. This confirms the audit's "dense on GPU is partial" (§1.3).
+
+**Remaining for Qwen2/Qwen2.5.** GGUF `qwen2` pre-tokenizer (GGUF files need
+`tokenizer.json` meanwhile); dense whole-layer device passes; a benchmark on power.
+
+**Next milestone.** Roadmap step 6 (P2): JSON mode and JSON Schema constrained decoding,
+ADR first. Steps 3–5 (registry capabilities, linear detokenization, Llama 3.x) are
+smaller and can be interleaved.
 
 ## 6. Baseline
 

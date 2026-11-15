@@ -1,0 +1,32 @@
+{
+  "architecture": {
+    "config": {
+      "qk_norm": "none",
+      "qkv_bias": true,
+      "tensor_names": "hf"
+    },
+    "id": "transformer_dense",
+    "version": "1.1.0"
+  },
+  "model": {
+    "id": "qwen2-tiny",
+    "name": "Tiny Qwen2-style fixture (q/k/v biases)"
+  },
+  "overrides": {},
+  "quantization": "bf16",
+  "schema_version": "1.0.0",
+  "tokenizer": {
+    "kind": "huggingface",
+    "path": "tokenizer.json"
+  },
+  "weights": {
+    "config": "config.json",
+    "format": "safetensors",
+    "shards": [
+      {
+        "path": "model.safetensors",
+        "size": 192304
+      }
+    ]
+  }
+}

@@ -169,7 +169,7 @@ What QUBIVEX adds over a straight port:
 | Storage | Sequential read throughput with and without the page cache (`O_DIRECT` / `F_NOCACHE`), random 4 MiB read latency (about one expert) |
 | Model files | SafeTensors (single or sharded) and GGUF v2/v3 readers, hardened against malformed and malicious headers |
 | Models | Manifest v1, architecture registry, the `transformer_moe` and `transformer_dense` architectures, full cross-validation of manifest, config and tensors, discovery, automatic manifest import |
-| Inference | CPU forward pass for `transformer_moe` (OLMoE, Qwen3-MoE) and `transformer_dense` (dense Qwen3, Llama-style): lossless kernels for f32, f16, bf16, Q8_0, Q4_K and Q6_K; an expert cache of any size with leases and LRU eviction; KV cache; greedy, temperature and top-p sampling; chat templates |
+| Inference | CPU forward pass for `transformer_moe` (OLMoE, Qwen3-MoE) and `transformer_dense` (dense Qwen3, Qwen2/Qwen2.5, Llama-style): lossless kernels for f32, f16, bf16, Q8_0, Q4_K and Q6_K; an expert cache of any size with leases and LRU eviction; KV cache; greedy, temperature and top-p sampling; chat templates |
 | Tokenizers | Hugging Face `tokenizer.json`, or rebuilt from a GGUF file's vocabulary (verified identical to the official tokenizer) |
 | Serving | `qubivex serve`: OpenAI-compatible `/v1/chat/completions` and `/v1/completions` (streaming or not), `/v1/models`, `/health`, `/metrics`, `/v1/system`, model load and unload; a bounded queue with priorities and deadlines, shared load of a model, independent KV per conversation, prefix reuse of retained KV (ADR-016), admission against the memory plan, cancellation when a client disconnects, a shutdown that drains (ADR-015) |
 | CLI | `qubivex run`, `qubivex serve`, `qubivex bench`, `qubivex system`, `qubivex doctor --storage`, `qubivex models search / pull / list / inspect / analyse / import / migrate / verify / remove / architectures` |
@@ -574,7 +574,8 @@ Writes a `manifest.json` for a checkpoint:
 
 The importer finds the weight files: a `model.safetensors.index.json`, all
 `*.safetensors`, or a single `.gguf`. It then tries each architecture
-(`transformer_moe`, then `transformer_dense`), tensor-name layout and q/k-norm mode, and
+(`transformer_moe`, then `transformer_dense`), tensor-name layout, q/k-norm mode and
+(for `transformer_dense`) q/k/v biases, and
 keeps the first combination under which every tensor validates. If none does, it
 reports the problems of the closest candidate. A tied output head reads the embedding;
 a copy of it stored under the head's name is listed in `overrides.ignore_tensors`. It records shard sizes,
@@ -702,7 +703,8 @@ A complete program is in
 - `transformer_moe`, a decoder-only transformer with RMSNorm, RoPE attention (MHA, GQA
   or MQA, optional q/k norm) and routed SwiGLU experts in every layer, with softmax or
   sigmoid routing and optional top-K renormalisation.
-- `transformer_dense`, the same attention with one dense SwiGLU FFN in every layer. The
+- `transformer_dense`, the same attention (plus optional q/k/v projection biases) with
+  one dense SwiGLU FFN in every layer. The
   forward pass shares the embedding, attention, KV cache and head with
   `transformer_moe`; only the FFN differs. It runs on the CPU; on Metal its matmuls are
   placed one by one (same bits, slower than the CPU for now).
@@ -712,9 +714,10 @@ A complete program is in
 | OLMoE (for example `allenai/OLMoE-1B-7B-0125-Instruct`) | Supported by configuration in per-expert SafeTensors, stacked SafeTensors and GGUF layouts. Validated on tiny checkpoints and on the full-size Q4_K_M GGUF |
 | Qwen3-MoE (for example `Qwen/Qwen3-30B-A3B`) | Supported by configuration in per-expert and stacked SafeTensors layouts. Tested on tiny checkpoints; not yet on a full-size one |
 | Dense Qwen3 (for example `Qwen/Qwen3-0.6B`) | `transformer_dense` by configuration (per-head q/k norm, GQA, tied head). Validated on the full-size bf16 SafeTensors checkpoint: 32 greedy tokens equal transformers', logits within 1.2e-5 |
+| Dense Qwen2 / Qwen2.5 (for example `Qwen/Qwen2.5-0.5B-Instruct`) | `transformer_dense` by configuration (q/k/v biases found by the importer, GQA, tied or separate head). Validated on the full-size Qwen2.5-0.5B-Instruct bf16 SafeTensors checkpoint: 32 greedy tokens, logits within 1.1e-5, chat template text and ids, and a chat reply equal transformers'; Metal and Vulkan give the CPU's tokens. GGUF files of this family need `tokenizer.json` (their GGUF pre-tokenizer is not rebuilt yet) |
 | Dense Llama-style (no q/k norm, GQA, tied or separate head) | `transformer_dense` by configuration. Tested on a tiny checkpoint against transformers |
 | Shared-expert or partly dense MoE (Qwen2-MoE, DeepSeek, GLM) | Refused with a clear message for now |
-| Attention or FFN biases, non-SiLU activations, RoPE scaling (YaRN and similar), sliding-window attention | Refused with a clear message for now |
+| Output-projection or FFN biases, non-SiLU activations, RoPE scaling (YaRN, `llama3`, multimodal RoPE and similar, in `rope_scaling` or `rope_parameters`), sliding-window attention | Refused with a clear message for now |
 
 **Containers:** SafeTensors (single file or sharded with `model.safetensors.index.json`)
 and GGUF v2/v3, little-endian, single file.

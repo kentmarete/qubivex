@@ -2,7 +2,9 @@
 
 - Status: **Accepted (2026-11-08)** by owner decision, with amendments 1 and 2. Amendment 1
   (2026-11-04): a second architecture, `transformer_dense`. Amendment 2 (2026-11-06): a
-  registry of installed models.
+  registry of installed models. Amendment 3 (2026-11-15, proposed in PR with the owner's
+  general-purpose runtime brief): q/k/v biases as a `transformer_dense` option, and plain
+  RoPE enforced in `rope_parameters`.
 - Date: 2026-11-01
 
 ## Context
@@ -82,3 +84,40 @@ adds a separate one for installed models, in a new crate, `qubivex-model-registr
 - A record's `dir` must be one path component, and a file that breaks this fails to load.
 - Loaded state is not recorded: a file cannot say whether a process is alive.
 - `models remove` deletes nothing without `--yes`.
+
+## Amendment 3 (2026-11-15): q/k/v biases, and RoPE settings in either key
+Roadmap step 2 (`docs/ROADMAP_GENERAL_PURPOSE_RUNTIME.md`, P1): Qwen2 and Qwen2.5 put
+biases on the q, k and v projections (not on o or the FFN) and their `config.json` does
+not say so. They are supported as configuration of the shared components, with no code
+path that knows the family:
+
+- **An attention option, not an architecture.** `transformer_dense` 1.1 takes
+  `architecture.config.qkv_bias` (default `false`). The tensor schema then requires the
+  three bias vectors with new roles `QBias`, `KBias`, `VBias` (so the planner's KV
+  estimate, which reads the K and V roles, is unchanged). Tensor-name presets gain
+  `q_bias`, `k_bias`, `v_bias` (`hf`: `…self_attn.q_proj.bias`; `gguf`:
+  `blk.{L}.attn_q.bias`). A manifest using the option records version 1.1; one without
+  it stays 1.0, so older builds still read it.
+- **Detected from the tensors.** Import tries `qkv_bias` false and true like the q/k norm
+  modes. Validation refuses unused tensors, so only the checkpoint's own layout
+  validates; a checkpoint's biases can never be silently dropped.
+- **Forward pass.** The biases are dequantized once at load and added to each token's
+  projections right after the matmul, before clipping, q/k norm and RoPE, as
+  `nn.Linear` does. Device-fused attention (MoE decode on Vulkan) is never used when a
+  model has biases. `transformer_moe` does not take the option yet.
+- **`attention_bias = true`** (biases on o as well) stays refused.
+- **RoPE settings.** transformers 5 writes RoPE settings as `rope_parameters`, which
+  was read for `rope_theta` but not checked, so a scaled RoPE stored there (for example
+  `llama3`, or multimodal RoPE) would have loaded with wrong positions. Both
+  `rope_scaling` and `rope_parameters` now accept only `rope_theta` and a `default` type;
+  any other key is refused by name.
+
+Verified: a new tiny fixture `qwen2-tiny` (random biases, untied head, from
+`cargo xtask gen-fixtures`) matches transformers layer by layer
+(`fixtures/oracle/forward.json`), runs on every backend and batching test, and the
+oracle fails when the bias add is disabled. The full-size `Qwen/Qwen2.5-0.5B-Instruct`
+bf16 checkpoint (revision `7ae5576`) imports with no edits and matches transformers in
+prompt ids, 32 greedy tokens, top-32 logits (1.05e-5 relative), chat template text and
+ids, and a greedy chat reply ending at its end-of-sequence id; Metal, Vulkan and the
+simulated device give the CPU's tokens (`tests/real_dense.rs`, env-gated
+`QUBIVEX_QWEN2_SAFETENSORS_DIR`, `fixtures/oracle/qwen2_real.json`).

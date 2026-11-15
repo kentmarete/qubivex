@@ -99,6 +99,17 @@ fn tensor(rng: &mut Rng, name: String, dims: Vec<u64>) -> T {
     T { name, dims, values }
 }
 
+/// A bias: random values, unlike [`tensor`]'s 1-D norms (all 1.0), so a bias applied to
+/// the wrong projection, or not at all, changes the output.
+fn bias(rng: &mut Rng, name: String, n: u64) -> T {
+    let values = (0..n).map(|_| rng.normal(0.5)).collect();
+    T {
+        name,
+        dims: vec![n],
+        values,
+    }
+}
+
 fn bf16_bytes(v: &[f32]) -> Vec<u8> {
     v.iter().flat_map(|&x| bf16(x).to_le_bytes()).collect()
 }
@@ -445,6 +456,58 @@ fn weight_files() -> BTreeMap<&'static str, BTreeMap<String, Vec<u8>>> {
         t.push(tensor(&mut rng, "model.norm.weight".into(), vec![h]));
         all.insert("dense-tiny", safetensors_files(&t, &cfg, vocab));
     }
+
+    // Dense (transformer_dense), Qwen2-style: biases on q, k and v (none on o),
+    // grouped-query attention, an untied output head. The importer must find the
+    // biases from the tensors alone (Qwen2's config does not state them).
+    {
+        let mut rng = Rng(0x5a17_c0de_b1a5_0002);
+        let hd = 16u64;
+        let (heads, kv, dffn) = (4u64, 2u64, 96u64);
+        let cfg = json!({
+            "architectures": ["Qwen2ForCausalLM"], "model_type": "qwen2",
+            "hidden_size": h, "intermediate_size": dffn, "num_hidden_layers": layers,
+            "num_attention_heads": heads, "num_key_value_heads": kv,
+            "rms_norm_eps": 1e-6, "rope_theta": 1_000_000.0, "rope_scaling": null,
+            "hidden_act": "silu", "attention_dropout": 0.0, "max_position_embeddings": 2048,
+            "max_window_layers": 2, "sliding_window": null, "use_sliding_window": false,
+            "vocab_size": vocab, "tie_word_embeddings": false, "torch_dtype": "bfloat16",
+            "bos_token_id": 0, "eos_token_id": 1
+        });
+        let mut t = vec![tensor(
+            &mut rng,
+            "model.embed_tokens.weight".into(),
+            vec![vocab, h],
+        )];
+        for l in 0..layers {
+            let p = |s: &str| format!("model.layers.{l}.{s}");
+            t.push(tensor(&mut rng, p("input_layernorm.weight"), vec![h]));
+            for (proj, out) in [
+                ("q_proj", heads * hd),
+                ("k_proj", kv * hd),
+                ("v_proj", kv * hd),
+            ] {
+                t.push(tensor(
+                    &mut rng,
+                    p(&format!("self_attn.{proj}.weight")),
+                    vec![out, h],
+                ));
+                t.push(bias(&mut rng, p(&format!("self_attn.{proj}.bias")), out));
+            }
+            for (n, d) in [
+                ("self_attn.o_proj.weight", vec![h, heads * hd]),
+                ("post_attention_layernorm.weight", vec![h]),
+                ("mlp.gate_proj.weight", vec![dffn, h]),
+                ("mlp.up_proj.weight", vec![dffn, h]),
+                ("mlp.down_proj.weight", vec![h, dffn]),
+            ] {
+                t.push(tensor(&mut rng, p(n), d));
+            }
+        }
+        t.push(tensor(&mut rng, "model.norm.weight".into(), vec![h]));
+        t.push(tensor(&mut rng, "lm_head.weight".into(), vec![vocab, h]));
+        all.insert("qwen2-tiny", safetensors_files(&t, &cfg, vocab));
+    }
     all
 }
 
@@ -525,6 +588,7 @@ fn generate(out: &Path) -> Result<Vec<PathBuf>, String> {
             "olmoe-tiny" => "Tiny OLMoE-style fixture",
             "olmoe-tiny-gguf" => "Tiny OLMoE-style fixture, GGUF Q8_0",
             "qwen3-moe-tiny" => "Tiny Qwen3-MoE-style fixture",
+            "qwen2-tiny" => "Tiny Qwen2-style fixture (q/k/v biases)",
             _ => dir,
         }
         .to_owned();

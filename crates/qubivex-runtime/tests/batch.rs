@@ -40,11 +40,12 @@ fn argmax(v: &[f32]) -> u32 {
     u32::try_from(best).unwrap()
 }
 
-const ALL: [&str; 4] = [
+const ALL: [&str; 5] = [
     "olmoe-tiny",
     "olmoe-tiny-gguf",
     "qwen3-moe-tiny",
     "dense-tiny",
+    "qwen2-tiny",
 ];
 
 /// Prompts of different lengths, so the sequences sit at different positions.
@@ -290,7 +291,7 @@ fn concurrent_callers_share_passes_and_keep_their_tokens() {
         let full = engine(id, None, 256);
         let largest = full.metadata().bytes().largest_expert;
         let mut engines = vec![full];
-        if id != "dense-tiny" {
+        if largest > 0 {
             engines.push(engine(id, Some(largest), 256));
         }
         for e in &engines {

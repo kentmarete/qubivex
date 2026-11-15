@@ -1,8 +1,13 @@
 # QUBIVEX Implementation Status
 
-Last updated: 2026-11-14
+Last updated: 2026-11-15
 
 ## Current phase
+**General-purpose runtime, milestone 1: Qwen2 and Qwen2.5 text models (2026-11-15, branch `qwen2-text`, stacked on PR #68).** Plan: [`docs/ROADMAP_GENERAL_PURPOSE_RUNTIME.md`](docs/ROADMAP_GENERAL_PURPOSE_RUNTIME.md) (the P0 audit, PR #68); decision: ADR-003 amendment 3.
+- Q/K/V biases are a `transformer_dense` 1.1 option (`qkv_bias`) found by the importer from the tensors; added after the projections. Plain RoPE is enforced in `rope_parameters` too (a scaled RoPE there was accepted unchecked before).
+- New fixture `qwen2-tiny` matches transformers per layer and passes every backend, batching and prefix test. `Qwen/Qwen2.5-0.5B-Instruct` bf16: greedy tokens, logits (1.05e-5), chat template and reply equal transformers'; Metal, Vulkan and Sim give the CPU's tokens.
+- **Next:** P2, JSON mode and JSON Schema constrained decoding (ADR first).
+
 **Step 5 spike: where the matmul kernel's instructions go (2026-11-14, branch `vulkan-kernel-throughput`; harness only, feature `spike`).** See docs/engineering/VULKAN_EXECUTION_AUDIT.md §23.
 - `spike/mm.comp` and `tests/matmul_spike.rs`: the production matmul's Q8_0, Q4_K and Q6_K bodies in variants, each bit for bit against the CPU (positive controls included), and an ignored timing test.
 - The reduction tree, rows per group and workgroup size move each format by 1–4%. Removing the decoding makes Q4_K 2.9× and Q6_K 3.9× faster: the decoding is 65–75% of the time, and its largest part is every lane recomputing the block's scale and min products.

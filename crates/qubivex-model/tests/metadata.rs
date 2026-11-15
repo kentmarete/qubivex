@@ -395,7 +395,7 @@ fn config_rules() {
         c[k] = v;
         c
     };
-    assert!(with_cfg(set("attention_bias", json!(true))).contains("attention biases"));
+    assert!(with_cfg(set("attention_bias", json!(true))).contains("output projection"));
     assert!(with_cfg(set("mlp_only_layers", json!([0]))).contains("dense FFN layers"));
     assert!(with_cfg(set("decoder_sparse_step", json!(2))).contains("dense FFN layers"));
     assert!(with_cfg(set("hidden_act", json!("gelu"))).contains("only silu"));
@@ -403,6 +403,24 @@ fn config_rules() {
     assert!(with_cfg(set("num_experts_per_tok", json!(5))).contains("out of range"));
     assert!(with_cfg(set("hidden_size", json!(-1))).contains("not a non-negative integer"));
     assert!(with_cfg(set("rope_scaling", json!({ "rope_type": "yarn" }))).contains("rope_scaling"));
+    // A scaling without a type, and every variant written the transformers 5 way.
+    assert!(
+        with_cfg(set("rope_scaling", json!({ "factor": 2.0 }))).contains("rope_scaling.factor")
+    );
+    assert!(
+        with_cfg(set(
+            "rope_parameters",
+            json!({ "rope_theta": 1e6, "rope_type": "llama3", "factor": 8.0 })
+        ))
+        .contains("only plain RoPE")
+    );
+    assert!(
+        with_cfg(set(
+            "rope_parameters",
+            json!({ "rope_theta": 1e6, "rope_type": "default", "type": "mrope", "mrope_section": [16, 24, 24] })
+        ))
+        .contains("only plain RoPE")
+    );
     let mut c = hf_config();
     c.as_object_mut().unwrap().remove("rms_norm_eps");
     assert!(with_cfg(c).contains("set overrides.config.rms_norm_eps"));

@@ -27,7 +27,7 @@ def bits(t):
 
 out = {"generator": "fixtures/oracle/forward.py", "transformers": transformers.__version__,
        "torch": torch.__version__, "prompt": PROMPT, "models": {}}
-for name in ["olmoe-tiny", "qwen3-moe-tiny", "dense-tiny"]:
+for name in ["olmoe-tiny", "qwen3-moe-tiny", "dense-tiny", "qwen2-tiny"]:
     model, info = AutoModelForCausalLM.from_pretrained(
         f"fixtures/models/{name}", dtype=torch.float32, output_loading_info=True)
     assert not any(info.values()), f"{name}: weights not loaded cleanly: {info}"
