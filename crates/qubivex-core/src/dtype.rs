@@ -166,6 +166,13 @@ pub enum DType {
 }
 
 impl DType {
+    /// Every dtype, plain floats first, then the GGML types in id order.
+    pub fn all() -> impl Iterator<Item = Self> {
+        [Self::F32, Self::F16, Self::BF16, Self::I8RowScaled]
+            .into_iter()
+            .chain(GgmlType::ALL.into_iter().map(Self::Ggml))
+    }
+
     /// Maps a GGUF tensor type id to a dtype.
     ///
     /// # Errors

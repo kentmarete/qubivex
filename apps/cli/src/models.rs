@@ -11,6 +11,7 @@ use qubivex_model::{
 use serde_json::{Value, json};
 
 use qubivex_model_registry::{REGISTRY_FILE, Registry};
+use qubivex_runtime::BackendKind;
 use qubivex_runtime::checksums::{ExpertSums, SumsState};
 
 use crate::chain;
@@ -579,12 +580,34 @@ pub(crate) fn with_set_hint(msg: &str) -> String {
     )
 }
 
+/// The built-in architectures with what each executes, then each backend's weight
+/// formats (roadmap step 3).
 pub(crate) fn architectures() -> String {
-    let mut o: Vec<String> = ArchitectureRegistry::with_builtins()
-        .list_supported()
-        .into_iter()
-        .map(|a| format!("{} {}  {}", a.id, a.version, a.description))
-        .collect();
+    fn names(v: &[&str]) -> String {
+        v.join(", ")
+    }
+    let mut o = Vec::new();
+    for a in ArchitectureRegistry::with_builtins().list_supported() {
+        let c = &a.capabilities;
+        let formats: Vec<&str> = c.weight_formats.iter().map(|d| d.name()).collect();
+        o.push(format!("{} {}  {}", a.id, a.version, a.description));
+        o.push(format!("  weights    {}", names(&formats)));
+        o.push(format!("  inputs     {}", names(&c.inputs)));
+        o.push(format!(
+            "  positions  {} (rope scaling: {})",
+            names(&c.positions),
+            names(&c.rope_scaling)
+        ));
+        o.push(format!("  norms      {}", names(&c.norms)));
+        o.push(format!("  attention  {}", names(&c.attention)));
+        o.push(format!("  ffn        {}", names(&c.ffn)));
+        o.push(String::new());
+    }
+    o.push("backend weight formats".into());
+    for b in BackendKind::ALL {
+        let formats: Vec<&str> = b.weight_formats().into_iter().map(|d| d.name()).collect();
+        o.push(format!("  {:<7}{}", b.name(), names(&formats)));
+    }
     o.push(String::new());
     o.join("\n")
 }
@@ -592,6 +615,23 @@ pub(crate) fn architectures() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn architectures_list_capabilities() {
+        let o = architectures();
+        assert!(o.contains("transformer_dense "), "{o}");
+        assert!(
+            o.contains("  weights    f32, f16, bf16, q8_0, q4_k, q6_k\n"),
+            "{o}"
+        );
+        assert!(
+            o.contains("  positions  rope (rope scaling: default)\n"),
+            "{o}"
+        );
+        assert!(o.contains("qkv_bias"), "{o}");
+        assert!(o.contains("  ffn        routed_swiglu, "), "{o}");
+        assert!(o.contains("\n  vulkan "), "{o}");
+    }
 
     #[test]
     fn set_hint_names_the_key() {

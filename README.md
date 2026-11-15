@@ -619,7 +619,9 @@ does not check whether a running server has the model loaded.
 
 ### `qubivex models architectures`
 
-Lists the architectures this build supports.
+Lists the architectures this build supports and what each executes: weight formats,
+inputs, position scheme and RoPE scalings, norms, attention options and FFN strategies.
+It ends with the weight formats each backend has kernels for.
 
 ## Model manifests
 

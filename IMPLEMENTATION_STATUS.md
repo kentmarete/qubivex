@@ -3,6 +3,11 @@
 Last updated: 2026-11-15
 
 ## Current phase
+**General-purpose runtime, milestone 3: registry capabilities (2026-11-15, branch `registry-capabilities`).** Roadmap step 3; decision: ADR-003 amendment 4.
+- Architectures declare capabilities (weight formats, inputs, positions, RoPE scalings, norms, attention and FFN options). Validation refuses undeclared weight formats before reading weights, grouped per format; engine load refuses a format the chosen backend or the CPU lacks. `qubivex models architectures` lists capabilities and each backend's formats.
+- A test holds the declared formats equal to every backend's kernels.
+- **Next:** roadmap step 4, linear detokenization.
+
 **General-purpose runtime, milestone 1: Qwen2 and Qwen2.5 text models (2026-11-15, branch `qwen2-text`, stacked on PR #68).** Plan: [`docs/ROADMAP_GENERAL_PURPOSE_RUNTIME.md`](docs/ROADMAP_GENERAL_PURPOSE_RUNTIME.md) (the P0 audit, PR #68); decision: ADR-003 amendment 3.
 - Q/K/V biases are a `transformer_dense` 1.1 option (`qkv_bias`) found by the importer from the tensors; added after the projections. Plain RoPE is enforced in `rope_parameters` too (a scaled RoPE there was accepted unchecked before).
 - New fixture `qwen2-tiny` matches transformers per layer and passes every backend, batching and prefix test. `Qwen/Qwen2.5-0.5B-Instruct` bf16: greedy tokens, logits (1.05e-5), chat template and reply equal transformers'; Metal, Vulkan and Sim give the CPU's tokens.

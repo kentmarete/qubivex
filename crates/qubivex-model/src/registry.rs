@@ -5,7 +5,7 @@ use std::collections::BTreeMap;
 use std::fmt;
 use std::sync::Arc;
 
-use qubivex_core::{ExpertIdx, LayerIdx};
+use qubivex_core::{DType, ExpertIdx, LayerIdx};
 use serde::Serialize;
 
 use crate::manifest::{ArchRef, Manifest, SemVer};
@@ -173,6 +173,39 @@ impl fmt::Debug for ArchConfig {
     }
 }
 
+/// What an architecture can execute, declared by its factory (roadmap step 3).
+///
+/// Validation refuses a model whose tensors use a weight format not listed here, before
+/// any weight is read. The strategy lists name the shared components the architecture
+/// composes and the options its config may select; they are what `qubivex models
+/// architectures` prints, so a family the registry cannot express is visible up front.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct ArchCapabilities {
+    /// Weight formats its tensors may be stored in. Every compute backend has a kernel
+    /// for each (a test in `qubivex-runtime` holds the two lists together).
+    pub weight_formats: Vec<DType>,
+    /// Input modalities.
+    pub inputs: Vec<&'static str>,
+    /// Position schemes.
+    pub positions: Vec<&'static str>,
+    /// RoPE scaling types accepted in `rope_scaling` / `rope_parameters`.
+    pub rope_scaling: Vec<&'static str>,
+    /// Normalisation.
+    pub norms: Vec<&'static str>,
+    /// Attention variants and options.
+    pub attention: Vec<&'static str>,
+    /// Feed-forward strategies and options.
+    pub ffn: Vec<&'static str>,
+}
+
+impl ArchCapabilities {
+    /// Whether tensors may be stored as `dtype`.
+    #[must_use]
+    pub fn accepts(&self, dtype: DType) -> bool {
+        self.weight_formats.contains(&dtype)
+    }
+}
+
 /// Where a factory reads its config from.
 #[derive(Clone, Copy, Debug)]
 pub struct ConfigSource<'a> {
@@ -195,6 +228,8 @@ pub trait ArchitectureFactory: Send + Sync {
     fn version(&self) -> SemVer;
     /// One-line description.
     fn description(&self) -> &'static str;
+    /// What it can execute: weight formats and strategies.
+    fn capabilities(&self) -> ArchCapabilities;
     /// Parses and checks the architecture config.
     ///
     /// # Errors
@@ -222,6 +257,8 @@ pub struct ArchDescriptor {
     pub version: String,
     /// Description.
     pub description: &'static str,
+    /// Capabilities.
+    pub capabilities: ArchCapabilities,
 }
 
 /// Architecture id → factory. Built at startup, then shared read-only.
@@ -305,6 +342,7 @@ impl ArchitectureRegistry {
                 id: f.id(),
                 version: f.version().to_string(),
                 description: f.description(),
+                capabilities: f.capabilities(),
             })
             .collect()
     }

@@ -16,7 +16,7 @@ use qubivex_backend_cpu::sim::{SimConfig, SimDevice};
 use qubivex_compute::WeightView;
 use qubivex_compute::host::PageAligned;
 use qubivex_compute::tensor::TensorView;
-use qubivex_core::{Bytes, ExpertIdx, LayerIdx, Shape, TensorDesc};
+use qubivex_core::{Bytes, DType, ExpertIdx, LayerIdx, Shape, TensorDesc};
 use qubivex_expert_stream::fault::{DiskLimit, SlowDisk, VerifiedSource};
 use qubivex_expert_stream::mirror::{MirrorPolicy, MirroredSource};
 use qubivex_expert_stream::policy::SaturationGauge;
@@ -984,6 +984,48 @@ fn read_into(file: &File, offset: u64, b: &mut [u8]) -> std::io::Result<()> {
     Ok(())
 }
 
+/// Refuses a model whose weights use a format the chosen backend, or the CPU (which
+/// runs whatever is not placed), has no kernel for: before any weight is read.
+fn refuse_formats(meta: &ModelMetadata, backend: BackendKind) -> Result<(), RuntimeError> {
+    refuse_weight_formats(meta, backend.name(), |d| {
+        backend.supports(d) && BackendKind::Cpu.supports(d)
+    })
+}
+
+/// Refuses a model with weights in a format `supports` rejects, naming those formats
+/// and the ones it accepts. Engine load runs this for the chosen backend before reading
+/// any weight; it is public for backends this crate does not know.
+///
+/// # Errors
+///
+/// [`RuntimeError::Model`] listing the unsupported formats.
+pub fn refuse_weight_formats(
+    meta: &ModelMetadata,
+    backend: &str,
+    supports: impl Fn(DType) -> bool,
+) -> Result<(), RuntimeError> {
+    let missing: std::collections::BTreeSet<&'static str> = meta
+        .roles
+        .keys()
+        .filter_map(|n| meta.tensors.get(n))
+        .map(|t| t.tensor.dtype)
+        .filter(|&d| !supports(d))
+        .map(DType::name)
+        .collect();
+    if missing.is_empty() {
+        return Ok(());
+    }
+    let runs: Vec<&str> = DType::all()
+        .filter(|&d| supports(d))
+        .map(DType::name)
+        .collect();
+    Err(RuntimeError::Model(format!(
+        "the {backend} backend has no kernel for {} weights (it runs {})",
+        missing.into_iter().collect::<Vec<_>>().join(", "),
+        runs.join(", ")
+    )))
+}
+
 impl Engine {
     /// Loads a validated model: reads the resident tensors, plans memory with them
     /// resident (ADR-005), sets up the expert store and the tokenizer.
@@ -1078,6 +1120,7 @@ impl Engine {
         opts: EngineOptions,
         wrap: impl FnOnce(Arc<ModelExpertSource>) -> Arc<dyn ExpertSource>,
     ) -> Result<Self, RuntimeError> {
+        refuse_formats(&meta, opts.backend)?;
         let files = meta
             .tensors
             .files()

@@ -134,8 +134,8 @@ No data-integrity or security defect was found (consistent with the health repor
    explicit (possibly multi-axis) positions.
 3. **Prefix cache keyed by token ids.** Correct for text; unsafe for any input whose
    placeholder tokens do not identify the content (images, audio).
-4. **Registry declares structure, not capabilities.** A model can be accepted by the
-   registry and then fail on a backend or format at load.
+4. ~~**Registry declares structure, not capabilities.**~~ **Done in milestone 3 (§5)**:
+   architectures declare capabilities; undeclared formats are refused at validation.
 5. **Dense models must be resident.** Streaming exists for experts only.
 6. **Device execution is MoE-first.** Dense models get per-matmul placement only.
 7. **Serving is OpenAI-only and text-only**, without constrained decoding.
@@ -179,7 +179,7 @@ State: ✅ implemented and tested, ◐ partial, ✗ missing.
 | GGUF read | ✅ | ✅ + all K-quant/legacy kernels | — | M | Each dtype bit-exact vs gguf-py dequant |
 | SafeTensors read | ✅ | ✅ | — | — | — |
 | Manifest | ✅ v1.1 | v1.2: model **components** (text, vision, audio, projector), each with format, config and weights | — | M | A manifest with GGUF text + SafeTensors vision imports, validates and round-trips |
-| Architecture registry | ◐ structure | + capabilities: quant formats, backends, position/norm/FFN strategy, preprocessing | — | S | `models architectures` lists capabilities; load refuses unsupported combos before reading weights |
+| Architecture registry | ✅ structure and capabilities (milestone 3) | + preprocessing (multimodal) | — | S | **Met**: `models architectures` lists capabilities; validation and load refuse unsupported formats before reading weights |
 | Hugging Face downloads | ✅ | + multi-component repos | manifest v1.2 | S | Pull of a VL repo installs all components |
 | Ollama registry import | ✗ | Resolve Ollama manifests to blobs, import those Qubivex can execute | GGUF coverage | M | `models import ollama://…` of a supported model runs; unsupported blobs refused with reason |
 | Weight validation | ✅ sha256, shapes, cross-checks | ✅ for every component | manifest v1.2 | S | — |
@@ -275,6 +275,7 @@ brief's priorities, with dependencies resolved inside them.
 ### Completed
 - P0 audit (this document), 2026-11-15 (PR #68).
 - Milestone 1, P1: Qwen2/Qwen2.5 text models (§5), 2026-11-15.
+- Milestone 3, P1: registry capabilities (§5), 2026-11-15.
 
 ### Partially completed
 - See §1.3.
@@ -347,6 +348,44 @@ on both. This confirms the audit's "dense on GPU is partial" (§1.3).
 **Next milestone.** Roadmap step 6 (P2): JSON mode and JSON Schema constrained decoding,
 ADR first. Steps 3–5 (registry capabilities, linear detokenization, Llama 3.x) are
 smaller and can be interleaved.
+
+### Milestone 3 (2026-11-15): registry capabilities (P1, roadmap step 3)
+
+**Implemented.** Architectures declare what they execute (`ArchCapabilities`: weight
+formats, inputs, positions, RoPE scalings, norms, attention and FFN options). Validation
+refuses tensors in undeclared formats before any weight is read; backends declare their
+formats without a device, and engine load refuses a format the chosen backend or the CPU
+lacks, before reading weights. `qubivex models architectures` lists all of it.
+
+**Files.** `qubivex-core/src/dtype.rs` (`DType::all`). `qubivex-model`: `registry.rs`
+(`ArchCapabilities`, `ArchitectureFactory::capabilities`, `ArchDescriptor`),
+`arch/common.rs` (shared declaration; RoPE check reads it), `arch/transformer_{dense,moe}.rs`,
+`metadata.rs` (format refusal). `qubivex-backend-vulkan/src/lib.rs` (`supported`).
+`qubivex-runtime`: `placement.rs` (`BackendKind::ALL`, `supports`, `weight_formats`),
+`engine.rs` (load refusal). `apps/cli/src/models.rs` (listing). Tests:
+`qubivex-model/tests/metadata.rs`, `qubivex-runtime/tests/capabilities.rs`, a unit test
+in `models.rs`.
+
+**Decisions.** ADR-003 amendment 4.
+
+**Tests.**
+- A GGUF MoE with four Q5_0 attention tensors and one Q4_1 expert is refused at
+  validation with one line per format (count, first tensor, formats run); the same
+  model in declared formats loads (positive control).
+- Every built-in declares f32 and not Q5_K, text input, `default` RoPE only.
+- Declared formats equal every backend's kernels for every dtype (CPU, Sim, Metal,
+  Vulkan).
+- Engine load with a backend lacking Q8_0 refuses the `olmoe-tiny-gguf` fixture, naming
+  Q8_0 and what the backend runs; every real backend accepts it.
+- The CLI listing shows each architecture's capabilities and each backend's formats.
+
+**Performance.** None: one pass over tensor descriptors at validation and at load.
+
+**Remaining.** Capability flags in `/v1/models` (with PR #71's `response_format`);
+preprocessing capabilities when multimodal input arrives (P4); new quantised kernels
+(Q4_0, Q5_K, ...) are a tensor-engine item and now show up as one clear refusal.
+
+**Next milestone.** Roadmap step 4: linear detokenization, then step 5, Llama 3.x.
 
 ## 6. Baseline
 

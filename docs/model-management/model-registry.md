@@ -116,8 +116,19 @@ An architecture is a registered component, and a model names one in its manifest
 qubivex models architectures
 ```
 
-lists what this build supports: `transformer_moe` and `transformer_dense`. Loading a
-model looks up `architecture.id` and checks its version.
+lists what this build supports: `transformer_moe` and `transformer_dense`, each with
+its **capabilities**, then each backend's weight formats. Loading a model looks up
+`architecture.id` and checks its version.
+
+Capabilities are what the architecture can execute: the weight formats its tensors may
+be stored in, input modalities, position scheme and RoPE scaling types, norms, and the
+attention and FFN options its config may select. Validation refuses a tensor stored in
+an undeclared format, grouped by format with the first tensor named, before any weight is
+read; so a Q5_K checkpoint is refused when it is inspected or imported, not when it runs.
+Loading on a backend checks the formats again against that backend's kernels (and the
+CPU's, which runs whatever is not placed). The declared formats are exactly the formats
+every backend runs; a test in `qubivex-runtime` (`tests/capabilities.rs`) fails if a
+kernel is added or removed without updating the declaration.
 
 An architecture provides three things: how to parse its config, the **tensor schema**
 (every tensor it expects, with its shape, dtype and role), and how to build the forward
