@@ -133,7 +133,23 @@ pub fn request(
     headers: &[(&str, &str)],
     body: Option<&Value>,
 ) -> String {
-    let body = body.map(Value::to_string).unwrap_or_default();
+    request_text(
+        addr,
+        method,
+        path,
+        headers,
+        &body.map(Value::to_string).unwrap_or_default(),
+    )
+}
+
+/// [`request`] with the body as JSON text, sent as written (key order kept).
+pub fn request_text(
+    addr: SocketAddr,
+    method: &str,
+    path: &str,
+    headers: &[(&str, &str)],
+    body: &str,
+) -> String {
     let mut req = format!(
         "{method} {path} HTTP/1.1\r\nhost: {addr}\r\nconnection: close\r\ncontent-type: application/json\r\ncontent-length: {}\r\n",
         body.len()
@@ -142,7 +158,7 @@ pub fn request(
         req.push_str(&format!("{k}: {v}\r\n"));
     }
     req.push_str("\r\n");
-    req.push_str(&body);
+    req.push_str(body);
     req
 }
 
@@ -169,10 +185,18 @@ pub fn http(
     headers: &[(&str, &str)],
     body: Option<&Value>,
 ) -> Resp {
+    send(addr, &request(addr, method, path, headers, body))
+}
+
+/// POSTs JSON text as written (key order kept).
+pub fn post_text(addr: SocketAddr, path: &str, body: &str) -> Resp {
+    send(addr, &request_text(addr, "POST", path, &[], body))
+}
+
+fn send(addr: SocketAddr, req: &str) -> Resp {
     let mut s = TcpStream::connect(addr).unwrap();
     s.set_read_timeout(Some(Duration::from_secs(60))).unwrap();
-    s.write_all(request(addr, method, path, headers, body).as_bytes())
-        .unwrap();
+    s.write_all(req.as_bytes()).unwrap();
     let mut raw = Vec::new();
     s.read_to_end(&mut raw).unwrap();
     let split = raw.windows(4).position(|w| w == b"\r\n\r\n").unwrap();

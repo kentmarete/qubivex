@@ -82,7 +82,7 @@ clients work to the extent that they send only what the tables below accept.
 | `user` | Supported | Used for fairness and to separate prefix caches; under a named key, within that key's client |
 | `n` | Only 1 | Any other value is a 400 |
 | `tools`, `tool_choice` (other than `"none"`) | Refused | 400: "tool calls are not supported" |
-| `response_format` | Only `{"type":"text"}` | `json_object` and `json_schema` are a 400 |
+| `response_format` | Supported (chat) | `text`, `json_object` (any JSON object) and `json_schema` (constrained decoding, ADR-020). The schema subset and refusals are listed below |
 | `logprobs`, `top_logprobs` | Refused | `logprobs: true` is a 400. `false` or absent is fine |
 | `presence_penalty`, `frequency_penalty` | Only 0 | A non-zero value is a 400 |
 | `logit_bias` | Only empty | A non-empty map is a 400 |
@@ -158,3 +158,34 @@ Stated once, in full:
 - The Responses, Assistants and Batch APIs.
 - Separate reasoning content.
 - Token-array prompts, `echo` and `suffix` on completions.
+
+## Structured output (`response_format`)
+
+`/v1/chat/completions` constrains the reply token by token (ADR-020), so a reply that
+ends with `finish_reason: "stop"` parses as JSON and validates against the schema, at any
+temperature. A reply cut by `max_tokens` (`length`) or a `stop` string is a prefix of a
+valid one, as with OpenAI. Properties are written in the schema's order.
+
+- `{"type":"json_object"}`: any JSON object.
+- `{"type":"json_schema","json_schema":{"name":...,"schema":{...},"strict":...}}`.
+  `schema` is required; `name` and `strict` are accepted (the output is always strict).
+
+Supported keywords: `type` (one or a list), `properties`, `required`,
+`additionalProperties` (`false`, `true` or absent; only declared properties are
+written), `items`, `prefixItems`, `minItems`, `maxItems`, `enum`, `const`, `anyOf`,
+`allOf` with one schema, local `$ref` (`#/$defs/...`, `#/definitions/...`, recursion
+included), `minLength`, `maxLength`, and annotations (`title`, `description`, `default`,
+`examples`, ...).
+
+Refused with a 400 naming the keyword, never ignored: `oneOf`, `not`, `pattern`,
+`patternProperties`, `format`, numeric bounds (`minimum`, `maximum`, `exclusive*`,
+`multipleOf`), `uniqueItems`, `contains`, `if`/`then`/`else`, `dependent*`,
+`propertyNames`, `min/maxProperties`, `unevaluated*`, a schema for
+`additionalProperties`, remote `$ref`, draft-7 array `items`, counts above 1024, and any
+unknown keyword. Numbers are written with at most 18 integer digits, 15 fraction digits
+and a two-digit exponent; strings are valid UTF-8 with JSON escapes (no lone surrogates);
+whitespace between tokens is at most 16 bytes per gap.
+
+A model whose tokenizer is not byte-level BPE cannot be constrained; its requests get a
+400 on `response_format`. Every model QUBIVEX loads today is byte-level.
+

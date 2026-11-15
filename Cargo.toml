@@ -1,7 +1,7 @@
 [workspace]
 resolver = "3"
-members = ["crates/qubivex-core", "crates/qubivex-hardware", "crates/qubivex-model", "crates/qubivex-model-registry", "crates/qubivex-model-download", "crates/qubivex-compute", "crates/qubivex-backend-cpu", "crates/qubivex-tokenizer", "crates/qubivex-scheduler", "crates/qubivex-kv-cache", "crates/qubivex-runtime", "crates/qubivex-expert-stream", "crates/qubivex-arch", "crates/qubivex-memory", "crates/qubivex-backend-metal", "crates/qubivex-backend-vulkan", "crates/qubivex-api", "apps/cli", "xtask"]
-default-members = ["crates/qubivex-core", "crates/qubivex-hardware", "crates/qubivex-model", "crates/qubivex-model-registry", "crates/qubivex-model-download", "crates/qubivex-compute", "crates/qubivex-backend-cpu", "crates/qubivex-tokenizer", "crates/qubivex-scheduler", "crates/qubivex-kv-cache", "crates/qubivex-runtime", "crates/qubivex-expert-stream", "crates/qubivex-arch", "crates/qubivex-memory", "crates/qubivex-backend-metal", "crates/qubivex-backend-vulkan", "crates/qubivex-api", "apps/cli", "xtask"]
+members = ["crates/qubivex-core", "crates/qubivex-hardware", "crates/qubivex-model", "crates/qubivex-model-registry", "crates/qubivex-model-download", "crates/qubivex-compute", "crates/qubivex-backend-cpu", "crates/qubivex-tokenizer", "crates/qubivex-scheduler", "crates/qubivex-kv-cache", "crates/qubivex-runtime", "crates/qubivex-expert-stream", "crates/qubivex-arch", "crates/qubivex-memory", "crates/qubivex-backend-metal", "crates/qubivex-backend-vulkan", "crates/qubivex-api", "crates/qubivex-grammar", "apps/cli", "xtask"]
+default-members = ["crates/qubivex-core", "crates/qubivex-hardware", "crates/qubivex-model", "crates/qubivex-model-registry", "crates/qubivex-model-download", "crates/qubivex-compute", "crates/qubivex-backend-cpu", "crates/qubivex-tokenizer", "crates/qubivex-scheduler", "crates/qubivex-kv-cache", "crates/qubivex-runtime", "crates/qubivex-expert-stream", "crates/qubivex-arch", "crates/qubivex-memory", "crates/qubivex-backend-metal", "crates/qubivex-backend-vulkan", "crates/qubivex-api", "crates/qubivex-grammar", "apps/cli", "xtask"]
 # Spikes are standalone packages with their own lock files (their dependencies are not
 # product dependencies until an ADR accepts them).
 exclude = ["spikes"]
@@ -33,6 +33,7 @@ qubivex-memory = { path = "crates/qubivex-memory", version = "0.1.0" }
 qubivex-backend-metal = { path = "crates/qubivex-backend-metal", version = "0.1.0" }
 qubivex-backend-vulkan = { path = "crates/qubivex-backend-vulkan", version = "0.1.0" }
 qubivex-api = { path = "crates/qubivex-api", version = "0.1.0" }
+qubivex-grammar = { path = "crates/qubivex-grammar", version = "0.1.0" }
 
 # Third-party versions are declared here once (ADR-001); members use `{ workspace = true }`.
 # Requirements stay at the oldest version we need. Exact versions live in Cargo.lock,

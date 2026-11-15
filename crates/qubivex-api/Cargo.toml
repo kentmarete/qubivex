@@ -10,6 +10,7 @@ publish.workspace = true
 
 [dependencies]
 kerniq-server = { workspace = true }
+qubivex-grammar = { workspace = true }
 qubivex-hardware = { workspace = true }
 qubivex-memory = { workspace = true }
 qubivex-model = { workspace = true }

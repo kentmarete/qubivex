@@ -380,6 +380,50 @@ impl Tokenizer {
         )
     }
 
+    /// Each id's bytes, for constrained decoding (ADR-020): `None` for special tokens
+    /// and unused ids. Byte-level BPE vocabularies map through the GPT-2 byte table;
+    /// non-special added tokens are their text.
+    ///
+    /// # Errors
+    /// [`TokenizerError::Codec`] for a tokenizer whose decoder is not byte-level (its
+    /// token bytes are not defined by the vocabulary alone), or a vocabulary entry
+    /// outside the byte table.
+    pub fn token_bytes(&self) -> Result<Vec<Option<Vec<u8>>>, TokenizerError> {
+        if !matches!(
+            self.inner.get_decoder(),
+            Some(tokenizers::DecoderWrapper::ByteLevel(_))
+        ) {
+            return Err(TokenizerError::Codec(
+                "constrained decoding needs a byte-level BPE tokenizer".into(),
+            ));
+        }
+        let mut unbyte = std::collections::HashMap::with_capacity(256);
+        for (b, c) in (0u8..=255).zip(byte_chars()) {
+            unbyte.insert(c, b);
+        }
+        let added = self.inner.get_added_tokens_decoder();
+        let n = u32::try_from(self.vocab_size()).unwrap_or(u32::MAX);
+        (0..n)
+            .map(|id| {
+                if let Some(t) = added.get(&id) {
+                    return Ok((!t.special).then(|| t.content.as_bytes().to_vec()));
+                }
+                let Some(t) = self.inner.id_to_token(id) else {
+                    return Ok(None);
+                };
+                t.chars()
+                    .map(|c| unbyte.get(&c).copied())
+                    .collect::<Option<Vec<u8>>>()
+                    .map(Some)
+                    .ok_or_else(|| {
+                        TokenizerError::Codec(format!(
+                            "token {id} ({t:?}) is outside the byte-level alphabet"
+                        ))
+                    })
+            })
+            .collect()
+    }
+
     /// An incremental decoder for streaming output.
     #[must_use]
     pub fn stream(&self) -> StreamDecoder<'_> {
@@ -389,6 +433,25 @@ impl Tokenizer {
             emitted: 0,
         }
     }
+}
+
+/// The GPT-2 byte-to-character table: byte `b` is written as `byte_chars()[b]`.
+fn byte_chars() -> Vec<char> {
+    let printable = |b: u32| {
+        (0x21..=0x7E).contains(&b) || (0xA1..=0xAC).contains(&b) || (0xAE..=0xFF).contains(&b)
+    };
+    let mut next = 256u32;
+    (0u32..256)
+        .map(|b| {
+            let cp = if printable(b) {
+                b
+            } else {
+                next += 1;
+                next - 1
+            };
+            char::from_u32(cp).unwrap_or('\u{fffd}')
+        })
+        .collect()
 }
 
 /// Renders a chat template in a sandbox matching `transformers`' Jinja settings

@@ -16,14 +16,14 @@ State as of 2026-11-15 (`main` at `8a70709`). ✅ implemented and tested over HT
 | Endpoint / feature | Now | Target | Roadmap step |
 |---|---|---|---|
 | `GET /v1/models`, `GET /v1/models/{id}` | ✅ | ✅ + capabilities (modalities, structured output, tools) | 3 |
-| `POST /v1/chat/completions` | ✅ text | + media parts, `response_format`, `tools` | 6, 10, 11 |
-| `POST /v1/completions` | ✅ | ✅ (+ `response_format`) | 6 |
+| `POST /v1/chat/completions` | ✅ text, `response_format` | + media parts, `tools` | 10, 11 |
+| `POST /v1/completions` | ✅ | ✅ (OpenAI has no `response_format` here; not planned) | — |
 | Streaming (SSE), `stream_options.include_usage` | ✅ | ✅ | — |
 | System / developer messages, history | ✅ | ✅ | — |
 | Usage (prompt, completion, cached tokens) | ✅ | + media tokens | 10 |
 | Cancellation on client disconnect | ✅ | ✅ | — |
-| `response_format: json_object` | ✗ (400) | constrained decoding | 6 |
-| `response_format: json_schema` (strict) | ✗ (400) | constrained decoding; output validated | 6 |
+| `response_format: json_object` | ✅ constrained decoding (ADR-020) | ✅ | 6 |
+| `response_format: json_schema` (strict) | ✅ constrained decoding; a documented subset, the rest refused (400) | + `pattern`, `format`, numeric bounds | 6 |
 | `tools`, `tool_choice`, tool messages | ✗ (400) | template-driven, arguments constrained by the tool's schema | 11 |
 | `image_url` parts (`data:` URIs) | ✗ (400) | supported for models with a vision component | 10 |
 | `input_audio` parts | ✗ (400) | for models with an audio component | 13 |
