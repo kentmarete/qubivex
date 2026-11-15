@@ -101,7 +101,7 @@ a file-format identifier needs one) and `cargo deny`.
 | RoPE scaling variants | Only `default` accepted: no `linear`, `dynamic`, `yarn`, `llama3`, `mrope` |
 | Sliding-window attention | Refused (`use_sliding_window`) |
 | Non-SwiGLU FFNs, LayerNorm, attention/MLP biases other than q/k/v, learned positions | Refused or absent |
-| Structured output | `response_format` `json_object`/`json_schema` refused (400); no constrained decoding |
+| ~~Structured output~~ | **Done in milestone 2 (§5)**: constrained decoding, ADR-020 |
 | Tool calling | `tools` refused (400); no tool-call parsing |
 | Embeddings endpoint | None |
 | Ollama-compatible API | None (`/api/*` answer 404) |
@@ -237,7 +237,7 @@ State: ✅ implemented and tested, ◐ partial, ✗ missing.
 | Feature | Now | Target | Depends on | Cx | Acceptance |
 |---|---|---|---|---|---|
 | OpenAI chat/completions/models, streaming | ✅ | + multimodal content, tools, `response_format` | C, D | — | `docs/serving/openai-compatibility.md` tables all green for supported fields |
-| JSON mode / JSON Schema | ✗ | token-level constrained decoding | tokenizer vocab | M–L | **P2**: every output parses and validates against the schema, over a schema test suite, temperature > 0 included |
+| JSON mode / JSON Schema | ✅ (milestone 2) | token-level constrained decoding | tokenizer vocab | M–L | **P2**: every output parses and validates against the schema, over a schema test suite, temperature > 0 included |
 | Tool calling | ✗ | template-driven tool definitions and parsing, constrained arguments | P2 | M | OpenAI SDK tool-call round trip |
 | Ollama API | ✗ | `/api/tags`, `/api/chat`, `/api/generate`, `/api/show`, `/api/embeddings` | embeddings for the last | M | Documented request/response shapes, streaming NDJSON, `images`, `format`, `options` |
 | Image/audio/video input | ✗ | per supported modality | D | — | refused with a clear error until supported (already true for images) |
@@ -275,6 +275,7 @@ brief's priorities, with dependencies resolved inside them.
 ### Completed
 - P0 audit (this document), 2026-11-15 (PR #68).
 - Milestone 1, P1: Qwen2/Qwen2.5 text models (§5), 2026-11-15.
+- Milestone 2, P2: JSON mode and JSON Schema constrained decoding (§5), 2026-11-15.
 - Milestone 3, P1: registry capabilities (§5), 2026-11-15.
 
 ### Partially completed
@@ -349,6 +350,63 @@ on both. This confirms the audit's "dense on GPU is partial" (§1.3).
 ADR first. Steps 3–5 (registry capabilities, linear detokenization, Llama 3.x) are
 smaller and can be interleaved.
 
+### Milestone 2 (2026-11-15): JSON mode and JSON Schema (P2, roadmap step 6)
+
+**Implemented.** Token-level constrained decoding as a generic component: a new crate
+`qubivex-grammar` (byte grammars, a JSON Schema front end, a lazily determinised matcher
+and token masks over a vocabulary trie), one hook at the engine's single sampling site,
+and `response_format` (`json_object`, `json_schema`) on `/v1/chat/completions`. Nothing
+in it knows a model family; tool-call arguments (P5) and Ollama `format` are further
+front ends over the same grammar and matcher. Requests without `response_format` run the
+old path.
+
+**Files.** `crates/qubivex-grammar/` (new: `grammar.rs`, `matcher.rs`, `trie.rs`,
+`schema.rs`, `json.rs`; `tests/schema.rs`). `qubivex-tokenizer`: `Tokenizer::token_bytes`.
+`qubivex-runtime`: `engine.rs` (`GenerateOptions::constraint`, `Engine::token_trie`,
+`sample_constrained`), `request.rs`, `lib.rs` (`RuntimeError::Constraint`); tests
+`constrained.rs`, `real_constrained.rs`. `qubivex-api`: `openai.rs`, `lib.rs`,
+`worker.rs`; `tests/gateway.rs`. `xtask/src/deps.rs`. Oracle:
+`fixtures/oracle/validate_json.py` (Python `jsonschema`, added to the oracle venv).
+
+**Decisions.** ADR-020 (Proposed). Masks apply before temperature, top-k and top-p;
+greedy takes the unconstrained argmax when allowed; the RNG is drawn as without a
+constraint. Schemas are read with their key order kept (the workspace's `serde_json`
+sorts keys), so properties are written in schema order. Unsupported keywords are 400s.
+
+**Tests.**
+- Grammar: 31 schemas, 400 random walks each (no model), every text parsed by `serde_json`
+  and validated by an independent test validator; the same 12 400 texts validate under
+  Python `jsonschema` (Draft 2020-12): 0 failures. Masks equal a per-token brute-force
+  check at every prefix of walks over a vocabulary with multi-byte tokens across JSON
+  structure. Known texts accepted and rejected (order, required, extra properties, lone
+  surrogates, invalid UTF-8, `1e999`, leading zeros, whitespace bound). 13 refusals and
+  9 invalid schemas. Repetition keeps states and frames constant.
+- Fixture models (random weights, temperature 1, 12 seeds × 5 schemas, two models, plus
+  JSON mode and greedy): every output stays in the grammar and every end-of-sequence
+  output parses. Four constrained requests at once (batched passes) get the tokens each
+  got alone.
+- Real `Qwen2.5-0.5B-Instruct` (151 665 tokens): 150 203 token byte strings equal the
+  tokenizer's own decoding; every byte is a token. Six chat prompts × (t = 0, t = 0.8 with
+  3 seeds): all 20 schema replies end at end-of-sequence, parse and validate (Python
+  `jsonschema`, with the 3 JSON-mode replies that ended: 23 of 23). JSON mode at t = 0
+  loops on repeated keys until `max_tokens` (a 0.5B model's repetition; the text is still
+  a valid prefix).
+- Gateway: `response_format` replies over HTTP, streamed equal to non-streamed, schema
+  order on the wire; 400 for an unsupported keyword, a missing schema and an unknown type.
+- Regressions: full `job verify` (see the PR).
+
+**Performance.** Qwen2.5 vocabulary trie: 42 ms, once per engine. Masks along a recipe
+reply, each state's first visit: mean 0.11 ms, worst 2.0 ms per token, against a decode
+step of about 12–15 ms on the CPU, so under 1%. States recur (inside strings, between
+items) and their masks are cached. Indicative only, on battery.
+
+**Remaining for structured output.** `pattern`, `format` and numeric bounds; a schema
+for `additionalProperties`; duplicate-key prevention in JSON mode; a compiled-grammar
+cache across requests with the same schema; `/v1/models` capability flags (step 3).
+
+**Next milestone.** Steps 3–5 (registry capabilities, linear detokenization, Llama 3.x)
+are small; step 7 (P3, unified multimodal input) starts the multimodal path, ADR first.
+
 ### Milestone 3 (2026-11-15): registry capabilities (P1, roadmap step 3)
 
 **Implemented.** Architectures declare what they execute (`ArchCapabilities`: weight
@@ -381,7 +439,7 @@ in `models.rs`.
 
 **Performance.** None: one pass over tensor descriptors at validation and at load.
 
-**Remaining.** Capability flags in `/v1/models` (with PR #71's `response_format`);
+**Remaining.** Capability flags in `/v1/models` (format support, `response_format`);
 preprocessing capabilities when multimodal input arrives (P4); new quantised kernels
 (Q4_0, Q5_K, ...) are a tensor-engine item and now show up as one clear refusal.
 

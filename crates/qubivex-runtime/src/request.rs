@@ -16,6 +16,7 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use std::time::Instant;
 
+use qubivex_grammar::Grammar;
 use qubivex_scheduler::Admission;
 use qubivex_tokenizer::ChatMessage;
 use thiserror::Error;
@@ -51,6 +52,8 @@ pub struct GenerationRequest {
     pub deadline: Option<Instant>,
     /// See [`GenerateOptions::cache_scope`].
     pub cache_scope: Option<String>,
+    /// See [`GenerateOptions::constraint`].
+    pub constraint: Option<Arc<Grammar>>,
 }
 
 impl GenerationRequest {
@@ -67,6 +70,7 @@ impl GenerationRequest {
             prefill_chunk: d.prefill_chunk,
             deadline: None,
             cache_scope: None,
+            constraint: None,
         }
     }
 }
@@ -281,6 +285,14 @@ impl Engine {
     /// # Errors
     /// [`RequestError::Invalid`] if the request cannot run on this model.
     pub fn prepare(&self, req: &GenerationRequest) -> Result<PreparedRequest, RequestError> {
+        if req.constraint.is_some() {
+            self.token_trie().map_err(|e| {
+                RequestError::invalid_param(
+                    "response_format",
+                    format!("this model cannot constrain its output: {e}"),
+                )
+            })?;
+        }
         let prompt = self.prompt_ids(&req.prompt)?;
         let prompt_tokens = prompt.len();
         let ctx = self.max_context();
@@ -356,6 +368,7 @@ impl Engine {
             prefill_chunk: req.prefill_chunk,
             deadline: req.deadline,
             cache_scope: req.cache_scope.clone(),
+            constraint: req.constraint.clone(),
         };
         let mut decoder = self.tokenizer().stream();
         let mut stops = Stops::new(&req.stops);

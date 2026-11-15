@@ -3,8 +3,10 @@
 //! the output (`n > 1`, tools, logprobs); fields that would not (`user`, penalties of
 //! zero) are accepted and ignored.
 
+use std::sync::Arc;
 use std::time::Duration;
 
+use qubivex_grammar::Grammar;
 use qubivex_runtime::scheduler::Priority;
 use serde::Deserialize;
 use serde_json::Value;
@@ -92,7 +94,22 @@ pub(crate) struct ChatRequest {
     pub(crate) max_completion_tokens: Option<u64>,
     pub(crate) tools: Option<Value>,
     pub(crate) tool_choice: Option<Value>,
-    pub(crate) response_format: Option<Value>,
+    pub(crate) response_format: Option<ResponseFormat>,
+}
+
+/// `response_format` (ADR-020): `text`, `json_object` or `json_schema`.
+#[derive(Clone, Debug, Deserialize)]
+pub(crate) struct ResponseFormat {
+    #[serde(rename = "type")]
+    pub(crate) kind: String,
+    pub(crate) json_schema: Option<JsonSchemaFormat>,
+}
+
+/// `response_format.json_schema`. The schema keeps its key order, which is the order
+/// properties are written in.
+#[derive(Clone, Debug, Deserialize)]
+pub(crate) struct JsonSchemaFormat {
+    pub(crate) schema: Option<qubivex_grammar::Json>,
 }
 
 /// `POST /v1/completions`.
@@ -129,6 +146,8 @@ pub(crate) struct Params {
     pub(crate) cache_scope: Option<String>,
     /// The named key's client, for the log.
     pub(crate) client_name: Option<String>,
+    /// The grammar the output must stay in (`response_format`).
+    pub(crate) constraint: Option<Arc<Grammar>>,
 }
 
 fn zero_or_absent(v: Option<f32>) -> bool {
@@ -227,11 +246,40 @@ impl Common {
             client: None,
             cache_scope: None,
             client_name: None,
+            constraint: None,
         })
     }
 }
 
 impl ChatRequest {
+    /// The grammar `response_format` asks for: `None` for text. Compiled here, so a
+    /// schema outside the supported subset is a 400 before the request queues.
+    pub(crate) fn constraint(&self) -> Result<Option<Arc<Grammar>>, ApiError> {
+        let Some(f) = &self.response_format else {
+            return Ok(None);
+        };
+        let bad = |m: String| ApiError::invalid_param("response_format", m);
+        match f.kind.as_str() {
+            "text" => Ok(None),
+            "json_object" => qubivex_grammar::json_object()
+                .map(Some)
+                .map_err(|e| bad(e.to_string())),
+            "json_schema" => {
+                let schema = f
+                    .json_schema
+                    .as_ref()
+                    .and_then(|j| j.schema.as_ref())
+                    .ok_or_else(|| bad("json_schema.schema is required".into()))?;
+                qubivex_grammar::json_schema(schema)
+                    .map(Some)
+                    .map_err(|e| bad(e.to_string()))
+            }
+            other => Err(bad(format!(
+                "unknown response format {other:?}; use text, json_object or json_schema"
+            ))),
+        }
+    }
+
     /// The messages as (role, text), checked.
     pub(crate) fn messages(&self) -> Result<Vec<(String, String)>, ApiError> {
         if self.tools.as_ref().is_some_and(|t| !t.is_null())
@@ -243,16 +291,6 @@ impl ChatRequest {
             return Err(ApiError::invalid_param(
                 "tools",
                 "tool calls are not supported",
-            ));
-        }
-        if let Some(f) = &self.response_format
-            && f.get("type")
-                .and_then(Value::as_str)
-                .is_some_and(|t| t != "text")
-        {
-            return Err(ApiError::invalid_param(
-                "response_format",
-                "only the text response format is supported",
             ));
         }
         if self.messages.is_empty() {

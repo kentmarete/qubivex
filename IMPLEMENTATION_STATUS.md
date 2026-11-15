@@ -8,6 +8,11 @@ Last updated: 2026-11-15
 - A test holds the declared formats equal to every backend's kernels.
 - **Next:** roadmap step 4, linear detokenization.
 
+**General-purpose runtime, milestone 2: JSON mode and JSON Schema constrained decoding (2026-11-15, branch `json-constrained`).** Decision: ADR-020 (Proposed); report: `docs/ROADMAP_GENERAL_PURPOSE_RUNTIME.md` §5.
+- New crate `qubivex-grammar`: byte grammars, a JSON Schema subset compiler (unsupported keywords are 400s), a lazily determinised matcher, token masks over a vocabulary trie. One hook at the engine's sampling site (`GenerateOptions::constraint`); `response_format` `json_object` and `json_schema` on `/v1/chat/completions`.
+- 12 400 random grammar walks over 31 schemas validate under Python `jsonschema`; random-weight fixtures at temperature 1 only end with valid JSON; Qwen2.5-0.5B-Instruct replies at t = 0 and 0.8 all parse and validate. Masks on the 151k vocabulary: mean 0.11 ms, worst 2.0 ms per token.
+- **Next:** roadmap steps 3–5, or step 7 (P3 multimodal input, ADR first).
+
 **General-purpose runtime, milestone 1: Qwen2 and Qwen2.5 text models (2026-11-15, branch `qwen2-text`, stacked on PR #68).** Plan: [`docs/ROADMAP_GENERAL_PURPOSE_RUNTIME.md`](docs/ROADMAP_GENERAL_PURPOSE_RUNTIME.md) (the P0 audit, PR #68); decision: ADR-003 amendment 3.
 - Q/K/V biases are a `transformer_dense` 1.1 option (`qkv_bias`) found by the importer from the tensors; added after the projections. Plain RoPE is enforced in `rope_parameters` too (a scaled RoPE there was accepted unchecked before).
 - New fixture `qwen2-tiny` matches transformers per layer and passes every backend, batching and prefix test. `Qwen/Qwen2.5-0.5B-Instruct` bf16: greedy tokens, logits (1.05e-5), chat template and reply equal transformers'; Metal, Vulkan and Sim give the CPU's tokens.

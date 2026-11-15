@@ -60,6 +60,10 @@ pub enum RuntimeError {
     /// Expert storage cannot serve reads (every I/O thread is stuck).
     #[error("storage: {0}")]
     Storage(String),
+    /// Constrained decoding cannot go on (ADR-020): the vocabulary has no token that
+    /// continues the output, or the matcher passed its limits.
+    #[error("constrained decoding: {0}")]
+    Constraint(String),
 }
 
 /// The tokenizer named by the model's manifest.
