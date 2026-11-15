@@ -1,0 +1,20 @@
+[package]
+name = "qubivex-grammar"
+description = "QUBIVEX constrained decoding: grammars over bytes, JSON Schema, token masks (ADR-020)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+proptest = { workspace = true }
+
+[lints]
+workspace = true

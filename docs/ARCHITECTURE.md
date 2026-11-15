@@ -96,10 +96,10 @@ the matrix in the roadmap follows it.
 | MoE Router | `qubivex-arch` (host routing), device routing in Metal/Vulkan | Implemented | — |
 | Expert Streaming | `qubivex-expert-stream`, `qubivex-runtime/src/experts.rs` | Implemented | — |
 | Scheduler | `qubivex-scheduler`, `qubivex-runtime` (batching, KV admission), `qubivex-kv-cache` (prefix reuse) | Implemented | Media-aware prefix keys; paged KV and speculative decoding when measured |
-| **Serving Engine** | `qubivex-api` | OpenAI API implemented (text) | Structured output, tool calling, Ollama API, multimodal content. See [API_COMPATIBILITY.md](API_COMPATIBILITY.md) |
-| OpenAI API | `qubivex-api/src/openai.rs` | Implemented | `response_format`, `tools`, image parts |
+| **Serving Engine** | `qubivex-api` | OpenAI API implemented (text, structured output) | Tool calling, Ollama API, multimodal content. See [API_COMPATIBILITY.md](API_COMPATIBILITY.md) |
+| OpenAI API | `qubivex-api/src/openai.rs` | Implemented, `response_format` included | `tools`, image parts |
 | Ollama API | — | Missing | `/api/*` in `qubivex-api` |
-| Structured Output | — | Missing | Constraint engine in the runtime (so embedders get it), JSON Schema compiler; API maps `response_format` and Ollama `format` onto it |
+| Structured Output | `qubivex-grammar`, `GenerateOptions::constraint` | Implemented (ADR-020): byte grammars, JSON Schema subset, token masks | `pattern`/`format`/numeric bounds; Ollama `format` and tool arguments reuse it |
 | Tool Calling | — | Missing | Built on structured output plus the chat template's tool format |
 
 ## One request through the target architecture

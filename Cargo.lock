@@ -1250,6 +1250,7 @@ version = "0.1.0"
 dependencies = [
  "kerniq-server",
  "qubivex-expert-stream",
+ "qubivex-grammar",
  "qubivex-hardware",
  "qubivex-memory",
  "qubivex-model",
@@ -1365,6 +1366,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "qubivex-grammar"
+version = "0.1.0"
+dependencies = [
+ "proptest",
+ "serde",
+ "serde_json",
+ "thiserror",
+]
+
+[[package]]
 name = "qubivex-hardware"
 version = "0.1.0"
 dependencies = [
@@ -1441,6 +1452,7 @@ dependencies = [
  "qubivex-compute",
  "qubivex-core",
  "qubivex-expert-stream",
+ "qubivex-grammar",
  "qubivex-hardware",
  "qubivex-kv-cache",
  "qubivex-memory",

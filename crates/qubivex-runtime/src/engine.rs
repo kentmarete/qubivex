@@ -4,7 +4,7 @@ use std::collections::HashMap;
 use std::fs::File;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, PoisonError};
+use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
@@ -25,6 +25,7 @@ use qubivex_expert_stream::{
     Batch, ExpertKey, ExpertSource, ExpertStore, Held, Lease, Next, Occupancy, Policy, PoolSpec,
     PrefetchStats, ReadTimeout, StoreError, StoreStats,
 };
+use qubivex_grammar::{Grammar, GrammarError, Matcher, TokenTrie};
 use qubivex_hardware::{Host, Probed, ResourceProbe, SystemProbe};
 use qubivex_kv_cache::{PrefixCache, PrefixStats};
 use qubivex_memory::{
@@ -743,6 +744,8 @@ pub struct GenerateOptions {
     /// faster, and so tells a caller that another request sent it: requests that must
     /// not learn of each other need different scopes.
     pub cache_scope: Option<String>,
+    /// Only tokens that keep the output in this grammar may be sampled (ADR-020).
+    pub constraint: Option<Arc<Grammar>>,
 }
 
 impl Default for GenerateOptions {
@@ -753,6 +756,7 @@ impl Default for GenerateOptions {
             prefill_chunk: 256,
             deadline: None,
             cache_scope: None,
+            constraint: None,
         }
     }
 }
@@ -954,6 +958,8 @@ pub struct Engine {
     predictor: Option<Mutex<Predictor>>,
     /// The whole-layer Metal pass, with `MetalOps::layers`.
     gpu: Option<MetalForward>,
+    /// The vocabulary as a byte trie for constrained decoding, built on first use.
+    token_trie: OnceLock<Result<Arc<TokenTrie>, String>>,
 }
 
 impl std::fmt::Debug for Engine {
@@ -1351,6 +1357,7 @@ impl Engine {
             verification: Verification::Off,
             model,
             tokenizer,
+            token_trie: OnceLock::new(),
             backend,
         })
     }
@@ -1397,6 +1404,24 @@ impl Engine {
     #[must_use]
     pub const fn metadata(&self) -> &ModelMetadata {
         &self.meta
+    }
+
+    /// The vocabulary as a byte trie for constrained decoding (ADR-020), built on
+    /// first use and kept.
+    ///
+    /// # Errors
+    /// [`RuntimeError::Constraint`] if the tokenizer's token bytes are not defined
+    /// (it is not byte-level BPE).
+    pub fn token_trie(&self) -> Result<Arc<TokenTrie>, RuntimeError> {
+        self.token_trie
+            .get_or_init(|| {
+                self.tokenizer
+                    .token_bytes()
+                    .map(|b| Arc::new(TokenTrie::new(b, self.tokenizer.eos_ids())))
+                    .map_err(|e| e.to_string())
+            })
+            .clone()
+            .map_err(RuntimeError::Constraint)
     }
 
     /// The tokenizer.
@@ -1944,6 +1969,13 @@ impl Engine {
             })
         };
         let mut rng = Rng(opts.sampling.seed ^ 0x9e37_79b9_7f4a_7c15);
+        let mut constraint = match &opts.constraint {
+            Some(g) => Some((
+                Matcher::new(Arc::clone(g)).map_err(constraint_error)?,
+                self.token_trie()?,
+            )),
+            None => None,
+        };
         let mut logits = Vec::new();
         let late = || opts.deadline.is_some_and(|d| Instant::now() >= d);
         for chunk in prompt[cached_tokens..].chunks(opts.prefill_chunk.max(1)) {
@@ -1964,7 +1996,18 @@ impl Engine {
             if cancel.load(Ordering::Acquire) {
                 return done(out, Finish::Cancelled, cache);
             }
-            let next = sample(&logits, opts.sampling, &mut rng);
+            let next = match &mut constraint {
+                None => sample(&logits, opts.sampling, &mut rng),
+                Some((m, trie)) => {
+                    let t = sample_constrained(&mut logits, opts.sampling, &mut rng, m, trie)?;
+                    if !m.accept_token(trie, t).map_err(constraint_error)? {
+                        return Err(RuntimeError::Constraint(format!(
+                            "token {t} was sampled but does not continue the output"
+                        )));
+                    }
+                    t
+                }
+            };
             if self.tokenizer.eos_ids().contains(&next) {
                 return done(out, Finish::Eos, cache);
             }
@@ -2180,20 +2223,63 @@ impl Rng {
     }
 }
 
+/// The likeliest token, lowest id on ties.
+fn argmax(logits: &[f32]) -> u32 {
+    let mut best = 0usize;
+    for (i, v) in logits.iter().enumerate() {
+        if v.total_cmp(&logits[best]).is_gt() {
+            best = i;
+        }
+    }
+    u32::try_from(best).unwrap_or(0)
+}
+
+fn constraint_error(e: GrammarError) -> RuntimeError {
+    RuntimeError::Constraint(e.to_string())
+}
+
+/// [`sample`] over the tokens `m` allows (ADR-020 §3): the others' logits become −∞
+/// before temperature, top-k and top-p. Greedy decoding checks the unconstrained
+/// argmax first and needs no mask when it is allowed (the same token, ties included).
+/// The RNG is drawn exactly as without a constraint.
+fn sample_constrained(
+    logits: &mut [f32],
+    s: Sampling,
+    rng: &mut Rng,
+    m: &mut Matcher,
+    trie: &TokenTrie,
+) -> Result<u32, RuntimeError> {
+    if s.temperature <= 0.0 {
+        let best = argmax(logits);
+        if m.allows_token(trie, best).map_err(constraint_error)? {
+            return Ok(best);
+        }
+    }
+    let mask = m.mask(trie).map_err(constraint_error)?;
+    let allowed = |i: usize| mask.get(i / 64).is_some_and(|w| (w >> (i % 64)) & 1 == 1);
+    if !(0..logits.len()).any(allowed) {
+        return Err(RuntimeError::Constraint(
+            "no token in the vocabulary continues the output".into(),
+        ));
+    }
+    for (i, l) in logits.iter_mut().enumerate() {
+        if !allowed(i) {
+            *l = f32::NEG_INFINITY;
+        }
+    }
+    let t = sample(logits, s, rng);
+    if allowed(t as usize) {
+        return Ok(t);
+    }
+    // Rounding carried the draw past every allowed token: take the likeliest allowed.
+    Ok(argmax(logits))
+}
+
 /// Greedy (argmax, lowest id on ties), or temperature, then top-k, then top-p: top-p
 /// measures its mass within what top-k kept, as `transformers` does.
 fn sample(logits: &[f32], s: Sampling, rng: &mut Rng) -> u32 {
-    let argmax = || {
-        let mut best = 0usize;
-        for (i, v) in logits.iter().enumerate() {
-            if v.total_cmp(&logits[best]).is_gt() {
-                best = i;
-            }
-        }
-        u32::try_from(best).unwrap_or(0)
-    };
     if s.temperature <= 0.0 {
-        return argmax();
+        return argmax(logits);
     }
     let mut p: Vec<(usize, f32)> = logits
         .iter()
@@ -2238,7 +2324,7 @@ fn sample(logits: &[f32], s: Sampling, rng: &mut Rng) -> u32 {
         }
     }
     p.last()
-        .map_or_else(argmax, |x| u32::try_from(x.0).unwrap_or(0))
+        .map_or_else(|| argmax(logits), |x| u32::try_from(x.0).unwrap_or(0))
 }
 
 #[cfg(test)]

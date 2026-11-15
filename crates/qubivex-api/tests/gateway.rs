@@ -12,8 +12,8 @@ use std::net::TcpStream;
 use std::time::Duration;
 
 use common::{
-    Resp, engine, http, meta, opts, post, reference, request, root, slow_engine, start, text_of,
-    wait_until,
+    Resp, engine, http, meta, opts, post, post_text, reference, request, root, slow_engine, start,
+    text_of, wait_until,
 };
 use qubivex_api::{Gateway, MemoryPolicy, ServerConfig};
 use qubivex_runtime::{Engine, EngineOptions};
@@ -123,6 +123,73 @@ fn openai_shapes_and_streaming_equal_non_streaming() {
             .collect();
         assert_eq!(streamed, text_of(&j), "{id} chat streamed");
         assert!(chunks.last().unwrap()["choices"][0]["finish_reason"].is_string());
+    }
+}
+
+/// `response_format` (ADR-020): the fixture's random weights know no JSON, so every
+/// structural byte comes from the constraint. Every reply that stops parses, writes
+/// properties in the schema's order (not `serde_json`'s sorted order), and streams the
+/// same text.
+#[test]
+fn response_format_constrains_replies() {
+    let gw = Gateway::new(ServerConfig::default());
+    gw.add_model("olmoe-tiny", engine("olmoe-tiny")).unwrap();
+    let s = start(&gw);
+    // As JSON text: `json!` would sort the keys before they reach the gateway.
+    let schema = r#"{"type":"object","properties":{"zeta":{"type":"integer"},"alpha":{"enum":["x","y"]}},"required":["zeta","alpha"],"additionalProperties":false}"#;
+    let mut stopped = 0;
+    for seed in 0..8 {
+        let body = json!({
+            "model": "olmoe-tiny",
+            "messages": [{ "role": "user", "content": "json please" }],
+            "max_tokens": 200, "temperature": 1.0, "seed": seed,
+            "response_format": { "type": "json_schema", "json_schema": { "name": "t", "strict": true, "schema": "SCHEMA" } },
+        });
+        let text_body = |b: &Value| b.to_string().replace("\"SCHEMA\"", schema);
+        let r = post_text(s.addr, "/v1/chat/completions", &text_body(&body));
+        assert_eq!(r.status, 200, "{}", String::from_utf8_lossy(&r.body));
+        let j = r.json();
+        let text = text_of(&j);
+        if j["choices"][0]["finish_reason"] == "stop" {
+            stopped += 1;
+            let v: Value = serde_json::from_str(&text).unwrap_or_else(|e| panic!("{text:?}: {e}"));
+            assert!(
+                v["zeta"].is_i64() && ["x", "y"].contains(&v["alpha"].as_str().unwrap()),
+                "{v}"
+            );
+            assert!(
+                text.find("\"zeta\"").unwrap() < text.find("\"alpha\"").unwrap(),
+                "{text}"
+            );
+        }
+        let mut sbody = body.clone();
+        sbody["stream"] = json!(true);
+        let ev = post_text(s.addr, "/v1/chat/completions", &text_body(&sbody)).events();
+        let streamed: String = ev[..ev.len() - 1]
+            .iter()
+            .filter_map(|e| serde_json::from_str::<Value>(e).ok())
+            .filter_map(|c| {
+                c["choices"][0]["delta"]["content"]
+                    .as_str()
+                    .map(str::to_owned)
+            })
+            .collect();
+        assert_eq!(streamed, text, "seed {seed} streamed");
+    }
+    assert!(stopped >= 4, "only {stopped} of 8 replies finished");
+    let body = json!({
+        "model": "olmoe-tiny",
+        "messages": [{ "role": "user", "content": "anything" }],
+        "max_tokens": 300, "temperature": 0.7, "seed": 5,
+        "response_format": { "type": "json_object" },
+    });
+    let j = post(s.addr, "/v1/chat/completions", &body).json();
+    if j["choices"][0]["finish_reason"] == "stop" {
+        assert!(
+            serde_json::from_str::<Value>(&text_of(&j))
+                .unwrap()
+                .is_object()
+        );
     }
 }
 
@@ -427,6 +494,22 @@ fn auth_admin_and_errors_without_paths() {
             json!({ "model": "olmoe-tiny", "messages": [] }),
             400,
             "messages",
+        ),
+        (
+            json!({ "model": "olmoe-tiny", "messages": msgs, "response_format": { "type": "json_schema",
+                "json_schema": { "name": "x", "schema": { "type": "string", "pattern": "^a" } } } }),
+            400,
+            "response_format",
+        ),
+        (
+            json!({ "model": "olmoe-tiny", "messages": msgs, "response_format": { "type": "json_schema", "json_schema": { "name": "x" } } }),
+            400,
+            "response_format",
+        ),
+        (
+            json!({ "model": "olmoe-tiny", "messages": msgs, "response_format": { "type": "yaml" } }),
+            400,
+            "response_format",
         ),
     ] {
         let r = chat(&body);

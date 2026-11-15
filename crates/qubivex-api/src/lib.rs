@@ -775,8 +775,10 @@ async fn chat(
         let caller = st.check_key(&headers)?;
         let req = json_body(&st, body)?;
         let messages = req.messages()?;
+        let constraint = req.constraint()?;
         let max = req.max_completion_tokens.or(req.common.max_tokens);
         let mut params = req.common.params(max)?;
+        params.constraint = constraint;
         st.identify(caller, &mut params);
         generate(
             &st,
