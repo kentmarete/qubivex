@@ -7,7 +7,9 @@ use qubivex_core::{ExpertIdx, LayerIdx};
 use serde::Serialize;
 
 use crate::manifest::{Manifest, ManifestFormat, read_small};
-use crate::registry::{ArchConfig, ArchitectureRegistry, ConfigSource, TensorRole, TensorSchema};
+use crate::registry::{
+    ArchCapabilities, ArchConfig, ArchitectureRegistry, ConfigSource, TensorRole, TensorSchema,
+};
 use crate::{ModelError, TensorIndex};
 
 /// The manifest file name inside a model directory.
@@ -172,7 +174,7 @@ pub(crate) fn check(
         gguf: tensors.gguf_metadata(),
     })?;
     let schema = factory.tensor_schema(&config)?;
-    let roles = validate(manifest, &schema, tensors)?;
+    let roles = validate(manifest, &schema, tensors, &factory.capabilities())?;
     Ok((config, roles))
 }
 
@@ -180,6 +182,7 @@ fn validate(
     manifest: &Manifest,
     schema: &TensorSchema,
     index: &TensorIndex,
+    caps: &ArchCapabilities,
 ) -> Result<BTreeMap<String, TensorRole>, ModelError> {
     let ignore: BTreeSet<&str> = manifest
         .overrides
@@ -228,6 +231,29 @@ fn validate(
             problems.push(format!(
                 "unexpected tensor {n:?}; the config does not use it (list it in overrides.ignore_tensors if that is intended)"
             ));
+        }
+    }
+    // Formats, grouped: a mixed-quant checkpoint can have hundreds of such tensors.
+    let mut formats: BTreeMap<&'static str, (usize, &str)> = BTreeMap::new();
+    for name in roles.keys() {
+        if let Some(t) = index.get(name)
+            && !caps.accepts(t.tensor.dtype)
+        {
+            formats.entry(t.tensor.dtype.name()).or_insert((0, name)).0 += 1;
+        }
+    }
+    if !formats.is_empty() {
+        let runs: Vec<&str> = caps.weight_formats.iter().map(|d| d.name()).collect();
+        for (i, (dtype, (n, first))) in formats.into_iter().enumerate() {
+            problems.insert(
+                i,
+                format!(
+                    "{n} tensor{} stored as {dtype} (first {first:?}); {} runs {}",
+                    if n == 1 { " is" } else { "s are" },
+                    manifest.architecture.id,
+                    runs.join(", ")
+                ),
+            );
         }
     }
     if problems.is_empty() {

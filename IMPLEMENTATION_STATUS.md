@@ -3,6 +3,11 @@
 Last updated: 2026-11-15
 
 ## Current phase
+**General-purpose runtime, milestone 3: registry capabilities (2026-11-15, branch `registry-capabilities`).** Roadmap step 3; decision: ADR-003 amendment 4.
+- Architectures declare capabilities (weight formats, inputs, positions, RoPE scalings, norms, attention and FFN options). Validation refuses undeclared weight formats before reading weights, grouped per format; engine load refuses a format the chosen backend or the CPU lacks. `qubivex models architectures` lists capabilities and each backend's formats.
+- A test holds the declared formats equal to every backend's kernels.
+- **Next:** roadmap step 4, linear detokenization.
+
 **General-purpose runtime, milestone 2: JSON mode and JSON Schema constrained decoding (2026-11-15, branch `json-constrained`).** Decision: ADR-020 (Proposed); report: `docs/ROADMAP_GENERAL_PURPOSE_RUNTIME.md` §5.
 - New crate `qubivex-grammar`: byte grammars, a JSON Schema subset compiler (unsupported keywords are 400s), a lazily determinised matcher, token masks over a vocabulary trie. One hook at the engine's sampling site (`GenerateOptions::constraint`); `response_format` `json_object` and `json_schema` on `/v1/chat/completions`.
 - 12 400 random grammar walks over 31 schemas validate under Python `jsonschema`; random-weight fixtures at temperature 1 only end with valid JSON; Qwen2.5-0.5B-Instruct replies at t = 0 and 0.8 all parse and validate. Masks on the 151k vocabulary: mean 0.11 ms, worst 2.0 ms per token.

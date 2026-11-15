@@ -14,14 +14,14 @@ use serde_json::Value;
 
 pub use super::common::QkNorm;
 use super::common::{
-    AttentionNames, DecoderDims, Values, attention_specs, cfg_err, decoder_dims, nonzero, small,
-    unsupported_common,
+    AttentionNames, DecoderDims, Values, attention_specs, cfg_err, decoder_capabilities,
+    decoder_dims, nonzero, small, unsupported_common,
 };
 use crate::ModelError;
 use crate::manifest::{ManifestFormat, SemVer};
 use crate::registry::{
-    ArchConfig, ArchitectureFactory, ConfigSource, ExpertPart, ModelDims, TensorRole, TensorSchema,
-    TensorSpec,
+    ArchCapabilities, ArchConfig, ArchitectureFactory, ConfigSource, ExpertPart, ModelDims,
+    TensorRole, TensorSchema, TensorSpec,
 };
 
 /// The factory.
@@ -371,6 +371,18 @@ impl ArchitectureFactory for TransformerMoe {
 
     fn description(&self) -> &'static str {
         "decoder-only transformer with RoPE attention and routed SwiGLU experts in every layer"
+    }
+
+    fn capabilities(&self) -> ArchCapabilities {
+        decoder_capabilities(
+            &[],
+            vec![
+                "routed_swiglu",
+                "router_softmax",
+                "router_sigmoid",
+                "norm_topk_prob",
+            ],
+        )
     }
 
     fn parse_config(&self, src: &ConfigSource<'_>) -> Result<ArchConfig, ModelError> {

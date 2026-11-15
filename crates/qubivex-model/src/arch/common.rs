@@ -2,11 +2,51 @@
 //! `config.json` or GGUF metadata with the manifest's overrides, and the attention
 //! dimensions every decoder-only transformer has.
 
-use qubivex_core::LayerIdx;
+use qubivex_core::{DType, GgmlType, LayerIdx};
 use serde_json::Value;
 
-use crate::registry::{AttentionPart, TensorRole, TensorSpec};
+use crate::registry::{ArchCapabilities, AttentionPart, TensorRole, TensorSpec};
 use crate::{GgufMetadata, GgufValue, ModelError};
+
+/// Weight formats the shared decoder executes: the formats every compute backend has
+/// a kernel for (CPU, Sim, Metal, Vulkan; `qubivex-runtime/tests/capabilities.rs`).
+pub(crate) const WEIGHT_FORMATS: [DType; 6] = [
+    DType::F32,
+    DType::F16,
+    DType::BF16,
+    DType::Ggml(GgmlType::Q8_0),
+    DType::Ggml(GgmlType::Q4_K),
+    DType::Ggml(GgmlType::Q6_K),
+];
+
+/// RoPE scaling types the shared decoder implements.
+pub(crate) const ROPE_SCALINGS: [&str; 1] = ["default"];
+
+/// The capabilities of a decoder built from the shared components: the common
+/// attention options plus `attention`, and its FFN.
+pub(crate) fn decoder_capabilities(
+    attention: &[&'static str],
+    ffn: Vec<&'static str>,
+) -> ArchCapabilities {
+    let mut all = vec![
+        "mha",
+        "gqa",
+        "mqa",
+        "qk_norm_full",
+        "qk_norm_per_head",
+        "clip_qkv",
+    ];
+    all.extend_from_slice(attention);
+    ArchCapabilities {
+        weight_formats: WEIGHT_FORMATS.to_vec(),
+        inputs: vec!["text"],
+        positions: vec!["rope"],
+        rope_scaling: ROPE_SCALINGS.to_vec(),
+        norms: vec!["rms_norm"],
+        attention: all,
+        ffn,
+    }
+}
 
 pub(crate) fn cfg_err(detail: impl Into<String>) -> ModelError {
     ModelError::Config(detail.into())
@@ -257,7 +297,9 @@ pub(crate) fn unsupported_common(v: &Values<'_>) -> Result<(), ModelError> {
             for (k, val) in rs {
                 let plain = match k.as_str() {
                     "rope_theta" => true,
-                    "rope_type" | "type" => val.as_str() == Some("default"),
+                    "rope_type" | "type" => {
+                        val.as_str().is_some_and(|t| ROPE_SCALINGS.contains(&t))
+                    }
                     _ => false,
                 };
                 if !plain {

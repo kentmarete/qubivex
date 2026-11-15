@@ -47,7 +47,8 @@ pub use index::{RawTensor, TensorEntry, TensorIndex, WeightFile, WeightFormat};
 pub use manifest::{Manifest, ModelSource};
 pub use metadata::{ByteSummary, MANIFEST_FILE, ModelMetadata};
 pub use registry::{
-    ArchConfig, ArchDescriptor, ArchitectureFactory, ArchitectureRegistry, AttentionPart,
-    ConfigSource, ExpertPart, FfnPart, ModelDims, TensorRole, TensorSchema, TensorSpec,
+    ArchCapabilities, ArchConfig, ArchDescriptor, ArchitectureFactory, ArchitectureRegistry,
+    AttentionPart, ConfigSource, ExpertPart, FfnPart, ModelDims, TensorRole, TensorSchema,
+    TensorSpec,
 };
 pub use safetensors::SafetensorsHeader;

@@ -44,6 +44,27 @@ impl BackendKind {
             Self::Vulkan => "vulkan",
         }
     }
+
+    /// Every backend.
+    pub const ALL: [Self; 4] = [Self::Cpu, Self::Metal, Self::Sim, Self::Vulkan];
+
+    /// Whether this backend has a matmul kernel for weights stored as `dtype`. Known
+    /// without opening a device, so a model is refused before its weights are read.
+    #[must_use]
+    pub fn supports(self, dtype: DType) -> bool {
+        match self {
+            // Sim runs the CPU's kernels on its own memory.
+            Self::Cpu | Self::Sim => qubivex_backend_cpu::formats::supported(dtype),
+            Self::Metal => qubivex_backend_metal::supported(dtype),
+            Self::Vulkan => qubivex_backend_vulkan::supported(dtype),
+        }
+    }
+
+    /// The weight formats this backend runs, in [`DType::all`] order.
+    #[must_use]
+    pub fn weight_formats(self) -> Vec<DType> {
+        DType::all().filter(|&d| self.supports(d)).collect()
+    }
 }
 
 /// What runs on Metal with [`BackendKind::Metal`].

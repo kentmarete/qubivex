@@ -15,14 +15,14 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use super::common::{
-    AttentionNames, DecoderDims, QkNorm, Values, attention_specs, cfg_err, decoder_dims, nonzero,
-    unsupported_common,
+    AttentionNames, DecoderDims, QkNorm, Values, attention_specs, cfg_err, decoder_capabilities,
+    decoder_dims, nonzero, unsupported_common,
 };
 use crate::ModelError;
 use crate::manifest::{ManifestFormat, SemVer};
 use crate::registry::{
-    ArchConfig, ArchitectureFactory, ConfigSource, FfnPart, ModelDims, TensorRole, TensorSchema,
-    TensorSpec,
+    ArchCapabilities, ArchConfig, ArchitectureFactory, ConfigSource, FfnPart, ModelDims,
+    TensorRole, TensorSchema, TensorSpec,
 };
 
 /// The factory.
@@ -301,6 +301,10 @@ impl ArchitectureFactory for TransformerDense {
 
     fn description(&self) -> &'static str {
         "decoder-only transformer with RoPE attention (optional q/k norm and q/k/v biases) and a dense SwiGLU FFN in every layer"
+    }
+
+    fn capabilities(&self) -> ArchCapabilities {
+        decoder_capabilities(&["qkv_bias"], vec!["swiglu"])
     }
 
     fn parse_config(&self, src: &ConfigSource<'_>) -> Result<ArchConfig, ModelError> {

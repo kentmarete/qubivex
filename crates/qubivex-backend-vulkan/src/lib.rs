@@ -58,6 +58,12 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, TryLockError};
 
 pub use device::{PhysicalInfo, list};
+
+/// Whether the Vulkan kernels support `dtype` (no device needed).
+#[must_use]
+pub fn supported(dtype: DType) -> bool {
+    device::dtype_index(dtype).is_some()
+}
 #[cfg(feature = "spike")]
 pub use device::{SpikeKernel, SpikePrefix, SpikeStep, SpikeTiming};
 use qubivex_compute::ComputeError;
@@ -421,7 +427,7 @@ impl DiscreteDevice for VulkanDevice {
     }
 
     fn supports(&self, dtype: DType) -> bool {
-        device::dtype_index(dtype).is_some()
+        supported(dtype)
     }
 
     fn upload(&self, host: &[u8], guard: Option<Guard>) -> Result<DeviceBuffer, ComputeError> {

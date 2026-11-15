@@ -4,7 +4,9 @@
   (2026-11-04): a second architecture, `transformer_dense`. Amendment 2 (2026-11-06): a
   registry of installed models. Amendment 3 (2026-11-15, proposed in PR with the owner's
   general-purpose runtime brief): q/k/v biases as a `transformer_dense` option, and plain
-  RoPE enforced in `rope_parameters`.
+  RoPE enforced in `rope_parameters`. Amendment 4 (2026-11-15, proposed in PR):
+  architectures declare capabilities, and undeclared weight formats are refused at
+  validation.
 - Date: 2026-11-01
 
 ## Context
@@ -121,3 +123,28 @@ prompt ids, 32 greedy tokens, top-32 logits (1.05e-5 relative), chat template te
 ids, and a greedy chat reply ending at its end-of-sequence id; Metal, Vulkan and the
 simulated device give the CPU's tokens (`tests/real_dense.rs`, env-gated
 `QUBIVEX_QWEN2_SAFETENSORS_DIR`, `fixtures/oracle/qwen2_real.json`).
+
+## Amendment 4 (2026-11-15): architectures declare capabilities
+Roadmap step 3 (`docs/ROADMAP_GENERAL_PURPOSE_RUNTIME.md`, P1). The registry described a
+model's structure but not what the build can execute, so a checkpoint in a format with no
+kernel (Q5_K, Q4_0, ...) passed validation and failed only when the forward pass met it.
+
+- **`ArchitectureFactory::capabilities()`** returns `ArchCapabilities`: weight formats,
+  inputs, positions, RoPE scaling types, norms, attention options and FFN strategies.
+  Both built-ins compose the shared decoder components, so they share one declaration
+  (`arch/common.rs`) and add their own options (`qkv_bias`; routed SwiGLU and the router
+  options). The strategy lists are descriptive: config parsing still enforces options.
+  The RoPE scaling check reads the same list, so the two cannot drift.
+- **Validation refuses undeclared formats** with the other problems, one line per
+  format: count, first tensor, and the formats the architecture runs. No weight is read.
+- **Backends declare formats** without opening a device (`BackendKind::supports`, from
+  each backend crate's `supported`). `Engine::load` refuses, before reading weights, a
+  model with a format the chosen backend or the CPU lacks, naming the formats.
+- **One set.** The architectures declare exactly the formats every backend runs
+  (f32, f16, bf16, Q8_0, Q4_K, Q6_K). A test compares the two for every dtype, so
+  adding a kernel to one backend, or a format to the declaration, fails until the other
+  side follows. A per-backend subset (formats only some backends run) would need the
+  architecture's set to become a union and the load check to carry the refusal; that
+  check exists and is tested with a backend lacking Q8_0.
+- **`qubivex models architectures`** prints each architecture's capabilities and each
+  backend's formats. `ArchDescriptor` carries the capabilities, so an API can list them.

@@ -20,7 +20,7 @@ pub use engine::{
     DEFAULT_BATCH_TOKENS, DEFAULT_BATCH_WAIT_US, DEFAULT_IO_THREADS, DEFAULT_READ_RETRIES,
     DEFAULT_SIM_VRAM, Engine, EngineOptions, Finish, GenerateOptions, Generation, KvReservation,
     PredictionStats, PrefetchOptions, PrefetchReport, Sampling, Verification, VerifyExperts,
-    cpu_pass_reason,
+    cpu_pass_reason, refuse_weight_formats,
 };
 pub use experts::{ExpertIo, ExpertLayout, IoPath, ModelExpertSource, PartLayout};
 pub use placement::{BackendKind, MetalOps, PlacementReport};

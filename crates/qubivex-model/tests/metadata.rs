@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use qubivex_core::{DType, ExpertIdx, GgmlType, LayerIdx, Shape};
-use qubivex_model::arch::TransformerMoe;
+use qubivex_model::arch::{TransformerDense, TransformerMoe};
 use qubivex_model::manifest::SemVer;
 use qubivex_model::write::{self, TensorData};
 use qubivex_model::{
@@ -160,6 +160,11 @@ fn gguf_meta() -> Vec<(&'static str, GgufValue)> {
 }
 
 fn write_gguf(dir: &Path, m: &Value) {
+    write_gguf_as(dir, m, |_, d| dtype_for(d, true));
+}
+
+/// As [`write_gguf`], with each tensor's dtype chosen by `dt(name, dims)`.
+fn write_gguf_as(dir: &Path, m: &Value, dt: impl Fn(&str, &[u64]) -> DType) {
     let meta = gguf_meta();
     let gm = GgufMetadata(
         meta.iter()
@@ -169,8 +174,8 @@ fn write_gguf(dir: &Path, m: &Value) {
     let t = expected(m, None, Some(&gm));
     let data: Vec<Vec<u8>> = t
         .iter()
-        .map(|(_, d)| {
-            let dt = dtype_for(d, true);
+        .map(|(n, d)| {
+            let dt = dt(n, d);
             vec![0u8; usize::try_from(dt.storage_bytes(&Shape::new(d).unwrap()).unwrap()).unwrap()]
         })
         .collect();
@@ -179,7 +184,7 @@ fn write_gguf(dir: &Path, m: &Value) {
         .zip(&data)
         .map(|((n, d), b)| TensorData {
             name: n,
-            dtype: dtype_for(d, true),
+            dtype: dt(n, d),
             dims: d,
             data: b,
         })
@@ -324,6 +329,70 @@ fn gguf_layout_takes_dims_from_metadata() {
     assert!(
         e.contains("expert_weights_norm") && e.contains("overrides.config.norm_topk_prob"),
         "{e}"
+    );
+}
+
+/// A weight format the architecture does not run is refused at validation, before any
+/// weight is read, grouped by format and listed first.
+#[test]
+fn unsupported_weight_formats_are_refused() {
+    let d = tmp("formats");
+    let m = manifest(
+        "gguf",
+        json!({ "qk_norm": "per_head" }),
+        json!({ "config": { "norm_topk_prob": true } }),
+    );
+    write_gguf_as(&d.0, &m, |n, d| {
+        if n.ends_with("attn_q.weight") || n.ends_with("attn_k.weight") {
+            DType::Ggml(GgmlType::Q5_0)
+        } else if n == "blk.1.ffn_down_exps.weight" {
+            DType::Ggml(GgmlType::Q4_1)
+        } else {
+            dtype_for(d, true)
+        }
+    });
+    let p = problems(load(&d.0));
+    let runs = "transformer_moe runs f32, f16, bf16, q8_0, q4_k, q6_k";
+    assert_eq!(p.len(), 2, "{p:?}");
+    assert_eq!(
+        p[0],
+        format!("1 tensor is stored as q4_1 (first \"blk.1.ffn_down_exps.weight\"); {runs}")
+    );
+    assert_eq!(
+        p[1],
+        format!("4 tensors are stored as q5_0 (first \"blk.0.attn_k.weight\"); {runs}")
+    );
+    // Positive control: the same model in a declared format loads.
+    write_gguf(&d.0, &m);
+    load(&d.0).unwrap();
+}
+
+/// Every built-in architecture declares what it runs, and the listing carries it.
+#[test]
+fn architectures_declare_capabilities() {
+    let r = ArchitectureRegistry::with_builtins();
+    for a in r.list_supported() {
+        let c = &a.capabilities;
+        assert!(
+            c.accepts(DType::F32) && !c.accepts(DType::Ggml(GgmlType::Q5_K)),
+            "{}",
+            a.id
+        );
+        assert_eq!(c.inputs, ["text"]);
+        assert_eq!(c.rope_scaling, ["default"]);
+        assert!(!c.ffn.is_empty() && !c.attention.is_empty());
+    }
+    assert!(
+        TransformerDense
+            .capabilities()
+            .attention
+            .contains(&"qkv_bias")
+    );
+    assert!(
+        !TransformerMoe
+            .capabilities()
+            .attention
+            .contains(&"qkv_bias")
     );
 }
 
