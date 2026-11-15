@@ -2858,3 +2858,99 @@ must handle that the spike does not:
 Then the gates of §8 (parity, `tests/vulkan.rs`, fixtures, the OLMoE test, every dtype,
 bench tokens identical, no prefill regression) and the alternated mains bench against
 §21.6. Token tiles (§22.5 item 2) after that, on the ported kernel.
+
+
+## 24. Step 5, first production commit: each scale product once per block (2026-11-14)
+
+Branch `vulkan-kernel-port`, on §23's spike. §23.6's recommendation, ported:
+`shaders/matmul_body.glsl` (and so `matmul.comp` and `matmul_fused.comp`, which include
+it) computes Q4_K's `d · sc_j` and `dmin · m_j` (lanes 0..7) and Q6_K's `d · sc_j`
+(lanes 0..15) once per block per row and shares them through shared memory, two
+barriers per block. No subgroup operations, no new device feature, no switch: every
+path that runs the matmul kernel takes it. Q8_0, F16 and F32 are unchanged.
+
+### 24.1 What the port handles that the spike did not
+
+- **Rows past `n`.** The barriers need every invocation in the block loop, so a row past
+  `n` now runs it on row `n − 1` (clamped) and writes nothing, instead of skipping it
+  behind `r < P_N`. A dispatch with `n = 0` returns before any barrier, uniformly across
+  the workgroup.
+- **`matmul_fused.comp`.** Its workgroups are one matrix each and return early only as a
+  whole workgroup, so the barriers stay in uniform control flow.
+- **Unaligned weight offsets.** The header is read with `word_at`/`byte_at`, as before;
+  `tests/parity.rs`'s offsets test puts every dtype at offsets aligned only to its own
+  element size, with 5–10 rows (partial 8-row workgroups).
+
+Each weight is still `(d · sc) · q − dmin · m` (Q4_K) or `(d · sc) · q` (Q6_K) from the
+same operands, each product rounded on its own, in the same fma order: the CPU's bits.
+
+### 24.2 Gates (all passed)
+
+- `qubivex-backend-vulkan` tests, release, `--features spike`: parity (every dtype, shape
+  and batch; offsets; fused; routed; norm), the spike harnesses — bit for bit.
+- `qubivex-runtime` `tests/vulkan.rs` and `tests/discrete.rs` with
+  `QUBIVEX_OLMOE_GGUF_DIR` set: the fixtures and the real OLMoE (plain and routed) against
+  the CPU's prompt logits and tokens; concurrent requests; decode attention.
+- The workspace's tests, `cargo fmt --check`, clippy `--all-targets --features
+  qubivex-backend-vulkan/spike -D warnings`.
+- Bench: every single-stream record's tokens equal the Step 1a reference; every concurrent
+  row's tokens identical across sequential, batched and concurrent.
+
+### 24.3 Measured on mains
+
+`scripts/bench-vulkan-baseline --tag step5 --prior main --variant plain= --variant
+attn='--vulkan-route on --vulkan-route-o on --vulkan-attn on --vulkan-kv-pool 512MiB'`:
+3 alternated rounds of Step 1a, then each variant built from `main` (c71ba78, before the
+port; `-prior`) immediately followed by the same variant built from this branch. The
+driver's new `--prior REV` builds REV in its own worktree for this. Records
+`2026-11-14-m3pro-vulkan-step5-{base,plain-prior,plain,attn-prior,attn}-{1,2,3}.json`, log
+`…-step5-mains.txt`. Untimed, 128 tokens, 1 warm-up + 5 runs.
+
+**Memory pressure:** swap used 1.15 GB before the first run, 2.47 GB from the end of
+round 1, then flat (2.44–2.55 GB) through rounds 2 and 3; free memory 44–72%. Every
+round's ordering and spread match the others, so the swap did not show in the timings.
+
+Single stream, decode ms per token (median):
+
+| Round | Step 1a | plain, prior | **plain** | attention, prior | **attention** |
+|---|---:|---:|---:|---:|---:|
+| 1 | 36.03 | 33.74 | **29.97** | 26.56 | **23.30** |
+| 2 | 37.05 | 33.57 | **30.08** | 26.46 | **23.30** |
+| 3 | 36.40 | 33.33 | **29.95** | 26.47 | **23.17** |
+| fastest step | 30.55–33.91 | 30.49–31.64 | 26.67–27.25 | 25.04–25.37 | 21.71–21.91 |
+| slowest step | 38.29–42.42 | 35.29–36.37 | 31.61–34.10 | 27.65–27.90 | 24.48–24.77 |
+| tok/s (median) | 26.99–27.76 | 29.64–30.00 | **33.25–33.39** | 37.65–37.79 | **42.93–43.16** |
+| prefill ms (median) | 200.5–206.2 | 196.5–198.5 | **164.7–166.7** | 196.3–197.3 | **166.2–166.9** |
+| submissions/token | 305 | 65 | 65 | 17 | 17 |
+
+- Against the prior build in the same round: **plain −3.77, −3.49, −3.38 ms per token
+  (−11.2%, −10.4%, −10.1%); attention −3.26, −3.16, −3.30 ms (−12.3%, −11.9%, −12.5%)**.
+  Fence waits per token: 31.2 → 27.6 ms (plain), 25.0 → 21.8 ms (attention).
+- §23.5 estimated about −4.5 ms (to ~22 ms); measured −3.2 to −3.3 ms (to 23.2–23.3).
+  The harness's estimate assumed the kernel's share of §22.4's split moves with the
+  kernel times; Q8_0, F32 and attention did not change.
+- Attention 26.11–26.30 ms per token in §21.6; 23.17–23.30 here: **43 tok/s**.
+- **Prefill −15%** (197 → 166 ms): prefill runs the same matmul kernel at 10 tokens.
+
+Concurrent (the batch example, 32 tokens per sequence, median of 3 runs), batched tok/s,
+rounds 1/2/3:
+
+| N | plain, prior | **plain** | attention, prior | **attention** |
+|---:|---|---|---|---|
+| 1 (sequential) | 30.05 / 30.08 / 30.42 | 36.08 / 33.90 / 33.90 | 37.09 / 37.56 / 36.83 | 43.10 / 43.29 / 42.97 |
+| 2 | 36.83 / 37.83 / 37.70 | 42.50 / 43.74 / 44.15 | 43.74 / 44.16 / 43.86 | 52.01 / 51.35 / 51.64 |
+| 4 | 41.98 / 43.18 / 42.95 | 50.84 / 50.78 / 50.65 | 47.64 / 47.84 / 47.84 | 56.86 / 56.90 / 56.88 |
+| 8 | 45.95 / 46.28 / 46.21 | 55.23 / 55.51 / 55.41 | 49.90 / 50.00 / 49.97 | 60.24 / 60.11 / 60.01 |
+
+- At 8 sequences: plain **+20%** (46.2 → 55.4 tok/s), attention **+20%** (50.0 → 60.1).
+  Concurrent tok/s within 1–3% of batched in every row (55.49 against 56.88 is the
+  largest gap).
+- Batching still scales sublinearly (1.40–1.42× at 8 with attention): each token is its
+  own workgroup and reloads the row (§23.2), which token tiles address.
+
+### 24.4 Recommendation (for review)
+
+Keep: tokens identical, prefill faster, a single-stream and concurrent gain in every
+round. Next in Step 5, on this kernel: token tiles (§22.5 item 2), where one workgroup
+decodes a row's block once for up to 8 tokens; the spike measured the per-token reload
+(§23.2) but not a tiled kernel, so a harness spike first, as in §23.
