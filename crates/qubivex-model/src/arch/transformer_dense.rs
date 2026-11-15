@@ -52,6 +52,12 @@ pub struct DenseTensorNames {
     pub q_norm: String,
     /// Key norm.
     pub k_norm: String,
+    /// Query projection bias (read when `qkv_bias` is set).
+    pub q_bias: String,
+    /// Key projection bias.
+    pub k_bias: String,
+    /// Value projection bias.
+    pub v_bias: String,
     /// Pre-FFN norm.
     pub ffn_norm: String,
     /// FFN gate projection.
@@ -79,6 +85,9 @@ impl DenseTensorNames {
                 o: "model.layers.{L}.self_attn.o_proj.weight".into(),
                 q_norm: "model.layers.{L}.self_attn.q_norm.weight".into(),
                 k_norm: "model.layers.{L}.self_attn.k_norm.weight".into(),
+                q_bias: "model.layers.{L}.self_attn.q_proj.bias".into(),
+                k_bias: "model.layers.{L}.self_attn.k_proj.bias".into(),
+                v_bias: "model.layers.{L}.self_attn.v_proj.bias".into(),
                 ffn_norm: "model.layers.{L}.post_attention_layernorm.weight".into(),
                 gate: "model.layers.{L}.mlp.gate_proj.weight".into(),
                 up: "model.layers.{L}.mlp.up_proj.weight".into(),
@@ -95,6 +104,9 @@ impl DenseTensorNames {
                 o: "blk.{L}.attn_output.weight".into(),
                 q_norm: "blk.{L}.attn_q_norm.weight".into(),
                 k_norm: "blk.{L}.attn_k_norm.weight".into(),
+                q_bias: "blk.{L}.attn_q.bias".into(),
+                k_bias: "blk.{L}.attn_k.bias".into(),
+                v_bias: "blk.{L}.attn_v.bias".into(),
                 ffn_norm: "blk.{L}.ffn_norm.weight".into(),
                 gate: "blk.{L}.ffn_gate.weight".into(),
                 up: "blk.{L}.ffn_up.weight".into(),
@@ -116,6 +128,9 @@ impl DenseTensorNames {
             "o" => &mut self.o,
             "q_norm" => &mut self.q_norm,
             "k_norm" => &mut self.k_norm,
+            "q_bias" => &mut self.q_bias,
+            "k_bias" => &mut self.k_bias,
+            "v_bias" => &mut self.v_bias,
             "ffn_norm" => &mut self.ffn_norm,
             "gate" => &mut self.gate,
             "up" => &mut self.up,
@@ -138,6 +153,9 @@ impl DenseTensorNames {
             ("o", &self.o),
             ("q_norm", &self.q_norm),
             ("k_norm", &self.k_norm),
+            ("q_bias", &self.q_bias),
+            ("k_bias", &self.k_bias),
+            ("v_bias", &self.v_bias),
             ("ffn_norm", &self.ffn_norm),
             ("gate", &self.gate),
             ("up", &self.up),
@@ -156,7 +174,7 @@ impl DenseTensorNames {
         Ok(())
     }
 
-    fn attention(&self) -> AttentionNames<'_> {
+    fn attention(&self, qkv_bias: bool) -> AttentionNames<'_> {
         AttentionNames {
             attn_norm: &self.attn_norm,
             q: &self.q,
@@ -165,6 +183,7 @@ impl DenseTensorNames {
             o: &self.o,
             q_norm: &self.q_norm,
             k_norm: &self.k_norm,
+            qkv_bias: qkv_bias.then_some([&self.q_bias, &self.k_bias, &self.v_bias]),
         }
     }
 }
@@ -198,6 +217,8 @@ pub struct DenseConfig {
     pub tie_embeddings: bool,
     /// Q/K norm.
     pub qk_norm: QkNorm,
+    /// Biases on the Q, K and V projections.
+    pub qkv_bias: bool,
     /// Tensor names.
     pub names: DenseTensorNames,
 }
@@ -210,6 +231,8 @@ struct ManifestOptions {
     tensor_names: Option<Value>,
     #[serde(default)]
     qk_norm: Option<QkNorm>,
+    #[serde(default)]
+    qkv_bias: Option<bool>,
 }
 
 /// Refuses a mixture-of-experts checkpoint, which `transformer_moe` describes.
@@ -271,13 +294,13 @@ impl ArchitectureFactory for TransformerDense {
     fn version(&self) -> SemVer {
         SemVer {
             major: 1,
-            minor: 0,
+            minor: 1,
             patch: 0,
         }
     }
 
     fn description(&self) -> &'static str {
-        "decoder-only transformer with RoPE attention and a dense SwiGLU FFN in every layer"
+        "decoder-only transformer with RoPE attention (optional q/k norm and q/k/v biases) and a dense SwiGLU FFN in every layer"
     }
 
     fn parse_config(&self, src: &ConfigSource<'_>) -> Result<ArchConfig, ModelError> {
@@ -326,6 +349,7 @@ impl ArchitectureFactory for TransformerDense {
             max_context,
             tie_embeddings,
             qk_norm: opts.qk_norm.unwrap_or(QkNorm::None),
+            qkv_bias: opts.qkv_bias.unwrap_or(false),
             names: names(opts.tensor_names.as_ref(), m.weights.format)?,
         };
         Ok(ArchConfig {
@@ -365,7 +389,7 @@ impl ArchitectureFactory for TransformerDense {
             let at = |p: &str| p.replace("{L}", &l.to_string());
             t.extend(attention_specs(
                 l,
-                &n.attention(),
+                &n.attention(c.qkv_bias),
                 c.qk_norm,
                 h,
                 q_out,

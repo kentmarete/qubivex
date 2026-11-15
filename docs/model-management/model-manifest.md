@@ -79,6 +79,7 @@ A GGUF model, at schema 1.1:
 | `tensor_names` | `"hf"` (one tensor per expert, as released Hugging Face checkpoints), `"hf_fused"` (stacked experts, as newer `transformers` saves), `"gguf"` (standard GGUF names), or `{"base": <preset>, "<slot>": "<pattern>"}` to rename individual tensors, with `{L}` for the layer and `{E}` for the expert | `"hf"` for SafeTensors, `"gguf"` for GGUF |
 | `qk_norm` | `"none"`, `"full"` (one norm across all heads), `"per_head"` | `"none"` |
 | `router_scoring` (`transformer_moe`) | `"softmax"`, `"sigmoid"` | `"softmax"` |
+| `qkv_bias` (`transformer_dense` 1.1) | `true`: the q, k and v projections have biases (slots `q_bias`, `k_bias`, `v_bias`), as in Qwen2 and Qwen2.5. Import sets it when the checkpoint has them | `false` |
 
 ## What the manifest does not hold
 
@@ -158,7 +159,7 @@ value the checkpoint does not record; supply it with `--set KEY=VALUE`.
 ## Not supported
 
 - **Architectures other than `transformer_moe` and `transformer_dense`.** Shared-expert
-  and partly dense MoE models, attention or FFN biases, non-SiLU activations, RoPE
+  and partly dense MoE models, output-projection or FFN biases (q/k/v biases are the `qkv_bias` option), non-SiLU activations, RoPE
   scaling and sliding-window attention are refused with a message that names the
   feature.
 - **`router_scoring: "sigmoid"` at run time.** The manifest accepts it and the forward

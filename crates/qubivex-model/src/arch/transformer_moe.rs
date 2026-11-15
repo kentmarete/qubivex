@@ -483,6 +483,7 @@ impl ArchitectureFactory for TransformerMoe {
                 o: &n.o,
                 q_norm: &n.q_norm,
                 k_norm: &n.k_norm,
+                qkv_bias: None,
             };
             for spec in attention_specs(l, &names, c.qk_norm, h, q_out, kv_out, c.head_dim) {
                 push(spec.name, spec.role, spec.shape);

@@ -227,9 +227,11 @@ pub(crate) fn decoder_dims(
 
 /// Rejects config features no architecture here implements yet.
 pub(crate) fn unsupported_common(v: &Values<'_>) -> Result<(), ModelError> {
+    // `attention_bias` biases o as well as q, k and v; q/k/v biases alone are the
+    // `qkv_bias` option, detected from the tensors at import.
     if v.bool("attention_bias", None)? == Some(true) {
         return Err(cfg_err(
-            "attention_bias = true: attention biases are not supported yet",
+            "attention_bias = true: a bias on the output projection is not supported yet",
         ));
     }
     if let Some(act) = v.get("hidden_act", None)?
@@ -247,15 +249,23 @@ pub(crate) fn unsupported_common(v: &Values<'_>) -> Result<(), ModelError> {
             "use_sliding_window = true: sliding-window attention is not supported yet",
         ));
     }
-    if let Some(Value::Object(rs)) = v.get("rope_scaling", None)? {
-        let kind = rs
-            .get("rope_type")
-            .or_else(|| rs.get("type"))
-            .and_then(Value::as_str);
-        if kind != Some("default") {
-            return Err(cfg_err(format!(
-                "rope_scaling {kind:?} is not supported yet"
-            )));
+    // transformers 5 writes RoPE settings as `rope_parameters`, older checkpoints as
+    // `rope_scaling`; any variant in either changes every position. Only plain RoPE is
+    // implemented: a `rope_theta` and a type of `default`, nothing else.
+    for key in ["rope_scaling", "rope_parameters"] {
+        if let Some(Value::Object(rs)) = v.get(key, None)? {
+            for (k, val) in rs {
+                let plain = match k.as_str() {
+                    "rope_theta" => true,
+                    "rope_type" | "type" => val.as_str() == Some("default"),
+                    _ => false,
+                };
+                if !plain {
+                    return Err(cfg_err(format!(
+                        "{key}.{k} = {val}: only plain RoPE is supported yet"
+                    )));
+                }
+            }
         }
     }
     Ok(())
@@ -270,6 +280,8 @@ pub(crate) struct AttentionNames<'a> {
     pub(crate) o: &'a str,
     pub(crate) q_norm: &'a str,
     pub(crate) k_norm: &'a str,
+    /// Q, K and V projection biases, when the attention has them.
+    pub(crate) qkv_bias: Option<[&'a str; 3]>,
 }
 
 /// Layer `l`'s pre-attention norm and attention tensors.
@@ -292,6 +304,11 @@ pub(crate) fn attention_specs(
         (at(n.v), attn(AttentionPart::V), vec![kv_out, h]),
         (at(n.o), attn(AttentionPart::O), vec![h, q_out]),
     ];
+    if let Some([qb, kb, vb]) = n.qkv_bias {
+        t.push((at(qb), attn(AttentionPart::QBias), vec![q_out]));
+        t.push((at(kb), attn(AttentionPart::KBias), vec![kv_out]));
+        t.push((at(vb), attn(AttentionPart::VBias), vec![kv_out]));
+    }
     match qk_norm {
         QkNorm::None => {}
         QkNorm::Full => {

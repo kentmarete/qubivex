@@ -40,11 +40,12 @@ fn bits(v: &[f32]) -> Vec<u32> {
 const IDS: [&str; 3] = ["olmoe-tiny", "olmoe-tiny-gguf", "qwen3-moe-tiny"];
 /// The mixture-of-experts fixtures and the dense one, for invariants that do not
 /// involve routing.
-const ALL: [&str; 4] = [
+const ALL: [&str; 5] = [
     "olmoe-tiny",
     "olmoe-tiny-gguf",
     "qwen3-moe-tiny",
     "dense-tiny",
+    "qwen2-tiny",
 ];
 const PROMPT: &[u32] = &[
     72, 101, 108, 108, 111, 44, 32, 101, 120, 112, 101, 114, 116, 115,

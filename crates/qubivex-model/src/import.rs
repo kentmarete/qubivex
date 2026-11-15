@@ -243,18 +243,37 @@ pub fn import(
     // no experts for `transformer_moe`) moves on to the next.
     let mut best: Option<(usize, ModelError)> = None;
     let mut refused: Vec<String> = Vec::new();
-    'arch: for (arch, names) in [
-        ("transformer_moe", candidates(format)),
-        ("transformer_dense", dense_candidates(format)),
+    // Attention options are detected from the tensors: a candidate that leaves a tensor
+    // unused, or misses one, fails validation, so the checkpoint's own layout decides.
+    'arch: for (arch, names, qkv_biases) in [
+        ("transformer_moe", candidates(format), &[false][..]),
+        (
+            "transformer_dense",
+            dense_candidates(format),
+            &[false, true][..],
+        ),
     ] {
         for tensor_names in names {
-            for qk in ["none", "full", "per_head"] {
+            for (qk, &qkv_bias) in ["none", "full", "per_head"]
+                .into_iter()
+                .flat_map(|qk| qkv_biases.iter().map(move |b| (qk, b)))
+            {
                 let mut m = base.clone();
                 m.architecture.id = arch.to_owned();
                 m.architecture
                     .config
                     .insert("tensor_names".into(), tensor_names.clone());
                 m.architecture.config.insert("qk_norm".into(), json!(qk));
+                if qkv_bias {
+                    m.architecture.config.insert("qkv_bias".into(), json!(true));
+                    // `qkv_bias` arrived in transformer_dense 1.1; manifests without it
+                    // stay 1.0 so older builds still read them.
+                    m.architecture.version = SemVer {
+                        major: 1,
+                        minor: 1,
+                        patch: 0,
+                    };
+                }
                 match check(&m, &tensors, hf_config.as_ref(), registry) {
                     Ok(_) => {
                         let mut m = m;

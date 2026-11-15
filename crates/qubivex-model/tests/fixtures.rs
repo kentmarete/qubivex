@@ -22,6 +22,7 @@ fn every_fixture_validates() {
             "dense-tiny",
             "olmoe-tiny",
             "olmoe-tiny-gguf",
+            "qwen2-tiny",
             "qwen3-moe-tiny"
         ]
     );
@@ -57,7 +58,7 @@ fn every_fixture_validates() {
 #[test]
 fn import_reproduces_the_committed_manifests() {
     let reg = ArchitectureRegistry::with_builtins();
-    for id in ["olmoe-tiny", "qwen3-moe-tiny", "dense-tiny"] {
+    for id in ["olmoe-tiny", "qwen3-moe-tiny", "dense-tiny", "qwen2-tiny"] {
         let dir = root().join(id);
         let committed = ModelMetadata::load(&dir, &reg).unwrap().manifest;
         let opts = ImportOptions {

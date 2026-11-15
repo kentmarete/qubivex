@@ -53,6 +53,12 @@ pub enum AttentionPart {
     QNorm,
     /// Key norm.
     KNorm,
+    /// Query projection bias.
+    QBias,
+    /// Key projection bias.
+    KBias,
+    /// Value projection bias.
+    VBias,
 }
 
 /// What a tensor is for. Validation and the memory planner work on roles only,

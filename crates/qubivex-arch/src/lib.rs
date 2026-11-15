@@ -548,6 +548,8 @@ struct LayerNorms {
     ffn: Vec<f32>,
     q: Option<Vec<f32>>,
     k: Option<Vec<f32>>,
+    /// Q, K and V projection biases, added to each token's projections.
+    qkv_bias: Option<[Vec<f32>; 3]>,
 }
 
 /// Tensor-name patterns the forward pass reads, the same for every FFN kind.
@@ -563,6 +565,8 @@ struct Names {
     o: String,
     q_norm: String,
     k_norm: String,
+    /// Q, K and V bias patterns, when the attention has biases.
+    qkv_bias: Option<[String; 3]>,
     ffn_norm: String,
 }
 
@@ -644,6 +648,7 @@ impl DecoderConfig {
                     o: n.o.clone(),
                     q_norm: n.q_norm.clone(),
                     k_norm: n.k_norm.clone(),
+                    qkv_bias: None,
                     ffn_norm: n.ffn_norm.clone(),
                 },
             },
@@ -682,6 +687,9 @@ impl DecoderConfig {
                     o: n.o.clone(),
                     q_norm: n.q_norm.clone(),
                     k_norm: n.k_norm.clone(),
+                    qkv_bias: c
+                        .qkv_bias
+                        .then(|| [n.q_bias.clone(), n.k_bias.clone(), n.v_bias.clone()]),
                     ffn_norm: n.ffn_norm.clone(),
                 },
             },
@@ -795,11 +803,20 @@ impl Transformer {
                     Some(vector(dense, be, &n(&c.names.k_norm), d)?),
                 ),
             };
+            let qkv_bias = match &c.names.qkv_bias {
+                Some([qb, kb, vb]) => Some([
+                    vector(dense, be, &n(qb), q_out)?,
+                    vector(dense, be, &n(kb), kv_out)?,
+                    vector(dense, be, &n(vb), kv_out)?,
+                ]),
+                None => None,
+            };
             norms.push(LayerNorms {
                 attn: vector(dense, be, &n(&c.names.attn_norm), h)?,
                 ffn: vector(dense, be, &n(&c.names.ffn_norm), h)?,
                 q,
                 k,
+                qkv_bias,
             });
         }
         let final_norm = vector(dense, be, &c.names.final_norm, h)?;
@@ -1108,8 +1125,11 @@ impl Transformer {
         // Audit §21: attention on the device, for decode steps only (every sequence one
         // new token): prefill and every declined pass run attention on the host, whose
         // cache stays authoritative.
+        // The device's fused attention has no projection biases, so a model with them
+        // always runs attention on the host.
         let dev_attn = !tracing
             && !lookahead
+            && c.names.qkv_bias.is_none()
             && layout.iter().all(|&(_, n, _)| n == 1)
             && match &self.ffn {
                 Ffn::Moe { .. } => be.routes_moe_attention(ne, k_top, s),
@@ -1232,6 +1252,14 @@ impl Transformer {
                         ys: &mut v,
                     },
                 ])?;
+                // The bias belongs to the projection, so it comes before any clip or norm.
+                if let Some([qb, kb, vb]) = &norms.qkv_bias {
+                    for (ys, b) in [(&mut q, qb), (&mut k, kb), (&mut v, vb)] {
+                        for row in ys.chunks_exact_mut(b.len()) {
+                            row.iter_mut().zip(b).for_each(|(y, &b)| *y += b);
+                        }
+                    }
+                }
                 if let Some(clip) = c.clip_qkv {
                     #[allow(clippy::cast_possible_truncation)]
                     let clip = clip as f32;
