@@ -106,6 +106,33 @@ jobs:
           docker logs qubivex
           test "$(docker inspect -f '{{.State.ExitCode}}' qubivex)" = 0
 
+  installer:
+    name: installer (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: shellcheck
+        if: runner.os == 'Linux'
+        run: shellcheck install.sh tests/install/run.sh
+      - name: Installer tests (fixture repository)
+        run: tests/install/run.sh
+      - name: Install this commit with the real installer
+        env:
+          QUBIVEX_NO_PROMPT: "1"
+          QUBIVEX_REPO_URL: file://${{ github.workspace }}
+        run: |
+          git branch -f ci-install HEAD
+          ./install.sh --branch ci-install --install-dir "$RUNNER_TEMP/bin"
+          "$RUNNER_TEMP/bin/qubivex" --version
+          "$RUNNER_TEMP/bin/qubivex" models list --dir fixtures/models
+          ./install.sh --uninstall --install-dir "$RUNNER_TEMP/bin"
+          test ! -e "$RUNNER_TEMP/bin/qubivex"
+
   deny:
     name: cargo deny
     runs-on: ubuntu-latest
