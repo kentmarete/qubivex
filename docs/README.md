@@ -4,6 +4,7 @@ Start with the page for what you want to do.
 
 | I want to | Read |
 |---|---|
+| Install it | [Installation](deployment/installation.md) |
 | Try it on my machine | [Local development](deployment/local-development.md) |
 | Run it as a service | [Linux deployment](deployment/linux-deployment.md), [macOS deployment](deployment/macos-deployment.md) |
 | Operate it | [Production operations](deployment/production-operations.md) |
@@ -79,6 +80,7 @@ case-insensitive filesystem.
 
 | Document | Contents |
 |---|---|
+| [installation.md](deployment/installation.md) | `install.sh`: options, layout, update, uninstall, troubleshooting |
 | [local-development.md](deployment/local-development.md) | Build, try, test |
 | [linux-deployment.md](deployment/linux-deployment.md) | systemd, Docker, Compose, the facts for Kubernetes |
 | [macos-deployment.md](deployment/macos-deployment.md) | CPU or Metal, launchd |

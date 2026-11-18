@@ -8,6 +8,15 @@
 
 **Qubivex is an independent, hardware-aware AI inference platform designed to download, manage, load, execute and serve large language models locally.**
 
+**Install** (Linux and macOS; builds from source, no sudo):
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/kentmarete/qubivex/main/install.sh | bash
+```
+
+Then run `qubivex system` to see your hardware. To read the script before running it, and
+for other options, updating and uninstalling, see [Installation](#installation).
+
 Built in Rust, Qubivex combines a high-performance tensor computation engine, a native inference runtime and an intelligent Mixture of Experts (MoE) execution architecture to make running AI models more efficient, accessible and adaptable to available hardware.
 
 Unlike solutions that rely on external inference runtimes, Qubivex aims to own the entire model inference lifecycle. From discovering and downloading models to managing model weights, allocating memory, routing experts, executing tensor operations and exposing inference APIs, everything is handled within the Qubivex ecosystem.
@@ -179,26 +188,73 @@ See the [Roadmap](#roadmap) for what is next.
 
 ## Installation
 
-QUBIVEX is not published to crates.io yet. Build it from source.
+QUBIVEX is not published to crates.io and has no prebuilt binaries yet. The installer
+builds it from source and installs the `qubivex` binary for your user, without sudo.
 
-**Requirements**
+**Quick installation**
 
-- Rust 1.88 or newer (`rustup` recommended). The workspace uses edition 2024.
-- Linux (x86-64 or arm64) or macOS (arm64 or x86-64). CI tests Linux x86-64 and macOS arm64.
-- A C compiler, for `ring` (the TLS library behind `qubivex models pull`). No Python or
-  GPU SDK is needed.
+```sh
+curl -fsSL https://raw.githubusercontent.com/kentmarete/qubivex/main/install.sh | bash
+```
 
-**Build and install**
+Piping a script into a shell runs it without showing it to you first. To read it before running it:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/kentmarete/qubivex/main/install.sh -o install.sh
+less install.sh
+bash install.sh
+```
+
+Options go after `bash -s --` when piping, e.g. `... | bash -s -- --branch main`.
+
+**Manual installation**
 
 ```sh
 git clone https://github.com/kentmarete/qubivex.git
 cd qubivex
-cargo build --release
-./target/release/qubivex --version
-
-# or put `qubivex` on your PATH:
-cargo install --path apps/cli
+chmod +x install.sh
+./install.sh
 ```
+
+The installer always builds a fresh clone of the requested branch or tag in a temporary
+directory, not the checkout it is run from. To build a checkout you have modified, use
+`cargo install --path apps/cli --locked`.
+
+**A specific branch or release**
+
+```sh
+./install.sh --branch main
+./install.sh --version 0.2.0      # tag v0.2.0 or 0.2.0
+```
+
+**Updating and uninstalling**
+
+```sh
+./install.sh --update             # rebuilds only if the installed branch has new commits
+./install.sh --uninstall          # removes the binary; ~/.qubivex and your models stay
+```
+
+**What it does.** It detects the OS and CPU and checks for git, a C compiler and Rust
+(at least the workspace's `rust-version`, 1.88 today). It then shallow-clones the
+repository into a temporary directory and runs `cargo install --path apps/cli --locked`
+(release profile: fat LTO, one codegen unit). The result goes into a staging directory,
+is checked with `qubivex --version`, and only then replaces any existing binary with a
+rename. It runs `qubivex system` and `qubivex doctor --storage` at the end; these report
+on the hardware and never fail the install. It never edits your shell startup files and
+never installs Rust unless you agree at the prompt or pass `--install-rust`.
+
+| | |
+|---|---|
+| Platforms | Linux x86-64 and arm64 (glibc), macOS Apple Silicon and Intel. CI runs the installer on Linux x86-64 and macOS arm64 |
+| Requirements | git; a C compiler (`xcode-select --install` on macOS, `build-essential` or `gcc` on Linux) for `ring`; Rust 1.88+; about 2 GB of free disk and several minutes for the build. No Python, CUDA, Vulkan SDK or Xcode |
+| Binary | `~/.cargo/bin/qubivex` (`$CARGO_HOME/bin`), or `--install-dir DIR` |
+| Models | `~/.qubivex/models` (the CLI's default; `--dir` or `QUBIVEX_MODELS_DIRS` change it) |
+| Install record | `~/.qubivex/install-receipt`: directory, branch or tag, commit, used by `--update` and `--uninstall` |
+
+If `~/.cargo/bin` is not on your `PATH`, the installer prints the line to add for your
+shell. All options, troubleshooting and upgrade details:
+[Installation](docs/deployment/installation.md). To build by hand instead:
+`cargo build --release --locked` and `./target/release/qubivex --version`.
 
 **Or as a container** (Linux, CPU backend):
 
