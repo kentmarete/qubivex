@@ -1246,7 +1246,7 @@ dependencies = [
 
 [[package]]
 name = "qubivex-api"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "kerniq-server",
  "qubivex-expert-stream",
@@ -1266,7 +1266,7 @@ dependencies = [
 
 [[package]]
 name = "qubivex-arch"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "qubivex-compute",
  "qubivex-core",
@@ -1277,7 +1277,7 @@ dependencies = [
 
 [[package]]
 name = "qubivex-backend-cpu"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "criterion",
  "proptest",
@@ -1289,7 +1289,7 @@ dependencies = [
 
 [[package]]
 name = "qubivex-backend-metal"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "criterion",
  "objc2",
@@ -1304,7 +1304,7 @@ dependencies = [
 
 [[package]]
 name = "qubivex-backend-vulkan"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "ash",
  "qubivex-arch",
@@ -1315,7 +1315,7 @@ dependencies = [
 
 [[package]]
 name = "qubivex-cli"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "clap",
  "qubivex-api",
@@ -1338,7 +1338,7 @@ dependencies = [
 
 [[package]]
 name = "qubivex-compute"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "qubivex-core",
  "thiserror",
@@ -1346,7 +1346,7 @@ dependencies = [
 
 [[package]]
 name = "qubivex-core"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "proptest",
  "serde",
@@ -1356,7 +1356,7 @@ dependencies = [
 
 [[package]]
 name = "qubivex-expert-stream"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "criterion",
  "loom",
@@ -1367,7 +1367,7 @@ dependencies = [
 
 [[package]]
 name = "qubivex-grammar"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "proptest",
  "serde",
@@ -1377,7 +1377,7 @@ dependencies = [
 
 [[package]]
 name = "qubivex-hardware"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "qubivex-core",
  "rustix",
@@ -1388,11 +1388,11 @@ dependencies = [
 
 [[package]]
 name = "qubivex-kv-cache"
-version = "0.1.0"
+version = "0.1.1"
 
 [[package]]
 name = "qubivex-memory"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "proptest",
  "qubivex-core",
@@ -1405,7 +1405,7 @@ dependencies = [
 
 [[package]]
 name = "qubivex-model"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "proptest",
  "qubivex-core",
@@ -1417,7 +1417,7 @@ dependencies = [
 
 [[package]]
 name = "qubivex-model-download"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "qubivex-model",
  "qubivex-model-registry",
@@ -1432,7 +1432,7 @@ dependencies = [
 
 [[package]]
 name = "qubivex-model-registry"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "qubivex-model",
  "rustix",
@@ -1443,7 +1443,7 @@ dependencies = [
 
 [[package]]
 name = "qubivex-runtime"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "qubivex-arch",
  "qubivex-backend-cpu",
@@ -1467,14 +1467,14 @@ dependencies = [
 
 [[package]]
 name = "qubivex-scheduler"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "loom",
 ]
 
 [[package]]
 name = "qubivex-tokenizer"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "minijinja",
  "minijinja-contrib",
@@ -2506,7 +2506,7 @@ checksum = "f17a85883d4e6d00e8a97c586de764dabcc06133f7f1d55dce5cdc070ad7fe59"
 
 [[package]]
 name = "xtask"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "qubivex-core",
  "qubivex-model",

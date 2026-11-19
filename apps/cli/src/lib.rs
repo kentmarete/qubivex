@@ -5,6 +5,7 @@
 //! `plan` (Phase 5); `serve` later.
 
 mod analyse;
+mod background;
 mod bench;
 mod doctor;
 mod keys;
@@ -13,7 +14,9 @@ mod plan;
 mod pull;
 mod run;
 mod serve;
+mod serve_detach;
 mod system;
+mod update;
 
 use std::ffi::OsString;
 use std::io::Write;
@@ -128,7 +131,7 @@ enum Command {
     },
     /// Serve models over an OpenAI-compatible HTTP API (/v1/chat/completions,
     /// /v1/completions, /v1/models, /health, /metrics).
-    Serve(serve::ServeFlags),
+    Serve(serve_detach::ServeArgs),
     /// Time prefill and decode, and record them with hardware, build flags, peak
     /// memory and a token check (docs/performance/BENCHMARKING.md).
     Bench {
@@ -260,6 +263,9 @@ enum Command {
         #[command(subcommand)]
         command: KeysCommand,
     },
+    /// Update qubivex to the newest commit of the branch install.sh installed
+    /// (--detach runs it in the background).
+    Update(update::UpdateFlags),
 }
 
 #[derive(Debug, Subcommand)]
@@ -1084,7 +1090,8 @@ fn execute(cmd: &Command) -> Result<(), String> {
             threads: *threads,
             quiet: *quiet,
         }),
-        Command::Serve(flags) => serve::serve(serve::plan(flags.clone())?),
+        Command::Serve(args) => serve_detach::serve(args),
+        Command::Update(flags) => update::update(flags),
         Command::Bench {
             model,
             dirs,
