@@ -275,9 +275,16 @@ pub fn import(
                     };
                 }
                 match check(&m, &tensors, hf_config.as_ref(), registry) {
-                    Ok(_) => {
+                    Ok((cfg, _)) => {
                         let mut m = m;
                         m.quantization = dominant_dtype(&tensors);
+                        // RoPE scaling arrived in transformer_dense 1.2 and
+                        // transformer_moe 1.1: an older build must refuse the manifest
+                        // rather than run it with unscaled positions.
+                        if cfg.describe["rope_scaling"]["type"] != "none" {
+                            let minor = if arch == "transformer_dense" { 2 } else { 1 };
+                            m.architecture.version.minor = m.architecture.version.minor.max(minor);
+                        }
                         return Ok(Imported {
                             dir,
                             manifest: m,

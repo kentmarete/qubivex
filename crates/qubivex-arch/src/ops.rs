@@ -9,6 +9,7 @@
 /// RMSNorm in place and its factor (defined in `qubivex-compute`, so a device backend
 /// can give the same bits without depending on this crate).
 pub use qubivex_compute::math::{rms_norm, rms_scale};
+use qubivex_model::arch::RopeScaling;
 
 /// RoPE tables for `rotary_dim` dimensions: `cos` and `sin` of `pos · θ^(−2i/d)`.
 #[derive(Clone, Debug)]
@@ -17,17 +18,48 @@ pub struct Rope {
 }
 
 impl Rope {
-    /// Inverse frequencies as `transformers` computes them (f32).
+    /// Inverse frequencies as `transformers` computes them (f32), with the power
+    /// correctly rounded.
     #[must_use]
     pub fn new(head_dim: usize, theta: f64) -> Self {
         #[allow(clippy::cast_possible_truncation, clippy::cast_precision_loss)]
         let inv_freq = (0..head_dim / 2)
             .map(|i| {
+                // The power is computed in f64 and rounded once, so it is the correctly
+                // rounded f32 on every platform. An f32 `powf` is not (θ = 500 000, d = 128,
+                // i = 6 is one ulp off on macOS), and torch's is within one ulp of this.
                 let e = (2 * i) as f32 / head_dim as f32;
-                1.0 / (theta as f32).powf(e)
+                1.0 / theta.powf(f64::from(e)) as f32
             })
             .collect();
         Self { inv_freq }
+    }
+
+    /// [`Rope::new`] with the inverse frequencies scaled as `transformers` scales them,
+    /// operation for operation in f32, so the bits match its tables.
+    #[must_use]
+    pub fn with_scaling(head_dim: usize, theta: f64, scaling: &RopeScaling) -> Self {
+        let mut r = Self::new(head_dim, theta);
+        match *scaling {
+            RopeScaling::None => {}
+            RopeScaling::Banded {
+                factor,
+                low_freq_factor,
+                high_freq_factor,
+                original_max_position_embeddings,
+            } => {
+                for f in &mut r.inv_freq {
+                    *f = banded(
+                        *f,
+                        factor,
+                        low_freq_factor,
+                        high_freq_factor,
+                        original_max_position_embeddings,
+                    );
+                }
+            }
+        }
+        r
     }
 
     /// Pairs per head (`head_dim / 2`).
@@ -74,6 +106,29 @@ impl Rope {
     }
 }
 
+/// One inverse frequency under banded scaling, as `transformers` computes it. Python
+/// scalars meet the f32 tensor rounded to f32, and torch evaluates `scalar / tensor` as
+/// `reciprocal(tensor) · scalar`; both are mirrored, and each step rounds once (no
+/// fused multiply-add), as torch's separate kernels do.
+#[allow(clippy::cast_possible_truncation, clippy::cast_precision_loss)]
+fn banded(inv: f32, factor: f64, low: f64, high: f64, original: u64) -> f32 {
+    let old = original as f64;
+    let (factor_f, low_f) = (factor as f32, low as f32);
+    let low_wavelen = (old / low) as f32;
+    let high_wavelen = (old / high) as f32;
+    let wavelen = (1.0 / inv) * (2.0 * std::f64::consts::PI) as f32;
+    let scaled = if wavelen > low_wavelen {
+        inv / factor_f
+    } else {
+        inv
+    };
+    if wavelen < high_wavelen || wavelen > low_wavelen {
+        return scaled;
+    }
+    let smooth = ((1.0 / wavelen) * old as f32 - low_f) / (high - low) as f32;
+    (1.0 - smooth) * scaled / factor_f + smooth * scaled
+}
+
 /// `silu(g) · u`, in place into `g` (defined in `qubivex-compute`, so a device backend
 /// can give the same bits without depending on this crate).
 pub use qubivex_compute::math::swiglu;
@@ -97,6 +152,137 @@ mod tests {
         let r = (12.5f64).sqrt();
         assert!((f64::from(x[0]) - 3.0 / r).abs() < 1e-6);
         assert!((f64::from(x[1]) - 8.0 / r).abs() < 1e-6);
+    }
+
+    /// Plain RoPE's inverse frequencies against `transformers` 5.22.1's
+    /// default rotary embedding (f32, CPU, arm64), at the common bases. Ours are the
+    /// correctly rounded power; torch's vectorised f32 `pow` is within one ulp of it and
+    /// misses in rare entries (θ = 10⁶, d = 128, i = 37), so this allows one ulp in at
+    /// most one entry per base.
+    #[test]
+    fn plain_rope_matches_transformers_bits() {
+        #[rustfmt::skip]
+        let cases: [(usize, f64, &str); 4] = [
+            (128, 500000.0, concat!(
+                "3f8000003f508ac13f29e1c63f0a63843ee177bc3eb7ab7d3e959ee33e73c461",
+                "3e4693b03e21c3a03e03c6a03dd6b19c3daee4ad3d8e78983d681e673d3d1684",
+                "3d1a08c83cfaf53f3ccc6f493ca689393c87a9c33c5d06ec3c340d6d3c12ac7f",
+                "3beef74f3bc2aa763b9e94023b812e353b5277203b2b72dc3b0baa413ae38c10",
+                "3ab95d213a9700233a7603ea3a4868863a23418d3a04fdbf39d8ac8139b08199",
+                "398fc8f8396a426f393ed4f4391b747538fd45c338ce51f538a8126b3888ea0f",
+                "385f10c43835b687381406cb37f12b8037c4761037a00a6937825f3437546808",
+                "372d07a7370cf40036e5a54d36bb12c7369864a7367848c2364a41b03624c2ff",
+            )),
+            (128, 1000000.0, concat!(
+                "3f8000003f4e4bad3f263de03f05f6ef3ed7e89b3eadfcff3e8c35043e61f835",
+                "3e3618873e12bd913dec7fd63dbe94c63d99940d3d7785133d47763f3d20bc1d",
+                "3d0186e33cd0c1a83ca8398b3c8790083c5a7bf23c3010523c0de12d3be4aa46",
+                "3bb8449c3b947dae3b6f520e3b40dac53b1b690d3afa78f03ac9d75c3aa2a6f7",
+                "3a83126f3a533f283a2a3b443a092e0239dd172539b229fb398f927239676492",
+                "393a77533916432438f22ce238c327b5389d43a4387d75d4384c3fbe382497ab",
+                "3804a2b237d5c44137ac431d378ad0ed375fba4f37344a0e371148e336ea2732",
+                "36bcb0c136980e023675107036457bab361f23e436003dec35ceaf7935a68e4c",
+            )),
+            (64, 10000.0, concat!(
+                "3f8000003f3ff9113f0ff59a3ed7e89b3ea1e89b3e72d4233e3618873e088d77",
+                "3dcccccd3d99940d3d6655c23d2cba153d0186e33cc2434f3c91ad393c5a7bf2",
+                "3c23d70a3bf5b9b03bb8449c3b8a2e773b4f3e383b1b690d3ae915283aaec98e",
+                "3a83126f3a44948c3a136a1639dd172539a5cb603978a815393a7753390bd472",
+            )),
+            (128, 10000.0, concat!(
+                "3f8000003f5dafd73f3ff9113f263de03f0ff59a3ef953cf3ed7e89b3ebaf81b",
+                "3ea1e89b3e8c35043e72d4233e5247ed3e3618873e1db0403e088d773dec7fd6",
+                "3dcccccd3db159783d99940d3d84fe4d3d6655c23d47763f3d2cba153d159348",
+                "3d0186e33ce054d23cc2434f3ca8398b3c91ad393c7c4d333c5a7bf23c3d3311",
+                "3c23d70a3c0de12d3bf5b9b03bd4ca153bb8449c3b9f91cc3b8a2e773b6f520e",
+                "3b4f3e383b33770f3b1b690d3b06946f3ae915283ac9d75c3aaec98e3a975c0e",
+                "3a83126f3a6301e23a44948c3a2a3b443a136a1639ff4fac39dd172539bf74d7",
+                "39a5cb60398f92723978a815395753e4393a775339217916390bd47238f22ce2",
+            )),
+        ];
+        for (d, theta, hex) in cases {
+            let want: Vec<u32> = (0..hex.len() / 8)
+                .map(|i| u32::from_str_radix(&hex[8 * i..8 * i + 8], 16).unwrap())
+                .collect();
+            let got: Vec<u32> = Rope::new(d, theta)
+                .inv_freq
+                .iter()
+                .map(|f| f.to_bits())
+                .collect();
+            assert_eq!(got.len(), want.len());
+            let off: Vec<usize> = (0..got.len()).filter(|&i| got[i] != want[i]).collect();
+            assert!(off.len() <= 1, "d={d} theta={theta}: {off:?} differ");
+            for i in off {
+                assert_eq!(got[i].abs_diff(want[i]), 1, "d={d} theta={theta} i={i}");
+            }
+        }
+    }
+
+    /// Inverse frequencies under banded scaling, bit for bit against `transformers`
+    /// 5.22.1 (f32, CPU): the factors of two released checkpoints (32 and 8 at θ = 500 000)
+    /// and two made-up configs whose bands fall elsewhere. Each value is its f32 bits in hex.
+    #[test]
+    #[allow(clippy::float_cmp)]
+    fn banded_scaling_matches_transformers_bits() {
+        #[rustfmt::skip]
+        let cases: [(usize, f64, f64, f64, f64, u64, &str); 4] = [
+            (128, 500000.0, 32.0, 1.0, 4.0, 8192, concat!(
+                "3f8000003f508ac13f29e1c63f0a63843ee177bc3eb7ab7d3e959ee33e73c461",
+                "3e4693b03e21c3a03e03c6a03dd6b19c3daee4ad3d8e78983d681e673d3d1684",
+                "3d1a08c83cfaf53f3ccc6f493ca689393c87a9c33c5d06ec3c340d6d3c12ac7f",
+                "3beef74f3bc2aa763b9e94023b812e353b5277203b0ad4f83aa9279b3a47e547",
+                "39e136203969959938cb98f737c8688637a3418d3784fdbf3758ac8137308199",
+                "370fc8f836ea426f36bed4f4369b7475367d45c3364e51f53628126b3608ea0f",
+                "35df10c435b5b687359406cb35712b803544761035200a6935025f3434d46808",
+                "34ad07a7348cf4003465a54d343b12c7341864a733f848c233ca41b033a4c2ff",
+            )),
+            (128, 500000.0, 8.0, 1.0, 4.0, 8192, concat!(
+                "3f8000003f508ac13f29e1c63f0a63843ee177bc3eb7ab7d3e959ee33e73c461",
+                "3e4693b03e21c3a03e03c6a03dd6b19c3daee4ad3d8e78983d681e673d3d1684",
+                "3d1a08c83cfaf53f3ccc6f493ca689393c87a9c33c5d06ec3c340d6d3c12ac7f",
+                "3beef74f3bc2aa763b9e94023b812e353b5277203b0dfd063ab3d11d3a60979e",
+                "3a0995d239a3f108393b2dd238c8688638a3418d3884fdbf3858ac8138308199",
+                "380fc8f837ea426f37bed4f4379b7475377d45c3374e51f53728126b3708ea0f",
+                "36df10c436b5b687369406cb36712b803644761036200a6936025f3435d46808",
+                "35ad07a7358cf4003565a54d353b12c7351864a734f848c234ca41b034a4c2ff",
+            )),
+            (64, 10000.0, 4.0, 1.5, 3.0, 2048, concat!(
+                "3f8000003f3ff9113f0ff59a3ed7e89b3ea1e89b3e72d4233e3618873e088d77",
+                "3dcccccd3d99940d3d6655c23d2cba153d0186e33cc2434f3c91ad393c5a7bf2",
+                "3c23d70a3bb172903b197c513a8a2e773a4f3e383a1b690d39e9152839aec98e",
+                "3983126f3944948c39136a1638dd172538a5cb603878a815383a7753380bd472",
+            )),
+            (96, 1000000.0, 16.0, 0.5, 7.0, 4096, concat!(
+                "3f8000003f3ff9113f0ff59a3ed7e89b3ea1e89b3e72d4253e3618873e088d78",
+                "3dcccccc3d99940d3d6655c43d2cba143d0186e33cc2434e3c91ad3a3c5a7bf2",
+                "3c1879263baae4a63b3f50733ad5d6a93a6e81ce3a04a09c3992ebe93921e0a1",
+                "38b104743844948f38136a1437dd172537a5cb623778a80f373a7753370bd474",
+                "36d1b713369d43a4366bdcf53630df4e3604a2b235c6ece035952c40355fba4f",
+                "3527c5b034fb9f6734bcb0c1348d7f7634543781341f23e433eead3b33b2fb6f",
+            )),
+        ];
+        for (d, theta, factor, low, high, old, hex) in cases {
+            let r = Rope::with_scaling(
+                d,
+                theta,
+                &RopeScaling::Banded {
+                    factor,
+                    low_freq_factor: low,
+                    high_freq_factor: high,
+                    original_max_position_embeddings: old,
+                },
+            );
+            let want: Vec<u32> = (0..hex.len() / 8)
+                .map(|i| u32::from_str_radix(&hex[8 * i..8 * i + 8], 16).unwrap())
+                .collect();
+            let got: Vec<u32> = r.inv_freq.iter().map(|f| f.to_bits()).collect();
+            assert_eq!(got, want, "d={d} theta={theta} factor={factor}");
+        }
+        // No scaling is plain RoPE.
+        assert_eq!(
+            Rope::with_scaling(64, 1e4, &RopeScaling::None).inv_freq,
+            Rope::new(64, 1e4).inv_freq
+        );
     }
 
     #[test]

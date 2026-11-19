@@ -163,8 +163,8 @@ Errors fail the request, not the process.
 - **Architectures beyond `transformer_moe` and `transformer_dense`.** No multi-head
   latent attention, state-space or encoder models.
 - **Sigmoid router scoring,** shared experts, output-projection or FFN biases (q/k/v biases are supported), non-SiLU
-  activations, RoPE scaling and sliding-window attention. Each is refused at load with
-  a message naming it.
+  activations, RoPE scaling other than `llama3`, and sliding-window attention. Each is
+  refused at load with a message naming it.
 - **Repetition, presence and frequency penalties, logit bias, logprobs, beam search and
   grammar-constrained sampling.**
 - **Multimodal input, embeddings output and LoRA adapters.**

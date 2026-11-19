@@ -96,6 +96,7 @@ would then run in a debug build and take many minutes.
 | `QUBIVEX_OLMOE_GGUF_DIR` | The OLMoE Q4_K_M model directory: `real_model`, `metal_parity`, `ledger_rss` and others in `crates/qubivex-runtime/tests` |
 | `QUBIVEX_OLMOE_TOKENIZER_JSON` | The official `tokenizer.json`, to compare with the tokenizer rebuilt from the GGUF |
 | `QUBIVEX_DENSE_SAFETENSORS_DIR` | A dense SafeTensors model directory: `real_dense` |
+| `QUBIVEX_LLAMA3_SAFETENSORS_DIR` | The imported `meta-llama/Llama-3.2-3B` directory (gated: needs `HF_TOKEN` to download): `real_dense` |
 | `QUBIVEX_REAL_MODEL_FILES`, `QUBIVEX_REAL_MODEL_DIRS` | `:`-separated files and directories for the container readers: `qubivex-model --test real_files` |
 
 ```sh

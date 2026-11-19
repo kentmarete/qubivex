@@ -15,8 +15,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use super::common::{
-    AttentionNames, DecoderDims, QkNorm, Values, attention_specs, cfg_err, decoder_capabilities,
-    decoder_dims, nonzero, unsupported_common,
+    AttentionNames, DecoderDims, QkNorm, RopeScaling, Values, attention_specs, cfg_err,
+    decoder_capabilities, decoder_dims, nonzero, unsupported_common,
 };
 use crate::ModelError;
 use crate::manifest::{ManifestFormat, SemVer};
@@ -209,6 +209,8 @@ pub struct DenseConfig {
     pub rms_eps: f64,
     /// RoPE base.
     pub rope_theta: f64,
+    /// RoPE frequency scaling.
+    pub rope_scaling: RopeScaling,
     /// Clamp q, k and v to `[-clip, clip]` after projection, if set.
     pub clip_qkv: Option<f64>,
     /// Maximum context, if stated.
@@ -294,7 +296,7 @@ impl ArchitectureFactory for TransformerDense {
     fn version(&self) -> SemVer {
         SemVer {
             major: 1,
-            minor: 1,
+            minor: 2,
             patch: 0,
         }
     }
@@ -331,6 +333,7 @@ impl ArchitectureFactory for TransformerDense {
             vocab,
             rms_eps,
             rope_theta,
+            rope_scaling,
             clip_qkv,
             max_context,
             tie_embeddings,
@@ -349,6 +352,7 @@ impl ArchitectureFactory for TransformerDense {
             ffn,
             rms_eps,
             rope_theta,
+            rope_scaling,
             clip_qkv,
             max_context,
             tie_embeddings,

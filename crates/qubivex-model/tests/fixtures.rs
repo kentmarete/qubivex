@@ -132,3 +132,34 @@ fn the_dense_architecture_refuses_what_it_does_not_implement() {
     let imported = import(&root().join("dense-tiny"), &ImportOptions::default(), &reg).unwrap();
     assert_eq!(imported.manifest.architecture.id, "transformer_dense");
 }
+
+/// A checkpoint with llama3 RoPE scaling imports as a version that older builds refuse,
+/// and loads with the scaling; one without it keeps the lowest version.
+#[test]
+fn llama3_scaling_imports_at_the_version_that_runs_it() {
+    let reg = ArchitectureRegistry::with_builtins();
+    let d = copy("dense-tiny", "llama3");
+    std::fs::remove_file(d.0.join("manifest.json")).unwrap();
+    let cfg_path = d.0.join("config.json");
+    let mut cfg: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&cfg_path).unwrap()).unwrap();
+    let plain = import(&d.0, &ImportOptions::default(), &reg)
+        .unwrap()
+        .manifest;
+    assert_eq!(plain.architecture.version.minor, 0);
+    cfg["rope_scaling"] = serde_json::json!({
+        "rope_type": "llama3", "factor": 32.0, "low_freq_factor": 1.0,
+        "high_freq_factor": 4.0, "original_max_position_embeddings": 8192
+    });
+    std::fs::write(&cfg_path, cfg.to_string()).unwrap();
+    let m = import(&d.0, &ImportOptions::default(), &reg)
+        .unwrap()
+        .manifest;
+    m.save(&d.0).unwrap();
+    assert_eq!(
+        (m.architecture.id.as_str(), m.architecture.version.minor),
+        ("transformer_dense", 2)
+    );
+    let loaded = ModelMetadata::load(&d.0, &reg).unwrap();
+    assert_eq!(loaded.config.describe["rope_scaling"]["type"], "llama3");
+}

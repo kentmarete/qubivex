@@ -148,3 +148,24 @@ kernel (Q5_K, Q4_0, ...) passed validation and failed only when the forward pass
   check exists and is tested with a backend lacking Q8_0.
 - **`qubivex models architectures`** prints each architecture's capabilities and each
   backend's formats. `ArchDescriptor` carries the capabilities, so an API can list them.
+
+### Amendment: Llama 3 RoPE scaling (2026-11-19)
+
+- **`rope_type: "llama3"`** is accepted in `rope_scaling` or `rope_parameters` with its
+  four values (`factor` ≥ 1, `0 < low_freq_factor < high_freq_factor`,
+  `original_max_position_embeddings` > 0); a missing or extra key is refused by name, and
+  the two places must agree. The parsed `RopeScaling` is part of `DenseConfig` and
+  `MoeConfig`, and `Rope::with_scaling` applies it to the inverse frequencies, so every
+  backend's tables carry it. `ROPE_SCALINGS` is `["default", "llama3"]`, and the type
+  check reads it.
+- **Versions:** `transformer_dense` 1.2.0, `transformer_moe` 1.1.0, so an older build
+  refuses a manifest that may need the scaling.
+- **Bits:** the llama3 adjustment mirrors `transformers`' f32 operations (a Python scalar
+  rounds to f32; `scalar / tensor` is `reciprocal(tensor) · scalar`) and matches it bit for
+  bit. The base power `θ^(2i/d)` is now the correctly rounded f32 (an f64 power rounded
+  once) instead of an f32 `powf`, which was one ulp off on macOS for some bases; torch's
+  own f32 `pow` is within one ulp of it.
+
+Verified: `qubivex-arch` unit tests against transformers' inverse frequencies;
+`real_dense` on Llama-3.2-3B (`QUBIVEX_LLAMA3_SAFETENSORS_DIR`,
+`fixtures/oracle/llama3_real.json`).

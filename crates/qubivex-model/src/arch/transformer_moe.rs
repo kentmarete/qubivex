@@ -14,8 +14,8 @@ use serde_json::Value;
 
 pub use super::common::QkNorm;
 use super::common::{
-    AttentionNames, DecoderDims, Values, attention_specs, cfg_err, decoder_capabilities,
-    decoder_dims, nonzero, small, unsupported_common,
+    AttentionNames, DecoderDims, RopeScaling, Values, attention_specs, cfg_err,
+    decoder_capabilities, decoder_dims, nonzero, small, unsupported_common,
 };
 use crate::ModelError;
 use crate::manifest::{ManifestFormat, SemVer};
@@ -230,6 +230,8 @@ pub struct MoeConfig {
     pub rms_eps: f64,
     /// RoPE base.
     pub rope_theta: f64,
+    /// RoPE frequency scaling.
+    pub rope_scaling: RopeScaling,
     /// Clamp q, k and v to `[-clip, clip]` after projection, if set.
     pub clip_qkv: Option<f64>,
     /// Maximum context, if stated.
@@ -364,7 +366,7 @@ impl ArchitectureFactory for TransformerMoe {
     fn version(&self) -> SemVer {
         SemVer {
             major: 1,
-            minor: 0,
+            minor: 1,
             patch: 0,
         }
     }
@@ -408,6 +410,7 @@ impl ArchitectureFactory for TransformerMoe {
             vocab,
             rms_eps,
             rope_theta,
+            rope_scaling,
             clip_qkv,
             max_context,
             tie_embeddings,
@@ -444,6 +447,7 @@ impl ArchitectureFactory for TransformerMoe {
             norm_topk_prob,
             rms_eps,
             rope_theta,
+            rope_scaling,
             clip_qkv,
             max_context,
             tie_embeddings,

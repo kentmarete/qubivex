@@ -3,7 +3,8 @@
 //! dimensions every decoder-only transformer has.
 
 use qubivex_core::{DType, GgmlType, LayerIdx};
-use serde_json::Value;
+use serde::Serialize;
+use serde_json::{Map, Value};
 
 use crate::registry::{ArchCapabilities, AttentionPart, TensorRole, TensorSpec};
 use crate::{GgufMetadata, GgufValue, ModelError};
@@ -19,8 +20,35 @@ pub(crate) const WEIGHT_FORMATS: [DType; 6] = [
     DType::Ggml(GgmlType::Q6_K),
 ];
 
+/// The `rope_type` naming wavelength-banded scaling ([`RopeScaling::Banded`]).
+pub(crate) const ROPE_BANDED: &str = "llama3"; // model-name-ok: the rope_type value in config.json
+
 /// RoPE scaling types the shared decoder implements.
-pub(crate) const ROPE_SCALINGS: [&str; 1] = ["default"];
+pub(crate) const ROPE_SCALINGS: [&str; 2] = ["default", ROPE_BANDED];
+
+/// How RoPE's inverse frequencies are scaled, from `rope_scaling` / `rope_parameters`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Serialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum RopeScaling {
+    /// Plain RoPE: `theta^(-2i/d)`.
+    #[default]
+    None,
+    /// Wavelength-banded scaling (`rope_type` [`ROPE_BANDED`] in transformers):
+    /// wavelengths longer than `original_max_position_embeddings / low_freq_factor` are
+    /// divided by `factor`, shorter than `… / high_freq_factor` are kept, and the band
+    /// between is blended. Described as its config value.
+    #[serde(rename = "llama3")] // model-name-ok: the rope_type value in config.json
+    Banded {
+        /// How much longer the context is than the original.
+        factor: f64,
+        /// The long-wavelength edge of the blend.
+        low_freq_factor: f64,
+        /// The short-wavelength edge of the blend.
+        high_freq_factor: f64,
+        /// The context the model was first trained at.
+        original_max_position_embeddings: u64,
+    },
+}
 
 /// The capabilities of a decoder built from the shared components: the common
 /// attention options plus `attention`, and its FFN.
@@ -181,6 +209,7 @@ pub(crate) struct DecoderDims {
     pub(crate) vocab: u64,
     pub(crate) rms_eps: f64,
     pub(crate) rope_theta: f64,
+    pub(crate) rope_scaling: RopeScaling,
     pub(crate) clip_qkv: Option<f64>,
     pub(crate) max_context: Option<u64>,
     pub(crate) tie_embeddings: bool,
@@ -247,6 +276,7 @@ pub(crate) fn decoder_dims(
             "rms_norm_eps and rope_theta must be positive and finite",
         ));
     }
+    let rope_scaling = rope_scaling(v)?;
     let clip_qkv = v.f64("clip_qkv", None)?;
     let max_context = v.u64("max_position_embeddings", Some("context_length"))?;
     let tie_embeddings = v.bool("tie_word_embeddings", None)?.unwrap_or(false);
@@ -259,6 +289,7 @@ pub(crate) fn decoder_dims(
         vocab,
         rms_eps,
         rope_theta,
+        rope_scaling,
         clip_qkv,
         max_context,
         tie_embeddings,
@@ -289,28 +320,116 @@ pub(crate) fn unsupported_common(v: &Values<'_>) -> Result<(), ModelError> {
             "use_sliding_window = true: sliding-window attention is not supported yet",
         ));
     }
-    // transformers 5 writes RoPE settings as `rope_parameters`, older checkpoints as
-    // `rope_scaling`; any variant in either changes every position. Only plain RoPE is
-    // implemented: a `rope_theta` and a type of `default`, nothing else.
+    Ok(())
+}
+
+/// Reads the RoPE scaling. transformers 5 writes RoPE settings as `rope_parameters`,
+/// older checkpoints as `rope_scaling`; any variant in either changes every position,
+/// so a key this build does not apply is refused rather than ignored.
+pub(crate) fn rope_scaling(v: &Values<'_>) -> Result<RopeScaling, ModelError> {
+    let mut found = RopeScaling::None;
     for key in ["rope_scaling", "rope_parameters"] {
-        if let Some(Value::Object(rs)) = v.get(key, None)? {
-            for (k, val) in rs {
-                let plain = match k.as_str() {
-                    "rope_theta" => true,
-                    "rope_type" | "type" => {
-                        val.as_str().is_some_and(|t| ROPE_SCALINGS.contains(&t))
-                    }
-                    _ => false,
-                };
-                if !plain {
-                    return Err(cfg_err(format!(
-                        "{key}.{k} = {val}: only plain RoPE is supported yet"
-                    )));
-                }
+        let Some(Value::Object(rs)) = v.get(key, None)? else {
+            continue;
+        };
+        let this = rope_scaling_of(key, &rs)?;
+        if this != RopeScaling::None {
+            if found != RopeScaling::None && found != this {
+                return Err(cfg_err(
+                    "rope_scaling and rope_parameters describe different scalings",
+                ));
             }
+            found = this;
         }
     }
-    Ok(())
+    Ok(found)
+}
+
+fn rope_scaling_of(key: &str, rs: &Map<String, Value>) -> Result<RopeScaling, ModelError> {
+    // Both spellings of the type must name the same scaling, and one this build applies
+    // (the capability list, so the check and the declaration cannot drift).
+    let mut kind = "default";
+    for k in ["rope_type", "type"] {
+        let Some(val) = rs.get(k) else { continue };
+        let t = val
+            .as_str()
+            .filter(|t| ROPE_SCALINGS.contains(t))
+            .ok_or_else(|| {
+                cfg_err(format!(
+                    "{key}.{k} = {val}: only {} RoPE is supported yet",
+                    ROPE_SCALINGS.join(" and ")
+                ))
+            })?;
+        if kind != "default" && t != kind || t == "default" && kind != "default" {
+            return Err(cfg_err(format!(
+                "{key}: rope_type and type name different scalings"
+            )));
+        }
+        kind = t;
+    }
+    // Keys each kind reads; any other is refused.
+    let known: &[&str] = if kind == ROPE_BANDED {
+        &[
+            "rope_theta",
+            "rope_type",
+            "type",
+            "factor",
+            "low_freq_factor",
+            "high_freq_factor",
+            "original_max_position_embeddings",
+        ]
+    } else {
+        &["rope_theta", "rope_type", "type"]
+    };
+    if let Some((k, val)) = rs.iter().find(|(k, _)| !known.contains(&k.as_str())) {
+        return Err(cfg_err(format!(
+            "{key}.{k} = {val}: {kind} RoPE does not read it; only {} RoPE is supported yet",
+            ROPE_SCALINGS.join(" and ")
+        )));
+    }
+    if kind == "default" {
+        return Ok(RopeScaling::None);
+    }
+    let num = |k: &str| {
+        rs.get(k)
+            .and_then(Value::as_f64)
+            .filter(|x| x.is_finite())
+            .ok_or_else(|| {
+                cfg_err(format!(
+                    "{key}.{k}: {ROPE_BANDED} scaling needs it as a finite number"
+                ))
+            })
+    };
+    let (factor, low, high) = (
+        num("factor")?,
+        num("low_freq_factor")?,
+        num("high_freq_factor")?,
+    );
+    let original = rs
+        .get("original_max_position_embeddings")
+        .and_then(Value::as_u64)
+        .filter(|&n| n > 0)
+        .ok_or_else(|| {
+            cfg_err(format!(
+                "{key}.original_max_position_embeddings: {ROPE_BANDED} scaling needs it as a positive integer"
+            ))
+        })?;
+    if factor < 1.0 {
+        return Err(cfg_err(format!(
+            "{key}.factor = {factor}: must be at least 1"
+        )));
+    }
+    if !(low > 0.0 && high > low) {
+        return Err(cfg_err(format!(
+            "{key}: low_freq_factor ({low}) must be positive and below high_freq_factor ({high})"
+        )));
+    }
+    Ok(RopeScaling::Banded {
+        factor,
+        low_freq_factor: low,
+        high_freq_factor: high,
+        original_max_position_embeddings: original,
+    })
 }
 
 /// Tensor-name patterns of one attention block (`{L}` is the layer).
