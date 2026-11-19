@@ -97,6 +97,27 @@ impl ApiError {
         )
     }
 
+    /// 404 `not_found` with `message`.
+    pub(crate) fn not_found_message(message: String) -> Self {
+        Self::new(
+            StatusCode::NOT_FOUND,
+            "invalid_request_error",
+            "not_found",
+            message,
+        )
+    }
+
+    /// 502: a model source failed or could not be reached. The message holds no URL or
+    /// credential.
+    pub(crate) fn upstream(message: impl Into<String>) -> Self {
+        Self::new(
+            StatusCode::BAD_GATEWAY,
+            "server_error",
+            "upstream_error",
+            message.into(),
+        )
+    }
+
     /// 409: a model with this id is already loaded.
     pub fn conflict(message: impl Into<String>) -> Self {
         Self::new(

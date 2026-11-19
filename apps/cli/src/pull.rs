@@ -2,16 +2,19 @@
 
 use std::collections::BTreeMap;
 use std::io::{IsTerminal, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use qubivex_api::{
+    ModelSource, PullOutcome, PullProgress, PullSpec, SourceError, SourceErrorKind, SourceHit,
+};
 use qubivex_core::Bytes;
 use qubivex_model::{ArchitectureRegistry, ModelMetadata};
 use qubivex_model_download::{
-    DEFAULT_BUDGET, DEFAULT_ENDPOINT, HuggingFace, Progress, PullOptions, PullRequest, Token, pull,
-    search,
+    DEFAULT_BUDGET, DEFAULT_ENDPOINT, DownloadError, HuggingFace, Progress, PullOptions,
+    PullRequest, Token, pull, search,
 };
 use qubivex_model_registry::Registry;
 use serde_json::json;
@@ -259,4 +262,201 @@ pub(crate) fn search_cmd(query: &str, limit: usize, json_out: bool) -> Result<St
         out.push('\n');
     }
     Ok(out)
+}
+
+/// What `qubivex serve` downloads with, for the admin download routes: Hugging Face,
+/// installing into the first models directory. The gateway itself has no network code
+/// (ADR-014); this is where it gets some.
+#[derive(Debug)]
+pub(crate) struct HubSource {
+    root: PathBuf,
+}
+
+impl HubSource {
+    pub(crate) fn new(root: PathBuf) -> Self {
+        Self { root }
+    }
+
+    /// `e` as a client may see it: no path, URL or credential, and wording for the API
+    /// rather than the command line.
+    fn error(&self, e: &DownloadError) -> SourceError {
+        use SourceErrorKind as K;
+        use qubivex_model_registry::RegistryError as R;
+        let (kind, message) = match e {
+            DownloadError::Cancelled => (
+                K::Cancelled,
+                "cancelled; retry the job to continue from what arrived".to_owned(),
+            ),
+            DownloadError::Io { source, .. } => (
+                K::Local,
+                format!("a file operation in the models directory failed: {source}"),
+            ),
+            DownloadError::NoSpace {
+                needed, available, ..
+            } => (
+                K::Local,
+                format!(
+                    "the models directory needs {} more, and {} are free",
+                    Bytes(*needed),
+                    Bytes(*available)
+                ),
+            ),
+            DownloadError::Registry(r) => match r {
+                R::AlreadyInstalled(_) | R::InstallInProgress(_) => (K::Conflict, r.to_string()),
+                R::InvalidId(_) | R::Validation { .. } => (K::Invalid, r.to_string()),
+                R::Io { source, .. } => (
+                    K::Local,
+                    format!("the model registry could not be updated: {source}"),
+                ),
+                _ => (K::Local, "the model registry could not be read".to_owned()),
+            },
+            DownloadError::Import(_) => (K::Invalid, set_hint(&chain(e))),
+            DownloadError::NotFound(_) | DownloadError::FileNotFound { .. } => {
+                (K::NotFound, e.to_string())
+            }
+            DownloadError::Unauthorized { .. } => (K::Unauthorized, e.to_string()),
+            DownloadError::InvalidRepository(_)
+            | DownloadError::Ambiguous { .. }
+            | DownloadError::NoWeights(_)
+            | DownloadError::UnsafePath(_) => (K::Invalid, e.to_string()),
+            DownloadError::InvalidEndpoint(_) | DownloadError::InvalidToken => {
+                (K::Local, format!("the server's download settings: {e}"))
+            }
+            _ => (K::Upstream, e.to_string()),
+        };
+        SourceError::new(kind, self.scrub(&message))
+    }
+
+    /// Takes local paths out of `message` and swaps command-line wording for the API's.
+    fn scrub(&self, message: &str) -> String {
+        let mut m = message.replace(&*self.root.to_string_lossy(), "the models directory");
+        if let Some(home) = std::env::var_os("HOME").filter(|h| h.len() > 1) {
+            m = m.replace(&*home.to_string_lossy(), "~");
+        }
+        m.replace("pick one with --file", "pick one in files")
+    }
+}
+
+/// Points a missing config value at the pull's `set`.
+fn set_hint(msg: &str) -> String {
+    let Some((_, rest)) = msg.split_once("overrides.config.") else {
+        return msg.to_owned();
+    };
+    let key: String = rest
+        .chars()
+        .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+        .collect();
+    if key.is_empty() {
+        return msg.to_owned();
+    }
+    format!(
+        "{msg}. Retry with set: {{\"{key}\": VALUE}}, with the value from the model's original config.json"
+    )
+}
+
+impl ModelSource for HubSource {
+    fn search(&self, query: &str, limit: usize) -> Result<Vec<SourceHit>, SourceError> {
+        let provider =
+            provider().map_err(|e| SourceError::new(SourceErrorKind::Local, self.scrub(&e)))?;
+        let cancel = AtomicBool::new(false);
+        let hits = search(&provider, query, limit, &PullOptions::default(), &cancel)
+            .map_err(|e| self.error(&e))?;
+        Ok(hits
+            .into_iter()
+            .map(|h| SourceHit {
+                repository: h.repository,
+                downloads: h.downloads,
+                likes: h.likes,
+                formats: h.formats,
+                gated: h.gated,
+            })
+            .collect())
+    }
+
+    fn pull(
+        &self,
+        spec: &PullSpec,
+        cancel: &AtomicBool,
+        progress: &(dyn Fn(PullProgress) + Sync),
+    ) -> Result<PullOutcome, SourceError> {
+        let provider =
+            provider().map_err(|e| SourceError::new(SourceErrorKind::Local, self.scrub(&e)))?;
+        let registry =
+            Registry::open(&self.root).map_err(|e| self.error(&DownloadError::Registry(e)))?;
+        let arch = ArchitectureRegistry::with_builtins();
+        let req = PullRequest {
+            repository: spec.repository.clone(),
+            revision: spec.revision.clone(),
+            files: spec.files.clone(),
+            id: spec.id.clone(),
+            name: spec.name.clone(),
+            set: spec.set.clone(),
+        };
+        let report = |p: Progress| {
+            let p = match p {
+                Progress::Planned { revision, files } => PullProgress::Planned { revision, files },
+                Progress::File { file, done, total } => PullProgress::File { file, done, total },
+                Progress::Retrying {
+                    file,
+                    attempt,
+                    delay,
+                    reason,
+                } => PullProgress::Retrying {
+                    file,
+                    attempt,
+                    delay,
+                    reason: self.scrub(&reason),
+                },
+                Progress::Validating => PullProgress::Validating,
+                _ => return,
+            };
+            progress(p);
+        };
+        let pulled = pull(
+            &registry,
+            &provider,
+            &req,
+            &PullOptions::default(),
+            &arch,
+            cancel,
+            &report,
+        )
+        .map_err(|e| self.error(&e))?;
+        let mut warnings: Vec<String> = pulled.warnings.iter().map(|w| self.scrub(w)).collect();
+        // As `models pull` does: checksums cover streamed experts; a dense model streams
+        // nothing.
+        let dir = registry.dir_of(&pulled.record);
+        match ModelMetadata::load(&dir, &arch) {
+            Ok(m) if m.bytes().routed_experts > 0 => {
+                if let Err(e) = record_sums(&m, 0) {
+                    warnings.push(format!(
+                        "expert checksums were not recorded: {}",
+                        self.scrub(&e)
+                    ));
+                }
+            }
+            Ok(_) => {}
+            Err(e) => warnings.push(format!(
+                "the installed model does not read back: {}",
+                self.scrub(&chain(&e))
+            )),
+        }
+        Ok(PullOutcome {
+            id: pulled.record.id,
+            warnings,
+            files: pulled.files,
+        })
+    }
+
+    fn installed(&self) -> Vec<(String, String)> {
+        Registry::open(&self.root)
+            .and_then(|r| r.list())
+            .map(|records| {
+                records
+                    .into_iter()
+                    .filter_map(|r| r.source.map(|s| (s.repository, r.id)))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
 }
