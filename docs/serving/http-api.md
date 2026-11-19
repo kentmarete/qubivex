@@ -22,6 +22,10 @@ cannot use), [Streaming](streaming.md), [Scheduler](scheduler.md). The design re
 | `POST /v1/models/load` | admin token | Load a model |
 | `POST /v1/models/unload` | admin token | Unload a model |
 | `POST /v1/admin/models`, `DELETE /v1/admin/models/{id}` | admin token | Aliases of load and unload |
+| `GET /v1/admin/models/search?q=&limit=` | admin token | Search a model hub (with downloads on) |
+| `POST /v1/admin/models/pull` | admin token | Download and install a model, as a job |
+| `GET /v1/admin/jobs`, `GET /v1/admin/jobs/{id}` | admin token | Download jobs |
+| `DELETE /v1/admin/jobs/{id}`, `POST /v1/admin/jobs/{id}/retry` | admin token | Cancel or retry one |
 
 Anything else answers 404 with code `not_found`.
 
@@ -205,6 +209,7 @@ is what `qubivex system --json` prints. The rest, from a server with one fixture
 
 ```json
 {
+  "capabilities": {"admin": true, "model_downloads": true},
   "generations_active": 0,
   "limits": {"default_max_tokens": 512, "load_context": null, "max_generation_tokens": null, "max_prompt_tokens": null},
   "model_states": [{"id": "olmoe-tiny", "state": "loaded"}],
@@ -232,6 +237,7 @@ is what `qubivex system --json` prints. The rest, from a server with one fixture
 
 | Field | Meaning |
 |---|---|
+| `capabilities` | `admin`: the admin endpoints are on. `model_downloads`: the download routes below are on |
 | `limits` | `--default-max-tokens`, `--max-generation-tokens`, `--max-prompt-tokens` and `--context` (`load_context`); `null` where unset, so the context limits it |
 | `models[].max_context` | The context the model was loaded with, in tokens |
 | `model_states[].state` | `loading`, `loaded` or `failed` |
@@ -286,6 +292,83 @@ curl -s http://127.0.0.1:8080/v1/models/unload \
 
 Unloading closes the model's queue, so waiting requests get a 503, and lets running
 generations finish. `draining` is how many were running.
+
+## Model downloads
+
+With an admin token, `qubivex serve` can search Hugging Face and download models into the
+first `--dir` directory, as `qubivex models pull` does. `/v1/system` then says
+`"model_downloads": true`. The gateway library has no network code of its own: an
+application embedding it supplies a `ModelSource`, and without one these routes answer 404
+`downloads_disabled`. Searches and downloads use `HF_ENDPOINT` and `HF_TOKEN` (or the token
+`hf auth login` saved) from the **server's** environment; clients never send a hub token.
+
+### `GET /v1/admin/models/search`
+
+```sh
+curl -s "http://127.0.0.1:8080/v1/admin/models/search?q=qwen3-4b&limit=2" \
+  -H "Authorization: Bearer $ADMIN"
+```
+
+```json
+{"object":"list","query":"qwen3-4b","data":[
+  {"repository":"Qwen/Qwen3-4B-Instruct-2507","downloads":2736684,"likes":1060,
+   "formats":["safetensors"],"gated":false,"installed_as":["qwen3-4b-instruct-2507"]}]}
+```
+
+`q` is required; `limit` is 1 to 100 (default 20). `installed_as` lists the ids already
+installed from that repository. A hub that fails or cannot be reached is a 502
+`upstream_error`.
+
+### `POST /v1/admin/models/pull`
+
+```sh
+curl -s http://127.0.0.1:8080/v1/admin/models/pull \
+  -H "Authorization: Bearer $ADMIN" -H 'content-type: application/json' \
+  -d '{"repository":"Qwen/Qwen3-4B-Instruct-2507"}'
+```
+
+The body mirrors `qubivex models pull`: `repository` (`owner/name`, required), and
+optionally `revision`, `files` (paths in the repository; needed when it holds several
+weight files), `id`, `name` and `set` (config values the checkpoint lacks, such as
+`{"norm_topk_prob": false}` for an OLMoE GGUF). It answers **202** with the job and a
+`location` header. The download runs on the server: closing the client does not stop it,
+and the model is not loaded when it finishes.
+
+| Refusal | Status, code |
+|---|---|
+| A pull of the same repository (or the same `id`) is running | 409 `conflict` |
+| Two pulls are already running | 429 `too_many_requests` |
+| A malformed body | 400 `invalid_request` |
+
+### Jobs
+
+`GET /v1/admin/jobs/{id}` returns the job; `GET /v1/admin/jobs` lists them, newest first.
+Finished jobs are kept for an hour.
+
+```json
+{"object":"job","id":"job-6920b3a1-1","kind":"pull","status":"running",
+ "model":null,"repository":"Qwen/Qwen3-4B-Instruct-2507","revision":"cdbee75…",
+ "created_at":1795086241,"started_at":1795086241,"finished_at":null,
+ "progress":{"bytes_done":734003200,"bytes_total":8053063680,"bytes_resumed":0,
+   "rate_bps":27262976,"eta_seconds":268,
+   "files":[{"name":"model-00001-of-00003.safetensors","done":734003200,"total":3957900840}],
+   "retrying":null},
+ "result":null,"error":null,"cancellable":true}
+```
+
+| Field | Meaning |
+|---|---|
+| `status` | `running`, `validating` (every file arrived; the model is being checked), `succeeded`, `failed` or `cancelled` |
+| `model` | The id it installs as, once known; `result.id` when it succeeded. Load it with `POST /v1/models/load` |
+| `progress.bytes_resumed` | Bytes already present from an earlier attempt, left out of `rate_bps` |
+| `progress.retrying` | `{file, attempt, delay_s, reason}` while a transfer waits to retry |
+| `error` | `{code, message}` when it failed or was cancelled. Messages hold no path, URL or token |
+
+`DELETE /v1/admin/jobs/{id}` asks a running job to stop and answers 202; it reads
+`cancelled` once it has. What arrived is kept, so `POST /v1/admin/jobs/{id}/retry` (on a
+failed or cancelled job) starts a new job that continues it. Cancelling a finished job, or
+retrying one that is not failed or cancelled, is a 409. At shutdown, running jobs are
+cancelled the same way.
 
 ## `GET /metrics`
 

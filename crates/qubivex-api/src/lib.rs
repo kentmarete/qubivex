@@ -5,6 +5,8 @@
 //! - `POST /v1/chat/completions` and `POST /v1/completions`, streaming (SSE) or not
 //! - `POST /v1/models/load` and `POST /v1/models/unload`, behind the admin token, with
 //!   `POST /v1/admin/models` and `DELETE /v1/admin/models/{id}` as aliases
+//! - With a [`ModelSource`], behind the admin token: `GET /v1/admin/models/search`,
+//!   `POST /v1/admin/models/pull`, and the jobs pulls become under `/v1/admin/jobs`
 //!
 //! Tokio and Kerniq Server (over Axum and Hyper) stay at the edge: every generation runs on its own dedicated thread
 //! (`worker`) and reaches the request over a bounded channel (QUBIVEX_DESIGN §4.7,
@@ -27,12 +29,14 @@
 //! scoped in the prefix cache as that client, whatever `user` they send.
 
 mod error;
+mod jobs;
 mod keys;
 mod limits;
 mod log;
 mod metrics;
 mod models;
 mod openai;
+mod source;
 mod worker;
 
 use std::collections::BTreeMap;
@@ -61,6 +65,9 @@ use qubivex_runtime::scheduler::{EnterError, Outcome, RequestInfo};
 pub use qubivex_runtime::scheduler::{MemoryPolicy, Stats};
 use qubivex_runtime::{Engine, EngineOptions};
 use serde_json::{Value, json};
+pub use source::{
+    ModelSource, PullOutcome, PullProgress, PullSpec, SourceError, SourceErrorKind, SourceHit,
+};
 use tokio::sync::{mpsc, oneshot, watch};
 use tokio_stream::wrappers::ReceiverStream;
 
@@ -78,6 +85,9 @@ const STOP_MARGIN: Duration = Duration::from_secs(5);
 /// Server settings.
 #[derive(Clone, Debug)]
 pub struct ServerConfig {
+    /// Searches and downloads models for the admin download routes. `None`: those
+    /// routes answer 404 `downloads_disabled`.
+    pub model_source: Option<Arc<dyn ModelSource>>,
     /// A key shared by every client, accepted as `Authorization: Bearer <key>` on
     /// `/v1/*`. With it or [`client_keys`](Self::client_keys) set, `/v1/*` needs one of
     /// them.
@@ -138,6 +148,7 @@ pub struct ServerConfig {
 impl Default for ServerConfig {
     fn default() -> Self {
         Self {
+            model_source: None,
             api_key: None,
             client_keys: Vec::new(),
             admin_token: None,
@@ -179,6 +190,8 @@ struct AppState {
     next_sequence: AtomicU64,
     /// Set when the shutdown grace ends: running requests stop.
     stop_now: watch::Sender<bool>,
+    /// Model downloads.
+    jobs: jobs::Jobs,
 }
 
 /// The gateway: models plus settings. Clones share state.
@@ -246,6 +259,7 @@ impl Gateway {
                 next_id: AtomicU64::new(1),
                 next_sequence: AtomicU64::new(1),
                 stop_now: watch::Sender::new(false),
+                jobs: jobs::Jobs::default(),
             }),
         }
     }
@@ -301,7 +315,13 @@ impl Gateway {
             .post("/v1/chat/completions", chat)
             .post("/v1/completions", completions)
             .post("/v1/admin/models", admin_load)
-            .delete("/v1/admin/models/{id}", admin_unload);
+            .delete("/v1/admin/models/{id}", admin_unload)
+            .get("/v1/admin/models/search", jobs::search)
+            .post("/v1/admin/models/pull", jobs::pull)
+            .get("/v1/admin/jobs", jobs::list)
+            .get("/v1/admin/jobs/{id}", jobs::get)
+            .delete("/v1/admin/jobs/{id}", jobs::cancel)
+            .post("/v1/admin/jobs/{id}/retry", jobs::retry);
         // Kerniq's defaults add no request timeout (a stream may run for minutes), no
         // concurrency limit (the schedulers queue) and no body limit of its own (ours
         // below answers in the OpenAI shape).
@@ -467,6 +487,7 @@ impl AppState {
         for (_, l) in self.ready() {
             l.scheduler.close();
         }
+        self.jobs.cancel_all();
     }
 
     /// Adds the request id header, and counts and logs the request. `began` is when it
@@ -709,6 +730,10 @@ async fn system(State(st): State<Arc<AppState>>, headers: HeaderMap) -> Response
                 "max_generation_tokens": st.cfg.max_generation_tokens,
                 "max_prompt_tokens": st.cfg.max_prompt_tokens,
                 "load_context": st.cfg.engine.max_context,
+            },
+            "capabilities": {
+                "admin": st.cfg.admin_token.is_some(),
+                "model_downloads": st.cfg.model_source.is_some(),
             },
             "models": models,
             "model_states": st.states(),

@@ -500,6 +500,7 @@ r = client.chat.completions.create(model="qwen3-0.6b",
 | `GET /health`, `GET /metrics` | Liveness; Prometheus metrics (below) |
 | `GET /v1/system` | Hardware, each model's memory (plan, ledger, reserved KV, prefix cache, free slots, queue) and state |
 | `POST /v1/models/load` `{"model": ID}`, `POST /v1/models/unload` `{"model": ID}` | With `--admin-token` only. Concurrent loads share one load. `POST /v1/admin/models` and `DELETE /v1/admin/models/{id}` are aliases |
+| `GET /v1/admin/models/search`, `POST /v1/admin/models/pull`, `/v1/admin/jobs` | With `--admin-token` only. Search Hugging Face and download into the first `--dir`, as a job the client polls, cancels or retries ([docs/serving/http-api.md](docs/serving/http-api.md#model-downloads)) |
 
 | Option | Default | |
 |---|---|---|

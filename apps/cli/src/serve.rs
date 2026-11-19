@@ -12,6 +12,7 @@
 
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::Duration;
 
 use qubivex_api::{ClientKey, Gateway, LogFormat, MemoryPolicy, RateLimit, ServerConfig};
@@ -425,6 +426,14 @@ pub(crate) fn serve(p: Plan) -> Result<(), String> {
     // The human-readable lines below belong to the text log; in the other formats the
     // gateway's own events say the same (`model_added`, `server_started`, ...).
     let text = cfg.log_format == LogFormat::Text;
+    let mut cfg = cfg;
+    // Downloads from the admin routes install into the first models directory, as
+    // `models pull` does.
+    if cfg.admin_token.is_some()
+        && let Some(root) = dirs.first()
+    {
+        cfg.model_source = Some(Arc::new(crate::pull::HubSource::new(root.clone())));
+    }
     let gw = Gateway::new(cfg);
     let reg = ArchitectureRegistry::with_builtins();
     for m in &models {

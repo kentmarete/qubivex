@@ -215,6 +215,34 @@ counts addresses, so behind a proxy every client shares one allowance.
   quotas on tokens rather than requests, and per-client metrics labels (unbounded label
   sets are what amendment 5 avoided).
 
+## Amendment 8 (2026-11-19): model downloads through the gateway
+
+The web UI asks the server to search for and download models (qubivex-ui
+`docs/03-backend-changes.md` §3.4 and §3.6). ADR-014 keeps network and TLS code out of
+`qubivex-runtime` and `qubivex-api`, so an application that embeds them has none.
+- **An injected source.** `qubivex-api` defines `ModelSource` (search, pull with progress
+  and a cancel flag, and the installed `(repository, id)` pairs) with its own plain types,
+  and depends on no download crate. `ServerConfig::model_source` holds one. `qubivex
+  serve` passes a Hugging Face source over `qubivex-model-download` when it has an admin
+  token, installing into the first models directory. Without a source the routes answer
+  404 `downloads_disabled`.
+- **Routes, all behind the admin token:** `GET /v1/admin/models/search`, `POST
+  /v1/admin/models/pull` (202 and a job), `GET /v1/admin/jobs[/{id}]`, `DELETE
+  /v1/admin/jobs/{id}` (cancel), `POST /v1/admin/jobs/{id}/retry`. `/v1/system` gains
+  `capabilities: {admin, model_downloads}`.
+- **Jobs.** Each pull runs on its own named thread, never a Tokio worker. At most two run
+  at once (429 past that) and one per repository or id (409). Finished jobs are kept an
+  hour, at most 64. The registry's install lock and staging still guard the files, so a
+  CLI pull and a server pull of one model cannot mix. A cancelled or failed pull keeps
+  its files and a retry continues it. A finished pull is not loaded; the client loads it.
+- **Errors.** The source's messages reach clients, so the CLI's source rewrites them
+  without paths (the models directory and home directory are replaced), URLs or tokens,
+  and maps each `DownloadError` to a kind that picks the status: not found, conflict,
+  unauthorized (403), upstream (502), local (503) or invalid (400).
+- **Not built yet:** the SSE event stream for jobs (clients poll `GET
+  /v1/admin/jobs/{id}`), the installed-models list, verify and delete routes, and a
+  `model_management` capability, which waits for those.
+
 ## Consequences
 - The exit criteria are met: `crates/qubivex-api/tests/gateway.rs` (over HTTP, tiny
   fixtures: shapes, streaming equals non-streaming, concurrent equals sequential,
