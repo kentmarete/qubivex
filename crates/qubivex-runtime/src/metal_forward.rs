@@ -269,7 +269,7 @@ impl MetalForward {
         };
         let head = resident(&be, &host, &dense.view(head_name)?, &mut count)?;
         Ok(Self {
-            rope: Rope::new(dims.d, c.rope_theta),
+            rope: Rope::with_scaling(dims.d, c.rope_theta, &c.rope_scaling),
             be,
             _host: host,
             cfg: c,

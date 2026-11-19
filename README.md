@@ -860,9 +860,9 @@ A complete program is in
 | Qwen3-MoE (for example `Qwen/Qwen3-30B-A3B`) | Supported by configuration in per-expert and stacked SafeTensors layouts. Tested on tiny checkpoints; not yet on a full-size one |
 | Dense Qwen3 (for example `Qwen/Qwen3-0.6B`) | `transformer_dense` by configuration (per-head q/k norm, GQA, tied head). Validated on the full-size bf16 SafeTensors checkpoint: 32 greedy tokens equal transformers', logits within 1.2e-5 |
 | Dense Qwen2 / Qwen2.5 (for example `Qwen/Qwen2.5-0.5B-Instruct`) | `transformer_dense` by configuration (q/k/v biases found by the importer, GQA, tied or separate head). Validated on the full-size Qwen2.5-0.5B-Instruct bf16 SafeTensors checkpoint: 32 greedy tokens, logits within 1.1e-5, chat template text and ids, and a chat reply equal transformers'; Metal and Vulkan give the CPU's tokens. GGUF files of this family need `tokenizer.json` (their GGUF pre-tokenizer is not rebuilt yet) |
-| Dense Llama-style (no q/k norm, GQA, tied or separate head) | `transformer_dense` by configuration. Tested on a tiny checkpoint against transformers |
+| Dense Llama-style (no q/k norm, GQA, tied or separate head), including Llama 3.x with `llama3` RoPE scaling | `transformer_dense` by configuration. Tested on a tiny checkpoint and on Llama-3.2-3B against transformers |
 | Shared-expert or partly dense MoE (Qwen2-MoE, DeepSeek, GLM) | Refused with a clear message for now |
-| Output-projection or FFN biases, non-SiLU activations, RoPE scaling (YaRN, `llama3`, multimodal RoPE and similar, in `rope_scaling` or `rope_parameters`), sliding-window attention | Refused with a clear message for now |
+| Output-projection or FFN biases, non-SiLU activations, RoPE scaling other than `llama3` (YaRN, linear, dynamic, multimodal RoPE and similar, in `rope_scaling` or `rope_parameters`), sliding-window attention | Refused with a clear message for now |
 
 **Containers:** SafeTensors (single file or sharded with `model.safetensors.index.json`)
 and GGUF v2/v3, little-endian, single file.

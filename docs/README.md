@@ -113,7 +113,7 @@ to discover a gap by hitting it.
 
 - Architectures other than `transformer_moe` and `transformer_dense`.
 - Shared-expert and partly dense MoE models, sigmoid routing, output-projection or FFN biases (q/k/v biases are supported),
-  non-SiLU activations, RoPE scaling, sliding-window attention.
+  non-SiLU activations, RoPE scaling other than Llama 3's (`llama3`), sliding-window attention.
 - I-quant GGUF dtypes, split GGUF files, big-endian GGUF.
 - Multimodal models, embedding models, LoRA adapters.
 - Model sources other than Hugging Face.

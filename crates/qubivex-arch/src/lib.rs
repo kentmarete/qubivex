@@ -24,7 +24,7 @@ use qubivex_compute::{
 use qubivex_core::{DType, Shape};
 use qubivex_core::{ExpertIdx, LayerIdx};
 use qubivex_model::ArchConfig;
-use qubivex_model::arch::{DenseConfig, MoeConfig, QkNorm, RouterScoring};
+use qubivex_model::arch::{DenseConfig, MoeConfig, QkNorm, RopeScaling, RouterScoring};
 use rayon::prelude::*;
 use thiserror::Error;
 
@@ -581,6 +581,7 @@ struct DecoderConfig {
     vocab: u64,
     rms_eps: f64,
     rope_theta: f64,
+    rope_scaling: RopeScaling,
     clip_qkv: Option<f64>,
     tie_embeddings: bool,
     qk_norm: QkNorm,
@@ -634,6 +635,7 @@ impl DecoderConfig {
                 vocab: c.vocab,
                 rms_eps: c.rms_eps,
                 rope_theta: c.rope_theta,
+                rope_scaling: c.rope_scaling,
                 clip_qkv: c.clip_qkv,
                 tie_embeddings: c.tie_embeddings,
                 qk_norm: c.qk_norm,
@@ -673,6 +675,7 @@ impl DecoderConfig {
                 vocab: c.vocab,
                 rms_eps: c.rms_eps,
                 rope_theta: c.rope_theta,
+                rope_scaling: c.rope_scaling,
                 clip_qkv: c.clip_qkv,
                 tie_embeddings: c.tie_embeddings,
                 qk_norm: c.qk_norm,
@@ -822,7 +825,7 @@ impl Transformer {
         let final_norm = vector(dense, be, &c.names.final_norm, h)?;
         Ok(Self {
             kv_heads: usize_of(c.kv_heads)?,
-            rope: Rope::new(d, c.rope_theta),
+            rope: Rope::with_scaling(d, c.rope_theta, &c.rope_scaling),
             norms,
             final_norm,
             cfg: c,

@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use qubivex_core::{DType, ExpertIdx, GgmlType, LayerIdx, Shape};
-use qubivex_model::arch::{TransformerDense, TransformerMoe};
+use qubivex_model::arch::{MoeConfig, RopeScaling, TransformerDense, TransformerMoe};
 use qubivex_model::manifest::SemVer;
 use qubivex_model::write::{self, TensorData};
 use qubivex_model::{
@@ -379,7 +379,7 @@ fn architectures_declare_capabilities() {
             a.id
         );
         assert_eq!(c.inputs, ["text"]);
-        assert_eq!(c.rope_scaling, ["default"]);
+        assert_eq!(c.rope_scaling, ["default", "llama3"]);
         assert!(!c.ffn.is_empty() && !c.attention.is_empty());
     }
     assert!(
@@ -476,19 +476,46 @@ fn config_rules() {
     assert!(
         with_cfg(set("rope_scaling", json!({ "factor": 2.0 }))).contains("rope_scaling.factor")
     );
+    // llama3 needs all four of its values, sane ones, and nothing else.
     assert!(
         with_cfg(set(
             "rope_parameters",
             json!({ "rope_theta": 1e6, "rope_type": "llama3", "factor": 8.0 })
         ))
-        .contains("only plain RoPE")
+        .contains("rope_parameters.low_freq_factor")
     );
+    let llama3 = || {
+        json!({ "rope_type": "llama3", "factor": 32.0, "low_freq_factor": 1.0,
+                "high_freq_factor": 4.0, "original_max_position_embeddings": 8192 })
+    };
+    let edit = |k: &str, v: Value| {
+        let mut r = llama3();
+        r[k] = v;
+        set("rope_scaling", r)
+    };
+    assert!(with_cfg(edit("factor", json!(0.5))).contains("at least 1"));
+    assert!(with_cfg(edit("high_freq_factor", json!(1.0))).contains("below high_freq_factor"));
+    assert!(
+        with_cfg(edit("original_max_position_embeddings", json!(0))).contains("positive integer")
+    );
+    assert!(with_cfg(edit("beta_fast", json!(32))).contains("rope_scaling.beta_fast"));
+    assert!(
+        with_cfg(set(
+            "rope_scaling",
+            json!({ "rope_type": "default", "type": "mrope" })
+        ))
+        .contains("rope_scaling.type")
+    );
+    let mut both = set("rope_scaling", llama3());
+    both["rope_parameters"] = json!({ "rope_type": "llama3", "factor": 8.0, "low_freq_factor": 1.0,
+        "high_freq_factor": 4.0, "original_max_position_embeddings": 8192 });
+    assert!(with_cfg(both).contains("different scalings"));
     assert!(
         with_cfg(set(
             "rope_parameters",
             json!({ "rope_theta": 1e6, "rope_type": "default", "type": "mrope", "mrope_section": [16, 24, 24] })
         ))
-        .contains("only plain RoPE")
+        .contains("only default and llama3 RoPE")
     );
     let mut c = hf_config();
     c.as_object_mut().unwrap().remove("rms_norm_eps");
@@ -498,6 +525,22 @@ fn config_rules() {
     c["rope_parameters"] = json!({ "rope_theta": 10000.0, "rope_type": "default" });
     std::fs::write(d.0.join("config.json"), c.to_string()).unwrap();
     assert!(load(&d.0).is_ok(), "rope_theta read from rope_parameters");
+    let mut c = hf_config();
+    c["rope_scaling"] = json!({ "rope_type": "llama3", "factor": 32.0, "low_freq_factor": 1.0,
+        "high_freq_factor": 4.0, "original_max_position_embeddings": 8192 });
+    std::fs::write(d.0.join("config.json"), c.to_string()).unwrap();
+    let m = load(&d.0).unwrap();
+    let moe = m.config.specific.downcast_ref::<MoeConfig>().unwrap();
+    assert_eq!(
+        moe.rope_scaling,
+        RopeScaling::Banded {
+            factor: 32.0,
+            low_freq_factor: 1.0,
+            high_freq_factor: 4.0,
+            original_max_position_embeddings: 8192
+        }
+    );
+    assert_eq!(m.config.describe["rope_scaling"]["type"], json!("llama3"));
 
     // Overrides fill gaps but may not contradict the checkpoint.
     std::fs::write(d.0.join("config.json"), hf_config().to_string()).unwrap();
@@ -612,11 +655,12 @@ fn registry_rules() {
             .architecture
     };
     assert!(r.resolve(&m("transformer_moe", "1.0.7")).is_ok());
+    assert!(r.resolve(&m("transformer_moe", "1.1.0")).is_ok());
     assert!(
-        r.resolve(&m("transformer_moe", "1.1.0"))
+        r.resolve(&m("transformer_moe", "1.2.0"))
             .unwrap_err()
             .to_string()
-            .contains("implements 1.0.0")
+            .contains("implements 1.1.0")
     );
     assert!(r.resolve(&m("transformer_moe", "2.0.0")).is_err());
     assert!(
@@ -631,7 +675,7 @@ fn registry_rules() {
         TransformerMoe.version(),
         SemVer {
             major: 1,
-            minor: 0,
+            minor: 1,
             patch: 0
         }
     );

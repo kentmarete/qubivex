@@ -9,7 +9,8 @@ transformers in f32 (bf16 weights widened exactly).
 
 <model dir> is an official checkpoint (config.json, model.safetensors, tokenizer.json):
 huggingface.co/Qwen/Qwen3-0.6B for dense_real.json, huggingface.co/Qwen/Qwen2.5-0.5B-Instruct
-(revision 7ae557604adf67be50417f59c2c2f167def9a775) for qwen2_real.json. For a fixed prompt: the prompt ids
+(revision 7ae557604adf67be50417f59c2c2f167def9a775) for qwen2_real.json, huggingface.co/meta-llama/Llama-3.2-3B
+(revision 13afe5124825b4f3751f836b40dafda64c1ed062, gated) for llama3_real.json. For a fixed prompt: the prompt ids
 from the tokenizer, 32 greedy tokens (full forward each step, no end-of-sequence stop),
 and, for every prompt position, the TOP largest f32 logits (ids and bit patterns). With
 --chat, also a conversation rendered by the checkpoint's chat template (its text and ids)

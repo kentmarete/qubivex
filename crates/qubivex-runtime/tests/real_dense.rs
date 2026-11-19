@@ -6,6 +6,8 @@
 //! - `QUBIVEX_QWEN2_SAFETENSORS_DIR`: Qwen2.5-0.5B-Instruct (q/k/v biases, tied head),
 //!   `qwen2_real.json`, which also checks the chat template and, where a device is
 //!   present, that Metal and Vulkan give the CPU's tokens.
+//! - `QUBIVEX_LLAMA3_SAFETENSORS_DIR`: Llama-3.2-3B (llama3 RoPE scaling, tied head),
+//!   `llama3_real.json`.
 
 #![allow(clippy::unwrap_used, clippy::cast_precision_loss)]
 
@@ -164,6 +166,18 @@ fn dense_checkpoint_matches_transformers() {
     check(&dir, "dense_real.json");
 }
 
+/// Llama 3's RoPE scaling changes the low frequencies' angles; with it switched off
+/// the logits leave the tolerance (checked once by hand), so this catches a missing or
+/// wrong scaling. Every backend present gives the CPU's tokens.
+#[test]
+fn llama3_rope_checkpoint_matches_transformers() {
+    let Ok(dir) = std::env::var("QUBIVEX_LLAMA3_SAFETENSORS_DIR") else {
+        return;
+    };
+    let cpu = check(&dir, "llama3_real.json");
+    same_tokens_on_devices(&dir, &cpu, "llama3_real.json");
+}
+
 /// Only a missing device skips a backend; any other load error fails the test.
 fn device_missing(backend: BackendKind, err: &str) -> bool {
     match backend {
@@ -184,14 +198,19 @@ fn qkv_bias_checkpoint_matches_transformers() {
         return;
     };
     let cpu = check(&dir, "qwen2_real.json");
-    let o = oracle("qwen2_real.json");
+    same_tokens_on_devices(&dir, &cpu, "qwen2_real.json");
+}
+
+/// Metal, Vulkan and Sim, where present, give the CPU's 16 greedy tokens.
+fn same_tokens_on_devices(dir: &str, cpu: &Engine, file: &str) {
+    let o = oracle(file);
     let prompt = ids(&o["prompt_ids"]);
     let want = cpu
         .generate(&prompt, 16, Sampling::default(), |_| true)
         .unwrap();
     for backend in [BackendKind::Metal, BackendKind::Vulkan, BackendKind::Sim] {
         let e = match load(
-            &dir,
+            dir,
             EngineOptions {
                 backend,
                 max_context: Some(128),

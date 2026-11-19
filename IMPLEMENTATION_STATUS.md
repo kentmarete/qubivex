@@ -1,8 +1,14 @@
 # QUBIVEX Implementation Status
 
-Last updated: 2026-11-15
+Last updated: 2026-11-19
 
 ## Current phase
+**Llama 3.x: `llama3` RoPE scaling (2026-11-19, branch `llama3-rope`).** Roadmap row "Llama 3.x"; decision: ADR-003 amendment (Llama 3 RoPE scaling).
+- `rope_type: "llama3"` (in `rope_scaling` or `rope_parameters`) is parsed into `RopeScaling`, carried by `DenseConfig` and `MoeConfig`, and applied by `Rope::with_scaling`, which every backend's tables use. Malformed or extra keys are refused by name. `transformer_dense` 1.2.0, `transformer_moe` 1.1.0; import records the higher version only when a model uses the scaling.
+- The adjustment matches transformers' inverse frequencies bit for bit on four configs. Plain RoPE's power is now the correctly rounded f32 (was f32 `powf`, one ulp off at θ = 500 000 on macOS); torch's own `pow` is within one ulp of it.
+- `meta-llama/Llama-3.2-3B` bf16: tokenizer ids, 32 greedy tokens and logits (6.79e-6) equal transformers'; Metal, Vulkan and Sim give the CPU's tokens. With the scaling switched off the logit check fails (negative control). Qwen3, Qwen2.5 and OLMoE real-model tests still pass.
+- **Next:** the `llama-bpe` GGUF tokenizer, so Llama GGUFs load without `tokenizer.json`.
+
 **General-purpose runtime, milestone 3: registry capabilities (2026-11-15, branch `registry-capabilities`).** Roadmap step 3; decision: ADR-003 amendment 4.
 - Architectures declare capabilities (weight formats, inputs, positions, RoPE scalings, norms, attention and FFN options). Validation refuses undeclared weight formats before reading weights, grouped per format; engine load refuses a format the chosen backend or the CPU lacks. `qubivex models architectures` lists capabilities and each backend's formats.
 - A test holds the declared formats equal to every backend's kernels.

@@ -83,7 +83,7 @@ a file-format identifier needs one) and `cargo deny`.
 | Area | What exists | What is missing |
 |---|---|---|
 | Dense on GPU | Dense matmuls placed one by one on Metal or Vulkan | Whole-layer/whole-token device passes exist for MoE only (`engine.rs:1154`); device attention is MoE-only (`qubivex-arch/src/lib.rs`, `dev_attn`) |
-| Llama family | Llama-shaped config through `transformer_dense` (fixture checked vs transformers) | No real Llama checkpoint test; Llama 3.x `rope_scaling: llama3` is refused (`arch/common.rs:250`); GGUF tokenizer `llama-bpe` refused |
+| Llama family | Llama-shaped config through `transformer_dense` (fixture checked vs transformers); Llama 3.x `llama3` RoPE scaling (Llama-3.2-3B checked vs transformers, 2026-11-19) | GGUF tokenizer `llama-bpe` refused |
 | GGUF tokenizers | Byte-level BPE rebuilt from GGUF for 3 pre-tokenizer types | `qwen2`, `llama-bpe` and others refused; those models need `tokenizer.json` |
 | Quantised formats | Kernels for f32/f16/bf16/Q8_0/Q4_K/Q6_K | Q4_0, Q4_1, Q5_0, Q5_1, Q2_K, Q3_K, Q5_K are known dtypes without kernels |
 | Architecture registry | id, version, config schema, tensor schema | Declared quantisation support, backend support, positional and normalisation strategy, preprocessing requirements (brief §4) |
@@ -98,7 +98,7 @@ a file-format identifier needs one) and `cargo deny`.
 | Area | State |
 |---|---|
 | ~~Q/K/V projection biases~~ | **Done in milestone 1 (§5)**: `transformer_dense` option `qkv_bias` |
-| RoPE scaling variants | Only `default` accepted: no `linear`, `dynamic`, `yarn`, `llama3`, `mrope` |
+| RoPE scaling variants | `default` and `llama3` accepted: no `linear`, `dynamic`, `yarn`, `mrope` |
 | Sliding-window attention | Refused (`use_sliding_window`) |
 | Non-SwiGLU FFNs, LayerNorm, attention/MLP biases other than q/k/v, learned positions | Refused or absent |
 | ~~Structured output~~ | **Done in milestone 2 (§5)**: constrained decoding, ADR-020 |
@@ -201,7 +201,7 @@ State: ✅ implemented and tested, ◐ partial, ✗ missing.
 |---|---|---|---|---|---|
 | Configurable decoder components | ◐ (q/k norm, clip, q/k/v bias) | bias on o and FFN, norm kind, activation, position scheme | — | M | Each option checked vs transformers on a fixture |
 | Llama 1/2-style | ◐ fixture | real checkpoint verified | — | S | Real-model tokens vs transformers |
-| Llama 3.x | ✗ | `llama3` RoPE scaling, `llama-bpe` GGUF tokenizer | RoPE variants | M | Llama-3.2-1B tokens vs transformers |
+| Llama 3.x | ◐ SafeTensors | ~~`llama3` RoPE scaling~~ (done 2026-11-19), `llama-bpe` GGUF tokenizer | RoPE variants | M | **Met for SafeTensors**: Llama-3.2-3B tokens and logits vs transformers; Metal, Vulkan, Sim give the CPU's tokens |
 | Qwen2 / Qwen2.5 | ✅ SafeTensors (milestone 1); ◐ GGUF needs `tokenizer.json` | + GGUF `qwen2` pre-tokenizer | q/k/v bias | S | **Met for SafeTensors**: Qwen2.5-0.5B-Instruct greedy tokens, logits, chat template and reply vs transformers; Metal, Vulkan, Sim give the CPU's tokens |
 | Qwen3 dense | ✅ | ✅ | — | — | — |
 | Qwen3-MoE, OLMoE | ✅ | ✅ | — | — | — |
