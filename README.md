@@ -15,7 +15,8 @@ curl -fsSL https://raw.githubusercontent.com/kentmarete/qubivex/main/install.sh 
 ```
 
 Then run `qubivex system` to see your hardware. To read the script before running it, and
-for other options, updating and uninstalling, see [Installation](#installation).
+for other options and uninstalling, see [Installation](#installation). To update later:
+`qubivex update` (see [Updating](#installation)).
 
 Built in Rust, Qubivex combines a high-performance tensor computation engine, a native inference runtime and an intelligent Mixture of Experts (MoE) execution architecture to make running AI models more efficient, accessible and adaptable to available hardware.
 
@@ -228,10 +229,36 @@ directory, not the checkout it is run from. To build a checkout you have modifie
 ./install.sh --version 0.2.0      # tag v0.2.0 or 0.2.0
 ```
 
-**Updating and uninstalling**
+**Updating**
+
+From version 0.1.1, `qubivex` updates itself. It rebuilds from the branch you installed,
+and only when that branch has new commits:
 
 ```sh
-./install.sh --update             # rebuilds only if the installed branch has new commits
+qubivex update --check            # is there a newer version? (installs nothing)
+qubivex update                    # update now, in this terminal
+qubivex update --detach           # update in the background and return at once
+qubivex update --status           # is a background update running? shows its log
+```
+
+A background update keeps running if you press Ctrl-C or close the terminal. Its output
+goes to `~/.qubivex/update.log` (`tail -f ~/.qubivex/update.log` to follow it). Your
+models and `~/.qubivex` are never touched; the new version is used from the next
+command. `--branch BRANCH` follows another branch, `--jobs N` limits build jobs.
+
+If `qubivex update` says *unrecognized subcommand*, your version is older than 0.1.1.
+Update once with the installer, and use `qubivex update` from then on:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/kentmarete/qubivex/main/install.sh | bash -s -- --update
+```
+
+If you built it yourself with `cargo install`, update the same way:
+`git pull && cargo install --path apps/cli --locked --force`.
+
+**Uninstalling**
+
+```sh
 ./install.sh --uninstall          # removes the binary; ~/.qubivex and your models stay
 ```
 
@@ -492,6 +519,23 @@ client = OpenAI(base_url="http://127.0.0.1:8080/v1", api_key="sk-local")
 r = client.chat.completions.create(model="qwen3-0.6b",
         messages=[{"role": "user", "content": "Hello"}], stream=True)
 ```
+
+**In the background.** Add `--detach` and `qubivex serve` returns once the server
+accepts connections, leaving it running after Ctrl-C or the terminal closing:
+
+```sh
+qubivex serve --model qwen3-0.6b --api-key sk-local --detach   # start, return when ready
+qubivex serve --status                                         # list servers; show the log
+qubivex serve --stop                                           # stop all (or --listen ADDR for one)
+```
+
+Settings and the port are checked before it starts, and a server that fails while
+loading its models reports the end of its log. There is one background server per port;
+its log is `~/.qubivex/serve-<port>.log` (replaced at each start) and its pid
+`~/.qubivex/serve-<port>.pid`. `--stop` drains open requests as Ctrl-C does and waits up
+to 60 s. A detached server does not restart after a crash or a reboot; for that, run it
+as a service ([Linux](docs/deployment/linux-deployment.md),
+[macOS](docs/deployment/macos-deployment.md)).
 
 | Endpoint | |
 |---|---|

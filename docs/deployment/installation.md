@@ -126,6 +126,32 @@ straight away if they match. Otherwise it rebuilds and replaces the binary in th
 way as a fresh install. Running the plain installer again always rebuilds, which is a
 safe way to repair an installation.
 
+### From the CLI
+
+An installed `qubivex` can update itself the same way, without a copy of the script:
+
+```sh
+qubivex update --check           # is there a newer commit? (installs nothing)
+qubivex update                   # rebuild in this terminal
+qubivex update --detach          # rebuild in the background and return at once
+qubivex update --status          # is a background update running? end of its log
+qubivex update --branch dev      # follow another branch (also leaves a pinned tag)
+```
+
+`qubivex update` reads `~/.qubivex/install-receipt`, asks the recorded repository for
+the branch's newest commit with `git ls-remote`, and when that differs from the
+installed one, shallow-clones that commit and runs its `install.sh --update`. It takes
+`--jobs N` and `--no-test`, which it passes to the installer. Without a receipt (a
+`cargo install` by hand) it refuses and says how to update instead.
+
+`--detach` starts the update in its own process group, so Ctrl-C and closing the
+terminal do not stop it. Its output goes to `~/.qubivex/update.log` (replaced by each
+background update) and its pid to `~/.qubivex/update.pid`; a second `--detach` while
+one runs is refused. It never prompts: a missing or old Rust fails the update, and the
+log says what to do. Follow it with `tail -f ~/.qubivex/update.log`. The running
+`qubivex` keeps working while the binary is replaced; the new version is used from the
+next command.
+
 ## Uninstalling
 
 ```sh

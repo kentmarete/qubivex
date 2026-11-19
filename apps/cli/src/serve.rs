@@ -274,6 +274,20 @@ pub(crate) struct Plan {
     cfg: ServerConfig,
 }
 
+impl Plan {
+    /// The address the server will listen on.
+    pub(crate) fn addr(&self) -> SocketAddr {
+        self.addr
+    }
+}
+
+impl ServeFlags {
+    /// `--listen`, if given on the command line.
+    pub(crate) fn listen(&self) -> Option<SocketAddr> {
+        self.listen
+    }
+}
+
 /// A list from the command line, else the file's, else empty.
 fn list<T>(flags: Vec<T>, file: Option<Vec<T>>) -> Vec<T> {
     if flags.is_empty() {
