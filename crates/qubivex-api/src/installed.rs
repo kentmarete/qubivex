@@ -149,12 +149,15 @@ mod tests {
     #[test]
     fn scrub_removes_paths() {
         let roots = [PathBuf::from("/srv/models")];
-        let dir = Path::new("/srv/models/qwen");
+        let dir = Path::new("/srv/models/model-a");
         let s = scrub(
-            "config.json in /srv/models/qwen is bad; also /srv/models/other/x and /srv/models",
+            "config.json in /srv/models/model-a is bad; also /srv/models/other/x and /srv/models",
             &roots,
             dir,
         );
-        assert_eq!(s, "config.json in qwen is bad; also other/x and <models>");
+        assert_eq!(
+            s,
+            "config.json in model-a is bad; also other/x and <models>"
+        );
     }
 }
