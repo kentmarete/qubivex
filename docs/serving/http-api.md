@@ -22,6 +22,7 @@ cannot use), [Streaming](streaming.md), [Scheduler](scheduler.md). The design re
 | `POST /v1/models/load` | admin token | Load a model |
 | `POST /v1/models/unload` | admin token | Unload a model |
 | `POST /v1/admin/models`, `DELETE /v1/admin/models/{id}` | admin token | Aliases of load and unload |
+| `GET /v1/admin/models/installed` | admin token | Models on disk under `--dir`, and which are loaded |
 | `GET /v1/admin/models/search?q=&limit=` | admin token | Search a model hub (with downloads on) |
 | `POST /v1/admin/models/pull` | admin token | Download and install a model, as a job |
 | `GET /v1/admin/jobs`, `GET /v1/admin/jobs/{id}` | admin token | Download jobs |
@@ -209,7 +210,7 @@ is what `qubivex system --json` prints. The rest, from a server with one fixture
 
 ```json
 {
-  "capabilities": {"admin": true, "model_downloads": true},
+  "capabilities": {"admin": true, "model_management": true, "model_downloads": true},
   "generations_active": 0,
   "limits": {"default_max_tokens": 512, "load_context": null, "max_generation_tokens": null, "max_prompt_tokens": null},
   "model_states": [{"id": "olmoe-tiny", "state": "loaded"}],
@@ -237,7 +238,7 @@ is what `qubivex system --json` prints. The rest, from a server with one fixture
 
 | Field | Meaning |
 |---|---|
-| `capabilities` | `admin`: the admin endpoints are on. `model_downloads`: the download routes below are on |
+| `capabilities` | `admin`: the admin endpoints are on. `model_management`: `GET /v1/admin/models/installed` is on (with the admin token). `model_downloads`: the download routes below are on |
 | `limits` | `--default-max-tokens`, `--max-generation-tokens`, `--max-prompt-tokens` and `--context` (`load_context`); `null` where unset, so the context limits it |
 | `models[].max_context` | The context the model was loaded with, in tokens |
 | `model_states[].state` | `loading`, `loaded` or `failed` |
@@ -292,6 +293,35 @@ curl -s http://127.0.0.1:8080/v1/models/unload \
 
 Unloading closes the model's queue, so waiting requests get a 503, and lets running
 generations finish. `draining` is how many were running.
+
+## Installed models
+
+`GET /v1/admin/models/installed` lists every model under the `--dir` directories, the ids
+`POST /v1/models/load` accepts, loaded or not. `/v1/models` lists only loaded ones.
+
+```sh
+curl -s http://127.0.0.1:8080/v1/admin/models/installed -H "Authorization: Bearer $ADMIN"
+```
+
+```jsonc
+{"object":"list","data":[{
+  "id":"qwen3-0.6b","name":"Qwen3 0.6B","dir":"qwen3-0.6b",
+  "status":"ok","error":null,"install_state":"installed",
+  "loaded":false,"serve_ids":[],
+  "architecture":"transformer_dense 1.0.0","format":"safetensors","quantization":"bf16",
+  "source":{"provider":"huggingface","repository":"Qwen/Qwen3-0.6B","revision":"…"},
+  "layers":28,"hidden":1024,"vocab":151936,"experts":0,"experts_per_token":0,
+  "max_context":40960,"bytes":{"total":1503238553,"dense":1503238553,"routed_experts":0}
+}]}
+```
+
+| Field | |
+|---|---|
+| `status` | `ok`, or `error` when the model does not validate; `error` then says why, and the model fields are absent |
+| `dir` | The directory's name inside its models directory; no path is returned |
+| `loaded` | `true` if any id serves it, else `"loading"`, `"failed"` or `false` |
+| `serve_ids` | The ids it is loaded under |
+| `install_state` | `installed`: only finished installs are on disk; failed downloads are jobs |
 
 ## Model downloads
 

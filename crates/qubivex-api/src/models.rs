@@ -47,7 +47,7 @@ pub(crate) enum Entry {
     Failed,
 }
 
-fn resolved(dir: &Path) -> PathBuf {
+pub(crate) fn resolved(dir: &Path) -> PathBuf {
     dir.canonicalize().unwrap_or_else(|_| dir.to_owned())
 }
 
@@ -121,6 +121,19 @@ impl AppState {
                     Entry::Failed => "failed",
                 };
                 json!({ "id": id, "state": state })
+            })
+            .collect()
+    }
+
+    /// Each model id the server knows, with its directory (resolved, once known) and
+    /// state, so the installed list can say which ids serve which directory.
+    pub(crate) fn served(&self) -> Vec<(String, Option<PathBuf>, &'static str)> {
+        self.read_models()
+            .iter()
+            .map(|(id, e)| match e {
+                Entry::Loading { dir, .. } => (id.clone(), dir.as_deref().map(resolved), "loading"),
+                Entry::Ready(l) => (id.clone(), Some(l.dir.clone()), "loaded"),
+                Entry::Failed => (id.clone(), None, "failed"),
             })
             .collect()
     }

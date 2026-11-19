@@ -29,6 +29,7 @@
 //! scoped in the prefix cache as that client, whatever `user` they send.
 
 mod error;
+mod installed;
 mod jobs;
 mod keys;
 mod limits;
@@ -315,6 +316,7 @@ impl Gateway {
             .post("/v1/chat/completions", chat)
             .post("/v1/completions", completions)
             .post("/v1/admin/models", admin_load)
+            .get("/v1/admin/models/installed", installed::list)
             .delete("/v1/admin/models/{id}", admin_unload)
             .get("/v1/admin/models/search", jobs::search)
             .post("/v1/admin/models/pull", jobs::pull)
@@ -733,6 +735,7 @@ async fn system(State(st): State<Arc<AppState>>, headers: HeaderMap) -> Response
             },
             "capabilities": {
                 "admin": st.cfg.admin_token.is_some(),
+                "model_management": st.cfg.admin_token.is_some(),
                 "model_downloads": st.cfg.model_source.is_some(),
             },
             "models": models,

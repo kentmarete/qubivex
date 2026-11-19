@@ -229,7 +229,9 @@ The web UI asks the server to search for and download models (qubivex-ui
 - **Routes, all behind the admin token:** `GET /v1/admin/models/search`, `POST
   /v1/admin/models/pull` (202 and a job), `GET /v1/admin/jobs[/{id}]`, `DELETE
   /v1/admin/jobs/{id}` (cancel), `POST /v1/admin/jobs/{id}/retry`. `/v1/system` gains
-  `capabilities: {admin, model_downloads}`.
+  `capabilities: {admin, model_downloads}`. `GET /v1/admin/models/installed` lists the
+  models under the model directories (as load resolves ids), with no path and whether each
+  is loaded; it reads the disk, not the registry, so the gateway keeps no registry dependency.
 - **Jobs.** Each pull runs on its own named thread, never a Tokio worker. At most two run
   at once (429 past that) and one per repository or id (409). Finished jobs are kept an
   hour, at most 64. The registry's install lock and staging still guard the files, so a
