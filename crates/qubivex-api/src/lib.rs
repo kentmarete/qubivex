@@ -704,6 +704,12 @@ async fn system(State(st): State<Arc<AppState>>, headers: HeaderMap) -> Response
         Ok(Json(json!({
             "object": "system",
             "hardware": hardware,
+            "limits": {
+                "default_max_tokens": st.cfg.default_max_tokens,
+                "max_generation_tokens": st.cfg.max_generation_tokens,
+                "max_prompt_tokens": st.cfg.max_prompt_tokens,
+                "load_context": st.cfg.engine.max_context,
+            },
             "models": models,
             "model_states": st.states(),
             "models_draining": st.draining(),
@@ -1159,7 +1165,21 @@ async fn admin_load(
             .get("id")
             .and_then(Value::as_str)
             .map_or_else(|| what.clone(), str::to_owned);
-        let (l, started) = st.load(&rid, &what, &id).await?;
+        let context = match body.get("context") {
+            None | Some(Value::Null) => None,
+            Some(v) => Some(
+                v.as_u64()
+                    .filter(|&c| c > 0)
+                    .and_then(|c| usize::try_from(c).ok())
+                    .ok_or_else(|| {
+                        ApiError::invalid_param(
+                            "context",
+                            "context must be a positive whole number of tokens",
+                        )
+                    })?,
+            ),
+        };
+        let (l, started) = st.load(&rid, &what, &id, context).await?;
         let status = if started {
             StatusCode::CREATED
         } else {

@@ -206,6 +206,7 @@ is what `qubivex system --json` prints. The rest, from a server with one fixture
 ```json
 {
   "generations_active": 0,
+  "limits": {"default_max_tokens": 512, "load_context": null, "max_generation_tokens": null, "max_prompt_tokens": null},
   "model_states": [{"id": "olmoe-tiny", "state": "loaded"}],
   "models": [
     {
@@ -231,6 +232,8 @@ is what `qubivex system --json` prints. The rest, from a server with one fixture
 
 | Field | Meaning |
 |---|---|
+| `limits` | `--default-max-tokens`, `--max-generation-tokens`, `--max-prompt-tokens` and `--context` (`load_context`); `null` where unset, so the context limits it |
+| `models[].max_context` | The context the model was loaded with, in tokens |
 | `model_states[].state` | `loading`, `loaded` or `failed` |
 | `plan_budget_bytes` | The RAM the memory plan may use for this model |
 | `ledger_bytes` | What is allocated now, by owner |
@@ -259,6 +262,17 @@ in the server's `--dir` directories. The request returns when the model has load
 Concurrent loads of one model share one load, and a generation that names a model still
 loading waits for it. A second id for a directory that is already loaded is a 409
 `conflict`.
+
+`context` (optional, a positive number of tokens) sets this load's context limit in place
+of `--context`; the model's own limit still caps it, and `/v1/system` reports the result
+as `max_context`. Anything else is a 400 with `param` `context`. A model already loaded,
+or loading, with a different context is a 409 `conflict`: unload it first.
+
+```sh
+curl -s http://127.0.0.1:8080/v1/models/load \
+  -H "Authorization: Bearer $ADMIN" -H 'content-type: application/json' \
+  -d '{"model":"qwen3-moe-tiny","context":8192}'
+```
 
 ```sh
 curl -s http://127.0.0.1:8080/v1/models/unload \

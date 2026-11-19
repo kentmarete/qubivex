@@ -634,3 +634,73 @@ fn several_models_share_the_machine() {
     all_clear(&gw, M);
     all_clear(&gw, dense);
 }
+
+/// A load may set its own context limit, which `/v1/system` reports; asking for another
+/// context while it is loaded is a conflict, and a context that is not a positive whole
+/// number is refused. `/v1/system` also reports the server's token limits.
+#[test]
+fn a_load_sets_its_own_context() {
+    let gw = Gateway::new(ServerConfig {
+        admin_token: Some("t".into()),
+        model_dirs: vec![root()],
+        default_max_tokens: 64,
+        max_generation_tokens: Some(100),
+        ..ServerConfig::default()
+    });
+    let s = start(&gw);
+    let admin = [("authorization", "Bearer t")];
+    for bad in [json!(0), json!(-4), json!(1.5), json!("64")] {
+        let body = json!({ "model": M, "context": bad });
+        let r = http(s.addr, "POST", "/v1/models/load", &admin, Some(&body));
+        assert_eq!(r.status, 400, "{bad}: {}", String::from_utf8_lossy(&r.body));
+        assert_eq!(r.json()["error"]["param"], "context");
+    }
+    assert!(gw.model_ids().is_empty());
+
+    let load = json!({ "model": M, "context": 64 });
+    let r = http(s.addr, "POST", "/v1/models/load", &admin, Some(&load));
+    assert_eq!(r.status, 201, "{}", String::from_utf8_lossy(&r.body));
+    let sys = http(s.addr, "GET", "/v1/system", &admin, None).json();
+    assert_eq!(sys["models"][0]["max_context"], 64);
+    assert_eq!(
+        sys["limits"],
+        json!({
+            "default_max_tokens": 64,
+            "max_generation_tokens": 100,
+            "max_prompt_tokens": null,
+            "load_context": null,
+        })
+    );
+    // The same context, or none, is the model already loaded.
+    let r = http(s.addr, "POST", "/v1/models/load", &admin, Some(&load));
+    assert_eq!(r.status, 200);
+    let r = http(
+        s.addr,
+        "POST",
+        "/v1/models/load",
+        &admin,
+        Some(&json!({ "model": M })),
+    );
+    assert_eq!(r.status, 200);
+    // Another context needs an unload first.
+    let other = json!({ "model": M, "context": 128 });
+    let r = http(s.addr, "POST", "/v1/models/load", &admin, Some(&other));
+    assert_eq!(r.status, 409, "{}", String::from_utf8_lossy(&r.body));
+    // A prompt past the loaded context is refused.
+    let r = post(
+        s.addr,
+        "/v1/completions",
+        &completion(&"word ".repeat(100), 2),
+    );
+    assert_eq!(r.status, 400, "{}", String::from_utf8_lossy(&r.body));
+
+    let unload = json!({ "model": M });
+    assert_eq!(
+        http(s.addr, "POST", "/v1/models/unload", &admin, Some(&unload)).status,
+        200
+    );
+    let r = http(s.addr, "POST", "/v1/models/load", &admin, Some(&other));
+    assert_eq!(r.status, 201, "{}", String::from_utf8_lossy(&r.body));
+    let sys = http(s.addr, "GET", "/v1/system", &admin, None).json();
+    assert_eq!(sys["models"][0]["max_context"], 128);
+}
