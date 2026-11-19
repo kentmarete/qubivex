@@ -33,7 +33,7 @@ pub enum RopeScaling {
     /// Plain RoPE: `theta^(-2i/d)`.
     #[default]
     None,
-    /// Wavelength-banded scaling (`rope_type` [`ROPE_BANDED`] in transformers):
+    /// Wavelength-banded scaling (the `rope_type` this variant serializes as, in transformers):
     /// wavelengths longer than `original_max_position_embeddings / low_freq_factor` are
     /// divided by `factor`, shorter than `… / high_freq_factor` are kept, and the band
     /// between is blended. Described as its config value.
