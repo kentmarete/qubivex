@@ -123,6 +123,7 @@ By combining native tensor computation, hardware-aware execution, MoE optimisati
 - [What works today](#what-works-today)
 - [Installation](#installation)
 - [Quick start](#quick-start)
+- [Configuring the server](#configuring-the-server)
 - [Command reference](#command-reference)
 - [Model manifests](#model-manifests)
 - [Embedding the runtime](#embedding-the-runtime)
@@ -370,6 +371,90 @@ Config   {...}
 
    The first run is slower, because it reads the experts from disk; later runs find
    them in the operating system's page cache.
+
+## Configuring the server
+
+`qubivex serve` can take every setting from a TOML file. There is no default location and
+the server does not look for one: it reads a file only when you name it with
+`--config <path>` or the `QUBIVEX_CONFIG` environment variable. Without either it uses
+flags, environment variables and built-in defaults.
+
+By convention the file lives at:
+
+| Platform | Path | Running it as a service |
+|---|---|---|
+| macOS | `~/.qubivex/serve.toml` | launchd agent, [`docs/deployment/macos-deployment.md`](docs/deployment/macos-deployment.md) |
+| Linux | `/etc/qubivex/serve.toml` | systemd unit, [`docs/deployment/linux-deployment.md`](docs/deployment/linux-deployment.md) |
+
+**1. Create the file.** This generates a random API key and admin token and writes them
+into a file only you can read:
+
+```sh
+mkdir -p ~/.qubivex
+umask 077
+cat > ~/.qubivex/serve.toml <<EOF
+[serve]
+listen = "127.0.0.1:8080"
+dirs = ["$HOME/.qubivex/models"]
+models = ["qwen2.5-0.5b-instruct"]
+backend = "cpu"
+api_key = "$(openssl rand -hex 24)"
+admin_token = "$(openssl rand -hex 24)"
+context = 8192
+default_max_tokens = 512
+max_generation_tokens = 4096
+EOF
+chmod 600 ~/.qubivex/serve.toml   # required: the server refuses a readable file holding secrets
+```
+
+Keys are the flag names with `_` for `-` (`qubivex serve --help` lists them; see
+[`qubivex serve`](#qubivex-serve---model-iddir-options) for the full table). Unknown keys
+are errors, so a misspelt setting stops the server at start instead of being ignored.
+
+**2. Start the server with it**, either way:
+
+```sh
+qubivex serve --config ~/.qubivex/serve.toml
+
+# or once, in your shell profile
+export QUBIVEX_CONFIG=~/.qubivex/serve.toml
+qubivex serve
+```
+
+The first lines it prints give the address, for example
+`serving ["qwen2.5-0.5b-instruct"] on http://127.0.0.1:8080 (OpenAI API under /v1)`.
+
+**3. Point clients at it.** The base URL is `http://<host>:<port>/v1`, and every `/v1`
+request sends `Authorization: Bearer <api_key>`; loading and unloading models use
+`Authorization: Bearer <admin_token>`. To read the secrets back:
+
+```sh
+grep -E '^(api_key|admin_token)' ~/.qubivex/serve.toml
+```
+
+```python
+from openai import OpenAI
+client = OpenAI(base_url="http://127.0.0.1:8080/v1", api_key="<api_key>")
+```
+
+In qubivex-ui, paste them under Settings → API key and Admin token.
+
+**Precedence.** A flag beats its environment variable, which beats the file, which beats the
+default. The demo `Makefile` passes `--dir`, `--model`, `--backend`, `--listen` and
+`--admin-token` as flags, so with `make up` only the file's other settings take effect:
+
+```sh
+make up SERVE_ARGS="--config $HOME/.qubivex/serve.toml"
+```
+
+To use the file as written, run `qubivex serve --config …` directly.
+
+**Serving other machines.** `127.0.0.1` accepts connections from this machine only. Set
+`listen = "0.0.0.0:8080"`; the server then requires `api_key` (or named client keys, or
+`--allow-unauthenticated`). Clients use `http://<this machine's address>:8080/v1`. Add
+`cors_origins` for browser apps on other origins, allow the port through the firewall, and
+consider one named key per client (`qubivex keys new <client>`, then paste the printed
+`[[serve.client_keys]]` table into the file).
 
 ## Command reference
 
