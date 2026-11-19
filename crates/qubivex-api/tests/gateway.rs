@@ -476,7 +476,7 @@ fn auth_admin_and_errors_without_paths() {
             "n",
         ),
         (
-            json!({ "model": "olmoe-tiny", "messages": msgs, "max_tokens": 100000 }),
+            json!({ "model": "olmoe-tiny", "messages": msgs, "max_tokens": 0 }),
             400,
             "max_tokens",
         ),

@@ -38,7 +38,8 @@ pub enum Prompt {
 pub struct GenerationRequest {
     /// What to generate from.
     pub prompt: Prompt,
-    /// Most tokens to generate. A value the context cannot hold is refused.
+    /// Most tokens to generate: an upper bound. Past the room left in the context, the
+    /// generation ends when the context is full.
     pub max_tokens: Option<usize>,
     /// Most tokens when `max_tokens` is `None`, capped by the room left in the context.
     pub default_max_tokens: usize,
@@ -301,19 +302,11 @@ impl Engine {
                 "the prompt has {prompt_tokens} tokens; the context holds {ctx}, leaving no room to generate"
             )));
         }
+        // An upper bound, as in other local inference servers: a client cannot know how
+        // many tokens its prompt became, so asking past the context ends at the context
+        // (`length`).
         let room = ctx - prompt_tokens;
-        let max_new = match req.max_tokens {
-            Some(m) if m > room => {
-                return Err(RequestError::invalid_param(
-                    "max_tokens",
-                    format!(
-                        "the prompt has {prompt_tokens} tokens and max_tokens is {m}; the context holds {ctx}"
-                    ),
-                ));
-            }
-            Some(m) => m,
-            None => req.default_max_tokens.min(room),
-        };
+        let max_new = req.max_tokens.unwrap_or(req.default_max_tokens).min(room);
         Ok(PreparedRequest { prompt, max_new })
     }
 
