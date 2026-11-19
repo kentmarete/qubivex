@@ -302,8 +302,9 @@ impl Engine {
                 "the prompt has {prompt_tokens} tokens; the context holds {ctx}, leaving no room to generate"
             )));
         }
-        // An upper bound, as in Ollama and llama.cpp: a client cannot know how many tokens
-        // its prompt became, so asking past the context ends at the context (`length`).
+        // An upper bound, as in other local inference servers: a client cannot know how
+        // many tokens its prompt became, so asking past the context ends at the context
+        // (`length`).
         let room = ctx - prompt_tokens;
         let max_new = req.max_tokens.unwrap_or(req.default_max_tokens).min(room);
         Ok(PreparedRequest { prompt, max_new })
