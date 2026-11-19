@@ -28,6 +28,8 @@ pub(crate) struct Loaded {
     source: String,
     /// The model's directory, resolved: an instance's identity.
     dir: PathBuf,
+    /// The context the load asked for; `None`: the server's setting.
+    context: Option<usize>,
 }
 
 /// A model's state in the serving process.
@@ -36,6 +38,8 @@ pub(crate) enum Entry {
         source: String,
         /// Set as soon as the load finds the model.
         dir: Option<PathBuf>,
+        /// The context the load asked for; `None`: the server's setting.
+        context: Option<usize>,
         done: watch::Receiver<LoadResult>,
     },
     Ready(Arc<Loaded>),
@@ -67,7 +71,7 @@ impl AppState {
         }
     }
 
-    fn entry_ready(&self, engine: Engine, source: String) -> Entry {
+    fn entry_ready(&self, engine: Engine, source: String, context: Option<usize>) -> Entry {
         let dir = resolved(&engine.metadata().dir);
         let engine = Arc::new(engine);
         Entry::Ready(Arc::new(Loaded {
@@ -76,12 +80,13 @@ impl AppState {
             created: now_secs(),
             source,
             dir,
+            context,
         }))
     }
 
     /// Serves `engine` under `id`.
     pub(crate) fn insert(&self, id: &str, engine: Engine) -> Result<(), ApiError> {
-        let entry = self.entry_ready(engine, id.to_owned());
+        let entry = self.entry_ready(engine, id.to_owned(), None);
         let mut m = self.write_models();
         if m.contains_key(id) {
             return Err(ApiError::conflict(format!(
@@ -150,11 +155,16 @@ impl AppState {
     /// Loads `what` as `id`, or joins the load already running. Returns the model and
     /// whether this call started the load. The load belongs to the server, not to the
     /// request: a client that goes away does not end it for the others.
+    ///
+    /// `context` overrides the server's context limit for this load (the model's own
+    /// limit still caps it). A model loaded or loading with another context is a
+    /// conflict: unload it first.
     pub(crate) async fn load(
         self: &Arc<Self>,
         rid: &str,
         what: &str,
         id: &str,
+        context: Option<usize>,
     ) -> Result<(Arc<Loaded>, bool), ApiError> {
         let busy = |id: &str| {
             ApiError::conflict(format!("the model {id:?} is already loaded from elsewhere"))
@@ -163,10 +173,28 @@ impl AppState {
             let mut m = self.write_models();
             match m.get(id) {
                 Some(Entry::Ready(l)) if l.source == what || id == what => {
-                    return Ok((Arc::clone(l), false));
+                    let have = l.engine.max_context();
+                    return match context {
+                        Some(c) if l.context != Some(c) && have != c => {
+                            Err(ApiError::conflict(format!(
+                                "the model {id:?} is loaded with a context of {have} tokens; unload it to load it with {c}"
+                            )))
+                        }
+                        _ => Ok((Arc::clone(l), false)),
+                    };
                 }
                 Some(Entry::Ready(_)) => return Err(busy(id)),
-                Some(Entry::Loading { source, done, .. }) if source == what => {
+                Some(Entry::Loading {
+                    source,
+                    context: loading,
+                    done,
+                    ..
+                }) if source == what => {
+                    if context.is_some() && context != *loading {
+                        return Err(ApiError::conflict(format!(
+                            "the model {id:?} is loading with another context; wait for it and unload it to change the context"
+                        )));
+                    }
                     (done.clone(), false)
                 }
                 Some(Entry::Loading { .. }) => return Err(busy(id)),
@@ -177,6 +205,7 @@ impl AppState {
                         Entry::Loading {
                             source: what.to_owned(),
                             dir: None,
+                            context,
                             done: rx.clone(),
                         },
                     );
@@ -186,6 +215,7 @@ impl AppState {
                         rid: rid.to_owned(),
                         what: what.to_owned(),
                         id: id.to_owned(),
+                        context,
                     };
                     tokio::spawn(job.run(tx));
                     (rx, true)
@@ -265,6 +295,8 @@ struct LoadJob {
     rid: String,
     what: String,
     id: String,
+    /// Overrides the server's context limit for this load.
+    context: Option<usize>,
 }
 
 impl LoadJob {
@@ -285,7 +317,11 @@ impl LoadJob {
             ApiError::model_not_found(what)
         })?;
         st.claim_dir(&self.id, &resolved(&meta.dir))?;
-        Engine::load(meta, st.cfg.engine).map_err(|e| ApiError::from_runtime(&e, rid, &st.log))
+        let mut opts = st.cfg.engine;
+        if let Some(c) = self.context {
+            opts.max_context = Some(c);
+        }
+        Engine::load(meta, opts).map_err(|e| ApiError::from_runtime(&e, rid, &st.log))
     }
 
     async fn run(self, done: watch::Sender<LoadResult>) {
@@ -315,7 +351,10 @@ impl LoadJob {
             }
         }
         let (entry, result) = match loaded {
-            Ok(engine) => (Some(st.entry_ready(engine, job.what.clone())), Ok(())),
+            Ok(engine) => (
+                Some(st.entry_ready(engine, job.what.clone(), job.context)),
+                Ok(()),
+            ),
             // Nothing was found to load, or another id serves it: no state to keep.
             Err(e) if e.status == StatusCode::NOT_FOUND || e.status == StatusCode::CONFLICT => {
                 (None, Err(e))
@@ -350,6 +389,7 @@ mod tests {
             Entry::Loading {
                 source: "m".to_owned(),
                 dir: None,
+                context: None,
                 done: rx,
             },
         );
