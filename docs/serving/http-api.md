@@ -139,7 +139,7 @@ answer.
 |---|---|---|---|
 | `model` | string | required | The id of a loaded model |
 | `messages` | array | required | Roles `system`, `developer` (treated as `system`), `user`, `assistant`. `content` is a string or a list of `{"type":"text","text":...}` parts |
-| `max_tokens` or `max_completion_tokens` | integer | `--default-max-tokens` (512) | Most tokens to generate. Above `--max-generation-tokens` is a 400 |
+| `max_tokens` or `max_completion_tokens` | integer | `--default-max-tokens` (512) | Most tokens to generate. Above `--max-generation-tokens` is a 400; past the room the prompt leaves in the context, generation ends when the context is full (`finish_reason` `length`) |
 | `temperature` | number | 1.0 | 0 to 2. 0 is greedy |
 | `top_p` | number | 1.0 | In (0, 1] |
 | `top_k` | integer | 0 (off) | Keep the K likeliest tokens before `top_p`. Not an OpenAI field |

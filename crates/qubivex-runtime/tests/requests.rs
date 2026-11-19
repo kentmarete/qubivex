@@ -136,19 +136,23 @@ fn requests_the_context_cannot_hold_are_refused_before_any_pass() {
         e.run_request(r, &AtomicBool::new(false), |_| panic!("no events expected"))
             .unwrap_err()
     };
-    assert!(matches!(
-        err(&request(1000)),
-        RequestError::Invalid {
-            param: Some("max_tokens"),
-            ..
-        }
-    ));
     let long = GenerationRequest::new(Prompt::Text("word ".repeat(500)));
     assert!(matches!(
         err(&long),
         RequestError::Invalid { param: None, .. }
     ));
     assert_eq!(e.store_stats().loads, 0);
+}
+
+/// `max_tokens` is an upper bound: past the room the prompt leaves, the request reserves
+/// and generates up to the end of the context.
+#[test]
+fn max_tokens_past_the_context_is_capped_by_it() {
+    let e = engine();
+    let p = e.prepare(&request(1000)).unwrap();
+    assert_eq!(p.positions(), e.max_context());
+    let small = e.prepare(&request(3)).unwrap();
+    assert_eq!(small.positions(), small.prompt_tokens() + 3);
 }
 
 #[test]

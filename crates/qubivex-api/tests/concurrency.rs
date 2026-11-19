@@ -704,3 +704,28 @@ fn a_load_sets_its_own_context() {
     let sys = http(s.addr, "GET", "/v1/system", &admin, None).json();
     assert_eq!(sys["models"][0]["max_context"], 128);
 }
+
+/// `max_tokens` past the room the prompt leaves is an upper bound: the generation ends
+/// when the context is full, with `length`, rather than being refused.
+#[test]
+fn max_tokens_past_the_context_ends_at_the_context() {
+    let gw = Gateway::new(ServerConfig::default());
+    gw.add_model(M, engine(M)).unwrap();
+    let s = start(&gw);
+    let sys = http(s.addr, "GET", "/v1/system", &[], None).json();
+    let ctx = sys["models"][0]["max_context"].as_u64().unwrap();
+    let r = post(
+        s.addr,
+        "/v1/completions",
+        &completion("Hello, experts", 100_000),
+    );
+    assert_eq!(r.status, 200, "{}", String::from_utf8_lossy(&r.body));
+    let body = r.json();
+    assert_eq!(body["choices"][0]["finish_reason"], "length");
+    let usage = &body["usage"];
+    assert_eq!(
+        usage["prompt_tokens"].as_u64().unwrap() + usage["completion_tokens"].as_u64().unwrap(),
+        ctx
+    );
+    all_clear(&gw, M);
+}
