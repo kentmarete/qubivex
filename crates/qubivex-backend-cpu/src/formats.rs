@@ -15,6 +15,37 @@ pub const QK_K: usize = 256;
 pub const Q4_K_BYTES: usize = 144;
 /// Q6_K block: 128 low-nibble bytes, 64 high-bit bytes, 16 i8 scales, f16 d.
 pub const Q6_K_BYTES: usize = 210;
+/// MXFP4 block: one E8M0 scale byte, then 16 bytes of E2M1 nibbles.
+pub const MXFP4_BYTES: usize = 17;
+/// Elements per MXFP4 block.
+pub const MXFP4_ELEMS: usize = 32;
+
+/// The 16 E2M1 values doubled, by nibble: `0, 0.5, 1, 1.5, 2, 3, 4, 6` and their
+/// negatives, times two so they are integers (GGML `kvalues_mxfp4`). The block scale
+/// is halved to match ([`e8m0_to_f32_half`]).
+pub const MXFP4_VALUES: [i8; 16] = [0, 1, 2, 3, 4, 6, 8, 12, 0, -1, -2, -3, -4, -6, -8, -12];
+
+/// Half the value of an E8M0 scale, `2^(e − 128)`, exactly (GGML
+/// `ggml_e8m0_to_fp32_half`). `e` 0 and 1 give the subnormals `2^-128` and `2^-127`.
+/// As in GGML, `e = 255` is the finite `2^127`, not the OCP specification's NaN.
+#[must_use]
+pub const fn e8m0_to_f32_half(e: u8) -> f32 {
+    let bits = if e < 2 {
+        0x0020_0000u32 << e
+    } else {
+        (e as u32 - 1) << 23
+    };
+    f32::from_bits(bits)
+}
+
+/// The doubled E2M1 value of element `i` (0..32) of an MXFP4 block's 16 nibble bytes:
+/// the low nibble of byte `i` for `i < 16`, else the high nibble of byte `i − 16`.
+#[inline(always)]
+#[must_use]
+pub fn mxfp4_nibble(qs: &[u8], i: usize) -> i8 {
+    let b = qs[i % 16];
+    MXFP4_VALUES[usize::from(if i < 16 { b & 0xF } else { b >> 4 })]
+}
 
 /// IEEE binary16 to f32, exactly (every f16 is representable in f32).
 #[must_use]
@@ -53,7 +84,7 @@ pub const fn supported(dtype: DType) -> bool {
         DType::F32
             | DType::F16
             | DType::BF16
-            | DType::Ggml(GgmlType::Q8_0 | GgmlType::Q4_K | GgmlType::Q6_K)
+            | DType::Ggml(GgmlType::Q8_0 | GgmlType::Q4_K | GgmlType::Q6_K | GgmlType::MXFP4)
     )
 }
 
@@ -81,6 +112,7 @@ pub fn dequant_row(dtype: DType, row: &[u8], out: &mut [f32]) {
         DType::Ggml(GgmlType::Q8_0) => q8_0(row, out),
         DType::Ggml(GgmlType::Q4_K) => q4_k(row, out),
         DType::Ggml(GgmlType::Q6_K) => q6_k(row, out),
+        DType::Ggml(GgmlType::MXFP4) => mxfp4(row, out),
         _ => out.fill(f32::NAN),
     }
 }
@@ -94,6 +126,22 @@ fn q8_0(row: &[u8], out: &mut [f32]) {
             #[allow(clippy::cast_possible_wrap)]
             let q = q as i8;
             *y = f32::from(q) * d;
+        }
+    }
+}
+
+/// `y = v · (s / 2)`, `v` the doubled E2M1 value: exact, since `v` has at most two
+/// significant bits and `s / 2` is a power of two (only overflow past `2^128` rounds,
+/// to infinity, which every path does alike). GGML `dequantize_row_mxfp4`.
+#[inline(always)]
+fn mxfp4(row: &[u8], out: &mut [f32]) {
+    for (blk, o) in row
+        .chunks_exact(MXFP4_BYTES)
+        .zip(out.chunks_exact_mut(MXFP4_ELEMS))
+    {
+        let d = e8m0_to_f32_half(blk[0]);
+        for (i, y) in o.iter_mut().enumerate() {
+            *y = f32::from(mxfp4_nibble(&blk[1..], i)) * d;
         }
     }
 }
@@ -169,6 +217,35 @@ fn q6_k(row: &[u8], out: &mut [f32]) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn e8m0_half_is_two_to_the_e_minus_128() {
+        for e in 0..=u8::MAX {
+            let want = 2f64.powi(i32::from(e) - 128);
+            assert_eq!(f64::from(e8m0_to_f32_half(e)), want, "e {e}");
+        }
+    }
+
+    #[test]
+    fn mxfp4_nibbles_are_low_then_high_halves() {
+        let qs: Vec<u8> = (0..16u8).map(|i| i | ((15 - i) << 4)).collect();
+        for i in 0..32 {
+            let n = if i < 16 { i } else { 31 - i };
+            assert_eq!(mxfp4_nibble(&qs, i), MXFP4_VALUES[n], "{i}");
+        }
+        // The E2M1 code points, doubled: sign bit 3, exponent bits 2..1, mantissa bit 0.
+        for (n, &v) in MXFP4_VALUES.iter().enumerate() {
+            let n = u8::try_from(n).unwrap_or(0);
+            let (e, m) = (i32::from((n >> 1) & 3), i32::from(n & 1));
+            let mag = if e == 0 {
+                f64::from(m) * 0.5
+            } else {
+                (1.0 + f64::from(m) / 2.0) * 2f64.powi(e - 1)
+            };
+            let want = if n & 8 != 0 { -mag } else { mag };
+            assert_eq!(f64::from(v) / 2.0, want, "nibble {n:#x}");
+        }
+    }
 
     #[test]
     fn f16_is_exact_for_every_value() {

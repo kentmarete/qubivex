@@ -1,4 +1,4 @@
-"""Reference dequantization of random GGML blocks, from gguf-py (llama.cpp's Python package).
+"""Reference dequantization of random GGML blocks (Q8_0, Q4_K, Q6_K, MXFP4), from gguf-py (llama.cpp's Python package).
 
 Run with the oracle venv (see fixtures/oracle/README.md):
     ~/.qubivex/oracle/bin/python -I fixtures/oracle/ggml_dequant.py > fixtures/oracle/ggml_dequant.json
@@ -43,6 +43,22 @@ for name, qtype, per_block, n_blocks in [("q8_0", T.Q8_0, 32, 8), ("q4_k", T.Q4_
         "bytes_hex": raw.hex(),
         "f32_bits": [int(b) for b in vals.view(np.uint32)],
     })
+
+# MXFP4: one block per E8M0 scale byte (0 to 255, subnormal halves and overflow
+# included), random nibbles. Drawn after the cases above so their bytes are unchanged.
+raw = bytearray(rng.integers(0, 256, 17 * 256, dtype=np.uint8).tobytes())
+for b in range(256):
+    raw[17 * b] = b
+raw = bytes(raw)
+with np.errstate(over="ignore"):
+    vals = dequantize(np.frombuffer(raw, dtype=np.uint8), T.MXFP4).astype(np.float32).reshape(-1)
+assert vals.size == 32 * 256
+cases.append({
+    "dtype": "mxfp4",
+    "cols": 32 * 256,
+    "bytes_hex": raw.hex(),
+    "f32_bits": [int(b) for b in vals.view(np.uint32)],
+})
 
 json.dump({
     "generator": "fixtures/oracle/ggml_dequant.py",

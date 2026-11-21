@@ -26,7 +26,10 @@ use core::arch::aarch64::{
     vsubq_s8,
 };
 
-use crate::formats::{Q4_K_BYTES, Q6_K_BYTES, Q8_0_BYTES, QK_K, f16_to_f32};
+use crate::formats::{
+    MXFP4_BYTES, MXFP4_VALUES, Q4_K_BYTES, Q6_K_BYTES, Q8_0_BYTES, QK_K, e8m0_to_f32_half,
+    f16_to_f32,
+};
 use crate::reduce::LANES;
 
 /// Accumulator vectors: 64 lanes / 4.
@@ -443,6 +446,58 @@ unsafe fn q8_0_impl(row: &[u8], x: &[f32]) -> f32 {
     }
 }
 
+/// The doubled E2M1 values of one half of an MXFP4 block, straight from its packed
+/// nibbles: half 0 is the low nibble of each of the 16 bytes (elements 0..16), half 1
+/// the high nibble (elements 16..32), each looked up in [`MXFP4_VALUES`] by `tbl`.
+///
+/// # Safety
+/// `blk` holds at least [`MXFP4_BYTES`] bytes.
+#[inline(always)]
+unsafe fn mxfp4_half(blk: &[u8], h: usize) -> [float32x4_t; 4] {
+    debug_assert!(blk.len() >= MXFP4_BYTES);
+    // SAFETY: bytes 1..17 are in bounds by the caller's guarantee; the table is 16 bytes.
+    unsafe {
+        let lut = core::arch::aarch64::vld1q_s8(MXFP4_VALUES.as_ptr());
+        let q = vld1q_u8(blk.as_ptr().add(1));
+        let idx = if h == 0 {
+            vandq_u8(q, vdupq_n_u8(0xF))
+        } else {
+            vshrq_n_u8::<4>(q)
+        };
+        i8x16_to_f32(core::arch::aarch64::vqtbl1q_s8(lut, idx))
+    }
+}
+
+/// MXFP4 row · x, from the packed blocks: per half block, 16 nibbles to doubled E2M1
+/// values by table lookup, times the halved E8M0 scale (exact), into lanes as
+/// [`q8_0_impl`] places them; an odd block count ends in a half chunk.
+///
+/// # Safety
+/// None beyond running on aarch64; lengths are asserted.
+unsafe fn mxfp4_impl(row: &[u8], x: &[f32]) -> f32 {
+    // SAFETY: NEON is part of the aarch64 baseline. Every load is in bounds: the
+    // asserts at the top fix the lengths, and each load notes its bound.
+    unsafe {
+        assert_eq!(row.len() / MXFP4_BYTES * 32, x.len());
+        let mut acc = [vdupq_n_f32(0.0); V];
+        for (bi, blk) in row.chunks_exact(MXFP4_BYTES).enumerate() {
+            let d = vdupq_n_f32(e8m0_to_f32_half(blk[0]));
+            for h in 0..2 {
+                // SAFETY: `blk` is one whole block.
+                let mut w = mxfp4_half(blk, h);
+                for v in &mut w {
+                    *v = vmulq_f32(*v, d);
+                }
+                let e = 32 * bi + 16 * h;
+                // SAFETY: e + 16 <= 32 * (bi + 1) <= x.len().
+                let xv = { load_x16(x, e) };
+                fma16(&mut acc, (e % LANES) / 4, w, xv);
+            }
+        }
+        reduce(acc)
+    }
+}
+
 /// bf16 row · x; a tail shorter than 64 fills lanes `0..rem`.
 ///
 /// # Safety
@@ -747,6 +802,62 @@ unsafe fn q8_0_rows_impl<const N: usize>(row: &[u8], xs: &[f32], out: &mut [f32]
     }
 }
 
+/// MXFP4, lane group `G`: half `G mod 2` of every block whose index is `G / 2` mod 2,
+/// the weights of [`mxfp4_impl`].
+///
+/// # Safety
+/// `xs` holds `N` rows of `k`, and the row `k / 32` blocks.
+#[inline(always)]
+unsafe fn mxfp4_group<const N: usize, const G: usize>(
+    row: &[u8],
+    xs: &[f32],
+    k: usize,
+) -> Group<N> {
+    // SAFETY: as `mxfp4_impl`; the caller fixes the lengths, and each load notes its
+    // bound.
+    unsafe {
+        let mut acc = zeros::<N>();
+        let h = G % 2;
+        for (bi, blk) in row
+            .chunks_exact(MXFP4_BYTES)
+            .enumerate()
+            .skip(G / 2)
+            .step_by(2)
+        {
+            let d = vdupq_n_f32(e8m0_to_f32_half(blk[0]));
+            let mut w = mxfp4_half(blk, h);
+            for v in &mut w {
+                *v = vmulq_f32(*v, d);
+            }
+            // SAFETY: 32 · bi + 16h + 16 <= 32 · (bi + 1) <= k, per row.
+            fma_rows(&mut acc, w, xs, k, 32 * bi + 16 * h);
+        }
+        acc
+    }
+}
+
+/// `N` MXFP4 dot products of one row.
+///
+/// # Safety
+/// None beyond running on aarch64; lengths are asserted.
+unsafe fn mxfp4_rows_impl<const N: usize>(row: &[u8], xs: &[f32], out: &mut [f32]) {
+    let k = row.len() / MXFP4_BYTES * 32;
+    assert_eq!(xs.len(), N * k);
+    assert_eq!(out.len(), N);
+    // SAFETY: the lengths were just asserted.
+    let g = unsafe {
+        [
+            mxfp4_group::<N, 0>(row, xs, k),
+            mxfp4_group::<N, 1>(row, xs, k),
+            mxfp4_group::<N, 2>(row, xs, k),
+            mxfp4_group::<N, 3>(row, xs, k),
+        ]
+    };
+    for (t, o) in out.iter_mut().enumerate() {
+        *o = reduce(lanes_of(&g, t));
+    }
+}
+
 /// bf16, lane group `G`: elements `64c + 16G ..` of the whole 16-element runs, the
 /// weights of [`bf16_impl`].
 ///
@@ -855,6 +966,12 @@ pub(crate) fn q8_0_rows(row: &[u8], xs: &[f32], out: &mut [f32]) {
     unsafe { by_rows!(q8_0_rows_impl, row, xs, out) }
 }
 
+/// MXFP4 multi-row dot.
+pub(crate) fn mxfp4_rows(row: &[u8], xs: &[f32], out: &mut [f32]) {
+    // SAFETY: NEON is always available on aarch64.
+    unsafe { by_rows!(mxfp4_rows_impl, row, xs, out) }
+}
+
 /// bf16 multi-row dot.
 pub(crate) fn bf16_rows(row: &[u8], xs: &[f32], out: &mut [f32]) {
     // SAFETY: NEON is always available on aarch64.
@@ -897,6 +1014,12 @@ pub(crate) fn q6_k(row: &[u8], x: &[f32]) -> f32 {
 pub(crate) fn q8_0(row: &[u8], x: &[f32]) -> f32 {
     // SAFETY: NEON is always available on aarch64.
     unsafe { q8_0_impl(row, x) }
+}
+
+/// MXFP4 row dot.
+pub(crate) fn mxfp4(row: &[u8], x: &[f32]) -> f32 {
+    // SAFETY: NEON is always available on aarch64.
+    unsafe { mxfp4_impl(row, x) }
 }
 
 /// bf16 row dot.
@@ -984,6 +1107,57 @@ mod tests {
         }
         // Most blocks give a number, not NaN, so the bit comparison did the work.
         assert!(checked > 100_000, "{checked}");
+    }
+
+    /// The MXFP4 kernels against dequantise-then-dot for every E8M0 scale byte (the
+    /// subnormal halves at 0 and 1, and 255, whose products can overflow), random
+    /// nibbles and activations, one block and odd and even block counts. NaN only has
+    /// to be NaN (infinite weights times opposite-signed activations).
+    #[test]
+    fn mxfp4_kernels_match_the_portable_path_for_every_scale() {
+        let dt = DType::Ggml(GgmlType::MXFP4);
+        let mut rng = Rng(0x5eed);
+        let mut checked = 0u32;
+        for blocks in [1usize, 2, 3, 4, 7] {
+            for e in 0..=u8::MAX {
+                let mut row: Vec<u8> = (0..blocks * MXFP4_BYTES).map(|_| rng.byte()).collect();
+                for b in row.chunks_exact_mut(MXFP4_BYTES) {
+                    b[0] = e.wrapping_add(rng.byte() % 3); // around e, so blocks differ
+                }
+                row[0] = e;
+                let k = blocks * 32;
+                let xs: Vec<f32> = (0..5 * k).map(|_| rng.f()).collect();
+                let mut w = vec![0f32; k];
+                dequant_row(dt, &row, &mut w);
+                let want: Vec<f32> = xs
+                    .chunks_exact(k)
+                    .map(|x| crate::reduce::dot(&w, x))
+                    .collect();
+                let same = |g: f32, want: f32| {
+                    if want.is_nan() {
+                        g.is_nan()
+                    } else {
+                        g.to_bits() == want.to_bits()
+                    }
+                };
+                assert!(
+                    same(mxfp4(&row, &xs[..k]), want[0]),
+                    "one row, {blocks} blocks, e {e}"
+                );
+                for n in 2..=MAX_ROWS {
+                    let mut out = vec![0f32; n];
+                    mxfp4_rows(&row, &xs[..n * k], &mut out);
+                    for t in 0..n {
+                        assert!(
+                            same(out[t], want[t]),
+                            "{n} rows, row {t}, {blocks} blocks, e {e}"
+                        );
+                    }
+                }
+                checked += u32::from(!want[0].is_nan());
+            }
+        }
+        assert!(checked > 1000, "{checked}");
     }
 
     /// Multi-block rows with random bytes everywhere except normal-range scales.
