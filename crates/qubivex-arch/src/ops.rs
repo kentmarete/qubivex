@@ -15,6 +15,8 @@ use qubivex_model::arch::RopeScaling;
 #[derive(Clone, Debug)]
 pub struct Rope {
     inv_freq: Vec<f32>,
+    /// The factor on every cos and sin (YaRN's `attention_factor`; 1 otherwise).
+    scale: f32,
 }
 
 impl Rope {
@@ -32,7 +34,10 @@ impl Rope {
                 1.0 / theta.powf(f64::from(e)) as f32
             })
             .collect();
-        Self { inv_freq }
+        Self {
+            inv_freq,
+            scale: 1.0,
+        }
     }
 
     /// [`Rope::new`] with the inverse frequencies scaled as `transformers` scales them,
@@ -56,6 +61,27 @@ impl Rope {
                         high_freq_factor,
                         original_max_position_embeddings,
                     );
+                }
+            }
+            RopeScaling::Yarn {
+                factor,
+                beta_fast,
+                beta_slow,
+                original_max_position_embeddings,
+                truncate,
+                attention_factor,
+            } => {
+                r.inv_freq = yarn(
+                    head_dim,
+                    theta,
+                    factor,
+                    (beta_fast, beta_slow),
+                    original_max_position_embeddings,
+                    truncate,
+                );
+                #[allow(clippy::cast_possible_truncation)]
+                {
+                    r.scale = attention_factor as f32;
                 }
             }
         }
@@ -88,6 +114,12 @@ impl Rope {
             {
                 c[i] = a.cos() as f32;
                 s[i] = a.sin() as f32;
+            }
+        }
+        // transformers multiplies the f32 cos and sin by the factor (YaRN); 1 is exact.
+        if self.scale != 1.0 {
+            for v in cs.iter_mut() {
+                *v *= self.scale;
             }
         }
     }
@@ -127,6 +159,50 @@ fn banded(inv: f32, factor: f64, low: f64, high: f64, original: u64) -> f32 {
     }
     let smooth = ((1.0 / wavelen) * old as f32 - low_f) / (high - low) as f32;
     (1.0 - smooth) * scaled / factor_f + smooth * scaled
+}
+
+/// YaRN inverse frequencies as transformers' `_compute_yarn_parameters` computes them:
+/// the correction range in f64 (Python floats), everything on the tensors in f32 with
+/// Python scalars rounded to f32, one rounding per operation and no fused multiply-add.
+/// The power `θ^(2i/d)` is the correctly rounded f32, as in [`Rope::new`]; torch's
+/// f32 `pow` is within one ulp of it, so where torch's is not correctly rounded the
+/// frequency can be one ulp from transformers'.
+#[allow(clippy::cast_possible_truncation, clippy::cast_precision_loss)]
+fn yarn(
+    head_dim: usize,
+    theta: f64,
+    factor: f64,
+    (beta_fast, beta_slow): (f64, f64),
+    original: u64,
+    truncate: bool,
+) -> Vec<f32> {
+    let dim = head_dim as f64;
+    let correction = |rotations: f64| {
+        (dim * (original as f64 / (rotations * 2.0 * std::f64::consts::PI)).ln())
+            / (2.0 * theta.ln())
+    };
+    let (mut low, mut high) = (correction(beta_fast), correction(beta_slow));
+    if truncate {
+        low = low.floor();
+        high = high.ceil();
+    }
+    let (low, mut high) = (low.max(0.0), high.min(dim - 1.0));
+    if low == high {
+        high += 0.001;
+    }
+    let factor_f = factor as f32;
+    let (low_f, span_f) = (low as f32, (high - low) as f32);
+    (0..head_dim / 2)
+        .map(|i| {
+            let e = (2 * i) as f32 / head_dim as f32;
+            let pos = theta.powf(f64::from(e)) as f32;
+            let extrapolation = 1.0 / pos;
+            let interpolation = 1.0 / (factor_f * pos);
+            let ramp = ((i as f32 - low_f) / span_f).clamp(0.0, 1.0);
+            let extra = 1.0 - ramp;
+            interpolation * (1.0 - extra) + extrapolation * extra
+        })
+        .collect()
 }
 
 /// `silu(g) · u`, in place into `g` (defined in `qubivex-compute`, so a device backend
@@ -283,6 +359,74 @@ mod tests {
             Rope::with_scaling(64, 1e4, &RopeScaling::None).inv_freq,
             Rope::new(64, 1e4).inv_freq
         );
+    }
+
+    /// YaRN inverse frequencies and attention factor against transformers 5.22
+    /// (`ROPE_INIT_FUNCTIONS["yarn"]`) on three configs, the first a 64-wide head at
+    /// θ = 150 000, factor 32, untruncated. Bit for bit, except one ulp at the listed
+    /// frequencies: there torch's f32 `pow` for `θ^(2i/d)` is not correctly rounded
+    /// (checked in Python: the correctly rounded powers give these bits exactly).
+    #[test]
+    fn yarn_scaling_matches_transformers_bits() {
+        #[rustfmt::skip]
+        let cases: [(usize, f64, f64, f64, f64, u64, bool, f64, &[usize], &str); 3] = [
+            (64, 150000.0, 32.0, 32.0, 1.0, 4096, false, 1.346_573_590_279_972_7, &[6, 10], concat!(
+                "3f8000003f3065353ef316a23ea77faa3e66d3fa3e1f0cfd3ddb2f9f3d970764",
+                "3d5021943d01ddd53c9e646f3c3dec943bdea8403b7cfe143b0938033a89f778",
+                "39ef543c390799b93820adc637dd6dfc37989328375242fa3710e12c36c7a82b",
+                "3689928c363d96473602a24535b4066835781728352af20034eb93eb34a252d3",
+            )),
+            (128, 10000.0, 4.0, 32.0, 1.0, 2048, true, 1.138_629_436_111_989, &[], concat!(
+                "3f8000003f5dafd73f3ff9113f263de03f0ff59a3ef953cf3ed7e89b3ebaf81b",
+                "3ea1e89b3e8c35043e72d4233e5247ed3e3618873e1db0403e088d773dec7fd6",
+                "3dcccccd3dac076d3d905d163d720c443d4ab1de3d298ae93d0da2d43cec5439",
+                "3cc4e1823ca3c30a3c87fbeb3c616bd43c3a77533c19e76a3bfd710f3bd01e92",
+                "3baa64c33b8b0ac13b62113a3b36ffb63b136a163aec29b43abbed463a9460f4",
+                "3a681cbb3a33770f3a1b690d3a06946f39e9152839c9d75c39aec98e39975c0e",
+                "3983126f396301e23944948c392a3b4439136a1638ff4fac38dd172538bf74d7",
+                "38a5cb60388f92723878a815385753e4383a775338217916380bd47237f22ce2",
+            )),
+            (96, 1e6, 8.0, 16.0, 2.0, 8192, true, 1.207_944_154_167_983_6, &[], concat!(
+                "3f8000003f3ff9113f0ff59a3ed7e89b3ea1e89b3e72d4253e3618873e088d78",
+                "3dcccccc3d99940d3d6655c43d2cba143d0186e33cc2434e3c91ad3a3c5a7bf2",
+                "3c11eb843bbff9133b779c323b1b74453abbd0643a55b07239da83d2392ec98f",
+                "3903126f38c4948f38936a14385d17253825cb6237f8a80f37ba7753378bd474",
+                "3751b713371d43a436ebdcf536b0df4e3684a2b23646ece036152c4035dfba4f",
+                "35a7c5b0357b9f67353cb0c1350d7f7634d43781349f23e4346ead3b3432fb6f",
+            )),
+        ];
+        for (d, theta, factor, bf, bs, old, truncate, af, off_by_one, hex) in cases {
+            let r = Rope::with_scaling(
+                d,
+                theta,
+                &RopeScaling::Yarn {
+                    factor,
+                    beta_fast: bf,
+                    beta_slow: bs,
+                    original_max_position_embeddings: old,
+                    truncate,
+                    // What the parser derives from the factor alone.
+                    attention_factor: 0.1 * factor.ln() + 1.0,
+                },
+            );
+            assert_eq!(0.1 * factor.ln() + 1.0, af, "d={d}: attention factor");
+            let want: Vec<u32> = (0..hex.len() / 8)
+                .map(|i| u32::from_str_radix(&hex[8 * i..8 * i + 8], 16).unwrap())
+                .collect();
+            let got: Vec<u32> = r.inv_freq.iter().map(|f| f.to_bits()).collect();
+            for (i, (g, w)) in got.iter().zip(&want).enumerate() {
+                let ulps = g.abs_diff(*w);
+                let allowed = u32::from(off_by_one.contains(&i));
+                assert!(ulps <= allowed, "d={d} theta={theta} dim {i}: {ulps} ulp");
+            }
+            // The table carries the factor on cos and sin.
+            let mut cs = vec![0f32; d];
+            r.table(0, &mut cs);
+            #[allow(clippy::cast_possible_truncation)]
+            let f = af as f32;
+            assert_eq!(cs[0], f, "cos 0 scaled");
+            assert_eq!(cs[d / 2], 0.0, "sin 0");
+        }
     }
 
     #[test]

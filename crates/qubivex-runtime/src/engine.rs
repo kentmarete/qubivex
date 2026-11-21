@@ -1152,6 +1152,13 @@ impl Engine {
                 .get(name)
                 .ok_or_else(|| RuntimeError::Model(format!("tensor {name:?} not indexed")))?;
             let bad = |e: &dyn std::fmt::Display| RuntimeError::Model(format!("{name:?}: {e}"));
+            // Split MXFP4 halves are not one contiguous range; only the expert source
+            // repacks them.
+            if t.scales.is_some() {
+                return Err(bad(
+                    &"is MXFP4 stored as separate blocks and scales, which only routed experts may be",
+                ));
+            }
             let mut desc = t.tensor.desc().map_err(|e| bad(&e))?;
             match *desc.dims() {
                 [n] => {

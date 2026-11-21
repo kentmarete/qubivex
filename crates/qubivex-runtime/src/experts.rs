@@ -37,6 +37,21 @@ pub struct PartLayout {
     file: usize,
     /// Absolute offset in that file.
     file_offset: u64,
+    /// How the stored bytes become the part's, when they are not a plain copy.
+    repack: Option<Repack>,
+}
+
+/// A part whose stored bytes are reordered as they load (lossless: the same values,
+/// moved). The part is then MXFP4 in the GGML layout, or its stored dtype, with gate
+/// rows first.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Repack {
+    /// SafeTensors MXFP4 halves (`qubivex_model::SplitScales`): the part's stored
+    /// nibble blocks (`file_offset`, `rows · cols / 2` bytes) and its scales here
+    /// (`file`, absolute offset), one byte per block.
+    scales: Option<(usize, u64)>,
+    /// Gate and up rows alternate in the file (row `2i` gate, `2i + 1` up).
+    interleaved: bool,
 }
 
 /// Every part of one expert, in a fixed order (gate, up, gate-up, down).
@@ -61,10 +76,10 @@ struct Extent {
 }
 
 /// The parts' reads, merging each part into the previous read when it continues it
-/// in both the file and the expert's bytes.
+/// in both the file and the expert's bytes. Repacked parts are read separately.
 fn coalesce(parts: &[PartLayout]) -> Vec<Extent> {
     let mut out: Vec<Extent> = Vec::new();
-    for p in parts {
+    for p in parts.iter().filter(|p| p.repack.is_none()) {
         if let Some(last) = out.last_mut()
             && last.file == p.file
             && last.file_offset + last.len as u64 == p.file_offset
@@ -245,6 +260,7 @@ impl ModelExpertSource {
                     let [rows, cols] = dims else {
                         return Err(bad());
                     };
+                    let (part, repack) = repacked(part, t.scales.map(|s| (s.file, s.offset)));
                     parts.entry((layer, expert)).or_default().push(PartLayout {
                         part,
                         dtype: t.tensor.dtype,
@@ -254,6 +270,7 @@ impl ModelExpertSource {
                         len: usize_of(t.tensor.bytes, "expert bytes")?,
                         file: t.file,
                         file_offset: t.tensor.offset,
+                        repack,
                     });
                 }
                 TensorRole::RoutedExpertStack {
@@ -268,7 +285,18 @@ impl ModelExpertSource {
                         return Err(bad());
                     }
                     let slice = t.tensor.bytes / u64::from(experts);
+                    // Split MXFP4: each expert's blocks are 16 of every 17 bytes, its
+                    // scales the 17th, each half contiguous per expert.
+                    let (stored, scale_slice) = match t.scales {
+                        Some(_) => (slice / 17 * 16, slice / 17),
+                        None => (slice, 0),
+                    };
                     for e in 0..experts {
+                        let e64 = u64::from(e);
+                        let (part, repack) = repacked(
+                            part,
+                            t.scales.map(|s| (s.file, s.offset + e64 * scale_slice)),
+                        );
                         parts
                             .entry((layer, ExpertIdx(e)))
                             .or_default()
@@ -280,7 +308,8 @@ impl ModelExpertSource {
                                 offset: 0,
                                 len: usize_of(slice, "expert bytes")?,
                                 file: t.file,
-                                file_offset: t.tensor.offset + u64::from(e) * slice,
+                                file_offset: t.tensor.offset + e64 * stored,
+                                repack,
                             });
                     }
                 }
@@ -348,6 +377,77 @@ impl ModelExpertSource {
     pub fn total_bytes(&self) -> u64 {
         self.experts.values().map(|e| e.size as u64).sum()
     }
+}
+
+/// The part an expert's tensor loads as, and how: an interleaved gate-up becomes the
+/// plain gate-up (gate rows first), and split MXFP4 is repacked.
+fn repacked(part: ExpertPart, scales: Option<(usize, u64)>) -> (ExpertPart, Option<Repack>) {
+    let interleaved = part == ExpertPart::GateUpInterleaved;
+    let part = if interleaved {
+        ExpertPart::GateUp
+    } else {
+        part
+    };
+    let repack = (interleaved || scales.is_some()).then_some(Repack {
+        scales,
+        interleaved,
+    });
+    (part, repack)
+}
+
+/// The source row of output row `r` of `rows`: gate rows (even source rows) first,
+/// then up rows (odd), when `interleaved`.
+const fn source_row(r: usize, rows: usize, interleaved: bool) -> usize {
+    if !interleaved {
+        r
+    } else if r < rows / 2 {
+        2 * r
+    } else {
+        2 * (r - rows / 2) + 1
+    }
+}
+
+/// Writes a repacked part into `dst` from its stored bytes: for split MXFP4, `blocks`
+/// (16 bytes per block, element `2j` in the low nibble of byte `j`, `2j + 1` in the
+/// high) and `scales` (one E8M0 byte per block) become GGML MXFP4 blocks (the scale,
+/// then element `i` in the low nibble of byte `i` and `i + 16` in its high nibble);
+/// otherwise `blocks` holds whole rows of `row_bytes`. Rows are reordered gate first
+/// when `interleaved`.
+fn repack_into(
+    dst: &mut [u8],
+    blocks: &[u8],
+    scales: Option<&[u8]>,
+    rows: usize,
+    interleaved: bool,
+) {
+    let out_row = dst.len() / rows;
+    match scales {
+        None => {
+            for (r, o) in dst.chunks_exact_mut(out_row).enumerate() {
+                let sr = source_row(r, rows, interleaved);
+                o.copy_from_slice(&blocks[sr * out_row..(sr + 1) * out_row]);
+            }
+        }
+        Some(scales) => {
+            let nb = out_row / 17;
+            let nib = |b: &[u8], m: usize| (b[m / 2] >> (4 * (m % 2))) & 0xF;
+            for (r, o) in dst.chunks_exact_mut(out_row).enumerate() {
+                let sr = source_row(r, rows, interleaved);
+                for (j, ob) in o.chunks_exact_mut(17).enumerate() {
+                    let src = &blocks[(sr * nb + j) * 16..(sr * nb + j + 1) * 16];
+                    ob[0] = scales[sr * nb + j];
+                    for i in 0..16 {
+                        ob[1 + i] = nib(src, i) | (nib(src, i + 16) << 4);
+                    }
+                }
+            }
+        }
+    }
+}
+
+thread_local! {
+    /// Each I/O thread's buffers for a repacked part's stored blocks and scales.
+    static STORED: RefCell<(Vec<u8>, Vec<u8>)> = const { RefCell::new((Vec::new(), Vec::new())) };
 }
 
 fn open(p: &Path) -> Result<File, RuntimeError> {
@@ -530,6 +630,53 @@ impl ExpertSource for ModelExpertSource {
                     detail: format!("{} bytes at {}: {err}", x.len, x.file_offset),
                 })?;
         }
+        for p in &e.parts {
+            let Some(r) = p.repack else { continue };
+            let fail = |what: &str, len: usize, off: u64, err: std::io::Error| StoreError::Load {
+                key,
+                detail: format!("{what}: {len} bytes at {off}: {err}"),
+            };
+            STORED.with(|s| -> Result<(), StoreError> {
+                let (blocks, scales) = &mut *s.borrow_mut();
+                let stored = if r.scales.is_some() {
+                    p.len / 17 * 16
+                } else {
+                    p.len
+                };
+                blocks.resize(stored, 0);
+                let x = Extent {
+                    file: p.file,
+                    file_offset: p.file_offset,
+                    offset: 0,
+                    len: stored,
+                };
+                self.read_extent(&x, blocks)
+                    .map_err(|err| fail("blocks", stored, p.file_offset, err))?;
+                let sc = match r.scales {
+                    Some((file, off)) => {
+                        scales.resize(p.len / 17, 0);
+                        let x = Extent {
+                            file,
+                            file_offset: off,
+                            offset: 0,
+                            len: scales.len(),
+                        };
+                        self.read_extent(&x, scales)
+                            .map_err(|err| fail("scales", x.len, off, err))?;
+                        Some(scales.as_slice())
+                    }
+                    None => None,
+                };
+                repack_into(
+                    &mut dst[p.offset..p.offset + p.len],
+                    blocks,
+                    sc,
+                    p.rows,
+                    r.interleaved,
+                );
+                Ok(())
+            })?;
+        }
         Ok(())
     }
 }
@@ -554,6 +701,7 @@ mod tests {
             len,
             file,
             file_offset,
+            repack: None,
         }
     }
 
