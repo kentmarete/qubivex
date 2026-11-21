@@ -28,6 +28,8 @@ use tokenizers::{AddedToken, Tokenizer as HfTokenizer};
 const MAX_TOKENIZER_BYTES: u64 = 64 << 20;
 /// Largest config file read.
 const MAX_CONFIG_BYTES: u64 = 4 << 20;
+/// Largest `chat_template.jinja` accepted.
+const MAX_TEMPLATE_BYTES: u64 = 1 << 20;
 /// Template instructions allowed per render (a guard against runaway templates).
 const TEMPLATE_FUEL: u64 = 1_000_000;
 
@@ -220,11 +222,27 @@ impl Tokenizer {
         eos.extend(eos_text.as_deref().and_then(id_of));
         let mut seen = HashSet::new();
         eos.retain(|i| seen.insert(*i));
-        let template = tc
+        // transformers writes the template into tokenizer_config.json, or (since 4.43)
+        // into chat_template.jinja beside it.
+        let template = match tc
             .as_ref()
             .and_then(|c| c.get("chat_template"))
             .and_then(serde_json::Value::as_str)
-            .map(str::to_owned);
+        {
+            Some(t) => Some(t.to_owned()),
+            None => {
+                let p = dir.join("chat_template.jinja");
+                if p.is_file() {
+                    let b = read_small(&p, MAX_TEMPLATE_BYTES)?;
+                    Some(String::from_utf8(b).map_err(|e| TokenizerError::Invalid {
+                        path: p.clone(),
+                        detail: e.to_string(),
+                    })?)
+                } else {
+                    None
+                }
+            }
+        };
         Ok(Self {
             inner,
             bos,
@@ -484,6 +502,17 @@ fn render_template(
             ))
         },
     );
+    // transformers' `strftime_now(format)`: the current date, here in UTC.
+    env.add_function(
+        "strftime_now",
+        |fmt: String| -> Result<String, minijinja::Error> {
+            let secs = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_secs());
+            strftime(secs, &fmt)
+                .map_err(|e| minijinja::Error::new(minijinja::ErrorKind::InvalidOperation, e))
+        },
+    );
     env.add_template("chat", src).map_err(t)?;
     env.get_template("chat")
         .map_err(t)?
@@ -497,6 +526,85 @@ fn render_template(
             eos_token => eos,
         })
         .map_err(t)
+}
+
+/// `secs` since the Unix epoch (UTC) formatted with the common `strftime` codes:
+/// `%Y %y %m %d %e %H %M %S %j %B %b %A %a %%`. Any other code is an error, so a
+/// template never gets a silently wrong date.
+fn strftime(secs: u64, fmt: &str) -> Result<String, String> {
+    const MONTHS: [&str; 12] = [
+        "January",
+        "February",
+        "March",
+        "April",
+        "May",
+        "June",
+        "July",
+        "August",
+        "September",
+        "October",
+        "November",
+        "December",
+    ];
+    const DAYS: [&str; 7] = [
+        "Thursday",
+        "Friday",
+        "Saturday",
+        "Sunday",
+        "Monday",
+        "Tuesday",
+        "Wednesday",
+    ];
+    let days = secs / 86_400;
+    let rem = secs % 86_400;
+    // Civil date from days since 1970-01-01 (Howard Hinnant's algorithm).
+    let z = i64::try_from(days).map_err(|e| e.to_string())? + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = yoe + era * 400 + i64::from(m <= 2);
+    let leap = (y % 4 == 0 && y % 100 != 0) || y % 400 == 0;
+    let cum = [0, 31, 59, 90, 120, 151, 181, 212, 243, 273, 304, 334];
+    #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
+    let yday = cum[(m - 1) as usize] + d + i64::from(leap && m > 2);
+    #[allow(clippy::cast_possible_truncation)]
+    let (mi, wd) = ((m - 1) as usize, (days % 7) as usize);
+    let mut out = String::new();
+    let mut chars = fmt.chars();
+    while let Some(c) = chars.next() {
+        if c != '%' {
+            out.push(c);
+            continue;
+        }
+        let piece = match chars.next() {
+            Some('Y') => format!("{y}"),
+            Some('y') => format!("{:02}", y.rem_euclid(100)),
+            Some('m') => format!("{m:02}"),
+            Some('d') => format!("{d:02}"),
+            Some('e') => format!("{d:2}"),
+            Some('H') => format!("{:02}", rem / 3600),
+            Some('M') => format!("{:02}", rem % 3600 / 60),
+            Some('S') => format!("{:02}", rem % 60),
+            Some('j') => format!("{yday:03}"),
+            Some('B') => MONTHS[mi].to_owned(),
+            Some('b') => MONTHS[mi][..3].to_owned(),
+            Some('A') => DAYS[wd].to_owned(),
+            Some('a') => DAYS[wd][..3].to_owned(),
+            Some('%') => "%".to_owned(),
+            other => {
+                return Err(format!(
+                    "strftime_now: unsupported format code %{}",
+                    other.unwrap_or(' ')
+                ));
+            }
+        };
+        out.push_str(&piece);
+    }
+    Ok(out)
 }
 
 /// Turns a growing id sequence into text pieces, holding back incomplete UTF-8.
@@ -546,6 +654,24 @@ impl StreamDecoder<'_> {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn strftime_formats_utc_dates() {
+        // 2024-02-29 13:05:09 UTC, a Thursday, day 60.
+        let t = 1_709_211_909;
+        assert_eq!(strftime(t, "%Y-%m-%d").unwrap(), "2024-02-29");
+        assert_eq!(
+            strftime(t, "%H:%M:%S %j %a %A %b %B %y %e %%").unwrap(),
+            "13:05:09 060 Thu Thursday Feb February 24 29 %"
+        );
+        assert_eq!(strftime(0, "%Y-%m-%d %A").unwrap(), "1970-01-01 Thursday");
+        assert_eq!(
+            strftime(951_782_400, "%Y-%m-%d %j").unwrap(),
+            "2000-02-29 060"
+        );
+        assert!(strftime(0, "%Z").is_err());
+    }
+
     use super::*;
 
     #[test]
