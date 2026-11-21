@@ -621,7 +621,7 @@ mod tests {
         let o = architectures();
         assert!(o.contains("transformer_dense "), "{o}");
         assert!(
-            o.contains("  weights    f32, f16, bf16, q8_0, q4_k, q6_k\n"),
+            o.contains("  weights    f32, f16, bf16, q8_0, q4_k, q6_k, mxfp4\n"),
             "{o}"
         );
         assert!(
