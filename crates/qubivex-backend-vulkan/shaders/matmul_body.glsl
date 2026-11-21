@@ -12,6 +12,11 @@ const uint DT_BF16 = 2;
 const uint DT_Q8_0 = 3;
 const uint DT_Q4_K = 4;
 const uint DT_Q6_K = 5;
+const uint DT_MXFP4 = 6;
+
+// MXFP4's E2M1 values, doubled, by nibble (`formats::MXFP4_VALUES`).
+const float MXFP4_VALUES[16] = float[16](0.0, 1.0, 2.0, 3.0, 4.0, 6.0, 8.0, 12.0,
+                                         0.0, -1.0, -2.0, -3.0, -4.0, -6.0, -8.0, -12.0);
 
 layout(constant_id = 0) const uint DTYPE = 0;
 
@@ -112,8 +117,31 @@ uvec2 scale_min_k4w(uint j, uvec3 sw) {
                  (sbyte(sw, j + 4u) >> 4) | ((sbyte(sw, j) >> 6) << 4));
 }
 
+// MXFP4 element `i` (0..32) of the block at byte `blk`: the doubled E2M1 value from
+// the packed nibble (byte i's low nibble for i < 16, else byte i - 16's high one)
+// times 2^(e - 128), exact as on the CPU. For e < 2 that scale is an f32 subnormal,
+// which MoltenVK's Apple GPUs flush, so the product is formed from two normal
+// factors, (v * 2^(e - 2)) * 2^-126: still exact, and the CPU's value whenever the
+// weight itself is normal.
+float mxfp4_at(uint blk, uint i) {
+    uint e = byte_at(blk);
+    uint b = byte_at(blk + 1u + (i & 15u));
+    float v = MXFP4_VALUES[i < 16u ? (b & 0xFu) : (b >> 4)];
+    if (e >= 2u) {
+        float y = v * uintBitsToFloat((e - 1u) << 23);
+        return y;
+    }
+    float t = opaque(v * uintBitsToFloat((e + 125u) << 23));
+    float y = t * uintBitsToFloat(1u << 23);
+    return y;
+}
+
 // The value of weight `j` of the row starting at byte `row`.
 float weight(uint row, uint j) {
+    if (DTYPE == DT_MXFP4) {
+        // 17-byte blocks of 32: the E8M0 scale byte, then 16 nibble bytes.
+        return mxfp4_at(row + 17u * (j / 32u), j % 32u);
+    }
     if (DTYPE == DT_F32) {
         return uintBitsToFloat(u32_at(row + 4u * j));
     } else if (DTYPE == DT_F16) {
@@ -277,6 +305,16 @@ void main() {
             }
 #undef K6H
 #undef K6Q
+        } else if (DTYPE == DT_MXFP4) {
+            // A chunk of 64 is two blocks of 32: lane l takes element l of each, read
+            // from the packed nibbles.
+            for (; c < full; c += 64u) {
+                uint b0 = row + 17u * (c / 32u);
+                float y0 = mxfp4_at(b0, lane);
+                float y1 = mxfp4_at(b0 + 17u, lane);
+                a0 = fma(y0, xs[x + c + lane], a0);
+                a1 = fma(y1, xs[x + c + lane + 32u], a1);
+            }
         } else if (DTYPE == DT_Q8_0) {
             // A chunk of 64 is two blocks of 32: lane l takes weight l of each.
             for (; c < full; c += 64u) {

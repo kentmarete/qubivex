@@ -36,13 +36,14 @@ fn device() -> Option<VulkanDevice> {
     open(VulkanConfig::default())
 }
 
-const DTYPES: [DType; 6] = [
+const DTYPES: [DType; 7] = [
     DType::F32,
     DType::F16,
     DType::BF16,
     DType::Ggml(GgmlType::Q8_0),
     DType::Ggml(GgmlType::Q4_K),
     DType::Ggml(GgmlType::Q6_K),
+    DType::Ggml(GgmlType::MXFP4),
 ];
 
 struct Rng(u32);
@@ -86,6 +87,14 @@ fn weights(dtype: DType, rows: usize, cols: usize, seed: u32) -> Vec<u8> {
                 ((v & 0x807F) | (e << 7)).to_le_bytes()
             })
             .collect(),
+        DType::Ggml(GgmlType::MXFP4) => {
+            let mut b: Vec<u8> = (0..n).map(|_| (r.next() >> 24) as u8).collect();
+            // E8M0 scales 2^-10 to 2^5.
+            for v in b.iter_mut().step_by(17) {
+                *v = 118 + (r.next() >> 28) as u8;
+            }
+            b
+        }
         _ => {
             let mut b: Vec<u8> = (0..n).map(|_| (r.next() >> 24) as u8).collect();
             // Keep the f16 scales of the block formats finite and small.
@@ -134,7 +143,7 @@ fn cpu(dtype: DType, rows: usize, cols: usize, host: &[u8], xs: &[f32], s: usize
 fn cols_for(dtype: DType) -> &'static [usize] {
     match dtype {
         DType::Ggml(GgmlType::Q4_K | GgmlType::Q6_K) => &[256, 512, 2048],
-        DType::Ggml(GgmlType::Q8_0) => &[32, 96, 544, 2048],
+        DType::Ggml(GgmlType::Q8_0 | GgmlType::MXFP4) => &[32, 96, 544, 2048],
         _ => &[1, 7, 63, 64, 65, 130, 2048],
     }
 }
@@ -166,6 +175,73 @@ fn every_dtype_shape_and_batch_matches_the_cpu() {
             }
         }
     }
+}
+
+/// `v` with an f32 subnormal replaced by a zero of the same sign.
+fn ftz(v: f32) -> f32 {
+    if v != 0.0 && v.abs() < f32::MIN_POSITIVE {
+        0.0f32.copysign(v)
+    } else {
+        v
+    }
+}
+
+/// MXFP4 for every E8M0 scale byte: one block per row, row `e` scaled by `e`, random
+/// nibbles. Scales below 2^0 take activations near 2^40 and the rest near 1, so no
+/// product or partial sum is subnormal unless the weight is: only at `e` 0 and 1,
+/// where a device that flushes subnormals (Apple GPUs through MoltenVK) must give the
+/// CPU's dot over the flushed row. Every other scale byte, 255's infinite weights
+/// included, gives the CPU's bits (NaNs compared as NaN).
+#[test]
+fn mxfp4_every_scale_byte() {
+    let Some(dev) = device() else { return };
+    let d = DType::Ggml(GgmlType::MXFP4);
+    let mut r = Rng(39);
+    let mut flushed = 0;
+    let same = |a: f32, b: f32| a.to_bits() == b.to_bits() || (a.is_nan() && b.is_nan());
+    for (first, mag) in [(0u32, 2f32.powi(40)), (128, 1.0)] {
+        let mut host: Vec<u8> = (0..128 * 17).map(|_| (r.next() >> 24) as u8).collect();
+        for e in 0..128u32 {
+            host[17 * e as usize] = (first + e) as u8;
+        }
+        let wv = WeightView::new(d, 128, 32, &host).unwrap();
+        let dw = DeviceWeights::like(dev.upload(&host, None).unwrap(), 0, &wv).unwrap();
+        for s in [1, 4] {
+            let xs: Vec<f32> = (0..32 * s)
+                .map(|_| {
+                    let v = r.next();
+                    let m = mag * (1.0 + (v >> 9) as f32 / (1u32 << 23) as f32);
+                    if v & 1 == 0 { m } else { -m }
+                })
+                .collect();
+            let want = cpu(d, 128, 32, &host, &xs, s);
+            let mut got = vec![f32::NAN; s * 128];
+            dev.matmul_many(&mut [DeviceMatMul {
+                w: &dw,
+                xs: &xs,
+                s,
+                ys: &mut got,
+            }])
+            .unwrap();
+            let mut row = vec![0f32; 32];
+            for t in 0..s {
+                for i in 0..128 {
+                    let e = first as usize + i;
+                    let (wv_, gv) = (want[t * 128 + i], got[t * 128 + i]);
+                    if same(wv_, gv) {
+                        continue;
+                    }
+                    assert!(e < 2, "e {e} s {s} t {t}: cpu {wv_:e} vulkan {gv:e}");
+                    CpuBackend::new().dequant_row(&wv, i, &mut row).unwrap();
+                    let ftz_row: Vec<u8> = row.iter().flat_map(|v| ftz(*v).to_le_bytes()).collect();
+                    let f = cpu(DType::F32, 1, 32, &ftz_row, &xs[t * 32..(t + 1) * 32], 1);
+                    assert_eq!(gv.to_bits(), f[0].to_bits(), "e {e} s {s} t {t}: flushed");
+                    flushed += 1;
+                }
+            }
+        }
+    }
+    eprintln!("{flushed} MXFP4 outputs with subnormal weights flushed");
 }
 
 #[test]

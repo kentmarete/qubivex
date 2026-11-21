@@ -31,7 +31,8 @@
 // same bits. Every invocation therefore runs the block loop; a row past `n` recomputes
 // row n - 1 and writes nothing.
 //
-// The weight dtype is a specialization constant, so one module gives six pipelines.
+// The weight dtype is a specialization constant, so one module gives one pipeline per
+// dtype (seven).
 
 #version 450
 

@@ -19,7 +19,8 @@
 //! one probe and refuses a device that splits it into a multiply and an add, as Mesa's
 //! lavapipe does: its outputs would differ from the CPU's in the last bits.
 //!
-//! Supported dtypes: f32, f16, bf16, Q8_0, Q4_K and Q6_K, the same set as the CPU.
+//! Supported dtypes: f32, f16, bf16, Q8_0, Q4_K, Q6_K and MXFP4, the same set as the
+//! CPU. Quantized weights are read packed inside the matmul shaders.
 //!
 //! The Vulkan loader is opened at run time, so the crate builds everywhere. Without
 //! one, [`VulkanDevice::new`] returns [`ComputeError::Device`]. `QUBIVEX_VULKAN_LIBRARY`
