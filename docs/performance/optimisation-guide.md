@@ -54,7 +54,7 @@ team waits for its slowest thread.
 
 **7. Choose the quantisation for the hardware.** A Q4_K_M file is about a quarter of
 the bf16 size, so four times as many experts fit in the same cache. The fused kernels
-cover Q4_K, Q6_K, Q8_0 and bf16.
+cover Q4_K, Q6_K, Q8_0, MXFP4 and bf16.
 
 ### Things that do not help
 

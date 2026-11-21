@@ -73,6 +73,8 @@ fn weights(dtype: DType, rows: usize, cols: usize, rng: &mut Rng) -> Vec<u8> {
             put(o + 2);
         }),
         DType::Ggml(GgmlType::Q6_K) => (0..n).step_by(210).for_each(|o| put(o + 208)),
+        // E8M0 scale 2^-7.
+        DType::Ggml(GgmlType::MXFP4) => (0..n).step_by(17).for_each(|o| b[o] = 120),
         _ => unreachable!(),
     }
     b
@@ -81,7 +83,8 @@ fn weights(dtype: DType, rows: usize, cols: usize, rng: &mut Rng) -> Vec<u8> {
 const Q4_K: DType = DType::Ggml(GgmlType::Q4_K);
 const Q6_K: DType = DType::Ggml(GgmlType::Q6_K);
 const Q8_0: DType = DType::Ggml(GgmlType::Q8_0);
-const ALL: [DType; 6] = [DType::F32, DType::F16, DType::BF16, Q8_0, Q4_K, Q6_K];
+const MXFP4: DType = DType::Ggml(GgmlType::MXFP4);
+const ALL: [DType; 7] = [DType::F32, DType::F16, DType::BF16, Q8_0, Q4_K, Q6_K, MXFP4];
 
 /// `(name, rows, cols)`: OLMoE-1B-7B expert projections.
 const EXPERT: [(&str, usize, usize); 2] = [

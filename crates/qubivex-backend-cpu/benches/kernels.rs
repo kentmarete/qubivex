@@ -92,6 +92,8 @@ fn weights(dtype: DType, rows: usize, cols: usize, rng: &mut Rng) -> Vec<u8> {
             put(o + 2);
         }),
         DType::Ggml(GgmlType::Q6_K) => (0..n).step_by(210).for_each(|o| put(o + 208)),
+        // E8M0 scale 2^-7.
+        DType::Ggml(GgmlType::MXFP4) => (0..n).step_by(17).for_each(|o| b[o] = 120),
         _ => unreachable!(),
     }
     b
@@ -100,7 +102,8 @@ fn weights(dtype: DType, rows: usize, cols: usize, rng: &mut Rng) -> Vec<u8> {
 const Q4_K: DType = DType::Ggml(GgmlType::Q4_K);
 const Q6_K: DType = DType::Ggml(GgmlType::Q6_K);
 const Q8_0: DType = DType::Ggml(GgmlType::Q8_0);
-const ALL: [DType; 6] = [DType::F32, DType::F16, DType::BF16, Q8_0, Q4_K, Q6_K];
+const MXFP4: DType = DType::Ggml(GgmlType::MXFP4);
+const ALL: [DType; 7] = [DType::F32, DType::F16, DType::BF16, Q8_0, Q4_K, Q6_K, MXFP4];
 
 /// `(name, rows, cols)`: OLMoE-1B-7B expert projections.
 const EXPERT: [(&str, usize, usize); 2] = [
@@ -111,7 +114,7 @@ const HEAD: (&str, usize, usize) = ("head_50304x2048", 50304, 2048);
 
 /// The dtypes with a fused one-row kernel on this CPU (see `fused` in the crate).
 const FUSED: &[DType] = if cfg!(target_arch = "aarch64") {
-    &[DType::BF16, Q8_0, Q4_K, Q6_K]
+    &[DType::BF16, Q8_0, Q4_K, Q6_K, MXFP4]
 } else {
     &[]
 };
@@ -240,7 +243,7 @@ fn decode_stream(c: &mut Criterion, threads: usize) {
     let pool = pool(threads);
     let mut g = c.benchmark_group(format!("decode_stream_t{threads}"));
     for &(shape, rows, cols) in &EXPERT {
-        for dtype in [DType::BF16, Q8_0, Q4_K, Q6_K] {
+        for dtype in [DType::BF16, Q8_0, Q4_K, Q6_K, MXFP4] {
             let case = Case::new(dtype, rows, cols, 1);
             let copies = STREAM_BYTES.div_ceil(case.w.len());
             let all: Vec<u8> = case.w.repeat(copies);
@@ -272,7 +275,7 @@ fn prefill(c: &mut Criterion) {
     matmul_group(
         c,
         &format!("prefill_s128_t{t}"),
-        &[DType::F32, DType::BF16, Q8_0, Q4_K, Q6_K],
+        &[DType::F32, DType::BF16, Q8_0, Q4_K, Q6_K, MXFP4],
         &EXPERT,
         128,
         t,

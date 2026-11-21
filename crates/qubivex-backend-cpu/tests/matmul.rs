@@ -55,18 +55,23 @@ fn weights(dtype: DType, rows: usize, cols: usize, rng: &mut Rng) -> Vec<u8> {
             put(o + 2);
         }),
         DType::Ggml(GgmlType::Q6_K) => (0..n).step_by(210).for_each(|o| put(o + 208)),
+        // E8M0 scales near 2^-7, so products stay in the normal range.
+        DType::Ggml(GgmlType::MXFP4) => (0..n)
+            .step_by(17)
+            .for_each(|o| b[o] = 118 + (rng.next() >> 61) as u8),
         _ => unreachable!(),
     }
     b
 }
 
-const DTYPES: [DType; 6] = [
+const DTYPES: [DType; 7] = [
     DType::F32,
     DType::F16,
     DType::BF16,
     DType::Ggml(GgmlType::Q8_0),
     DType::Ggml(GgmlType::Q4_K),
     DType::Ggml(GgmlType::Q6_K),
+    DType::Ggml(GgmlType::MXFP4),
 ];
 
 fn shapes(d: DType) -> &'static [(usize, usize)] {

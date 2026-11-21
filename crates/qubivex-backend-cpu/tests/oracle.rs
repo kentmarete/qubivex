@@ -15,12 +15,13 @@ fn ggml_dequant_matches_gguf_py_bit_for_bit() {
     );
     let v: Value = serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
     let cases = v["cases"].as_array().unwrap();
-    assert_eq!(cases.len(), 3);
+    assert_eq!(cases.len(), 4);
     for c in cases {
         let dtype = match c["dtype"].as_str().unwrap() {
             "q8_0" => DType::Ggml(GgmlType::Q8_0),
             "q4_k" => DType::Ggml(GgmlType::Q4_K),
             "q6_k" => DType::Ggml(GgmlType::Q6_K),
+            "mxfp4" => DType::Ggml(GgmlType::MXFP4),
             other => panic!("unexpected {other}"),
         };
         let hex = c["bytes_hex"].as_str().unwrap();

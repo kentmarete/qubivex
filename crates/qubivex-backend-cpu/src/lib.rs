@@ -6,7 +6,12 @@
 //! of an output therefore depend only on its weight row and activation row, never on
 //! the batch size, the thread count or the instruction set used (ADR-002).
 //!
-//! Supported dtypes: f32, f16, bf16, Q8_0, Q4_K and Q6_K.
+//! Supported dtypes: f32, f16, bf16, Q8_0, Q4_K, Q6_K and MXFP4.
+//!
+//! The quantized formats are read packed: the fused kernels decode each block in
+//! registers inside the dot product, so no f32 copy of a weight matrix ever exists.
+//! The portable path and the tiled kernel decode one row (or one tile of rows) at a
+//! time into a scratch buffer that stays in cache.
 //!
 //! Paths, all with the same bits: one activation row (decode) uses a fused NEON row dot
 //! where there is one, and two to twelve rows (a decode step over a few sequences) its
@@ -114,6 +119,7 @@ fn fused(dtype: DType) -> Option<RowDot> {
         DType::Ggml(GgmlType::Q4_K) => Some(neon::q4_k),
         DType::Ggml(GgmlType::Q6_K) => Some(neon::q6_k),
         DType::Ggml(GgmlType::Q8_0) => Some(neon::q8_0),
+        DType::Ggml(GgmlType::MXFP4) => Some(neon::mxfp4),
         DType::BF16 => Some(neon::bf16),
         _ => None,
     }
@@ -148,6 +154,7 @@ fn fused_rows(dtype: DType) -> Option<neon::RowsDot> {
         DType::Ggml(GgmlType::Q4_K) => Some(neon::q4_k_rows),
         DType::Ggml(GgmlType::Q6_K) => Some(neon::q6_k_rows),
         DType::Ggml(GgmlType::Q8_0) => Some(neon::q8_0_rows),
+        DType::Ggml(GgmlType::MXFP4) => Some(neon::mxfp4_rows),
         DType::BF16 => Some(neon::bf16_rows),
         _ => None,
     }

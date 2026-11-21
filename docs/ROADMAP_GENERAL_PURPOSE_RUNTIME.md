@@ -59,7 +59,7 @@ a file-format identifier needs one) and `cargo deny`.
 | Architecture registry | Factories by id, versioned, config parsing with cross-validation, tensor schema; two architectures: `transformer_moe`, `transformer_dense` | `qubivex-model/src/registry.rs`, `arch/` |
 | Real models | OLMoE-1B-7B Q4_K_M GGUF (tokens identical to a committed reference, also to Colibri's lossless path); Qwen3-0.6B bf16 SafeTensors (32 greedy tokens and top-32 logits vs transformers) | `qubivex-runtime/tests/oracle.rs`, `tests/real_dense.rs` (env-gated) |
 | Fixture models | Llama-config dense, OLMoE, Qwen3-MoE, OLMoE GGUF, all vs transformers in f32 per layer | `fixtures/models/`, `fixtures/oracle/forward.json` |
-| Lossless kernels | f32, f16, bf16, Q8_0, Q4_K, Q6_K: matmul and dequant bit for bit against gguf-py | `qubivex-backend-cpu/tests/oracle.rs`, `fixtures/oracle/ggml_dequant.json` |
+| Lossless kernels | f32, f16, bf16, Q8_0, Q4_K, Q6_K, MXFP4: matmul and dequant bit for bit against gguf-py | `qubivex-backend-cpu/tests/oracle.rs`, `fixtures/oracle/ggml_dequant.json` |
 | Attention | MHA/GQA/MQA, optional per-head q/k RMSNorm, `clip_qkv`, NeoX RoPE with correctly rounded tables | `qubivex-arch/src/{lib,ops}.rs` |
 | KV cache | Per-sequence caches, reservation against the memory plan, restore for prefix reuse | `qubivex-arch` `KvCache`, `qubivex-runtime/tests/prefix.rs` |
 | MoE | Top-k routing (optional renormalisation), host or device routing, fused expert dispatch | `qubivex-arch`, `qubivex-runtime/tests/batch.rs` |
@@ -85,7 +85,7 @@ a file-format identifier needs one) and `cargo deny`.
 | Dense on GPU | Dense matmuls placed one by one on Metal or Vulkan | Whole-layer/whole-token device passes exist for MoE only (`engine.rs:1154`); device attention is MoE-only (`qubivex-arch/src/lib.rs`, `dev_attn`) |
 | Llama family | Llama-shaped config through `transformer_dense` (fixture checked vs transformers); Llama 3.x `llama3` RoPE scaling (Llama-3.2-3B checked vs transformers, 2026-11-19) | GGUF tokenizer `llama-bpe` refused |
 | GGUF tokenizers | Byte-level BPE rebuilt from GGUF for 3 pre-tokenizer types | `qwen2`, `llama-bpe` and others refused; those models need `tokenizer.json` |
-| Quantised formats | Kernels for f32/f16/bf16/Q8_0/Q4_K/Q6_K | Q4_0, Q4_1, Q5_0, Q5_1, Q2_K, Q3_K, Q5_K are known dtypes without kernels |
+| Quantised formats | Kernels for f32/f16/bf16/Q8_0/Q4_K/Q6_K/MXFP4 (MXFP4 read packed in every kernel, ADR-007 amendment 2) | Q4_0, Q4_1, Q5_0, Q5_1, Q2_K, Q3_K, Q5_K are known dtypes without kernels |
 | Architecture registry | id, version, config schema, tensor schema | Declared quantisation support, backend support, positional and normalisation strategy, preprocessing requirements (brief §4) |
 | Vulkan speed | Bit-identical; Step 5 kernel (−10 to −12.5% decode) on branch `vulkan-kernel-port` (PR #67) | PR #67 undecided; prefill attention on host; decode attention and routing off by default |
 | CPU SIMD | NEON and AVX2+FMA | No AVX-512 path; x86-64 Linux not verified on real models (RW-05 in the 2026-11-14 action plan) |

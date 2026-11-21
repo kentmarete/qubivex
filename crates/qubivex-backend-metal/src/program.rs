@@ -15,9 +15,10 @@ use crate::{MetalBackend, MetalWeights, check_dtype};
 #[cfg(target_os = "macos")]
 use crate::device::{Arg, Buffer, Recorder, bytes_of};
 
-/// The forward-pass kernels, after the six matmul kernels in the pipeline list.
+/// The forward-pass kernels, after the matmul kernels (one per `DTYPES` entry) in the
+/// pipeline list. Each per-format run follows `DTYPES` order.
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
-pub(crate) const OP_KERNELS: [&str; 34] = [
+pub(crate) const OP_KERNELS: [&str; 37] = [
     "gather_rows",
     "scatter_rows",
     "exp_in_place",
@@ -39,18 +40,21 @@ pub(crate) const OP_KERNELS: [&str; 34] = [
     "routed_q8_0",
     "routed_q4_k",
     "routed_q6_k",
+    "routed_mxfp4",
     "matmul_f32_t",
     "matmul_f16_t",
     "matmul_bf16_t",
     "matmul_q8_0_t",
     "matmul_q4_k_t",
     "matmul_q6_k_t",
+    "matmul_mxfp4_t",
     "routed_f32_g",
     "routed_f16_g",
     "routed_bf16_g",
     "routed_q8_0_g",
     "routed_q4_k_g",
     "routed_q6_k_g",
+    "routed_mxfp4_g",
     "moe_group",
 ];
 

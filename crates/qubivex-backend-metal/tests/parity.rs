@@ -31,13 +31,14 @@ impl Rng {
     }
 }
 
-const DTYPES: [DType; 6] = [
+const DTYPES: [DType; 7] = [
     DType::F32,
     DType::F16,
     DType::BF16,
     DType::Ggml(GgmlType::Q8_0),
     DType::Ggml(GgmlType::Q4_K),
     DType::Ggml(GgmlType::Q6_K),
+    DType::Ggml(GgmlType::MXFP4),
 ];
 
 /// How weight bytes are drawn.
@@ -127,6 +128,15 @@ fn weights(dtype: DType, rows: usize, cols: usize, fill: Fill, rng: &mut Rng) ->
         DType::Ggml(GgmlType::Q6_K) => (0..n)
             .step_by(210)
             .for_each(|o| scale(&mut b, o + 208, rng)),
+        // E8M0 scales: typical near 2^-7; wild from 2^-98 to 2^92, so no product of a
+        // weight and an activation is subnormal or overflows.
+        DType::Ggml(GgmlType::MXFP4) => (0..n).step_by(17).for_each(|o| {
+            b[o] = if wild {
+                30 + (rng.next() % 191) as u8
+            } else {
+                118 + (rng.next() >> 62) as u8
+            };
+        }),
         _ => unreachable!(),
     }
     b
@@ -151,7 +161,7 @@ fn shapes(d: DType) -> &'static [(usize, usize)] {
     match d {
         DType::Ggml(GgmlType::Q4_K | GgmlType::Q6_K) => &[(37, 256), (64, 1024), (9, 2048)],
         // 32 and 96 columns: tails of 32 lanes.
-        DType::Ggml(GgmlType::Q8_0) => &[(37, 32), (70, 96), (64, 2048)],
+        DType::Ggml(GgmlType::Q8_0 | GgmlType::MXFP4) => &[(37, 32), (70, 96), (64, 2048)],
         // 100 and 37: tails of 36 and 37 lanes, so both halves of a thread's lanes
         // are partly used.
         _ => &[(37, 32), (70, 96), (13, 100), (5, 37), (64, 2048)],
@@ -250,6 +260,56 @@ fn subnormals_are_the_only_divergence() {
         "{flushed} of {} subnormal cases flushed to zero",
         cases.len()
     );
+}
+
+/// MXFP4 for every E8M0 scale byte: one block per row, row `e` scaled by `e`, random
+/// nibbles. Scales below 2^0 take activations near 2^40 and the rest near 1, so no
+/// product or partial sum is subnormal (ADR-011's divergence) unless the weight is:
+/// that is only at `e` 0 and 1 (`|v| · 2^(e − 128) < 2^-126`), where Metal flushes the
+/// weight to zero and must give the CPU's dot over the flushed row. Every other scale
+/// byte, 255's infinite weights included, gives the CPU's bits.
+#[test]
+fn mxfp4_every_scale_byte() {
+    let Some(gpu) = metal() else { return };
+    let cpu = CpuBackend::new();
+    let d = DType::Ggml(GgmlType::MXFP4);
+    let mut rng = Rng(39);
+    let mut flushed = 0;
+    for (first, mag) in [(0u8, 2f32.powi(40)), (128, 1.0)] {
+        let mut wb: Vec<u8> = (0..128 * 17).map(|_| (rng.next() >> 56) as u8).collect();
+        for e in 0..128 {
+            wb[17 * e] = first + e as u8;
+        }
+        let w = WeightView::new(d, 128, 32, &wb).unwrap();
+        let mut row = vec![0f32; 32];
+        for s in [1, 4] {
+            let xs: Vec<f32> = (0..32 * s)
+                .map(|_| (mag * (1.0 + rng.f().abs())).copysign(rng.f()))
+                .collect();
+            let (mut want, mut got) = (vec![0f32; 128 * s], vec![f32::NAN; 128 * s]);
+            cpu.matmul(&w, &xs, s, &mut want).unwrap();
+            gpu.matmul(&w, &xs, s, &mut got).unwrap();
+            for t in 0..s {
+                for r in 0..128 {
+                    let e = usize::from(first) + r;
+                    let (wv, gv) = (want[t * 128 + r], got[t * 128 + r]);
+                    if bits(&[wv]) == bits(&[gv]) {
+                        continue;
+                    }
+                    assert!(e < 2, "e {e} s {s} t {t}: cpu {wv:e} metal {gv:e}");
+                    cpu.dequant_row(&w, r, &mut row).unwrap();
+                    let ftz_row: Vec<u8> = row.iter().flat_map(|v| ftz(*v).to_le_bytes()).collect();
+                    let fw = WeightView::new(DType::F32, 1, 32, &ftz_row).unwrap();
+                    let mut f = [0f32; 1];
+                    cpu.matmul(&fw, &xs[t * 32..(t + 1) * 32], 1, &mut f)
+                        .unwrap();
+                    assert_eq!(gv.to_bits(), f[0].to_bits(), "e {e} s {s} t {t}: flushed");
+                    flushed += 1;
+                }
+            }
+        }
+    }
+    eprintln!("{flushed} MXFP4 outputs with subnormal weights flushed");
 }
 
 #[test]

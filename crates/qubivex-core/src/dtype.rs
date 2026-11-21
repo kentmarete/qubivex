@@ -40,11 +40,15 @@ pub enum GgmlType {
     Q6_K,
     /// 8-bit K-quant (activation type), 256-element super-blocks.
     Q8_K,
+    /// OCP microscaling FP4: 32-element blocks of 4-bit E2M1 floats sharing one E8M0
+    /// (power-of-two) scale. A block is the scale byte then 16 bytes of nibbles; byte
+    /// `i` holds element `i` in its low nibble and element `i + 16` in its high one.
+    MXFP4,
 }
 
 impl GgmlType {
     /// Every supported block type, in GGML id order.
-    pub const ALL: [Self; 12] = [
+    pub const ALL: [Self; 13] = [
         Self::Q4_0,
         Self::Q4_1,
         Self::Q5_0,
@@ -57,6 +61,7 @@ impl GgmlType {
         Self::Q5_K,
         Self::Q6_K,
         Self::Q8_K,
+        Self::MXFP4,
     ];
 
     /// The numeric type id used in GGUF tensor headers.
@@ -75,6 +80,7 @@ impl GgmlType {
             Self::Q5_K => 13,
             Self::Q6_K => 14,
             Self::Q8_K => 15,
+            Self::MXFP4 => 39,
         }
     }
 
@@ -82,7 +88,13 @@ impl GgmlType {
     #[must_use]
     pub const fn block_elems(self) -> u64 {
         match self {
-            Self::Q4_0 | Self::Q4_1 | Self::Q5_0 | Self::Q5_1 | Self::Q8_0 | Self::Q8_1 => 32,
+            Self::Q4_0
+            | Self::Q4_1
+            | Self::Q5_0
+            | Self::Q5_1
+            | Self::Q8_0
+            | Self::Q8_1
+            | Self::MXFP4 => 32,
             Self::Q2_K | Self::Q3_K | Self::Q4_K | Self::Q5_K | Self::Q6_K | Self::Q8_K => 256,
         }
     }
@@ -103,6 +115,7 @@ impl GgmlType {
             Self::Q5_K => 2 + 2 + 12 + 32 + 128,
             Self::Q6_K => 128 + 64 + 16 + 2,
             Self::Q8_K => 4 + 256 + 32,
+            Self::MXFP4 => 1 + 16,
         }
     }
 
@@ -122,6 +135,7 @@ impl GgmlType {
             Self::Q5_K => "q5_k",
             Self::Q6_K => "q6_k",
             Self::Q8_K => "q8_k",
+            Self::MXFP4 => "mxfp4",
         }
     }
 }
@@ -357,6 +371,7 @@ mod tests {
             (GgmlType::Q5_K, 256, 176),
             (GgmlType::Q6_K, 256, 210),
             (GgmlType::Q8_K, 256, 292),
+            (GgmlType::MXFP4, 32, 17),
         ];
         for (t, elems, bytes) in expected {
             assert_eq!((t.block_elems(), t.block_bytes()), (elems, bytes), "{t}");
@@ -371,6 +386,7 @@ mod tests {
         assert_eq!(DType::from_ggml_id(0), Ok(DType::F32));
         assert_eq!(DType::from_ggml_id(1), Ok(DType::F16));
         assert_eq!(DType::from_ggml_id(30), Ok(DType::BF16));
+        assert_eq!(DType::from_ggml_id(39), Ok(DType::Ggml(GgmlType::MXFP4)));
         // 4 and 5 were Q4_2 / Q4_3, removed from GGML.
         assert_eq!(DType::from_ggml_id(4), Err(CoreError::UnknownGgmlType(4)));
         assert_eq!(

@@ -83,13 +83,14 @@ const ROWS: u32 = 8;
 const STAGING: u64 = 64 << 20;
 
 /// Shader dtype codes, in pipeline order. Must match `DT_*` in the shader.
-const DTYPES: [DType; 6] = [
+const DTYPES: [DType; 7] = [
     DType::F32,
     DType::F16,
     DType::BF16,
     DType::Ggml(GgmlType::Q8_0),
     DType::Ggml(GgmlType::Q4_K),
     DType::Ggml(GgmlType::Q6_K),
+    DType::Ggml(GgmlType::MXFP4),
 ];
 
 pub(crate) fn dtype_index(dtype: DType) -> Option<usize> {
@@ -695,7 +696,7 @@ fn create_pipelines(
                 return Err(err("shader module", e));
             }
         };
-        let values: [u32; 6] = [0, 1, 2, 3, 4, 5];
+        let values: [u32; 7] = [0, 1, 2, 3, 4, 5, 6];
         let entries = [vk::SpecializationMapEntry::default()
             .constant_id(0)
             .offset(0)
@@ -802,7 +803,7 @@ fn create_fused(device: &ash::Device) -> Result<Fused, ComputeError> {
                 return Err(e);
             }
         };
-        let values: [u32; 6] = [0, 1, 2, 3, 4, 5];
+        let values: [u32; 7] = [0, 1, 2, 3, 4, 5, 6];
         let entries = [vk::SpecializationMapEntry::default()
             .constant_id(0)
             .offset(0)
