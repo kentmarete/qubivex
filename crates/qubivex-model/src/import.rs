@@ -356,9 +356,12 @@ fn moe_tensor_options(
     for (key, present) in [
         ("attention_sinks", has(&n.sinks)),
         ("router_bias", has(&n.router_bias)),
+        // Expert biases exist only beside a stacked gate-up (the config refuses them
+        // otherwise, which would end the search for this architecture).
         (
             "expert_bias",
-            has(&n.expert_gate_up_bias) || has(&n.expert_down_bias),
+            matches!(n.experts, crate::arch::ExpertLayout::StackedGateUp { .. })
+                && (has(&n.expert_gate_up_bias) || has(&n.expert_down_bias)),
         ),
     ] {
         if present {

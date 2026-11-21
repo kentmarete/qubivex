@@ -1022,8 +1022,9 @@ impl Transformer {
     /// expert block) can run this model: they implement none of the output bias,
     /// sinks, sliding windows, router and expert biases, top-K softmax routing or the
     /// clamped SwiGLU, so a model with any of them runs those steps on the host (its
-    /// matmuls still go to the backend).
-    fn fusable(&self) -> bool {
+    /// matmuls still go to the backend). A whole-layer device pass needs it too.
+    #[must_use]
+    pub fn fusable(&self) -> bool {
         let layers_plain = self.norms.iter().all(|n| {
             n.o_bias.is_none()
                 && n.sinks.is_none()

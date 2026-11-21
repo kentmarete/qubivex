@@ -1,0 +1,39 @@
+{
+  "architecture": {
+    "config": {
+      "attention_sinks": true,
+      "expert_bias": true,
+      "qk_norm": "none",
+      "router_bias": true,
+      "router_scoring": "topk_softmax",
+      "tensor_names": "hf_interleaved"
+    },
+    "id": "transformer_moe",
+    "version": "1.2.0"
+  },
+  "model": {
+    "id": "gpt-oss-tiny",
+    "name": "Tiny GPT-OSS-style fixture (MXFP4 experts, sinks, sliding window, YaRN)"
+  },
+  "overrides": {
+    "config": {
+      "swiglu_alpha": 1.702
+    }
+  },
+  "quantization": "bf16",
+  "schema_version": "1.0.0",
+  "tokenizer": {
+    "kind": "huggingface",
+    "path": "tokenizer.json"
+  },
+  "weights": {
+    "config": "config.json",
+    "format": "safetensors",
+    "shards": [
+      {
+        "path": "model.safetensors",
+        "size": 178704
+      }
+    ]
+  }
+}

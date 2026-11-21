@@ -20,6 +20,7 @@ fn every_fixture_validates() {
         ids,
         [
             "dense-tiny",
+            "gpt-oss-tiny",
             "olmoe-tiny",
             "olmoe-tiny-gguf",
             "qwen2-tiny",
@@ -53,12 +54,20 @@ fn every_fixture_validates() {
     assert_eq!(b("olmoe-tiny"), 3 * 32 * 64 * 2);
     assert_eq!(b("qwen3-moe-tiny"), 3 * 32 * 64 * 2);
     assert_eq!(b("olmoe-tiny-gguf"), 3 * 32 * 64 / 32 * 34);
+    // MXFP4: 17 bytes per 32 (the split halves count as one tensor).
+    assert_eq!(b("gpt-oss-tiny"), 3 * 32 * 64 / 32 * 17);
 }
 
 #[test]
 fn import_reproduces_the_committed_manifests() {
     let reg = ArchitectureRegistry::with_builtins();
-    for id in ["olmoe-tiny", "qwen3-moe-tiny", "dense-tiny", "qwen2-tiny"] {
+    for id in [
+        "olmoe-tiny",
+        "qwen3-moe-tiny",
+        "dense-tiny",
+        "qwen2-tiny",
+        "gpt-oss-tiny",
+    ] {
         let dir = root().join(id);
         let committed = ModelMetadata::load(&dir, &reg).unwrap().manifest;
         let opts = ImportOptions {

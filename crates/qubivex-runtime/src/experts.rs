@@ -723,6 +723,61 @@ mod tests {
         }
     }
 
+    /// The repack against an independent decode of the SafeTensors MXFP4 layout (as
+    /// transformers' `convert_moe_packed_tensors`: element `2j` from byte `j`'s low
+    /// nibble, `2j + 1` from its high one, times `2^(scale − 127)`), through the CPU's
+    /// MXFP4 dequantizer, with gate/up rows interleaved and not.
+    #[test]
+    fn split_mxfp4_repacks_to_the_values_it_stores() {
+        use qubivex_backend_cpu::formats::dequant_row;
+        use qubivex_core::GgmlType;
+        const FP4: [f64; 16] = [
+            0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0, -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0,
+        ];
+        let (rows, cols) = (6, 64);
+        let nb = cols / 32;
+        let mut x = 0x9e37_79b9u32;
+        let mut byte = || {
+            x ^= x << 13;
+            x ^= x >> 17;
+            x ^= x << 5;
+            (x >> 24) as u8
+        };
+        let blocks: Vec<u8> = (0..rows * nb * 16).map(|_| byte()).collect();
+        let scales: Vec<u8> = (0..rows * nb).map(|_| 110 + byte() % 30).collect();
+        let want = |r: usize, c: usize| {
+            let (j, m) = (c / 32, c % 32);
+            let b = blocks[(r * nb + j) * 16 + m / 2];
+            let n = if m % 2 == 0 { b & 0xF } else { b >> 4 };
+            FP4[usize::from(n)] * 2f64.powi(i32::from(scales[r * nb + j]) - 127)
+        };
+        for interleaved in [false, true] {
+            let mut dst = vec![0u8; rows * nb * 17];
+            repack_into(&mut dst, &blocks, Some(&scales), rows, interleaved);
+            let mut row = vec![0f32; cols];
+            for r in 0..rows {
+                dequant_row(
+                    qubivex_core::DType::Ggml(GgmlType::MXFP4),
+                    &dst[r * nb * 17..(r + 1) * nb * 17],
+                    &mut row,
+                );
+                let sr = source_row(r, rows, interleaved);
+                for (c, v) in row.iter().enumerate() {
+                    assert_eq!(f64::from(*v), want(sr, c), "row {r} col {c} {interleaved}");
+                }
+            }
+        }
+        assert_eq!(source_row(1, 6, true), 2);
+        assert_eq!(source_row(3, 6, true), 1);
+        // Whole rows of another dtype are only reordered.
+        let plain: Vec<u8> = (0..24).collect();
+        let mut dst = vec![0u8; 24];
+        repack_into(&mut dst, &plain, None, 4, true);
+        assert_eq!(dst[..6], plain[..6]);
+        assert_eq!(dst[6..12], plain[12..18]);
+        assert_eq!(dst[12..18], plain[6..12]);
+    }
+
     #[test]
     fn aligned_windows_read_any_extent() {
         #[allow(clippy::cast_possible_truncation)]

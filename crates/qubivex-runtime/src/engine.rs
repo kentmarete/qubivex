@@ -1207,9 +1207,11 @@ impl Engine {
         let backend = match opts.backend {
             // Placed once the ledger exists (below).
             BackendKind::Cpu | BackendKind::Sim | BackendKind::Vulkan => Placed::cpu(),
-            // Whole layers exist for routed experts only; a dense model places its
-            // matmuls one by one instead (below), with the same bits.
-            BackendKind::Metal if opts.metal_ops.layers && model.is_moe() => {
+            // Whole layers exist for routed experts only, and only for the options the
+            // device's layer pass implements (no attention or expert biases, sinks,
+            // windows, top-K softmax or clamped SwiGLU); otherwise the matmuls are
+            // placed one by one instead (below), with the same bits.
+            BackendKind::Metal if opts.metal_ops.layers && model.is_moe() && model.fusable() => {
                 let be = MetalBackend::new().map_err(|e| metal_err(&e))?;
                 let host = be
                     .map_host(Arc::clone(&dense.arena))
@@ -1223,7 +1225,19 @@ impl Engine {
                     .into_iter()
                     .map(|(kind, name)| Ok((kind, dense.view(&name)?)))
                     .collect::<Result<Vec<_>, ArchError>>()?;
-                Placed::metal(&dense.arena, weights, opts.metal_ops)
+                // Whole layers asked for but not runnable: every dense matmul instead.
+                let ops = if opts.metal_ops.layers {
+                    MetalOps {
+                        attention: true,
+                        router: true,
+                        head: true,
+                        layers: false,
+                        token: false,
+                    }
+                } else {
+                    opts.metal_ops
+                };
+                Placed::metal(&dense.arena, weights, ops)
                     .map_err(|e| RuntimeError::Model(format!("cannot place on Metal: {e}")))?
             }
         };

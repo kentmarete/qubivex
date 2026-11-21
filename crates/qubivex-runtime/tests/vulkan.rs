@@ -27,13 +27,17 @@ fn bits(v: &[f32]) -> Vec<u32> {
     v.iter().map(|x| x.to_bits()).collect()
 }
 
+/// The fixtures whose layers the device can route and fuse. `gpt-oss-tiny` uses options
+/// those paths lack (biases, sinks, windows, top-K softmax, clamped SwiGLU): it runs
+/// its matmuls on the device and routes on the host, and is in [`ALL`] for its bits.
 const MOE: [&str; 3] = ["olmoe-tiny", "olmoe-tiny-gguf", "qwen3-moe-tiny"];
-const ALL: [&str; 5] = [
+const ALL: [&str; 6] = [
     "olmoe-tiny",
     "olmoe-tiny-gguf",
     "qwen3-moe-tiny",
     "dense-tiny",
     "qwen2-tiny",
+    "gpt-oss-tiny",
 ];
 const PROMPT: &[u32] = &[
     72, 101, 108, 108, 111, 44, 32, 101, 120, 112, 101, 114, 116, 115,
@@ -114,7 +118,8 @@ fn vulkan_matches_the_cpu_bits() {
         assert_eq!(v.total().0, r.usage.used, "{id}: ledger = device memory");
         assert!(r.transfers.submissions > 0, "{id}");
         assert_eq!(r.usage.refused, 0, "{id}");
-        if MOE.contains(&id) {
+        // Every mixture of experts copies its experts, routed on the device or not.
+        if !["dense-tiny", "qwen2-tiny"].contains(&id) {
             assert!(r.experts.misses > 0, "{id}: experts were copied");
             assert_eq!(r.transfers.uploads, 1 + r.experts.misses, "{id}");
         } else {

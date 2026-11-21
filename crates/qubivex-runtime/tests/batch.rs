@@ -40,12 +40,13 @@ fn argmax(v: &[f32]) -> u32 {
     u32::try_from(best).unwrap()
 }
 
-const ALL: [&str; 5] = [
+const ALL: [&str; 6] = [
     "olmoe-tiny",
     "olmoe-tiny-gguf",
     "qwen3-moe-tiny",
     "dense-tiny",
     "qwen2-tiny",
+    "gpt-oss-tiny",
 ];
 
 /// Prompts of different lengths, so the sequences sit at different positions.
@@ -384,7 +385,12 @@ fn bad_step_fails_only_its_caller(e: &Engine, id: &str) {
 }
 
 /// The fixtures with routed experts, which whole Metal layers need.
-const MOE: [&str; 3] = ["olmoe-tiny", "olmoe-tiny-gguf", "qwen3-moe-tiny"];
+const MOE: [&str; 4] = [
+    "olmoe-tiny",
+    "olmoe-tiny-gguf",
+    "qwen3-moe-tiny",
+    "gpt-oss-tiny",
+];
 
 /// Whole layers on Metal, routed on the host (`layers`) or on the GPU (`token`, with
 /// the experts loaded at the first pass so every pass is routed); `None` without a
@@ -487,7 +493,8 @@ fn metal_batches_give_the_cpu_bits() {
             for (i, (g, w)) in got.iter().zip(&want).enumerate() {
                 assert_eq!(bits(g), bits(w), "{what} segment {i}");
             }
-            if ops.token {
+            // A model whose options the layer pass lacks is placed matmul by matmul.
+            if e.placement().ops.is_some_and(|o| o.token) {
                 // Two prefills and the batch, each one routed submission.
                 assert_eq!(e.gpu_routed_passes() - routed, 3, "{what}");
             }
