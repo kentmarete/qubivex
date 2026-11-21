@@ -352,7 +352,7 @@ fn unsupported_weight_formats_are_refused() {
         }
     });
     let p = problems(load(&d.0));
-    let runs = "transformer_moe runs f32, f16, bf16, q8_0, q4_k, q6_k";
+    let runs = "transformer_moe runs f32, f16, bf16, q8_0, q4_k, q6_k, mxfp4";
     assert_eq!(p.len(), 2, "{p:?}");
     assert_eq!(
         p[0],
