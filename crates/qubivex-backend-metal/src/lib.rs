@@ -6,7 +6,8 @@
 //! from source when the backend is created (no offline Metal toolchain is needed), with
 //! fast math off.
 //!
-//! Supported dtypes: f32, f16, bf16, Q8_0, Q4_K and Q6_K, the same set as the CPU.
+//! Supported dtypes: f32, f16, bf16, Q8_0, Q4_K, Q6_K and MXFP4, the same set as the
+//! CPU. Quantized weights are read packed inside the matmul kernels.
 //!
 //! [`MetalBackend`] implements [`ComputeBackend`] by copying host weights into a
 //! shared buffer per call (correct, not fast). The fast path keeps weights on the
@@ -92,18 +93,20 @@ const fn kernel_name(dtype: DType) -> Option<&'static str> {
         DType::Ggml(GgmlType::Q8_0) => Some("matmul_q8_0"),
         DType::Ggml(GgmlType::Q4_K) => Some("matmul_q4_k"),
         DType::Ggml(GgmlType::Q6_K) => Some("matmul_q6_k"),
+        DType::Ggml(GgmlType::MXFP4) => Some("matmul_mxfp4"),
         _ => None,
     }
 }
 
 /// Every dtype with a kernel, in pipeline order.
-pub(crate) const DTYPES: [DType; 6] = [
+pub(crate) const DTYPES: [DType; 7] = [
     DType::F32,
     DType::F16,
     DType::BF16,
     DType::Ggml(GgmlType::Q8_0),
     DType::Ggml(GgmlType::Q4_K),
     DType::Ggml(GgmlType::Q6_K),
+    DType::Ggml(GgmlType::MXFP4),
 ];
 
 fn pipeline_index(dtype: DType) -> Option<usize> {

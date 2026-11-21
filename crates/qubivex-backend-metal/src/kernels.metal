@@ -56,6 +56,26 @@ static inline float w_q8_0(device const uchar *row, uint j) {
     return q * d;
 }
 
+// MXFP4: 17-byte blocks of 32, an E8M0 scale byte e then 16 nibble bytes (element i
+// in the low nibble of byte i for i < 16, else the high nibble of byte i - 16), read
+// packed. y = v * 2^(e - 128), v the doubled E2M1 value: exact, as on the CPU. For
+// e < 2 that scale is an f32 subnormal, which Apple GPUs flush, so the product is
+// formed as (v * 2^(e - 2)) * 2^-126 from two normal factors: still exact, and equal
+// to the CPU's value whenever the weight itself is normal.
+constant char MXFP4_VALUES[16] = {0, 1, 2, 3, 4, 6, 8, 12, 0, -1, -2, -3, -4, -6, -8, -12};
+
+static inline float w_mxfp4(device const uchar *row, uint j) {
+    device const uchar *blk = row + 17 * (j / 32);
+    uint e = blk[0];
+    uint i = j % 32;
+    uint b = blk[1 + (i & 15)];
+    float v = float(MXFP4_VALUES[i < 16 ? (b & 0xF) : (b >> 4)]);
+    if (e >= 2) {
+        return v * as_type<float>((e - 1) << 23);
+    }
+    return (v * as_type<float>((e + 125) << 23)) * as_type<float>(1u << 23);
+}
+
 // ---- The shared reduction. ----
 
 // `a` is thread t's sum of lanes t and t + 32 (the w = 32 step). Returns the full sum
@@ -158,6 +178,7 @@ GENERIC_ROWS(f32, w_f32)
 GENERIC_ROWS(f16, w_f16)
 GENERIC_ROWS(bf16, w_bf16)
 GENERIC_ROWS(q8_0, w_q8_0)
+GENERIC_ROWS(mxfp4, w_mxfp4)
 
 // ---- Block-wise K-quant rows. ----
 //
@@ -415,6 +436,7 @@ MATMUL_KERNELS(bf16, 1)
 MATMUL_KERNELS(q8_0, 1)
 MATMUL_KERNELS(q4_k, NR)
 MATMUL_KERNELS(q6_k, NR)
+MATMUL_KERNELS(mxfp4, 1)
 
 // ---- Forward-pass operations (Phase 8 slice 3). ----
 //
