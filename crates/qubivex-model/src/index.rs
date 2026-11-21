@@ -5,7 +5,7 @@ use std::fs::File;
 use std::io::BufReader;
 use std::path::{Path, PathBuf};
 
-use qubivex_core::{CoreError, DType, Shape, TensorDesc};
+use qubivex_core::{CoreError, DType, GgmlType, Shape, TensorDesc};
 use serde::Serialize;
 
 use crate::gguf::{self, GgufMetadata};
@@ -66,7 +66,33 @@ pub struct TensorEntry {
     pub tensor: RawTensor,
     /// Index into [`TensorIndex::files`].
     pub file: usize,
+    /// For an MXFP4 tensor stored split, as SafeTensors writes it (see
+    /// [`SplitScales`]): where its scales are. `None` for every contiguous tensor.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub scales: Option<SplitScales>,
 }
+
+/// The scales of an MXFP4 tensor stored as two SafeTensors tensors, `P_blocks`
+/// (`[…, rows, cols / 32, 16]` bytes) and `P_scales` (`[…, rows, cols / 32]` E8M0 bytes),
+/// which the index pairs into one tensor `P` of dtype MXFP4 and shape `[…, rows, cols]`.
+///
+/// The pair's bytes are not the GGML layout and not contiguous: the entry's
+/// `tensor.offset` (in its `file`) is the first nibble block, 16 bytes per block of 32
+/// with element `2j` in the low nibble of byte `j` and `2j + 1` in its high nibble, and
+/// the scales are here, one byte per block, in the same order. `tensor.bytes` is the
+/// MXFP4 size of both together. Only a reader that repacks them into the GGML layout
+/// (the runtime's expert source) may use such a tensor; the dense loader refuses it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+pub struct SplitScales {
+    /// Index into [`TensorIndex::files`].
+    pub file: usize,
+    /// Absolute byte offset of the first scale.
+    pub offset: u64,
+}
+
+/// Suffixes of the two halves of a split MXFP4 tensor.
+const BLOCKS: &str = "_blocks";
+const SCALES: &str = "_scales";
 
 /// Every tensor of a model, by name, with the file and byte range holding it.
 ///
@@ -152,8 +178,92 @@ impl TensorIndex {
             size,
         });
         for t in tensors {
-            self.tensors
-                .insert(t.name.clone(), TensorEntry { tensor: t, file });
+            self.tensors.insert(
+                t.name.clone(),
+                TensorEntry {
+                    tensor: t,
+                    file,
+                    scales: None,
+                },
+            );
+        }
+        Ok(())
+    }
+
+    /// Pairs every `P_blocks` / `P_scales` couple of u8 tensors (SafeTensors MXFP4) into
+    /// one MXFP4 tensor `P` ([`SplitScales`]). A couple whose shapes do not fit
+    /// together is an error; a lone half is left as it is, for validation to report.
+    ///
+    /// # Errors
+    /// [`ModelError::Tensor`] for mismatched halves, or when `P` already exists.
+    pub fn pair_split_mxfp4(&mut self) -> Result<(), ModelError> {
+        let names: Vec<String> = self
+            .tensors
+            .keys()
+            .filter(|n| n.ends_with(BLOCKS))
+            .cloned()
+            .collect();
+        for blocks_name in names {
+            let base = &blocks_name[..blocks_name.len() - BLOCKS.len()];
+            let scales_name = format!("{base}{SCALES}");
+            let (Some(b), Some(s)) = (
+                self.tensors.get(&blocks_name),
+                self.tensors.get(&scales_name),
+            ) else {
+                continue;
+            };
+            let bad = |detail: String| ModelError::Tensor {
+                path: self.files[b.file].path.clone(),
+                name: base.to_owned(),
+                detail,
+            };
+            let (bd, sd) = (b.tensor.shape.dims(), s.tensor.shape.dims());
+            if b.tensor.dtype != DType::U8 || s.tensor.dtype != DType::U8 {
+                return Err(bad(format!(
+                    "split MXFP4 halves must be u8, not {} and {}",
+                    b.tensor.dtype, s.tensor.dtype
+                )));
+            }
+            if bd.len() < 3 || bd.last() != Some(&16) || bd[..bd.len() - 1] != *sd {
+                return Err(bad(format!(
+                    "split MXFP4 blocks {bd:?} and scales {sd:?} do not fit (blocks are [..., rows, cols / 32, 16], scales [..., rows, cols / 32])"
+                )));
+            }
+            if self.tensors.contains_key(base) {
+                return Err(bad("also stored whole beside its split MXFP4 halves".into()));
+            }
+            let mut dims = sd.to_vec();
+            let groups = dims.pop().unwrap_or(0);
+            dims.push(
+                groups
+                    .checked_mul(32)
+                    .ok_or_else(|| bad("too large".into()))?,
+            );
+            let dtype = DType::Ggml(GgmlType::MXFP4);
+            let shape = Shape::new(&dims).map_err(|e| bad(e.to_string()))?;
+            let bytes = dtype
+                .storage_bytes(&shape)
+                .map_err(|e| bad(e.to_string()))?;
+            if Some(bytes) != b.tensor.bytes.checked_add(s.tensor.bytes) {
+                return Err(bad("split MXFP4 halves have the wrong byte sizes".into()));
+            }
+            let entry = TensorEntry {
+                tensor: RawTensor {
+                    name: base.to_owned(),
+                    dtype,
+                    shape,
+                    offset: b.tensor.offset,
+                    bytes,
+                },
+                file: b.file,
+                scales: Some(SplitScales {
+                    file: s.file,
+                    offset: s.tensor.offset,
+                }),
+            };
+            self.tensors.remove(&blocks_name);
+            self.tensors.remove(&scales_name);
+            self.tensors.insert(base.to_owned(), entry);
         }
         Ok(())
     }

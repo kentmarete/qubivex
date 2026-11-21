@@ -24,8 +24,11 @@ pub(crate) const WEIGHT_FORMATS: [DType; 7] = [
 /// The `rope_type` naming wavelength-banded scaling ([`RopeScaling::Banded`]).
 pub(crate) const ROPE_BANDED: &str = "llama3"; // model-name-ok: the rope_type value in config.json
 
+/// The `rope_type` naming YaRN scaling ([`RopeScaling::Yarn`]).
+pub(crate) const ROPE_YARN: &str = "yarn";
+
 /// RoPE scaling types the shared decoder implements.
-pub(crate) const ROPE_SCALINGS: [&str; 2] = ["default", ROPE_BANDED];
+pub(crate) const ROPE_SCALINGS: [&str; 3] = ["default", ROPE_BANDED, ROPE_YARN];
 
 /// How RoPE's inverse frequencies are scaled, from `rope_scaling` / `rope_parameters`.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Serialize)]
@@ -48,6 +51,24 @@ pub enum RopeScaling {
         high_freq_factor: f64,
         /// The context the model was first trained at.
         original_max_position_embeddings: u64,
+    },
+    /// YaRN, as transformers computes it: each inverse frequency blends the
+    /// interpolated `inv / factor` and the original `inv` by a linear ramp over the
+    /// dimensions between the correction bounds of `beta_fast` and `beta_slow`
+    /// rotations, and every cos and sin is multiplied by `attention_factor`.
+    Yarn {
+        /// How much longer the context is than the original.
+        factor: f64,
+        /// Rotations at the extrapolation bound.
+        beta_fast: f64,
+        /// Rotations at the interpolation bound.
+        beta_slow: f64,
+        /// The context the model was first trained at.
+        original_max_position_embeddings: u64,
+        /// Round the correction bounds to whole dimensions.
+        truncate: bool,
+        /// The factor on cos and sin (given, or derived from `factor` as transformers does).
+        attention_factor: f64,
     },
 }
 
@@ -214,6 +235,43 @@ pub(crate) struct DecoderDims {
     pub(crate) clip_qkv: Option<f64>,
     pub(crate) max_context: Option<u64>,
     pub(crate) tie_embeddings: bool,
+    /// Per layer, the sliding attention window if it has one (`layer_types`).
+    pub(crate) windows: Vec<Option<u64>>,
+}
+
+/// Per-layer attention windows from `layer_types` (each `full_attention` or
+/// `sliding_attention`) and `sliding_window`. Without `layer_types` every layer is
+/// full; `use_sliding_window = true` without them is refused in
+/// [`unsupported_common`].
+fn attention_windows(v: &Values<'_>, layers: u32) -> Result<Vec<Option<u64>>, ModelError> {
+    let Some(types) = v.get("layer_types", None)? else {
+        return Ok(vec![None; layers as usize]);
+    };
+    let types = types
+        .as_array()
+        .ok_or_else(|| cfg_err("layer_types must be an array"))?;
+    if types.len() != layers as usize {
+        return Err(cfg_err(format!(
+            "layer_types has {} entries for {layers} layers",
+            types.len()
+        )));
+    }
+    let window = v.u64("sliding_window", None)?;
+    types
+        .iter()
+        .map(|t| match t.as_str() {
+            Some("full_attention") => Ok(None),
+            Some("sliding_attention") => match window {
+                Some(w) if w > 0 => Ok(Some(w)),
+                _ => Err(cfg_err(
+                    "layer_types has sliding_attention layers but sliding_window is not a positive integer",
+                )),
+            },
+            _ => Err(cfg_err(format!(
+                "layer_types entry {t}: only full_attention and sliding_attention are supported"
+            ))),
+        })
+        .collect()
 }
 
 /// Reads [`DecoderDims`], checking them.
@@ -281,6 +339,7 @@ pub(crate) fn decoder_dims(
     let clip_qkv = v.f64("clip_qkv", None)?;
     let max_context = v.u64("max_position_embeddings", Some("context_length"))?;
     let tie_embeddings = v.bool("tie_word_embeddings", None)?.unwrap_or(false);
+    let windows = attention_windows(v, layers)?;
     Ok(DecoderDims {
         hidden,
         layers,
@@ -294,18 +353,12 @@ pub(crate) fn decoder_dims(
         clip_qkv,
         max_context,
         tie_embeddings,
+        windows,
     })
 }
 
 /// Rejects config features no architecture here implements yet.
 pub(crate) fn unsupported_common(v: &Values<'_>) -> Result<(), ModelError> {
-    // `attention_bias` biases o as well as q, k and v; q/k/v biases alone are the
-    // `qkv_bias` option, detected from the tensors at import.
-    if v.bool("attention_bias", None)? == Some(true) {
-        return Err(cfg_err(
-            "attention_bias = true: a bias on the output projection is not supported yet",
-        ));
-    }
     if let Some(act) = v.get("hidden_act", None)?
         && act != "silu"
     {
@@ -316,7 +369,7 @@ pub(crate) fn unsupported_common(v: &Values<'_>) -> Result<(), ModelError> {
     if v.bool("mlp_bias", None)? == Some(true) {
         return Err(cfg_err("mlp_bias = true: FFN biases are not supported yet"));
     }
-    if v.bool("use_sliding_window", None)? == Some(true) {
+    if v.bool("use_sliding_window", None)? == Some(true) && v.get("layer_types", None)?.is_none() {
         return Err(cfg_err(
             "use_sliding_window = true: sliding-window attention is not supported yet",
         ));
@@ -358,7 +411,7 @@ fn rope_scaling_of(key: &str, rs: &Map<String, Value>) -> Result<RopeScaling, Mo
             .ok_or_else(|| {
                 cfg_err(format!(
                     "{key}.{k} = {val}: only {} RoPE is supported yet",
-                    ROPE_SCALINGS.join(" and ")
+                    ROPE_SCALINGS.join(", ")
                 ))
             })?;
         if kind != "default" && t != kind || t == "default" && kind != "default" {
@@ -379,17 +432,34 @@ fn rope_scaling_of(key: &str, rs: &Map<String, Value>) -> Result<RopeScaling, Mo
             "high_freq_factor",
             "original_max_position_embeddings",
         ]
+    } else if kind == ROPE_YARN {
+        &[
+            "rope_theta",
+            "rope_type",
+            "type",
+            "factor",
+            "beta_fast",
+            "beta_slow",
+            "original_max_position_embeddings",
+            "truncate",
+            "attention_factor",
+            "mscale",
+            "mscale_all_dim",
+        ]
     } else {
         &["rope_theta", "rope_type", "type"]
     };
     if let Some((k, val)) = rs.iter().find(|(k, _)| !known.contains(&k.as_str())) {
         return Err(cfg_err(format!(
             "{key}.{k} = {val}: {kind} RoPE does not read it; only {} RoPE is supported yet",
-            ROPE_SCALINGS.join(" and ")
+            ROPE_SCALINGS.join(", ")
         )));
     }
     if kind == "default" {
         return Ok(RopeScaling::None);
+    }
+    if kind == ROPE_YARN {
+        return yarn_of(key, rs);
     }
     let num = |k: &str| {
         rs.get(k)
@@ -430,6 +500,73 @@ fn rope_scaling_of(key: &str, rs: &Map<String, Value>) -> Result<RopeScaling, Mo
         low_freq_factor: low,
         high_freq_factor: high,
         original_max_position_embeddings: original,
+    })
+}
+
+/// YaRN parameters with transformers' defaults (`_compute_yarn_parameters`): `beta_fast`
+/// 32, `beta_slow` 1, `truncate` true, and `attention_factor`, when absent, from
+/// `mscale` and `mscale_all_dim` if both are set, else `0.1 · ln(factor) + 1`.
+fn yarn_of(key: &str, rs: &Map<String, Value>) -> Result<RopeScaling, ModelError> {
+    let opt = |k: &str| -> Result<Option<f64>, ModelError> {
+        match rs.get(k) {
+            None | Some(Value::Null) => Ok(None),
+            Some(v) => v
+                .as_f64()
+                .filter(|x| x.is_finite())
+                .map(Some)
+                .ok_or_else(|| cfg_err(format!("{key}.{k} = {v} is not a finite number"))),
+        }
+    };
+    let factor = opt("factor")?
+        .ok_or_else(|| cfg_err(format!("{key}.factor: {ROPE_YARN} scaling needs it")))?;
+    if factor < 1.0 {
+        return Err(cfg_err(format!(
+            "{key}.factor = {factor}: must be at least 1"
+        )));
+    }
+    let original = rs
+        .get("original_max_position_embeddings")
+        .and_then(Value::as_u64)
+        .filter(|&n| n > 0)
+        .ok_or_else(|| {
+            cfg_err(format!(
+                "{key}.original_max_position_embeddings: {ROPE_YARN} scaling needs it as a positive integer"
+            ))
+        })?;
+    // transformers reads these with `or`, so 0 also means the default.
+    let beta_fast = opt("beta_fast")?.filter(|b| *b != 0.0).unwrap_or(32.0);
+    let beta_slow = opt("beta_slow")?.filter(|b| *b != 0.0).unwrap_or(1.0);
+    let truncate = match rs.get("truncate") {
+        None | Some(Value::Null) => true,
+        Some(v) => v
+            .as_bool()
+            .ok_or_else(|| cfg_err(format!("{key}.truncate = {v} is not a boolean")))?,
+    };
+    let mscale = |scale: f64, m: f64| {
+        if scale <= 1.0 {
+            1.0
+        } else {
+            0.1 * m * scale.ln() + 1.0
+        }
+    };
+    let attention_factor = match (
+        opt("attention_factor")?,
+        opt("mscale")?,
+        opt("mscale_all_dim")?,
+    ) {
+        (Some(a), _, _) => a,
+        (None, Some(m), Some(all)) if m != 0.0 && all != 0.0 => {
+            mscale(factor, m) / mscale(factor, all)
+        }
+        _ => mscale(factor, 1.0),
+    };
+    Ok(RopeScaling::Yarn {
+        factor,
+        beta_fast,
+        beta_slow,
+        original_max_position_embeddings: original,
+        truncate,
+        attention_factor,
     })
 }
 

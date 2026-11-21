@@ -26,6 +26,7 @@ fn st_dtype(d: DType) -> Option<&'static str> {
         DType::F32 => Some("F32"),
         DType::F16 => Some("F16"),
         DType::BF16 => Some("BF16"),
+        DType::U8 => Some("U8"),
         _ => None,
     }
 }
@@ -33,7 +34,7 @@ fn st_dtype(d: DType) -> Option<&'static str> {
 /// A SafeTensors file. Tensors are laid out in the given order.
 ///
 /// # Panics
-/// If a dtype has no SafeTensors spelling (only f32, f16 and bf16 do).
+/// If a dtype has no SafeTensors spelling (only f32, f16, bf16 and u8 do).
 #[must_use]
 pub fn safetensors(tensors: &[TensorData<'_>], metadata: &BTreeMap<String, String>) -> Vec<u8> {
     let mut header = serde_json::Map::new();

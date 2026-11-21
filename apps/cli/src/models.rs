@@ -228,8 +228,9 @@ pub(crate) fn inspect(
             TensorRole::OutputHead => "output head",
             TensorRole::FinalNorm | TensorRole::Norm { .. } => "norms",
             TensorRole::Attention { .. } => "attention",
-            TensorRole::Router { .. } => "router",
+            TensorRole::Router { .. } | TensorRole::RouterBias { .. } => "router",
             TensorRole::Ffn { .. } => "dense FFN",
+            TensorRole::RoutedExpertBias { .. } => "expert biases",
             TensorRole::RoutedExpert { .. } | TensorRole::RoutedExpertStack { .. } => {
                 "routed experts"
             }

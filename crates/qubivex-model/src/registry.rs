@@ -21,6 +21,10 @@ pub enum ExpertPart {
     Up,
     /// Gate and up stacked in one tensor (gate rows first).
     GateUp,
+    /// Gate and up in one tensor with their rows alternating: row `2i` is gate row `i`,
+    /// row `2i + 1` up row `i`. The expert source reorders it into [`ExpertPart::GateUp`]
+    /// as it loads (a row permutation, so the values and products are unchanged).
+    GateUpInterleaved,
     /// Down projection.
     Down,
 }
@@ -59,6 +63,11 @@ pub enum AttentionPart {
     KBias,
     /// Value projection bias.
     VBias,
+    /// Output projection bias.
+    OBias,
+    /// One learned logit per query head, joined to every softmax over the scores and
+    /// dropped after it (an attention sink).
+    Sinks,
 }
 
 /// What a tensor is for. Validation and the memory planner work on roles only,
@@ -95,6 +104,22 @@ pub enum TensorRole {
     Router {
         /// Layer.
         layer: LayerIdx,
+    },
+    /// The MoE router's bias, added to its logits.
+    RouterBias {
+        /// Layer.
+        layer: LayerIdx,
+    },
+    /// One bias row per expert of a layer, `[experts, rows of the part]`, added to the
+    /// part's output. Small and resident, unlike the experts' matrices.
+    RoutedExpertBias {
+        /// Layer.
+        layer: LayerIdx,
+        /// The part the bias follows ([`ExpertPart::GateUpInterleaved`] rows
+        /// alternate as that part's do).
+        part: ExpertPart,
+        /// Number of experts.
+        experts: u32,
     },
     /// One expert's tensor.
     RoutedExpert {

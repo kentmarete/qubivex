@@ -379,7 +379,7 @@ fn architectures_declare_capabilities() {
             a.id
         );
         assert_eq!(c.inputs, ["text"]);
-        assert_eq!(c.rope_scaling, ["default", "llama3"]);
+        assert_eq!(c.rope_scaling, ["default", "llama3", "yarn"]);
         assert!(!c.ffn.is_empty() && !c.attention.is_empty());
     }
     assert!(
@@ -464,7 +464,12 @@ fn config_rules() {
         c[k] = v;
         c
     };
-    assert!(with_cfg(set("attention_bias", json!(true))).contains("output projection"));
+    // transformer_moe runs attention biases, so the config asks for their tensors.
+    let e = with_cfg(set("attention_bias", json!(true)));
+    assert!(
+        e.contains("self_attn.o_proj.bias") && e.contains("self_attn.q_proj.bias"),
+        "{e}"
+    );
     assert!(with_cfg(set("mlp_only_layers", json!([0]))).contains("dense FFN layers"));
     assert!(with_cfg(set("decoder_sparse_step", json!(2))).contains("dense FFN layers"));
     assert!(with_cfg(set("hidden_act", json!("gelu"))).contains("only silu"));
@@ -515,7 +520,7 @@ fn config_rules() {
             "rope_parameters",
             json!({ "rope_theta": 1e6, "rope_type": "default", "type": "mrope", "mrope_section": [16, 24, 24] })
         ))
-        .contains("only default and llama3 RoPE")
+        .contains("only default, llama3, yarn RoPE")
     );
     let mut c = hf_config();
     c.as_object_mut().unwrap().remove("rms_norm_eps");
@@ -656,11 +661,12 @@ fn registry_rules() {
     };
     assert!(r.resolve(&m("transformer_moe", "1.0.7")).is_ok());
     assert!(r.resolve(&m("transformer_moe", "1.1.0")).is_ok());
+    assert!(r.resolve(&m("transformer_moe", "1.2.0")).is_ok());
     assert!(
-        r.resolve(&m("transformer_moe", "1.2.0"))
+        r.resolve(&m("transformer_moe", "1.3.0"))
             .unwrap_err()
             .to_string()
-            .contains("implements 1.1.0")
+            .contains("implements 1.2.0")
     );
     assert!(r.resolve(&m("transformer_moe", "2.0.0")).is_err());
     assert!(
@@ -675,7 +681,7 @@ fn registry_rules() {
         TransformerMoe.version(),
         SemVer {
             major: 1,
-            minor: 1,
+            minor: 2,
             patch: 0
         }
     );
