@@ -97,7 +97,7 @@ the dtype. All give the same bits:
 
 | Activation rows | Path | Where |
 |---|---|---|
-| 1 (decode) | Fused: dequantise inside the row dot, no scratch buffer | NEON, for Q4_K, Q6_K, Q8_0, bf16 |
+| 1 (decode) | Fused: dequantise inside the row dot, no scratch buffer | NEON, for Q4_K, Q6_K, Q8_0, MXFP4, bf16 |
 | 2 to 12 (decode for a few sequences) | Fused multi-row: each weight dequantised once into up to five rows at a time | NEON, same dtypes |
 | 6 and more not covered above (prefill) | Register-blocked tiles | All targets |
 | Anything else | Dequantise a row, one portable dot per output | All targets |

@@ -11,13 +11,14 @@ use crate::{GgufMetadata, GgufValue, ModelError};
 
 /// Weight formats the shared decoder executes: the formats every compute backend has
 /// a kernel for (CPU, Sim, Metal, Vulkan; `qubivex-runtime/tests/capabilities.rs`).
-pub(crate) const WEIGHT_FORMATS: [DType; 6] = [
+pub(crate) const WEIGHT_FORMATS: [DType; 7] = [
     DType::F32,
     DType::F16,
     DType::BF16,
     DType::Ggml(GgmlType::Q8_0),
     DType::Ggml(GgmlType::Q4_K),
     DType::Ggml(GgmlType::Q6_K),
+    DType::Ggml(GgmlType::MXFP4),
 ];
 
 /// The `rope_type` naming wavelength-banded scaling ([`RopeScaling::Banded`]).

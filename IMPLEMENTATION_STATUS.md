@@ -3,6 +3,12 @@
 Last updated: 2026-11-19
 
 ## Current phase
+**MXFP4 execution format (2026-11-22, branch `mxfp4`).** Decision: ADR-007 amendment 2 (Proposed).
+- GGML type 39 is a dtype: 32-element blocks of 4-bit E2M1 values sharing one E8M0 power-of-two scale. CPU, Metal, Vulkan and Sim run MXFP4 matmuls that read the packed blocks inside the dot. CPU decode uses fused NEON kernels for one row and for 2 to 12 rows. Q4_K and Q6_K are unchanged. The shared decoder accepts MXFP4 weights.
+- Every backend gives the CPU's bits. On Metal and Vulkan the only exception is a weight that is itself an f32 subnormal (scale bytes 0 and 1), which the GPU flushes. The scale for those two bytes is built from two normal factors, so normal weights there stay exact.
+- Dequantization matches gguf-py on all 256 scale bytes. A model with every matrix in MXFP4 gives, bit for bit, the logits and tokens of the same model stored as f32 with the decoded values, on every backend.
+- **Owed:** decode and prefill rates against Q4_K (the benches include MXFP4; this session ran on battery). Hugging Face gpt-oss `*_blocks`/`*_scales` import (a nibble repack) once the gpt-oss architecture options exist. The Vulkan matmul for MXFP4 is the straightforward per-lane one; block-wise tuning comes after measurement.
+
 **Llama 3.x: `llama3` RoPE scaling (2026-11-19, branch `llama3-rope`).** Roadmap row "Llama 3.x"; decision: ADR-003 amendment (Llama 3 RoPE scaling).
 - `rope_type: "llama3"` (in `rope_scaling` or `rope_parameters`) is parsed into `RopeScaling`, carried by `DenseConfig` and `MoeConfig`, and applied by `Rope::with_scaling`, which every backend's tables use. Malformed or extra keys are refused by name. `transformer_dense` 1.2.0, `transformer_moe` 1.1.0; import records the higher version only when a model uses the scaling.
 - The adjustment matches transformers' inverse frequencies bit for bit on four configs. Plain RoPE's power is now the correctly rounded f32 (was f32 `powf`, one ulp off at θ = 500 000 on macOS); torch's own `pow` is within one ulp of it.
