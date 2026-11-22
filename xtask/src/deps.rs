@@ -49,6 +49,8 @@ fn allowed_deps(krate: &str) -> Option<Vec<&'static str>> {
         "qubivex-scheduler" => vec![],
         // Grammars and token masks over bytes (ADR-020); knows nothing of models.
         "qubivex-grammar" => vec![],
+        // Prepares requests longer than the context (ADR-021); knows nothing of models.
+        "qubivex-context" => vec![],
         // Decides which retained KV a prompt can reuse; knows nothing of tensors.
         "qubivex-kv-cache" => vec![],
         "qubivex-compute" => vec!["qubivex-core"],
@@ -71,6 +73,7 @@ fn allowed_deps(krate: &str) -> Option<Vec<&'static str>> {
                 "qubivex-scheduler",
                 "qubivex-tokenizer",
                 "qubivex-grammar",
+                "qubivex-context",
                 "qubivex-hardware",
                 "qubivex-compute",
                 "qubivex-core",

@@ -10,6 +10,7 @@ mod combine;
 mod discrete;
 mod engine;
 mod experts;
+mod managed;
 mod metal_forward;
 mod placement;
 mod request;
@@ -23,11 +24,13 @@ pub use engine::{
     cpu_pass_reason, refuse_weight_formats,
 };
 pub use experts::{ExpertIo, ExpertLayout, IoPath, ModelExpertSource, PartLayout};
+pub use managed::{ContextLimits, ManageOptions, Managed};
 pub use placement::{BackendKind, MetalOps, PlacementReport};
 pub use qubivex_arch::{KvCache, Logits, Segment};
 pub use qubivex_backend_cpu::sim::SimConfig;
 pub use qubivex_backend_vulkan::VulkanConfig;
 pub use qubivex_compute::discrete::{DeviceUsage, TransferStats};
+pub use qubivex_context as context;
 pub use qubivex_expert_stream::fault::DiskLimit;
 pub use qubivex_kv_cache::PrefixStats;
 use qubivex_model::manifest::TokenizerSection;

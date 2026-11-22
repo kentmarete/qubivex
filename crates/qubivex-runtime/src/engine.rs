@@ -951,6 +951,8 @@ pub struct Engine {
     tokenizer: Tokenizer,
     backend: Placed,
     max_context: usize,
+    /// Where `max_context` comes from (ADR-021).
+    context_limits: crate::managed::ContextLimits,
     /// The forward pass runs inside this pool, so every matmul starts on a worker that
     /// joins the work instead of a caller blocked on a condition variable.
     pool: rayon::ThreadPool,
@@ -1274,6 +1276,12 @@ impl Engine {
                 (Some(plan), capacity, ctx)
             }
         };
+        let context_limits = crate::managed::ContextLimits {
+            model: model_ctx,
+            configured: opts.max_context,
+            memory: plan.as_ref().and_then(|p| usize::try_from(p.context).ok()),
+            effective: max_context,
+        };
         let top_k = model.moe_config().map_or(0, |c| c.top_k as usize);
         let cpu_pass = cpu_pass_reason(&footprint.layers, capacity, top_k);
         let (backend, gpu) = match layers_on {
@@ -1405,6 +1413,7 @@ impl Engine {
             },
             pool,
             max_context,
+            context_limits,
             meta,
             dense,
             source,
@@ -2143,6 +2152,13 @@ impl Engine {
     #[must_use]
     pub const fn max_context(&self) -> usize {
         self.max_context
+    }
+
+    /// The limits `max_context` is the least of: the model's, the configured one and
+    /// what the memory plan holds for one conversation (ADR-021).
+    #[must_use]
+    pub const fn context_limits(&self) -> crate::managed::ContextLimits {
+        self.context_limits
     }
 
     /// Whether the prefetch throttle holds speculation for this forward pass.
