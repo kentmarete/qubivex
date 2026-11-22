@@ -1,13 +1,20 @@
 # QUBIVEX Implementation Status
 
-Last updated: 2026-11-19
+Last updated: 2026-11-22
 
 ## Current phase
+**gpt-oss SafeTensors (2026-11-22, branch `gpt-oss`).** Decision: ADR-003 amendment 5 (Proposed).
+- `openai/gpt-oss-20b` runs on the shared MoE decoder as configuration of `transformer_moe` 1.2.0: q/k/v/o biases, attention sinks, per-layer sliding windows, YaRN RoPE, router bias with a softmax over the top-K, expert biases, interleaved gate/up with the clamped SwiGLU. Nothing names the family in the code paths.
+- Hugging Face MXFP4 `*_blocks`/`*_scales` are repacked into the GGML layout as each expert loads (a byte shuffle; values unchanged). Fused device paths decline these options, so those steps run on the host and the matmuls on the device; every backend gives the CPU's bits.
+- Tokenizer: `chat_template.jinja`, minijinja macros, `strftime_now` (UTC).
+- `gpt-oss-tiny` matches transformers per layer, in logits and 12 greedy tokens (worst 9.4e-7; removing the window, sinks, clamp or YaRN factor fails it). Real `gpt-oss-20b` cut to two layers matches transformers f32 (worst 2.83e-6 relative, either side of the 128-position window); the full model's greedy chat reply is the same on CPU, Metal, Vulkan and Sim.
+- **Owed:** decode/prefill rates for gpt-oss-20b; device kernels for sinks, windows and biases so the fused paths can take it.
+
 **MXFP4 execution format (2026-11-22, branch `mxfp4`).** Decision: ADR-007 amendment 2 (Proposed).
 - GGML type 39 is a dtype: 32-element blocks of 4-bit E2M1 values sharing one E8M0 power-of-two scale. CPU, Metal, Vulkan and Sim run MXFP4 matmuls that read the packed blocks inside the dot. CPU decode uses fused NEON kernels for one row and for 2 to 12 rows. Q4_K and Q6_K are unchanged. The shared decoder accepts MXFP4 weights.
 - Every backend gives the CPU's bits. On Metal and Vulkan the only exception is a weight that is itself an f32 subnormal (scale bytes 0 and 1), which the GPU flushes. The scale for those two bytes is built from two normal factors, so normal weights there stay exact.
 - Dequantization matches gguf-py on all 256 scale bytes. A model with every matrix in MXFP4 gives, bit for bit, the logits and tokens of the same model stored as f32 with the decoded values, on every backend.
-- **Owed:** decode and prefill rates against Q4_K (the benches include MXFP4; this session ran on battery). Hugging Face gpt-oss `*_blocks`/`*_scales` import (a nibble repack) once the gpt-oss architecture options exist. The Vulkan matmul for MXFP4 is the straightforward per-lane one; block-wise tuning comes after measurement.
+- **Owed:** decode and prefill rates against Q4_K (the benches include MXFP4; this session ran on battery). The Vulkan matmul for MXFP4 is the straightforward per-lane one; block-wise tuning comes after measurement.
 
 **Llama 3.x: `llama3` RoPE scaling (2026-11-19, branch `llama3-rope`).** Roadmap row "Llama 3.x"; decision: ADR-003 amendment (Llama 3 RoPE scaling).
 - `rope_type: "llama3"` (in `rope_scaling` or `rope_parameters`) is parsed into `RopeScaling`, carried by `DenseConfig` and `MoeConfig`, and applied by `Rope::with_scaling`, which every backend's tables use. Malformed or extra keys are refused by name. `transformer_dense` 1.2.0, `transformer_moe` 1.1.0; import records the higher version only when a model uses the scaling.

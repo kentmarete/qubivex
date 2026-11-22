@@ -169,3 +169,51 @@ kernel (Q5_K, Q4_0, ...) passed validation and failed only when the forward pass
 Verified: `qubivex-arch` unit tests against transformers' inverse frequencies;
 `real_dense` on Llama-3.2-3B (`QUBIVEX_LLAMA3_SAFETENSORS_DIR`,
 `fixtures/oracle/llama3_real.json`).
+
+## Amendment 5 (2026-11-22, Proposed): gpt-oss as configuration of `transformer_moe`
+
+gpt-oss SafeTensors checkpoints run on the shared decoder; nothing in the code
+paths names the family. `transformer_moe` 1.2.0 (and `transformer_dense` 1.3.0 for
+the shared parts) adds options, each read from the checkpoint:
+
+| Option | Where it comes from | What it does |
+|---|---|---|
+| `attention_bias` | `config.json` | biases on q, k, v and the output projection |
+| `attention_sinks` | detected: the `sinks` tensor exists | one learned logit per query head joins every attention softmax (in the maximum and, last, in the sum) and is dropped |
+| per-layer windows | `layer_types` + `sliding_window` | a `sliding_attention` layer attends to its last `sliding_window` positions, the current one included |
+| YaRN | `rope_scaling` / `rope_parameters`, `rope_type: "yarn"` | transformers' `_compute_yarn_parameters`, defaults included; `attention_factor` multiplies every cos and sin in the RoPE table |
+| `router_bias` | detected | a bias on the router logits |
+| `router_scoring: topk_softmax` | transformers' config-class default for the `model_type` (below) | the top-K logits, then a softmax over those K |
+| `expert_bias` | detected (stacked gate-up layouts only) | per-expert biases after gate-up and after down |
+| clamped SwiGLU | `swiglu_limit` (+ `swiglu_alpha`) | `(clamp(up, ±limit) + 1) · g · σ(alpha · g)`, `g = min(gate, limit)` |
+| `hf_interleaved` preset | the importer's candidates | router at `mlp.router`, fused gate-up whose rows alternate gate, up |
+
+- **Values a `config.json` leaves to its transformers config class** come from a small
+  table in the importer keyed by `model_type` (here: `topk_softmax` routing and
+  `swiglu_alpha` 1.702, as `GptOssTopKRouter` and `GptOssConfig` define them). Each
+  applies only when the checkpoint omits it, and is written into the manifest, so the
+  model reads the same without the table.
+- **SafeTensors MXFP4.** The index pairs `P_blocks` (`[…, rows, cols/32, 16]` u8) with
+  `P_scales` (`[…, rows, cols/32]` u8) into one MXFP4 tensor `P` (`SplitScales` records
+  where the scales are). The expert source repacks each expert as it loads: the scale
+  byte joins its 16 nibble bytes, the nibbles move from consecutive pairs (element `2j`
+  low, `2j + 1` high) to the GGML order (element `i` low, `i + 16` high), and interleaved
+  gate/up rows become gate rows then up rows. All of it moves bytes; values are
+  unchanged, and the kernels read MXFP4 packed as before (ADR-007 amendment 2). The
+  checkpoint on disk is not rewritten. Dense tensors stored split are refused.
+- **Device paths.** The fused device paths (attention, routing and the expert block on
+  the device; Metal's whole-layer pass) implement none of these options, so a model
+  using any of them runs those steps on the host and places its matmuls on the device
+  (`Transformer::fusable`). Every backend gives the CPU's bits.
+- **Tokenizer.** The chat template is read from `chat_template.jinja` when
+  `tokenizer_config.json` has none; minijinja's `macros` are on; `strftime_now(format)`
+  is provided, in UTC (transformers uses the server's local time, so the date can differ
+  by a day around midnight).
+
+Verified: the `gpt-oss-tiny` fixture (MXFP4 experts with interleaved gate/up, biases,
+sinks, a 4-position window, YaRN) matches transformers per layer and in logits and
+greedy tokens (`fixtures/oracle/forward.json`; with the window, the sinks, the clamp or
+YaRN's factor removed it fails), and gives the CPU's bits on Metal, Vulkan and Sim, in
+batches and with prefix reuse. YaRN's frequencies match transformers bit for bit except
+where torch's f32 `pow` is not correctly rounded (one ulp). The real checkpoint:
+`real_gpt_oss.rs` (`QUBIVEX_GPT_OSS_DIR`, `fixtures/oracle/gpt_oss_real.json`).
