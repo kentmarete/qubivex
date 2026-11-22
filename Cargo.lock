@@ -1334,6 +1334,7 @@ dependencies = [
  "sha2",
  "tokio",
  "toml",
+ "ureq",
 ]
 
 [[package]]

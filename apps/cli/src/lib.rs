@@ -17,6 +17,7 @@ mod serve;
 mod serve_detach;
 mod system;
 mod update;
+mod update_check;
 
 use std::ffi::OsString;
 use std::io::Write;
@@ -266,6 +267,13 @@ enum Command {
     /// Update qubivex to the newest commit of the branch install.sh installed
     /// (--detach runs it in the background).
     Update(update::UpdateFlags),
+    /// Look up the latest version for the update notice (started in the background).
+    #[command(name = update_check::REFRESH_COMMAND, hide = true)]
+    RefreshUpdateCheck {
+        /// The Cargo.toml to read the version from.
+        #[arg(long)]
+        url: String,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -984,7 +992,8 @@ fn to_json(v: &impl serde::Serialize) -> Result<String, String> {
     Ok(t)
 }
 
-/// Parses `args` (including the program name) and runs the command.
+/// Parses `args` (including the program name) and runs the command, then shows the update
+/// notice when one is due (see `update_check`).
 ///
 /// Returns the process exit code: 0 on success, 1 on a runtime error, 2 on a usage
 /// error.
@@ -993,12 +1002,16 @@ where
     I: IntoIterator<Item = T>,
     T: Into<OsString> + Clone,
 {
-    match Cli::try_parse_from(args) {
+    let args: Vec<OsString> = args.into_iter().map(Into::into).collect();
+    let (code, notice) = match Cli::try_parse_from(&args) {
         Ok(cli) => match execute(&cli.command) {
-            Ok(()) => ExitCode::SUCCESS,
+            Ok(()) => (
+                ExitCode::SUCCESS,
+                cli.command.allows_update_notice() && !args.iter().any(|a| a == "--json"),
+            ),
             Err(e) => {
                 eprintln!("qubivex: {e}");
-                ExitCode::FAILURE
+                (ExitCode::FAILURE, false)
             }
         },
         Err(e) => {
@@ -1006,8 +1019,28 @@ where
             let code = e.exit_code();
             // Printing can fail only on a closed stdout/stderr, where nothing useful remains to do.
             let _ = e.print();
-            ExitCode::from(u8::try_from(code).unwrap_or(2))
+            // After help, not after `--version`, whose one line scripts read.
+            let help = e.kind() == clap::error::ErrorKind::DisplayHelp;
+            (ExitCode::from(u8::try_from(code).unwrap_or(2)), help)
         }
+    };
+    update_check::after_command(notice);
+    code
+}
+
+impl Command {
+    /// Whether the update notice may follow this command. Not after commands that run
+    /// models or a server, whose output and timing must stay as they are, nor after
+    /// `update` itself.
+    fn allows_update_notice(&self) -> bool {
+        !matches!(
+            self,
+            Self::Run { .. }
+                | Self::Serve(_)
+                | Self::Bench { .. }
+                | Self::Update(_)
+                | Self::RefreshUpdateCheck { .. }
+        )
     }
 }
 
@@ -1092,6 +1125,7 @@ fn execute(cmd: &Command) -> Result<(), String> {
         }),
         Command::Serve(args) => serve_detach::serve(args),
         Command::Update(flags) => update::update(flags),
+        Command::RefreshUpdateCheck { url } => update_check::refresh(url),
         Command::Bench {
             model,
             dirs,

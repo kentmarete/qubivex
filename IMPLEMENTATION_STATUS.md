@@ -3,6 +3,11 @@
 Last updated: 2026-11-22
 
 ## Current phase
+**CLI update notice (2026-11-22, branch `update-check`).**
+- After a command in a terminal, `qubivex` says on stderr when the branch the installation follows (from `~/.qubivex/install-receipt`) has a newer version than the compiled one, and suggests `qubivex update`. The latest version is that branch's workspace `Cargo.toml` `version`, the project's one version source; the repository has no releases or version tags, and `qubivex update` installs that branch. Versions compare by semver precedence (prereleases included), parsed in `apps/cli/src/update_check/version.rs`; no new dependency (ureq and toml were already in the workspace).
+- The lookup runs at most once a day in a detached `qubivex refresh-update-check` (hidden; 3 s timeout), cached in `~/.qubivex/update-check.json`; the command shows what the cache holds and never waits. Not shown or looked up when stdout or stderr is not a terminal, after `--version`, `--json`, `run`, `serve`, `bench`, `update` or an error, with `CI` or `QUBIVEX_NO_UPDATE_CHECK` set, or for installs `qubivex update` cannot move (no receipt, tag-pinned, not GitHub).
+- Tests: unit tests for versions, cache, URL and the decision; `apps/cli/tests/update_check.rs` runs the lookup against a local HTTP server (success, 500, invalid version, no answer, refused, corrupted cache) and the notice in a pseudo-terminal via `script` (shown after help once; absent when not due; background refresh). Docs: `docs/deployment/installation.md` "Update notices", README.
+
 **gpt-oss SafeTensors (2026-11-22, branch `gpt-oss`).** Decision: ADR-003 amendment 5 (Proposed).
 - `openai/gpt-oss-20b` runs on the shared MoE decoder as configuration of `transformer_moe` 1.2.0: q/k/v/o biases, attention sinks, per-layer sliding windows, YaRN RoPE, router bias with a softmax over the top-K, expert biases, interleaved gate/up with the clamped SwiGLU. Nothing names the family in the code paths.
 - Hugging Face MXFP4 `*_blocks`/`*_scales` are repacked into the GGML layout as each expert loads (a byte shuffle; values unchanged). Fused device paths decline these options, so those steps run on the host and the matmuls on the device; every backend gives the CPU's bits.

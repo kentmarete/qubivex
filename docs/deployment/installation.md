@@ -99,6 +99,7 @@ loads. The binary therefore builds without the CUDA, Vulkan or Metal SDKs, and
 |---|---|---|
 | `~/.cargo/bin/qubivex` (or `--install-dir`) | The binary | Yes |
 | `~/.qubivex/install-receipt` | What was installed, from where | Yes |
+| `~/.qubivex/update-check.json` | The latest version last looked up, for the update notice | No |
 | `~/.qubivex/models/` | Models (the CLI's default models directory) | **Never** |
 | `~/.qubivex/` (anything else) | Your configuration and data | **Never** |
 
@@ -151,6 +152,44 @@ one runs is refused. It never prompts: a missing or old Rust fails the update, a
 log says what to do. Follow it with `tail -f ~/.qubivex/update.log`. The running
 `qubivex` keeps working while the binary is replaced; the new version is used from the
 next command.
+
+### Update notices
+
+When a newer version is out, a command run in a terminal ends with a notice on stderr,
+after its own output:
+
+```text
+----------------------------------------
+Qubivex Update Available
+
+Current version: 0.1.1
+Latest version:  0.1.2
+
+Run `qubivex update` to upgrade.
+----------------------------------------
+```
+
+- **What counts as newer.** The latest version is the `version` in the workspace
+  `Cargo.toml` on the branch the installation follows (the one in
+  `~/.qubivex/install-receipt`), which is what `qubivex update` would install. It is
+  compared with the version compiled into the binary (the one `qubivex --version`
+  prints) by semantic-version precedence, so `0.10.0` is newer than `0.9.0` and
+  `0.2.0-rc.1` older than `0.2.0`. New commits without a version bump are not
+  announced; `qubivex update --check` reports those. A build ahead of the branch gets
+  no notice, and after `qubivex update` the notice stops from the next command.
+- **How often.** At most one lookup a day. It never runs in the command's process: when
+  the cache `~/.qubivex/update-check.json` is a day old, the command starts a lookup in
+  the background (giving up after 3 seconds) and shows what the cache already holds.
+  The first notice therefore comes on the command after the one that found it. A failed
+  lookup (offline, GitHub down, a bad answer) is silent and leaves the last version
+  found in place until the next day. A missing or damaged cache file counts as none.
+- **When it is never shown.** When stdout or stderr is not a terminal (piped,
+  redirected, cron, scripts); after `--version`, any `--json` output, `run`, `serve`,
+  `bench` and `update`; after an error; when `CI` is set; and for installations that
+  `qubivex update` cannot move: no receipt (a checkout or `cargo install`), pinned to a
+  tag, or not hosted on GitHub. In none of these cases does it look anything up either.
+- **Turning it off.** `export QUBIVEX_NO_UPDATE_CHECK=1` (any value but `0` or
+  `false`). It then neither looks anything up nor shows anything.
 
 ## Uninstalling
 
