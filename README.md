@@ -577,6 +577,8 @@ as a service ([Linux](docs/deployment/linux-deployment.md),
 | `--request-timeout S` | 600 | A generation then ends with `finish_reason: "length"` |
 | `--log-format text\|json\|off` | `text` | The log on standard error. `json` is one object per line |
 | `--no-metrics` | off | Do not serve `GET /metrics` (it answers 404) |
+| `--no-context-management` | on | Refuse requests longer than the model's context with a 400, instead of preparing them to fit (older turns condensed into quoted excerpts, long documents cut to their relevant blocks). Requests that fit are never changed. See [Context management](docs/serving/context-management.md) |
+| `--context-store DIR` | memory | Keep notes on condensed turns in files, so the next turn reuses them after a restart (`--context-store-mb`, `--context-store-days`, `--context-note-share`) |
 | memory, device, `--context`, `--threads` | as `qubivex run` | Per model |
 
 Each conversation has its own KV cache and runs only when the memory plan can hold every

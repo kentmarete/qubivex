@@ -14,6 +14,7 @@ qubivex-backend-cpu = { workspace = true }
 qubivex-backend-metal = { workspace = true }
 qubivex-backend-vulkan = { workspace = true }
 qubivex-compute = { workspace = true }
+qubivex-context = { workspace = true }
 qubivex-core = { workspace = true }
 qubivex-expert-stream = { workspace = true }
 qubivex-grammar = { workspace = true }

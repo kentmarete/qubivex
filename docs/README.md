@@ -67,6 +67,7 @@ Start with the page for what you want to do.
 | [http-api.md](serving/http-api.md) | Every endpoint, field, error and setting, with real payloads |
 | [openai-compatibility.md](serving/openai-compatibility.md) | What an OpenAI client can use, and what is refused |
 | [streaming.md](serving/streaming.md) | Server-sent events, errors in a stream, cancelling, time limits |
+| [context-management.md](serving/context-management.md) | Requests longer than the context: what is kept, condensed or cut, and how to see it (ADR-021) |
 | [scheduler.md](serving/scheduler.md) | The queue, priorities, fairness, admission, deadlines |
 | [concurrent-inference.md](serving/concurrent-inference.md) | Shared forward passes, isolation, measured throughput |
 

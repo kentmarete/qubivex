@@ -15,7 +15,10 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
-use qubivex_api::{ClientKey, Gateway, LogFormat, MemoryPolicy, RateLimit, ServerConfig};
+use qubivex_api::{
+    ClientKey, ContextConfig, ContextSettings, Gateway, LogFormat, MemoryPolicy, RateLimit,
+    ServerConfig,
+};
 use qubivex_model::{ArchitectureRegistry, find};
 use qubivex_runtime::Engine;
 use serde::Deserialize;
@@ -141,6 +144,25 @@ pub(crate) struct ServeFlags {
     /// Do not serve GET /metrics.
     #[arg(long)]
     no_metrics: bool,
+    /// Refuse requests longer than the model's context (a 400) instead of preparing
+    /// them to fit by condensing older turns and reducing long messages (ADR-021).
+    /// Requests that fit are never changed either way.
+    #[arg(long)]
+    no_context_management: bool,
+    /// Share of the room left after the instructions and the current message that is
+    /// kept for the note on older turns, in [0, 1] (default: 0.25).
+    #[arg(long)]
+    context_note_share: Option<f64>,
+    /// Keep notes on earlier turns in files in this directory, so the next turn reuses
+    /// them after a restart. They hold excerpts of conversations (default: in memory).
+    #[arg(long)]
+    context_store: Option<PathBuf>,
+    /// MiB of notes on earlier turns to keep (default: 64 in memory, 256 in files).
+    #[arg(long)]
+    context_store_mb: Option<u64>,
+    /// Days a note in files is kept after its last use (default: 7).
+    #[arg(long)]
+    context_store_days: Option<u64>,
 }
 
 /// The config file. Unknown keys are errors, so a misspelt setting is not ignored.
@@ -217,6 +239,11 @@ struct FileServe {
     threads: Option<usize>,
     log_format: Option<String>,
     no_metrics: Option<bool>,
+    context_management: Option<bool>,
+    context_note_share: Option<f64>,
+    context_store: Option<PathBuf>,
+    context_store_mb: Option<u64>,
+    context_store_days: Option<u64>,
 }
 
 /// Refuses a config file holding a secret that other users can read (Unix).
@@ -405,6 +432,26 @@ impl ServeFlags {
                 .as_deref()
                 .map_or(Ok(d.log_format), log_format)?,
             metrics_enabled: !(self.no_metrics || file.no_metrics.unwrap_or(false)),
+            context: ContextSettings {
+                config: ContextConfig {
+                    enabled: !self.no_context_management && file.context_management.unwrap_or(true),
+                    note_share: self
+                        .context_note_share
+                        .or(file.context_note_share)
+                        .unwrap_or(d.context.config.note_share),
+                },
+                store_dir: self.context_store.or(file.context_store),
+                store_bytes: self
+                    .context_store_mb
+                    .or(file.context_store_mb)
+                    .map(|mb| mb.saturating_mul(1 << 20)),
+                store_age: self
+                    .context_store_days
+                    .or(file.context_store_days)
+                    .map_or(d.context.store_age, |days| {
+                        Duration::from_secs(days.saturating_mul(24 * 3600))
+                    }),
+            },
             ..d
         };
         cfg.validate()?;
@@ -610,6 +657,35 @@ mod tests {
             p.cfg.prefill_chunk, 256,
             "untouched settings keep their defaults"
         );
+    }
+
+    #[test]
+    fn context_management_is_on_by_default_and_follows_the_same_precedence() {
+        let p = flags(&["--model", "m"]).plan(FileServe::default()).unwrap();
+        assert!(p.cfg.context.config.enabled, "the default");
+        assert_eq!(p.cfg.context.store_dir, None);
+        let f = || {
+            file(
+                "[serve]\ncontext_management = false\ncontext_note_share = 0.4\n\
+                 context_store = \"/var/lib/q\"\ncontext_store_mb = 8\ncontext_store_days = 2\n",
+            )
+        };
+        let p = flags(&["--model", "m"]).plan(f()).unwrap();
+        assert!(!p.cfg.context.config.enabled, "the file");
+        assert!((p.cfg.context.config.note_share - 0.4).abs() < 1e-12);
+        assert_eq!(
+            p.cfg.context.store_dir,
+            Some(std::path::PathBuf::from("/var/lib/q"))
+        );
+        assert_eq!(p.cfg.context.store_bytes, Some(8 << 20));
+        assert_eq!(p.cfg.context.store_age, Duration::from_secs(2 * 86_400));
+        let p = flags(&["--model", "m", "--no-context-management"])
+            .plan(FileServe::default())
+            .unwrap();
+        assert!(!p.cfg.context.config.enabled, "the flag");
+        let bad =
+            flags(&["--model", "m", "--context-note-share", "1.5"]).plan(FileServe::default());
+        assert!(bad.unwrap_err().contains("note share"));
     }
 
     #[test]

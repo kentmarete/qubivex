@@ -418,6 +418,11 @@ Documented server options:
   `--prefix-cache-mb`         Memory budget for reusable prefix/KV cache
   `--log-format`              Logging format
   `--no-metrics`              Disable Prometheus metrics
+  `--no-context-management`   Refuse requests longer than the context (400)
+  `--context-note-share`      Room kept for the note on older turns (0.25)
+  `--context-store`           Keep context checkpoints in files in this directory
+  `--context-store-mb`        Size of the context checkpoint store
+  `--context-store-days`      Age limit of context checkpoint files
 
 The previously documented HTTP endpoints are:
 

@@ -1346,6 +1346,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "qubivex-context"
+version = "0.1.2"
+dependencies = [
+ "criterion",
+ "serde",
+ "serde_json",
+ "sha2",
+ "thiserror",
+]
+
+[[package]]
 name = "qubivex-core"
 version = "0.1.2"
 dependencies = [
@@ -1451,6 +1462,7 @@ dependencies = [
  "qubivex-backend-metal",
  "qubivex-backend-vulkan",
  "qubivex-compute",
+ "qubivex-context",
  "qubivex-core",
  "qubivex-expert-stream",
  "qubivex-grammar",

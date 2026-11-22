@@ -19,6 +19,7 @@ cannot use), [Streaming](streaming.md), [Scheduler](scheduler.md). The design re
 | `POST /v1/chat/completions` | API key | Chat completion, streaming or not |
 | `POST /v1/completions` | API key | Text completion, streaming or not |
 | `GET /v1/system` | API key | Hardware, memory and queue state |
+| `POST /v1/context/inspect` | API key | What context management would do to a request, without generating ([Context management](context-management.md)) |
 | `POST /v1/models/load` | admin token | Load a model |
 | `POST /v1/models/unload` | admin token | Unload a model |
 | `POST /v1/admin/models`, `DELETE /v1/admin/models/{id}` | admin token | Aliases of load and unload |
@@ -241,6 +242,8 @@ is what `qubivex system --json` prints. The rest, from a server with one fixture
 | `capabilities` | `admin`: the admin endpoints are on. `model_management`: `GET /v1/admin/models/installed` is on (with the admin token). `model_downloads`: the download routes below are on |
 | `limits` | `--default-max-tokens`, `--max-generation-tokens`, `--max-prompt-tokens` and `--context` (`load_context`); `null` where unset, so the context limits it |
 | `models[].max_context` | The context the model was loaded with, in tokens |
+| `models[].context_limits` | Where `max_context` comes from: the model's own limit, the configured one, what the memory plan holds, and the effective (least) one |
+| `context_management` | Whether long requests are prepared to fit, the note share, where checkpoints are kept (`memory` or `files`) and the store's counters. See [Context management](context-management.md) |
 | `model_states[].state` | `loading`, `loaded` or `failed` |
 | `plan_budget_bytes` | The RAM the memory plan may use for this model |
 | `ledger_bytes` | What is allocated now, by owner |
@@ -455,6 +458,7 @@ Every error is JSON in OpenAI's shape:
 |---|---|---|---|
 | 400 | `invalid_request` | `invalid_request_error` | Malformed JSON, a bad value, a field the server cannot honour (`param` names it), or a prompt that leaves no room in the context |
 | 400 | `prompt_too_long` | `invalid_request_error` | The prompt exceeds `--max-prompt-tokens` |
+| 400 | `context_length_exceeded` | `invalid_request_error` | A request longer than the context that cannot be prepared to fit: its instructions alone are too long, or the current message cannot be cut far enough. `param` is `messages` or `prompt`. See [Context management](context-management.md) |
 | 401 | `invalid_api_key` | `authentication_error` | Missing or wrong bearer token |
 | 403 | `admin_disabled` | `permission_error` | An admin endpoint with no admin token configured |
 | 403 | | | A CORS preflight from an origin that is not allowed |
@@ -542,6 +546,9 @@ config file. The highest wins: flag, then environment, then file, then default.
 | `--io-threads N` | 4 | Threads reading experts from disk |
 | `--log-format text\|json\|off` | `text` | The log on standard error |
 | `--no-metrics` | off | `GET /metrics` answers 404 |
+| `--no-context-management` | on | Refuse requests longer than the context (400) instead of preparing them to fit |
+| `--context-note-share F` | 0.25 | Room kept for the note on older turns. See [Context management](context-management.md) |
+| `--context-store DIR`, `--context-store-mb N`, `--context-store-days N` | memory, 64 MiB | Keep checkpoints of condensed turns in files that survive a restart |
 
 In the config file each key is the flag's name with `_` for `-`. The repeatable flags
 are lists named `models`, `dirs` and `cors_origins`, and a list given on the command

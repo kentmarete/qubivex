@@ -4,6 +4,21 @@ Notable changes to QUBIVEX, newest first. Versions follow the workspace `version
 `Cargo.toml`, which `qubivex --version` prints. There are no tagged releases yet:
 `qubivex update` installs the newest commit of the branch you follow.
 
+## Unreleased
+
+### Added
+
+- **Context management** (ADR-021, Proposed). A request longer than the model's context
+  is prepared to fit instead of refused with a 400: system and developer messages are
+  kept verbatim, recent turns are kept, older turns become a note of quoted excerpts
+  (never model-written), and a long pasted document or source file is cut to its most
+  relevant blocks with markers naming what was left out. Every change is recounted with
+  the model's own template and tokenizer. Requests that fit are untouched. Prepared
+  responses carry `x-qubivex-context` headers; `POST /v1/context/inspect` shows what
+  would be done; new `qubivex_context_*` metrics. Notes are reused across turns (in
+  memory, or in files with `--context-store`). `--no-context-management` restores the
+  old refusal. New crate `qubivex-context`.
+
 ## 0.1.2 (2026-11-22)
 
 ### Added

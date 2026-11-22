@@ -137,10 +137,13 @@ fn requests_the_context_cannot_hold_are_refused_before_any_pass() {
             .unwrap_err()
     };
     let long = GenerationRequest::new(Prompt::Text("word ".repeat(500)));
-    assert!(matches!(
-        err(&long),
-        RequestError::Invalid { param: None, .. }
-    ));
+    let e2 = err(&long);
+    assert!(
+        matches!(e2, RequestError::ContextOverflow { context, .. } if context == e.max_context()),
+        "{e2:?}"
+    );
+    // The message clients have always seen.
+    assert!(e2.to_string().ends_with("leaving no room to generate"));
     assert_eq!(e.store_stats().loads, 0);
 }
 

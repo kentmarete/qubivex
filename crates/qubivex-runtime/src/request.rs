@@ -161,6 +161,20 @@ pub enum RequestError {
         /// What is wrong.
         message: String,
     },
+    /// The prompt does not leave room in the context to generate. The message is the one
+    /// [`RequestError::Invalid`] carried before this variant existed.
+    #[error(
+        "the prompt has {prompt_tokens} tokens; the context holds {context}, leaving no room to generate"
+    )]
+    ContextOverflow {
+        /// The prompt's tokens.
+        prompt_tokens: usize,
+        /// The context, in positions.
+        context: usize,
+    },
+    /// Context management (ADR-021) could not prepare the request to fit.
+    #[error(transparent)]
+    Context(qubivex_context::ContextError),
     /// The memory plan has no room for this conversation now.
     #[error(transparent)]
     Admission(RuntimeError),
@@ -249,7 +263,7 @@ impl<'a> Stops<'a> {
 
 impl Engine {
     /// The prompt's tokens.
-    fn prompt_ids(&self, prompt: &Prompt) -> Result<Vec<u32>, RequestError> {
+    pub(crate) fn prompt_ids(&self, prompt: &Prompt) -> Result<Vec<u32>, RequestError> {
         let tok = self.tokenizer();
         let (text, special) = match prompt {
             Prompt::Text(t) => (t.clone(), true),
@@ -284,7 +298,8 @@ impl Engine {
     /// pass.
     ///
     /// # Errors
-    /// [`RequestError::Invalid`] if the request cannot run on this model.
+    /// [`RequestError::Invalid`] if the request cannot run on this model;
+    /// [`RequestError::ContextOverflow`] if its prompt leaves no room to generate.
     pub fn prepare(&self, req: &GenerationRequest) -> Result<PreparedRequest, RequestError> {
         if req.constraint.is_some() {
             self.token_trie().map_err(|e| {
@@ -298,9 +313,10 @@ impl Engine {
         let prompt_tokens = prompt.len();
         let ctx = self.max_context();
         if prompt_tokens >= ctx {
-            return Err(RequestError::invalid(format!(
-                "the prompt has {prompt_tokens} tokens; the context holds {ctx}, leaving no room to generate"
-            )));
+            return Err(RequestError::ContextOverflow {
+                prompt_tokens,
+                context: ctx,
+            });
         }
         // An upper bound, as in other local inference servers: a client cannot know how
         // many tokens its prompt became, so asking past the context ends at the context
