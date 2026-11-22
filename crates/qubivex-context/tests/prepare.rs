@@ -487,3 +487,45 @@ fn a_full_store_costs_reuse_not_correctness() {
     assert_eq!(p.report.checkpoint, CheckpointUse::Miss);
     assert!(p.report.prepared_tokens <= 2048 - 64);
 }
+
+/// Turn after turn, the stored note is extended rather than rebuilt, and it always
+/// quotes something when the budget has room for it.
+#[test]
+fn a_growing_conversation_extends_its_note_over_several_turns() {
+    let e = engine();
+    let mut conv = conversation(40, "Which port does item 3 use?");
+    let mut hits = 0;
+    let mut previous: Vec<String> = Vec::new();
+    for turn in 0..8 {
+        let input = Input::Chat(conv.clone());
+        let req = request(&input, &BYTE, 4096);
+        let p = e.prepare(&req, &BYTE, Interrupt::default()).unwrap();
+        let r = &p.report;
+        assert!(r.prepared_tokens <= req.budget.input);
+        assert!(r.excerpts >= 3, "turn {turn}: {} excerpts", r.excerpts);
+        // Most of the budget is used: the note does not leave a large share idle.
+        assert!(
+            r.prepared_tokens * 10 >= req.budget.input * 7,
+            "turn {turn}: {r:?}"
+        );
+        let lines: Vec<String> = chat(&p)[1]
+            .content
+            .lines()
+            .filter(|l| l.starts_with('#'))
+            .map(str::to_owned)
+            .collect();
+        if r.checkpoint == CheckpointUse::Hit {
+            hits += 1;
+            assert!(
+                lines.starts_with(&previous),
+                "turn {turn}: the note was changed"
+            );
+        }
+        previous = lines;
+        conv.push(asst(&format!("Answer {turn}: port {}.", 8000 + turn)));
+        conv.push(user(&format!(
+            "Next question number {turn}, about item {turn}?"
+        )));
+    }
+    assert!(hits >= 4, "{hits} of 8 turns reused the note");
+}

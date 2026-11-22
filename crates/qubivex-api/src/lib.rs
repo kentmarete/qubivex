@@ -62,9 +62,13 @@ pub use keys::{ClientKey, hash_key};
 pub use limits::RateLimit;
 pub use log::LogFormat;
 pub use metrics::Metrics;
+pub use qubivex_runtime::context::ContextConfig;
+use qubivex_runtime::context::{
+    CheckpointStore, ContextEngine, ContextError, FileStore, MemoryStore, Report,
+};
 use qubivex_runtime::scheduler::{EnterError, Outcome, RequestInfo};
 pub use qubivex_runtime::scheduler::{MemoryPolicy, Stats};
-use qubivex_runtime::{Engine, EngineOptions};
+use qubivex_runtime::{Engine, EngineOptions, ManageOptions, RequestError};
 use serde_json::{Value, json};
 pub use source::{
     ModelSource, PullOutcome, PullProgress, PullSpec, SourceError, SourceErrorKind, SourceHit,
@@ -144,6 +148,36 @@ pub struct ServerConfig {
     pub log_format: LogFormat,
     /// Serve `GET /metrics`. Off: it answers 404.
     pub metrics_enabled: bool,
+    /// Context management (ADR-021): a request longer than the model's context is
+    /// prepared to fit instead of refused. Requests that fit are never touched.
+    pub context: ContextSettings,
+}
+
+/// Context management settings (ADR-021).
+#[derive(Clone, Debug, PartialEq)]
+pub struct ContextSettings {
+    /// On or off, and how the room is shared. Off: a request longer than the context
+    /// gets the 400 it always got.
+    pub config: ContextConfig,
+    /// Where notes on earlier turns are kept so the next turn reuses them: `None`, in
+    /// memory; a directory, in files there that survive a restart (they hold excerpts
+    /// of conversations).
+    pub store_dir: Option<PathBuf>,
+    /// Most bytes of notes kept. `None`: 64 MiB in memory, 256 MiB in files.
+    pub store_bytes: Option<u64>,
+    /// How long a note in files is kept after its last use.
+    pub store_age: Duration,
+}
+
+impl Default for ContextSettings {
+    fn default() -> Self {
+        Self {
+            config: ContextConfig::default(),
+            store_dir: None,
+            store_bytes: None,
+            store_age: FileStore::DEFAULT_AGE,
+        }
+    }
 }
 
 impl Default for ServerConfig {
@@ -173,6 +207,7 @@ impl Default for ServerConfig {
             engine: EngineOptions::default(),
             log_format: LogFormat::default(),
             metrics_enabled: true,
+            context: ContextSettings::default(),
         }
     }
 }
@@ -193,6 +228,8 @@ struct AppState {
     stop_now: watch::Sender<bool>,
     /// Model downloads.
     jobs: jobs::Jobs,
+    /// Prepares requests longer than the context (ADR-021).
+    context: Arc<ContextEngine>,
 }
 
 /// The gateway: models plus settings. Clones share state.
@@ -207,6 +244,36 @@ impl std::fmt::Debug for Gateway {
             .field("models", &self.model_ids())
             .finish_non_exhaustive()
     }
+}
+
+/// The context engine `cfg` asks for. A store directory that cannot be opened is
+/// logged, and notes are kept in memory instead: requests never fail for it.
+fn context_engine(cfg: &ContextSettings, log: &Log) -> ContextEngine {
+    let memory = |bytes: Option<u64>| -> Arc<dyn CheckpointStore> {
+        Arc::new(MemoryStore::new(
+            bytes.map_or(MemoryStore::DEFAULT_BYTES, |b| {
+                usize::try_from(b).unwrap_or(usize::MAX)
+            }),
+        ))
+    };
+    let store = match &cfg.store_dir {
+        None => memory(cfg.store_bytes),
+        Some(dir) => match FileStore::open(
+            dir,
+            cfg.store_bytes.unwrap_or(FileStore::DEFAULT_BYTES),
+            cfg.store_age,
+        ) {
+            Ok(s) => Arc::new(s) as Arc<dyn CheckpointStore>,
+            Err(e) => {
+                log.warn(
+                    "context_store_unavailable",
+                    &[("detail", e.to_string().into())],
+                );
+                memory(None)
+            }
+        },
+    };
+    ContextEngine::new(cfg.config, store)
 }
 
 fn now_secs() -> u64 {
@@ -246,8 +313,10 @@ impl Gateway {
     }
 
     fn with(cfg: ServerConfig, log: Log) -> Self {
+        let context = Arc::new(context_engine(&cfg.context, &log));
         Self {
             state: Arc::new(AppState {
+                context,
                 limiter: RateLimiter::with_keys(
                     cfg.rate_limit,
                     cfg.client_keys.iter().map(|k| k.rate_limit).collect(),
@@ -315,6 +384,7 @@ impl Gateway {
             .get("/v1/models/{id}", get_model)
             .post("/v1/chat/completions", chat)
             .post("/v1/completions", completions)
+            .post("/v1/context/inspect", inspect)
             .post("/v1/admin/models", admin_load)
             .get("/v1/admin/models/installed", installed::list)
             .delete("/v1/admin/models/{id}", admin_unload)
@@ -700,6 +770,7 @@ async fn system(State(st): State<Arc<AppState>>, headers: HeaderMap) -> Response
                     "id": id,
                     "architecture": e.metadata().manifest.architecture.id,
                     "max_context": e.max_context(),
+                    "context_limits": limits_json(e),
                     "generation_slots": st.cfg.max_concurrent,
                     "generation_slots_free": st.cfg.max_concurrent.saturating_sub(queue.running),
                     "queue_depth": queue.queued,
@@ -733,6 +804,12 @@ async fn system(State(st): State<Arc<AppState>>, headers: HeaderMap) -> Response
                 "max_prompt_tokens": st.cfg.max_prompt_tokens,
                 "load_context": st.cfg.engine.max_context,
             },
+            "context_management": {
+                "enabled": st.context.enabled(),
+                "note_share": st.context.config().note_share,
+                "store": if st.cfg.context.store_dir.is_some() { "files" } else { "memory" },
+                "checkpoints": st.context.store().stats(),
+            },
             "capabilities": {
                 "admin": st.cfg.admin_token.is_some(),
                 "model_management": st.cfg.admin_token.is_some(),
@@ -747,6 +824,17 @@ async fn system(State(st): State<Arc<AppState>>, headers: HeaderMap) -> Response
     }
     .await;
     st.finish("system", &rid, began, r)
+}
+
+/// Where a model's context limit comes from (ADR-021 §2.2).
+fn limits_json(e: &Engine) -> Value {
+    let l = e.context_limits();
+    json!({
+        "model": l.model,
+        "configured": l.configured,
+        "memory": l.memory,
+        "effective": l.effective,
+    })
 }
 
 fn model_card(id: &str, created: u64) -> Value {
@@ -856,6 +944,93 @@ async fn completions(
     st.finish("completions", &rid, began, r)
 }
 
+/// `POST /v1/context/inspect` (ADR-021 §2.9): a chat or completion body, answered with
+/// what context management would do to it (the budget, the decision, which messages and
+/// lines are kept, condensed or left out) without generating. The prepared text is in
+/// the answer only with `"include_text": true`, and it is only ever the caller's own.
+async fn inspect(
+    State(st): State<Arc<AppState>>,
+    headers: HeaderMap,
+    body: Result<Json<Value>, JsonRejection>,
+) -> Response {
+    let began = Instant::now();
+    let rid = st.request_id(&headers);
+    let r = async {
+        let caller = st.check_key(&headers)?;
+        let body = json_body(&st, body)?;
+        let include_text = body.get("include_text").and_then(Value::as_bool) == Some(true);
+        let parse = |e: serde_json::Error| ApiError::invalid(format!("invalid request body: {e}"));
+        let (model, input, mut params, kind) = if body.get("messages").is_some() {
+            let req: ChatRequest = serde_json::from_value(body).map_err(parse)?;
+            let messages = req.messages()?;
+            let max = req.max_completion_tokens.or(req.common.max_tokens);
+            let params = req.common.params(max)?;
+            (req.model, Input::Chat(messages), params, Kind::Chat)
+        } else {
+            let req: CompletionRequest = serde_json::from_value(body).map_err(parse)?;
+            let prompt = req.prompt()?;
+            let max = req.common.max_tokens;
+            let params = req.common.params(max)?;
+            (req.model, Input::Text(prompt), params, Kind::Text)
+        };
+        st.identify(caller, &mut params);
+        let loaded = st.model(&model)?;
+        let request = worker::request(
+            input,
+            &params,
+            st.cfg.default_max_tokens,
+            st.cfg.prefill_chunk,
+        );
+        let engine = Arc::clone(&loaded.engine);
+        let context = Arc::clone(&st.context);
+        let prompt_cap = st.cfg.max_prompt_tokens;
+        let managed = tokio::task::spawn_blocking(move || {
+            let opts = ManageOptions {
+                prompt_cap,
+                ..ManageOptions::default()
+            };
+            engine.prepare_managed(request, Some(&context), &opts)
+        })
+        .await
+        .map_err(|_| ApiError::internal(&rid))?;
+        let managed = match managed {
+            Ok(m) => m,
+            Err(e) => {
+                let mut err = ApiError::from_request(&e, &rid, &st.log);
+                if err.code == "context_length_exceeded" {
+                    err.param = Some(prompt_param(kind));
+                }
+                return Err(err);
+            }
+        };
+        let e = &loaded.engine;
+        let budget = qubivex_runtime::context::Budget::new(
+            e.max_context(),
+            params.max_tokens,
+            st.cfg.default_max_tokens,
+            prompt_cap,
+        );
+        let mut out = json!({
+            "object": "context.inspection",
+            "model": model,
+            "managed": managed.report.is_some(),
+            "prompt_tokens": managed.prepared.prompt_tokens(),
+            "context_limits": limits_json(e),
+            "budget": managed.report.as_ref().map_or(budget, |r| r.budget),
+            "report": managed.report,
+        });
+        if include_text {
+            out["prepared"] = match &managed.request.prompt {
+                qubivex_runtime::Prompt::Chat(m) => json!(m),
+                qubivex_runtime::Prompt::Text(t) => json!(t),
+            };
+        }
+        Ok(Json(out).into_response())
+    }
+    .await;
+    st.finish("context_inspect", &rid, began, r)
+}
+
 /// Completes when the server has told running requests to stop.
 async fn stopped(stop: &mut watch::Receiver<bool>) {
     if stop.wait_for(|s| *s).await.is_err() {
@@ -897,22 +1072,38 @@ async fn generate(
             EnterError::Full => ApiError::queue_full(st.cfg.max_concurrent, st.cfg.max_queue),
             EnterError::Closed => ApiError::model_closing(),
         })?;
-    let mut request = worker::request(
+    let request = worker::request(
         input,
         &params,
         st.cfg.default_max_tokens,
         st.cfg.prefill_chunk,
     );
     let engine = Arc::clone(&loaded.engine);
-    // Tokenizing a long prompt is CPU work: off the Tokio workers.
-    let (returned, prepared) = tokio::task::spawn_blocking(move || {
-        let prepared = engine.prepare(&request);
-        (request, prepared)
+    let context = Arc::clone(&st.context);
+    let prompt_cap = st.cfg.max_prompt_tokens;
+    // Set when this handler is dropped: a client that goes away stops the preparation.
+    let preparing = Arc::new(AtomicBool::new(false));
+    let stop_preparing = CancelOnDrop(Arc::clone(&preparing));
+    // Tokenizing a long prompt is CPU work: off the Tokio workers. A request that fits
+    // is tokenized and checked once, as it always was (ADR-021 §2.1).
+    let managed = tokio::task::spawn_blocking(move || {
+        let opts = ManageOptions {
+            prompt_cap,
+            cancel: Some(&preparing),
+            deadline: limit,
+        };
+        engine.prepare_managed(request, Some(&context), &opts)
     })
     .await
-    .map_err(|_| ApiError::internal(rid))?;
-    request = returned;
-    let prepared = prepared.map_err(|e| ApiError::from_request(&e, rid, &st.log))?;
+    .map_err(|_| ApiError::internal(rid))?
+    .map_err(|e| context_refused(st, &e, rid, model, kind))?;
+    drop(stop_preparing);
+    let report = managed.report;
+    let mut request = managed.request;
+    let prepared = managed.prepared;
+    if let Some(r) = &report {
+        context_managed(st, r, rid, model);
+    }
     if let Some(cap) = st.cfg.max_prompt_tokens {
         let n = prepared.prompt_tokens();
         if n > cap {
@@ -1012,7 +1203,10 @@ async fn generate(
                 }) => {
                     drop(guard);
                     let tokens = usage(prompt_tokens, completion_tokens, cached_tokens);
-                    return Ok(reply.whole(&text, finish, tokens));
+                    return Ok(context_headers(
+                        reply.whole(&text, finish, tokens),
+                        report.as_ref(),
+                    ));
                 }
                 Some(Event::Failed(e)) => return Err(e),
                 Some(Event::Started { .. }) | None => return Err(ApiError::internal(rid)),
@@ -1028,7 +1222,113 @@ async fn generate(
         let _guard = guard;
         reply.forward(rx, out_tx, stall, stop).await;
     });
-    Ok(Sse::new(ReceiverStream::new(out_rx)).into_response())
+    Ok(context_headers(
+        Sse::new(ReceiverStream::new(out_rx)).into_response(),
+        report.as_ref(),
+    ))
+}
+
+/// The parameter a context refusal names.
+const fn prompt_param(kind: Kind) -> &'static str {
+    match kind {
+        Kind::Chat => "messages",
+        Kind::Text => "prompt",
+    }
+}
+
+/// Counts and logs a request longer than the context that could not be prepared, and
+/// says why. Other preparation errors pass through as they always did.
+fn context_refused(
+    st: &AppState,
+    e: &RequestError,
+    rid: &str,
+    model: &str,
+    kind: Kind,
+) -> ApiError {
+    let reason = match e {
+        RequestError::ContextOverflow { .. } => Some("disabled"),
+        RequestError::Context(c) => Some(match c {
+            ContextError::Mandatory { .. } => "mandatory",
+            ContextError::Unfit { .. } => "unfit",
+            ContextError::Cancelled => "cancelled",
+            ContextError::DeadlineExceeded => "deadline",
+            _ => "count",
+        }),
+        _ => None,
+    };
+    let mut err = ApiError::from_request(e, rid, &st.log);
+    if let Some(reason) = reason {
+        st.metrics.context.overflows.fetch_add(1, Ordering::Relaxed);
+        st.metrics.context.refuse(reason);
+        st.log.info(
+            "context_refused",
+            &[
+                ("request_id", rid.into()),
+                ("model", model.into()),
+                ("reason", reason.into()),
+            ],
+        );
+        if err.code == "context_length_exceeded" {
+            err.param = Some(prompt_param(kind));
+        }
+    }
+    err
+}
+
+/// Counts and logs a prepared request: numbers only, never text.
+fn context_managed(st: &AppState, r: &Report, rid: &str, model: &str) {
+    let c = &st.metrics.context;
+    c.overflows.fetch_add(1, Ordering::Relaxed);
+    c.compacted
+        .fetch_add(u64::from(r.compacted), Ordering::Relaxed);
+    c.reduced.fetch_add(u64::from(r.reduced), Ordering::Relaxed);
+    c.tokens_saved
+        .fetch_add(r.tokens_saved() as u64, Ordering::Relaxed);
+    let hit = r.checkpoint == qubivex_runtime::context::CheckpointUse::Hit;
+    c.checkpoint_hits
+        .fetch_add(u64::from(hit), Ordering::Relaxed);
+    c.prepare.observe_duration(r.total_time);
+    st.log.info(
+        "context_managed",
+        &[
+            ("request_id", rid.into()),
+            ("model", model.into()),
+            ("strategy", r.strategies().into()),
+            ("original_tokens", r.original_tokens.into()),
+            ("prepared_tokens", r.prepared_tokens.into()),
+            ("context", r.budget.context.into()),
+            ("reserve", r.budget.reserve.into()),
+            ("input_budget", r.budget.input.into()),
+            ("messages_condensed", r.messages_condensed.into()),
+            ("excerpts", r.excerpts.into()),
+            ("blocks_kept", r.blocks_kept.into()),
+            ("blocks_omitted", r.blocks_omitted.into()),
+            (
+                "checkpoint",
+                serde_json::to_value(r.checkpoint).unwrap_or(Value::Null),
+            ),
+            ("prepare_ms", millis(r.total_time)),
+            ("compaction_ms", millis(r.compaction_time)),
+            ("retrieval_ms", millis(r.retrieval_time)),
+        ],
+    );
+}
+
+/// The headers that say a request was prepared to fit (ADR-021 §2.9). None on a
+/// request that fitted.
+fn context_headers(mut resp: Response, report: Option<&Report>) -> Response {
+    if let Some(r) = report {
+        let h = resp.headers_mut();
+        if let Ok(v) = HeaderValue::from_str(&r.strategies()) {
+            h.insert("x-qubivex-context", v);
+        }
+        if let Ok(v) =
+            HeaderValue::from_str(&format!("{};{}", r.original_tokens, r.prepared_tokens))
+        {
+            h.insert("x-qubivex-context-tokens", v);
+        }
+    }
+    resp
 }
 
 /// What every part of one response repeats.

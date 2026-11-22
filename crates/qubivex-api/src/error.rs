@@ -5,6 +5,7 @@
 use kerniq_server::axum::Json;
 use kerniq_server::axum::http::StatusCode;
 use kerniq_server::axum::response::{IntoResponse, Response};
+use qubivex_runtime::context::ContextError;
 use qubivex_runtime::{RequestError, RuntimeError};
 use serde_json::json;
 
@@ -255,9 +256,25 @@ impl ApiError {
                 param: None,
                 message,
             } => Self::invalid(message.clone()),
+            // The message it always had, as a plain 400.
+            RequestError::ContextOverflow { .. } => Self::invalid(e.to_string()),
+            RequestError::Context(c) => Self::from_context(c, request_id),
             RequestError::Admission(err) | RequestError::Generation(err) => {
                 Self::from_runtime(err, request_id, log)
             }
+            _ => Self::internal(request_id),
+        }
+    }
+
+    /// A request context management (ADR-021) could not prepare.
+    fn from_context(e: &ContextError, request_id: &str) -> Self {
+        match e {
+            ContextError::Mandatory { .. } | ContextError::Unfit { .. } => Self {
+                code: "context_length_exceeded",
+                ..Self::invalid(e.to_string())
+            },
+            ContextError::DeadlineExceeded => Self::deadline_exceeded(),
+            ContextError::Cancelled | ContextError::Count(_) => Self::invalid(e.to_string()),
             _ => Self::internal(request_id),
         }
     }

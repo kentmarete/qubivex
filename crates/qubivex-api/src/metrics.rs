@@ -22,6 +22,11 @@ const RATE: &[f64] = &[
     2000.0, 5000.0,
 ];
 
+/// Bucket bounds in seconds for context preparation (ADR-021): 0.1 ms to 10 s.
+const PREPARE: &[f64] = &[
+    0.0001, 0.0005, 0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0,
+];
+
 /// A label value as the text format wants it.
 fn escape(v: &str) -> String {
     v.replace('\\', "\\\\")
@@ -405,6 +410,105 @@ pub struct Metrics {
     pub(crate) errors: AtomicU64,
     /// Model loads started.
     model_loads: AtomicU64,
+    /// Context management (ADR-021).
+    pub(crate) context: ContextMetrics,
+}
+
+/// What context management did (ADR-021).
+#[derive(Debug)]
+pub(crate) struct ContextMetrics {
+    /// Requests longer than the context, managed or not.
+    pub(crate) overflows: AtomicU64,
+    /// Requests whose older turns were condensed.
+    pub(crate) compacted: AtomicU64,
+    /// Requests with a long message reduced to its relevant blocks.
+    pub(crate) reduced: AtomicU64,
+    /// Requests that could not be prepared, by reason.
+    refused: Mutex<BTreeMap<&'static str, u64>>,
+    /// Prompt tokens taken out.
+    pub(crate) tokens_saved: AtomicU64,
+    /// Preparations that reused a stored note.
+    pub(crate) checkpoint_hits: AtomicU64,
+    /// How long preparations took.
+    pub(crate) prepare: Histogram,
+}
+
+impl Default for ContextMetrics {
+    fn default() -> Self {
+        Self {
+            overflows: AtomicU64::new(0),
+            compacted: AtomicU64::new(0),
+            reduced: AtomicU64::new(0),
+            refused: Mutex::new(BTreeMap::new()),
+            tokens_saved: AtomicU64::new(0),
+            checkpoint_hits: AtomicU64::new(0),
+            prepare: Histogram::new(PREPARE),
+        }
+    }
+}
+
+impl ContextMetrics {
+    /// Counts a request that could not be prepared, for `reason`.
+    pub(crate) fn refuse(&self, reason: &'static str) {
+        if let Ok(mut m) = self.refused.lock() {
+            *m.entry(reason).or_default() += 1;
+        }
+    }
+
+    fn render(&self, out: &mut String) {
+        let r = |c: &AtomicU64| c.load(Ordering::Relaxed);
+        for (name, help, v) in [
+            (
+                "qubivex_context_overflows_total",
+                "Requests longer than the model's context, prepared or refused.",
+                r(&self.overflows),
+            ),
+            (
+                "qubivex_context_tokens_saved_total",
+                "Prompt tokens context management took out.",
+                r(&self.tokens_saved),
+            ),
+            (
+                "qubivex_context_checkpoint_hits_total",
+                "Context preparations that reused a stored note on earlier turns.",
+                r(&self.checkpoint_hits),
+            ),
+        ] {
+            let _ = writeln!(out, "# HELP {name} {help}");
+            let _ = writeln!(out, "# TYPE {name} counter");
+            let _ = writeln!(out, "{name} {v}");
+        }
+        let name = "qubivex_context_managed_total";
+        let _ = writeln!(
+            out,
+            "# HELP {name} Requests prepared to fit, by strategy (one request can count under both)."
+        );
+        let _ = writeln!(out, "# TYPE {name} counter");
+        let _ = writeln!(
+            out,
+            "{name}{{strategy=\"compacted\"}} {}",
+            r(&self.compacted)
+        );
+        let _ = writeln!(out, "{name}{{strategy=\"reduced\"}} {}", r(&self.reduced));
+        let name = "qubivex_context_failures_total";
+        let _ = writeln!(
+            out,
+            "# HELP {name} Requests longer than the context that could not be prepared, by reason."
+        );
+        let _ = writeln!(out, "# TYPE {name} counter");
+        if let Ok(m) = self.refused.lock() {
+            for (reason, n) in m.iter() {
+                let _ = writeln!(out, "{name}{{reason=\"{reason}\"}} {n}");
+            }
+        }
+        let name = "qubivex_context_prepare_seconds";
+        let _ = writeln!(
+            out,
+            "# HELP {name} Time spent preparing requests to fit the context."
+        );
+        let _ = writeln!(out, "# TYPE {name} histogram");
+        self.prepare.render(out, name, "stage=\"total\"");
+    }
 }
 
 impl Metrics {
@@ -475,6 +579,21 @@ impl Metrics {
     #[must_use]
     pub fn model_loads(&self) -> u64 {
         self.model_loads.load(Ordering::Relaxed)
+    }
+
+    /// Requests longer than the context so far, prepared or refused.
+    #[must_use]
+    pub fn context_overflows(&self) -> u64 {
+        self.context.overflows.load(Ordering::Relaxed)
+    }
+
+    /// Requests prepared to fit so far: (compacted, reduced).
+    #[must_use]
+    pub fn context_managed(&self) -> (u64, u64) {
+        (
+            self.context.compacted.load(Ordering::Relaxed),
+            self.context.reduced.load(Ordering::Relaxed),
+        )
     }
 
     /// Requests counted for `endpoint` with `status`.
@@ -578,6 +697,7 @@ impl Metrics {
                 pick(m).render(out, name, &format!("model=\"{}\"", escape(id)));
             }
         }
+        self.context.render(out);
     }
 }
 

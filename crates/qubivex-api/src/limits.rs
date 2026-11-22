@@ -325,6 +325,12 @@ impl ServerConfig {
                 self.max_generation_tokens.unwrap_or_default()
             ));
         }
+        let share = self.context.config.note_share;
+        if !(0.0..=1.0).contains(&share) {
+            return Err(format!(
+                "the context note share ({share}) must be between 0 and 1"
+            ));
+        }
         Ok(())
     }
 

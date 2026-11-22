@@ -10,8 +10,8 @@ use std::sync::{Arc, Barrier};
 use qubivex_model::{ArchitectureRegistry, ModelMetadata};
 use qubivex_runtime::context::{ContextConfig, ContextEngine, ContextError};
 use qubivex_runtime::{
-    ChatMessage, Engine, EngineOptions, GenerationEvent, GenerationRequest, ManageOptions,
-    Prompt, RequestError,
+    ChatMessage, Engine, EngineOptions, GenerationEvent, GenerationRequest, ManageOptions, Prompt,
+    RequestError,
 };
 
 fn engine_with(id: &str, ctx: usize) -> Engine {
@@ -48,12 +48,17 @@ fn chat(msgs: &[(&str, &str)]) -> GenerationRequest {
 fn long_chat() -> GenerationRequest {
     let mut m: Vec<(String, String)> = vec![("system".into(), "Be brief.".into())];
     for i in 0..12 {
-        m.push(("user".into(), format!("Note {i}: the colour of box {i} is blue.")));
+        m.push((
+            "user".into(),
+            format!("Note {i}: the colour of box {i} is blue."),
+        ));
         m.push(("assistant".into(), format!("Noted, box {i} is blue.")));
     }
     m.push(("user".into(), "What colour is box 4?".into()));
     let mut r = GenerationRequest::new(Prompt::Chat(
-        m.iter().map(|(r, c)| ChatMessage::new(r.as_str(), c.as_str())).collect(),
+        m.iter()
+            .map(|(r, c)| ChatMessage::new(r.as_str(), c.as_str()))
+            .collect(),
     ));
     r.max_tokens = Some(16);
     r
@@ -63,14 +68,20 @@ fn generate(e: &Engine, m: &qubivex_runtime::Managed) -> (usize, String) {
     let kv = e.reserve_kv(m.prepared.positions()).unwrap();
     let mut text = String::new();
     let mut started = 0;
-    e.run_prepared(&m.request, &m.prepared, &kv, &AtomicBool::new(false), |ev| {
-        match ev {
-            GenerationEvent::Started { prompt_tokens } => started = prompt_tokens,
-            GenerationEvent::Text(t) => text.push_str(&t),
-            GenerationEvent::Token(_) => {}
-        }
-        true
-    })
+    e.run_prepared(
+        &m.request,
+        &m.prepared,
+        &kv,
+        &AtomicBool::new(false),
+        |ev| {
+            match ev {
+                GenerationEvent::Started { prompt_tokens } => started = prompt_tokens,
+                GenerationEvent::Text(t) => text.push_str(&t),
+                GenerationEvent::Token(_) => {}
+            }
+            true
+        },
+    )
     .unwrap();
     (started, text)
 }
@@ -86,7 +97,10 @@ fn a_request_that_fits_is_left_exactly_as_it_was() {
     assert!(m.report.is_none());
     assert_eq!(m.prepared.prompt_tokens(), plain.prompt_tokens());
     assert_eq!(m.prepared.positions(), plain.positions());
-    assert_eq!(format!("{:?}", m.request.prompt), format!("{:?}", req.prompt));
+    assert_eq!(
+        format!("{:?}", m.request.prompt),
+        format!("{:?}", req.prompt)
+    );
     // And it generates the same tokens as the plain path.
     let (_, a) = generate(&e, &m);
     let kv = e.reserve_kv(plain.positions()).unwrap();
@@ -115,7 +129,11 @@ fn a_conversation_longer_than_the_context_is_prepared_and_generates() {
     let r = m.report.as_ref().unwrap();
     assert!(r.compacted);
     assert!(r.original_tokens > e.max_context());
-    assert_eq!(r.prepared_tokens, m.prepared.prompt_tokens(), "the counts are exact");
+    assert_eq!(
+        r.prepared_tokens,
+        m.prepared.prompt_tokens(),
+        "the counts are exact"
+    );
     assert!(m.prepared.prompt_tokens() <= r.budget.input);
     assert_eq!(r.budget.context, e.max_context());
     let (started, _) = generate(&e, &m);
@@ -124,7 +142,12 @@ fn a_conversation_longer_than_the_context_is_prepared_and_generates() {
         panic!()
     };
     assert_eq!(msgs[0].content, "Be brief.");
-    assert!(msgs.last().unwrap().content.ends_with("What colour is box 4?"));
+    assert!(
+        msgs.last()
+            .unwrap()
+            .content
+            .ends_with("What colour is box 4?")
+    );
 }
 
 #[test]
@@ -138,8 +161,14 @@ fn with_context_management_off_the_old_refusal_stands() {
         let err = e
             .prepare_managed(long_chat(), ctx, &ManageOptions::default())
             .unwrap_err();
-        assert!(matches!(err, RequestError::ContextOverflow { .. }), "{err:?}");
-        assert_eq!(err.to_string(), e.prepare(&long_chat()).unwrap_err().to_string());
+        assert!(
+            matches!(err, RequestError::ContextOverflow { .. }),
+            "{err:?}"
+        );
+        assert_eq!(
+            err.to_string(),
+            e.prepare(&long_chat()).unwrap_err().to_string()
+        );
     }
 }
 
@@ -201,7 +230,10 @@ fn a_cancelled_preparation_stops() {
             },
         )
         .unwrap_err();
-    assert!(matches!(err, RequestError::Context(ContextError::Cancelled)));
+    assert!(matches!(
+        err,
+        RequestError::Context(ContextError::Cancelled)
+    ));
 }
 
 /// Models with other templates and tokenizers (a GGUF vocabulary among them) and other

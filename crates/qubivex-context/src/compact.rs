@@ -594,17 +594,13 @@ fn prepare_chat(
             break;
         }
     }
-    if let Some(cp) = &frozen {
-        let mut c = 0;
-        for e in &cp.entries {
-            c += w.frag(&entry_line(e))? + 1;
-        }
-        // Nearly full: rebuild, so later turns have room to add to it.
-        if c > note_max - note_max / 8 {
-            frozen = None;
-        }
-    }
-    let head_cost = w.frag(NOTE_HEAD)? + w.frag(&note_text(&[], 0, tail))? + 4;
+    // The note's framing: its first line and the longest last line it can have.
+    let head_cost = w.frag(NOTE_HEAD)?
+        + w.frag("[End of earlier conversation: messages #100000–#100000.]")?
+        + 2;
+    // How much a stored note may grow per turn: an eighth of the share, so it lasts
+    // several turns before it fills and is rebuilt.
+    let step = note_max / 8;
     let mut forced = 0usize; // kept turns moved into the note after a failed count
     let mut shrink = 0usize;
     for _ in 0..ROUNDS {
@@ -642,16 +638,9 @@ fn prepare_chat(
             drop -= 1;
         }
         let condensed_idx: Vec<usize> = older.iter().copied().filter(|&i| i < first_kept).collect();
-        // A new note takes half its share, leaving the rest for the turns condensed
-        // after it, which extend it without changing it.
-        let cap = if frozen.is_some() {
-            note_max
-        } else {
-            note_max / 2
-        };
+        // The room the kept turns leave for the note's excerpts.
         let note_budget = available
             .saturating_sub(kept_cost)
-            .min(cap)
             .saturating_sub(head_cost)
             .saturating_sub(shrink);
         let frozen_entries = frozen.as_ref().map_or(&[][..], |c| &c.entries[..]);
@@ -667,17 +656,18 @@ fn prepare_chat(
             .copied()
             .filter(|&i| i >= floor)
             .collect();
-        if frozen_cost > note_budget {
-            // The stored note no longer fits beside the turns kept: start afresh.
+        if frozen.is_some() && frozen_cost + step.min(note_budget / 8) > note_budget {
+            // The stored note leaves no room to add the newly condensed turns: rebuild.
             frozen = None;
             continue;
         }
-        // Extending a stored note: an eighth of the share per turn, so it lasts several
-        // turns before it fills and is rebuilt.
+        // A stored note grows by at most a step. A new one leaves room for later turns
+        // to extend it without changing it: half the share, or more when the room left
+        // is larger than the share.
         let fresh_budget = if frozen.is_some() {
-            (note_budget - frozen_cost).min(note_max / 8)
+            (note_budget - frozen_cost).min(step.max(1))
         } else {
-            note_budget
+            note_budget.saturating_sub((note_max / 2).min(note_budget / 2))
         };
         let picked = select(msgs, &fresh, &query, tail, fresh_budget, w)?;
         let mut fresh_cost = 0;
