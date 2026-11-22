@@ -17,7 +17,7 @@ use common::{
     Resp, Server, engine, http, meta, post, reference, request, root, slow_engine, start, text_of,
     wait_until,
 };
-use qubivex_api::{Gateway, ServerConfig};
+use qubivex_api::{ContextConfig, ContextSettings, Gateway, ServerConfig};
 use serde_json::{Value, json};
 
 const M: &str = "olmoe-tiny";
@@ -336,10 +336,21 @@ fn a_request_waits_for_memory_held_by_others() {
     all_clear(&gw, M);
 }
 
-/// What can never run is refused without waiting for a slot it would not use.
+/// What can never run is refused without waiting for a slot it would not use. With
+/// context management on (the default) the same request is prepared to fit and runs:
+/// `tests/context.rs` covers that.
 #[test]
 fn a_request_past_the_context_does_not_wait() {
-    let (gw, s, holder) = occupied(ServerConfig::default());
+    let (gw, s, holder) = occupied(ServerConfig {
+        context: ContextSettings {
+            config: ContextConfig {
+                enabled: false,
+                ..ContextConfig::default()
+            },
+            ..ContextSettings::default()
+        },
+        ..ServerConfig::default()
+    });
     let t = Instant::now();
     let r = post(
         s.addr,
