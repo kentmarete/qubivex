@@ -272,6 +272,13 @@ impl FileStore {
     pub fn open(dir: &Path, max_bytes: u64, max_age: Duration) -> Result<Self, StoreError> {
         std::fs::create_dir_all(dir)
             .map_err(|e| StoreError(format!("cannot create the store directory: {e}")))?;
+        // Checkpoints quote conversations: only this user may list or read them.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))
+                .map_err(|e| StoreError(format!("cannot restrict the store directory: {e}")))?;
+        }
         let s = Self {
             dir: dir.to_owned(),
             max_bytes,
@@ -389,7 +396,14 @@ impl CheckpointStore for FileStore {
             TMP.fetch_add(1, Ordering::Relaxed)
         ));
         let write = || -> std::io::Result<()> {
-            let mut f = std::fs::File::create(&tmp)?;
+            let mut o = std::fs::File::options();
+            o.write(true).create_new(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                o.mode(0o600);
+            }
+            let mut f = o.open(&tmp)?;
             f.write_all(&json)?;
             f.sync_all()?;
             std::fs::rename(&tmp, self.path(key))
@@ -489,6 +503,13 @@ mod tests {
         }
         let s = FileStore::open(&d, FileStore::DEFAULT_BYTES, FileStore::DEFAULT_AGE).unwrap();
         assert_eq!(s.get(&k).unwrap(), Some(cp(4, "kept")));
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode(&d), 0o700, "the directory is private");
+            assert_eq!(mode(&s.path(&k)), 0o600, "checkpoints are private");
+        }
         // A torn file (written by something else) is a miss and goes away.
         let bad = Key([8; 32]);
         std::fs::write(s.path(&bad), b"{\"covered\":").unwrap();

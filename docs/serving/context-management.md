@@ -89,6 +89,9 @@ reserve  = max_tokens (or --default-max-tokens), at most half the context
 input    = context − reserve, and at most --max-prompt-tokens
 ```
 
+A prompt that fits the context but exceeds `--max-prompt-tokens` is still refused with
+`prompt_too_long`, as before: only a context overflow starts management.
+
 `GET /v1/system` shows each model's `context_limits` (`model`, `configured`, `memory`,
 `effective`). A request that fits the context but waits for memory other conversations
 hold is queued by the scheduler as before; it is not compacted.
@@ -104,7 +107,7 @@ stored. Checkpoints of one client are never used for another.
 
 Checkpoints live in memory (64 MiB by default) or, with `--context-store DIR`, in files
 that survive a restart (256 MiB, kept 7 days after last use; they contain excerpts of
-conversations). A failed write never fails a request; the next turn rebuilds the note.
+conversations, so the directory is made private: 0700, files 0600). A failed write never fails a request; the next turn rebuilds the note.
 
 ## Diagnostics
 
