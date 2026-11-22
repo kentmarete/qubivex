@@ -291,8 +291,9 @@ type Case = (
 fn no_notice_in_a_terminal_when_not_due() {
     let env = Env::new("tty-quiet");
     env.write_cache(now(), SOURCE, Some("99.0.0"));
-    let cases: [Case; 5] = [
-        (&["--version"], &[]),
+    let cases: [Case; 6] = [
+        (&["--version"], &[("QUBIVEX_NO_UPDATE_CHECK", "1")]),
+        (&["--version"], &[("CI", "true")]),
         (&["system", "--json"], &[]),
         (&["--help"], &[("QUBIVEX_NO_UPDATE_CHECK", "1")]),
         (&["--help"], &[("CI", "true")]),
@@ -357,4 +358,64 @@ fn an_expired_cache_is_refreshed_in_the_background() {
     }
     let second = env.in_terminal(&["--help"], &[("QUBIVEX_UPDATE_CHECK_URL", &url)]);
     assert!(second.contains("Latest version:  42.0.0"), "{second}");
+}
+
+/// A URL on this machine where nothing listens: a lookup there is refused at once.
+fn refused_url() -> String {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let url = format!("http://{}/Cargo.toml", listener.local_addr().unwrap());
+    drop(listener);
+    url
+}
+
+/// `--version` in a terminal looks the latest up at once, even when the daily lookup has
+/// just said there is nothing newer: a release made since then is shown straight away,
+/// after the version line, and recorded in the cache.
+#[test]
+fn version_looks_up_the_latest_now() {
+    let env = Env::new("tty-version");
+    let url = serve(vec![Some((200, manifest("42.0.0")))]);
+    env.write_cache(now(), &url, Some(env!("CARGO_PKG_VERSION")));
+    let shown = env.in_terminal(&["--version"], &[("QUBIVEX_UPDATE_CHECK_URL", &url)]);
+    let line = shown
+        .find(&format!("qubivex {}\n", env!("CARGO_PKG_VERSION")))
+        .expect(&shown);
+    let notice = shown.find("Qubivex Update Available").expect(&shown);
+    assert!(line < notice, "{shown}");
+    assert!(
+        shown.contains(&format!(
+            "{RULE}\nQubivex Update Available\n\nCurrent version: {}\nLatest version:  42.0.0\n\n\
+             Run `qubivex update` to upgrade.\n{RULE}\n",
+            env!("CARGO_PKG_VERSION")
+        )),
+        "{shown}"
+    );
+    assert_eq!(env.cache().unwrap()["latest"], "42.0.0");
+}
+
+/// When the lookup fails, `--version` answers from the cache, and never waits more than
+/// its few seconds.
+#[test]
+fn version_falls_back_to_the_cache() {
+    let env = Env::new("tty-version-offline");
+    let refused = refused_url();
+    env.write_cache(now(), &refused, Some("99.0.0"));
+    let shown = env.in_terminal(&["--version"], &[("QUBIVEX_UPDATE_CHECK_URL", &refused)]);
+    assert!(shown.contains("Latest version:  99.0.0"), "{shown}");
+
+    let silent = serve(vec![None]);
+    env.write_cache(now(), &silent, Some("98.0.0"));
+    let start = Instant::now();
+    let shown = env.in_terminal(&["--version"], &[("QUBIVEX_UPDATE_CHECK_URL", &silent)]);
+    assert!(start.elapsed() < Duration::from_secs(5), "{:?}", start.elapsed());
+    assert!(shown.contains("Latest version:  98.0.0"), "{shown}");
+
+    // Nothing cached and nothing found: only the version line.
+    std::fs::remove_file(env.cache_path()).unwrap();
+    let shown = env.in_terminal(&["--version"], &[("QUBIVEX_UPDATE_CHECK_URL", &refused)]);
+    assert!(
+        shown.contains(&format!("qubivex {}\n", env!("CARGO_PKG_VERSION"))),
+        "{shown}"
+    );
+    assert!(!shown.contains(RULE), "{shown}");
 }

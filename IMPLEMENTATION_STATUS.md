@@ -3,6 +3,8 @@
 Last updated: 2026-11-22
 
 ## Current phase
+**`--version` update notice (2026-11-22, branch `version-update-notice`).** `qubivex --version` in a terminal shows the #86 notice after its line, looking the latest up at once (2 s, `update_check::after_version`, recorded in the cache; the cache answers on a failure), so a release since the daily lookup is seen straight away. Piped, `CI` and `QUBIVEX_NO_UPDATE_CHECK` unchanged. Tests: `version_looks_up_the_latest_now`, `version_falls_back_to_the_cache`.
+
 **Context management (2026-11-22, branch `context-engine`).** Decision: ADR-021 (Proposed); guide: `docs/serving/context-management.md`.
 - A request longer than the model's context is prepared to fit instead of refused; a request that fits takes the same single `Engine::prepare` call as before (measured: no difference beyond noise; responses identical with management on and off). `--no-context-management` restores the old 400 byte for byte.
 - New crate `qubivex-context` (no internal dependencies): budget (context ∧ `--context` ∧ memory plan, minus an answer reserve of at most half, ∧ `--max-prompt-tokens`), instructions never shortened (else 400 `context_length_exceeded`), long messages cut to their relevant blocks verbatim with line markers, older turns condensed into a user-role note of quoted excerpts (BM25 + salience + recency; no model summaries), exact recount after every change through the model's own template and tokenizer. Checkpoints (memory, or files with `--context-store`) keep the note's stored part stable across turns; a recall section adds excerpts for the current question.

@@ -248,7 +248,7 @@ command. `--branch BRANCH` follows another branch, `--jobs N` limits build jobs.
 
 When the branch you follow has a newer version, commands you run in a terminal end with
 a short notice on stderr saying so and suggesting `qubivex update`. It is looked up at
-most once a day in the background, never shown when output is piped, with `--json`, or
+most once a day in the background (`qubivex --version` looks it up at once), never shown when output is piped, with `--json`, or
 after `run`, `serve` and `bench`, and `QUBIVEX_NO_UPDATE_CHECK=1` turns it off. See
 [Update notices](docs/deployment/installation.md#update-notices).
 

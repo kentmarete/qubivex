@@ -6,6 +6,13 @@ Notable changes to QUBIVEX, newest first. Versions follow the workspace `version
 and 0.1.2 were not tagged. `qubivex update` installs the newest commit of the branch you
 follow, not the newest tag.
 
+## Unreleased
+
+- **`qubivex --version` shows the update notice** (from #86). In a terminal it looks
+  the latest version up at once (2 s at most, falling back to the cache), so a version
+  released since the daily lookup is announced straight away. Its stdout line is
+  unchanged, and piped output, `CI` and `QUBIVEX_NO_UPDATE_CHECK` still get no notice.
+
 ## 0.2.0 (2026-11-22)
 
 A new minor version because the serving design changes: a request longer than the
