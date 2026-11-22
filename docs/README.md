@@ -10,6 +10,7 @@ Start with the page for what you want to do.
 | Operate it | [Production operations](deployment/production-operations.md) |
 | Call it from a program | [HTTP API](serving/http-api.md), [OpenAI compatibility](serving/openai-compatibility.md) |
 | Use the command line | [CLI command reference](cli/COMMAND_REFERENCE.md) |
+| See what changed between versions | [CHANGELOG.md](../CHANGELOG.md) |
 | Get and manage models | [Model downloads](model-management/model-downloads.md), [Model lifecycle](model-management/model-lifecycle.md) |
 | Use the engine inside a Rust program | [Inference engine](runtime/inference-engine.md) |
 | Understand how it works | [Architecture overview](architecture/overview.md) |
