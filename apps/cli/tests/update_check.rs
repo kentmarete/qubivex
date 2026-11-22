@@ -407,7 +407,11 @@ fn version_falls_back_to_the_cache() {
     env.write_cache(now(), &silent, Some("98.0.0"));
     let start = Instant::now();
     let shown = env.in_terminal(&["--version"], &[("QUBIVEX_UPDATE_CHECK_URL", &silent)]);
-    assert!(start.elapsed() < Duration::from_secs(5), "{:?}", start.elapsed());
+    assert!(
+        start.elapsed() < Duration::from_secs(5),
+        "{:?}",
+        start.elapsed()
+    );
     assert!(shown.contains("Latest version:  98.0.0"), "{shown}");
 
     // Nothing cached and nothing found: only the version line.

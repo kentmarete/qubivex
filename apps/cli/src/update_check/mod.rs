@@ -202,11 +202,13 @@ pub(crate) fn after_version() {
     let Some(installed) = Version::parse(qubivex_core::VERSION) else {
         return;
     };
-    let latest = record_lookup(&data, &source, VERSION_TIMEOUT).ok().or_else(|| {
-        cache::load(&data.join(cache::FILE))
-            .filter(|c| c.source == source)
-            .and_then(|c| Version::parse(c.latest.as_deref()?))
-    });
+    let latest = record_lookup(&data, &source, VERSION_TIMEOUT)
+        .ok()
+        .or_else(|| {
+            cache::load(&data.join(cache::FILE))
+                .filter(|c| c.source == source)
+                .and_then(|c| Version::parse(c.latest.as_deref()?))
+        });
     if let Some(latest) = latest.filter(|l| l > &installed) {
         let _ = std::io::stderr()
             .lock()
