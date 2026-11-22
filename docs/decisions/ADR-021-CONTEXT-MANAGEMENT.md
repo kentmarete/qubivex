@@ -146,11 +146,12 @@ budget (`note_share`, default 25 %) for older history. Older turns become a **co
 note**: verbatim excerpts, never paraphrase, so it cannot introduce a fact:
 
 ```
-[Earlier conversation, condensed to fit the model's context: messages 2–9 of 14 are
-shown as excerpts. Nothing was added.]
-#2 user: …
+[Earlier conversation, condensed to fit the model's context. Quoted excerpts only; nothing was added.]
+#2 user: …                          ← stored part: reused unchanged by later turns (2.7)
 #3 assistant: …
-[End of earlier conversation]
+[Also from the earlier conversation, relevant to the current message:]
+#6 user: …                          ← chosen for this message alone; never stored
+[End of earlier conversation: messages #2–#9.]
 ```
 
 - Excerpts are sentences (prose) or whole fenced code blocks (code is never cut or
@@ -158,6 +159,8 @@ shown as excerpts. Nothing was added.]
 - Sentences are ranked by BM25 relevance to the current user message, salience (numbers,
   identifiers, code, decision and obligation words), and recency; the chosen ones are
   printed in the original order with their message number and role (provenance).
+- The first line never changes and the range is named only in the last, so a stored
+  note keeps the prompt's prefix stable.
 - The note goes in a **user-role** message (merged in front of the first kept user
   message, so alternation holds). Putting user text in a system message would give it
   system authority; a user message gives quoted assistant text none it lacked.
@@ -195,7 +198,17 @@ only what is new, so the rendered prompt keeps the same prefix (system + note) t
 turn, and the prefix cache (when enabled) reuses its KV: the gateway reports it as
 `cached_tokens` in `usage`, as for any request.
 
-- Key: SHA-256 over the cache scope, the model id, the budget and the messages
+- Budget: the note's excerpts get the room the kept turns leave (recent turns first get
+  the context minus `note_share` of it). A new note stores at most that room less
+  `min(share / 2, room / 2)`; a stored note grows by at most `share / 8` per turn and is
+  rebuilt when it cannot. So a conversation reuses its note for several turns, then
+  rebuilds it once.
+- The room the stored part leaves goes to excerpts chosen for the current message from
+  every condensed turn (the recall section), after the stored part and never stored. A
+  stored note was chosen for an earlier question; without this section a later question
+  about another condensed turn finds nothing (seen on Qwen2.5-0.5B: the second answer
+  was wrong until the section existed).
+- Key: SHA-256 over the cache scope, the model id and context, and the messages
   (length-prefixed). Different scopes never share a checkpoint, as with ADR-016.
 - `MemoryStore`: bounded LRU (default 64 MiB), the default.
 - `FileStore` (`--context-store <dir>`): one JSON file per checkpoint, written to a
@@ -223,8 +236,8 @@ deadline between phases, so an abandoned request stops preparing.
   `qubivex_context_failures_total{reason}`, `qubivex_context_tokens_saved_total`,
   `qubivex_context_checkpoint_hits_total`, `qubivex_context_prepare_seconds`.
 - `/v1/system`: `context_management` settings and, per model, `context_limits`.
-- `POST /v1/context/inspect`: a chat or completion body; answers the budget, the
-  decision and the provenance (which messages and lines were kept, condensed or
+- `POST /v1/context/inspect`: a chat or completion body (with `include_text`); answers
+  the budget, the decision and the provenance (which messages and lines were kept, condensed or
   omitted) without generating. The prepared text is included only with
   `"include_text": true`, and it is only ever the caller's own request.
 
@@ -263,7 +276,23 @@ them.
   `thiserror`); `qubivex-runtime` depends on it and re-exports it as
   `qubivex_runtime::context`.
 
-## 5. Implementation plan (each step tested on its own)
+## 5. Results (2026-11-22, M3 Pro, release)
+
+- A request that fits: `prepare` 199 µs, `prepare_managed` 193 µs with management on and
+  187 µs off (268 tokens, Qwen2.5 tokenizer): no difference beyond noise. Responses are
+  identical with management on and off (gateway test).
+- A 19 988-token conversation into a 4096 context: 3 614 tokens in 64.5 ms (46.0 ms with
+  a stored note), against 11.2 ms for the context check that refused it before. A 91 KiB
+  source file in one message: 3 182 tokens in 87.5 ms. The engine alone (criterion):
+  1 000 turns 40.5 ms, 250 KB document 7.7 ms; the rest is exact counting.
+- Qwen2.5-0.5B-Instruct, 1024 context, 60 records (3 426 tokens): 929 tokens prepared;
+  the answers about two condensed records are both correct; the second turn reuses the
+  note and skips 170 prompt tokens through the prefix cache.
+- Tests: `qubivex-context` (unit and `tests/prepare.rs`, 27), runtime `tests/context.rs`
+  on all six fixture models (9), gateway `tests/context.rs` over HTTP (10), CLI flags,
+  and `tests/real_context.rs` on the real model.
+
+## 6. Implementation plan (each step tested on its own)
 1. `RequestError::ContextOverflow`; `Engine::context_limits()`; exact counter.
 2. `qubivex-context`: budget, overflow classification, segmentation and BM25.
 3. History compaction and document reduction, with the shrink-and-recount loop.

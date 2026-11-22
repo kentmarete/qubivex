@@ -46,6 +46,7 @@ Qubivex Runtime
     ├── OpenAI API
     ├── Ollama API
     ├── Structured Output
+    ├── Context Management
     └── Tool Calling
 ```
 
@@ -100,6 +101,7 @@ the matrix in the roadmap follows it.
 | OpenAI API | `qubivex-api/src/openai.rs` | Implemented, `response_format` included | `tools`, image parts |
 | Ollama API | — | Missing | `/api/*` in `qubivex-api` |
 | Structured Output | `qubivex-grammar`, `GenerateOptions::constraint` | Implemented (ADR-020): byte grammars, JSON Schema subset, token masks | `pattern`/`format`/numeric bounds; Ollama `format` and tool arguments reuse it |
+| Context Management | `qubivex-context`, `qubivex-runtime/src/managed.rs` (`Engine::prepare_managed`), gateway | Implemented (ADR-021): requests longer than the context are prepared to fit (quoted excerpts of older turns, relevant blocks of long messages, checkpoints); requests that fit are untouched | Tool schemas pinned when tools arrive; embedding ranking with an embedding model |
 | Tool Calling | — | Missing | Built on structured output plus the chat template's tool format |
 
 ## One request through the target architecture
@@ -112,7 +114,8 @@ the matrix in the roadmap follows it.
    according to the model's declared pipeline, runs the encoder and projector, and
    returns an **embedding span** with its positions.
 4. The chat template renders the conversation; placeholders become token runs; spans
-   are attached at their positions.
+   are attached at their positions. A conversation longer than the context is prepared
+   to fit by **Context Management** and rendered again (ADR-021).
 5. **Execution Engine** schedules the sequence into a batch, reuses any retained prefix
    (keyed by tokens *and* media digests), and runs the decoder through the **Tensor
    Engine** on the placed backends, streaming experts as needed.

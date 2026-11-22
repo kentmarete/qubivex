@@ -276,6 +276,7 @@ fn the_next_turn_reuses_the_note_so_the_prompt_keeps_its_prefix() {
     let entries = |m: &Message| -> Vec<String> {
         m.content
             .lines()
+            .take_while(|l| !l.starts_with("[Also from the earlier conversation"))
             .filter(|l| l.starts_with('#'))
             .map(str::to_owned)
             .collect()
@@ -508,9 +509,11 @@ fn a_growing_conversation_extends_its_note_over_several_turns() {
             r.prepared_tokens * 10 >= req.budget.input * 7,
             "turn {turn}: {r:?}"
         );
+        // The stored part: up to the excerpts chosen for this message alone.
         let lines: Vec<String> = chat(&p)[1]
             .content
             .lines()
+            .take_while(|l| !l.starts_with("[Also from the earlier conversation"))
             .filter(|l| l.starts_with('#'))
             .map(str::to_owned)
             .collect();

@@ -21,6 +21,8 @@ const MIN_REDUCED: usize = 16;
 
 const NOTE_HEAD: &str = "[Earlier conversation, condensed to fit the model's context. \
                          Quoted excerpts only; nothing was added.]";
+/// Introduces the excerpts chosen for the current message alone, after the stored ones.
+const RECALL_HEAD: &str = "[Also from the earlier conversation, relevant to the current message:]";
 
 /// Counts and clocks of one preparation.
 struct Work<'a> {
@@ -276,13 +278,13 @@ fn entry_line(e: &NoteEntry) -> String {
     format!("#{} {}: {}", e.message + 1, e.role, e.text)
 }
 
-fn note_text(entries: &[NoteEntry], first: usize, last: usize) -> String {
+fn note_text(entries: &[NoteEntry], recalled: &[NoteEntry], first: usize, last: usize) -> String {
     let range = if first == last {
         format!("message #{}", first + 1)
     } else {
         format!("messages #{}–#{}", first + 1, last + 1)
     };
-    if entries.is_empty() {
+    if entries.is_empty() && recalled.is_empty() {
         return format!("[Earlier {range} left out to fit the model's context.]");
     }
     let mut s = String::from(NOTE_HEAD);
@@ -290,17 +292,27 @@ fn note_text(entries: &[NoteEntry], first: usize, last: usize) -> String {
         s.push('\n');
         s.push_str(&entry_line(e));
     }
+    if !recalled.is_empty() {
+        s.push('\n');
+        s.push_str(RECALL_HEAD);
+        for e in recalled {
+            s.push('\n');
+            s.push_str(&entry_line(e));
+        }
+    }
     s.push_str(&format!("\n[End of earlier conversation: {range}.]"));
     s
 }
 
-/// Picks excerpts from `idxs` (older messages, in order) within `budget` tokens.
+/// Picks excerpts from `idxs` (older messages, in order) within `budget` tokens,
+/// leaving out what `quoted` already quotes.
 fn select(
     msgs: &[Message],
     idxs: &[usize],
     query: &str,
     tail: usize,
     budget: usize,
+    quoted: &[NoteEntry],
     w: &mut Work<'_>,
 ) -> Result<Note, ContextError> {
     struct U<'t> {
@@ -321,6 +333,12 @@ fn select(
         prefix.insert(i, w.frag(&format!("#{} {}: ", i + 1, m.role))? + 1);
         for (ord, u) in found.into_iter().enumerate() {
             let text = &m.content[u.start..u.end];
+            if quoted
+                .iter()
+                .any(|e| e.message == i && e.text.contains(text))
+            {
+                continue;
+            }
             us.push(U {
                 msg: i,
                 ord,
@@ -601,6 +619,7 @@ fn prepare_chat(
     // How much a stored note may grow per turn: an eighth of the share, so it lasts
     // several turns before it fills and is rebuilt.
     let step = note_max / 8;
+    let recall_head = w.frag(RECALL_HEAD)? + 1;
     let mut forced = 0usize; // kept turns moved into the note after a failed count
     let mut shrink = 0usize;
     for _ in 0..ROUNDS {
@@ -669,16 +688,35 @@ fn prepare_chat(
         } else {
             note_budget.saturating_sub((note_max / 2).min(note_budget / 2))
         };
-        let picked = select(msgs, &fresh, &query, tail, fresh_budget, w)?;
+        let picked = select(msgs, &fresh, &query, tail, fresh_budget, &[], w)?;
         let mut fresh_cost = 0;
         for e in &picked.entries {
             fresh_cost += w.frag(&entry_line(e))? + 1;
         }
         let mut entries: Vec<NoteEntry> = frozen_entries.to_vec();
         entries.extend(picked.entries);
+        // What is left goes to excerpts relevant to the current message from any
+        // condensed turn. They follow the stored ones and are never stored, so the
+        // prompt keeps its prefix while each question still finds its own context.
+        let recall_budget = note_budget
+            .saturating_sub(frozen_cost + fresh_cost)
+            .saturating_sub(recall_head);
+        let recalled = select(
+            msgs,
+            &condensed_idx,
+            &query,
+            tail,
+            recall_budget,
+            &entries,
+            w,
+        )?
+        .entries;
+        for e in &recalled {
+            fresh_cost += w.frag(&entry_line(e))? + 1;
+        }
         let first_c = condensed_idx.first().copied().unwrap_or(0);
         let last_c = condensed_idx.last().copied().unwrap_or(0);
-        let text = note_text(&entries, first_c, last_c);
+        let text = note_text(&entries, &recalled, first_c, last_c);
         let mut condensed = vec![false; n];
         for &i in &condensed_idx {
             condensed[i] = true;
@@ -687,18 +725,21 @@ fn prepare_chat(
         let n_tokens = w.chat(&out)?;
         if n_tokens <= input {
             w.compaction += began.elapsed();
-            let by_msg: HashMap<usize, &NoteEntry> =
-                entries.iter().map(|e| (e.message, e)).collect();
+            let mut by_msg: HashMap<usize, (usize, usize)> = HashMap::new();
+            for e in entries.iter().chain(&recalled) {
+                let c = by_msg.entry(e.message).or_insert((0, e.units));
+                c.0 += e.excerpts;
+            }
             for &i in &condensed_idx {
-                let (excerpts, units) = by_msg.get(&i).map_or_else(
-                    || (0, units(&msgs[i].content).len()),
-                    |e| (e.excerpts, e.units),
-                );
+                let (excerpts, units) = by_msg
+                    .get(&i)
+                    .copied()
+                    .unwrap_or_else(|| (0, units(&msgs[i].content).len()));
                 fates[i] = Fate::Condensed { excerpts, units };
             }
             report.compacted = !condensed_idx.is_empty();
             report.messages_condensed = condensed_idx.len();
-            report.excerpts = entries.iter().map(|e| e.excerpts).sum();
+            report.excerpts = entries.iter().chain(&recalled).map(|e| e.excerpts).sum();
             report.checkpoint = match (&frozen, condensed_idx.is_empty()) {
                 (_, true) => CheckpointUse::None,
                 (Some(_), false) => CheckpointUse::Hit,
