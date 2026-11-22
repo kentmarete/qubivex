@@ -232,7 +232,7 @@ directory, not the checkout it is run from. To build a checkout you have modifie
 **Updating**
 
 From version 0.1.1, `qubivex` updates itself. It rebuilds from the branch you installed,
-and only when that branch has new commits:
+and only when that branch has new commits ([CHANGELOG.md](CHANGELOG.md) lists what each version changed):
 
 ```sh
 qubivex update --check            # is there a newer version? (installs nothing)
