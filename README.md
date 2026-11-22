@@ -246,6 +246,12 @@ goes to `~/.qubivex/update.log` (`tail -f ~/.qubivex/update.log` to follow it). 
 models and `~/.qubivex` are never touched; the new version is used from the next
 command. `--branch BRANCH` follows another branch, `--jobs N` limits build jobs.
 
+When the branch you follow has a newer version, commands you run in a terminal end with
+a short notice on stderr saying so and suggesting `qubivex update`. It is looked up at
+most once a day in the background, never shown when output is piped, with `--json`, or
+after `run`, `serve` and `bench`, and `QUBIVEX_NO_UPDATE_CHECK=1` turns it off. See
+[Update notices](docs/deployment/installation.md#update-notices).
+
 If `qubivex update` says *unrecognized subcommand*, your version is older than 0.1.1.
 Update once with the installer, and use `qubivex update` from then on:
 

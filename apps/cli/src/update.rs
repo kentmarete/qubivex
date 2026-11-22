@@ -117,6 +117,15 @@ fn read_receipt(data: &Path) -> Result<Receipt, String> {
     Ok(r)
 }
 
+/// The repository and branch `qubivex update` follows with no flags, or `None` when it
+/// cannot update this installation (no receipt, or a tag-pinned install). Used by the
+/// update notice, so both look at the same branch.
+pub(crate) fn followed_branch(data: &Path) -> Option<(String, String)> {
+    let receipt = read_receipt(data).ok()?;
+    let branch = branch_of(&UpdateFlags::default(), &receipt).ok()?;
+    Some((receipt.repo, branch))
+}
+
 /// The branch to follow: `--branch`, else the installed one. A tag-pinned install has none.
 fn branch_of(flags: &UpdateFlags, r: &Receipt) -> Result<String, String> {
     if let Some(b) = &flags.branch {
