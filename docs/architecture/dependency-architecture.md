@@ -155,6 +155,6 @@ and `qubivex system` reports them.
 - **A crates.io release.** Every crate is `publish = false`. Embedding the runtime
   today means a git or path dependency.
 - **A stable API.** The public Rust interfaces change with the ADRs. Versions are all
-  0.1.2.
+  0.2.0.
 - **A C API, Python bindings or WebAssembly.**
 - **Dynamically loaded backends or architectures.**
