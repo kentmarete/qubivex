@@ -43,6 +43,7 @@ fn dtype(s: &str) -> Option<DType> {
         "F32" => Some(DType::F32),
         "F16" => Some(DType::F16),
         "BF16" => Some(DType::BF16),
+        "U8" => Some(DType::U8),
         _ => None,
     }
 }

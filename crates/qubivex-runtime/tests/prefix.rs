@@ -21,12 +21,13 @@ use qubivex_runtime::{
 
 /// Plenty for every test that is not about the budget.
 const LARGE: u64 = 64 << 20;
-const IDS: [&str; 5] = [
+const IDS: [&str; 6] = [
     "olmoe-tiny",
     "olmoe-tiny-gguf",
     "qwen3-moe-tiny",
     "dense-tiny",
     "qwen2-tiny",
+    "gpt-oss-tiny",
 ];
 
 fn meta(id: &str) -> ModelMetadata {

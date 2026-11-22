@@ -67,11 +67,9 @@ dequantisation never the normal execution path.
   is subnormal for `e < 2`. Metal and Vulkan therefore form that product as
   `(v · 2^(e − 2)) · 2^-126` from two normal factors, which is still exact. Only a weight
   that is itself subnormal is flushed: ADR-011's existing exception, which a test bounds.
-- **Not yet:** the Hugging Face `*_blocks` / `*_scales` layout (gpt-oss SafeTensors). It
-  packs two consecutive elements per byte (low nibble first) and stores the E8M0 bytes
-  apart from the nibbles. It would be repacked into the GGML layout at import, which is a
-  lossless byte shuffle. That needs the gpt-oss architecture options (attention sinks,
-  biases, the clamped SwiGLU), so it is a later step.
+- **Hugging Face layout (2026-11-22):** SafeTensors `*_blocks` / `*_scales` pairs (gpt-oss)
+  are repacked into this layout as each expert loads, a lossless byte shuffle, so the
+  kernels are the same (ADR-003 amendment 5).
 - **Evidence:**
   - `qubivex-backend-cpu/tests/oracle.rs`: gguf-py's MXFP4 dequantizer on every E8M0
     byte, bit for bit.

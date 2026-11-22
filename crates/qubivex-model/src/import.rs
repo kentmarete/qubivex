@@ -264,6 +264,15 @@ pub fn import(
                     .config
                     .insert("tensor_names".into(), tensor_names.clone());
                 m.architecture.config.insert("qk_norm".into(), json!(qk));
+                if arch == "transformer_moe" {
+                    let found = moe_tensor_options(&tensor_names, format, &tensors);
+                    if !found.is_empty() {
+                        // These options arrived in transformer_moe 1.2.
+                        m.architecture.version.minor = m.architecture.version.minor.max(2);
+                    }
+                    m.architecture.config.extend(found);
+                    config_class_defaults(hf_config.as_ref(), &mut m);
+                }
                 if qkv_bias {
                     m.architecture.config.insert("qkv_bias".into(), json!(true));
                     // `qkv_bias` arrived in transformer_dense 1.1; manifests without it
@@ -281,8 +290,24 @@ pub fn import(
                         // RoPE scaling arrived in transformer_dense 1.2 and
                         // transformer_moe 1.1: an older build must refuse the manifest
                         // rather than run it with unscaled positions.
-                        if cfg.describe["rope_scaling"]["type"] != "none" {
+                        let d = &cfg.describe;
+                        if d["rope_scaling"]["type"] != "none" {
                             let minor = if arch == "transformer_dense" { 2 } else { 1 };
+                            m.architecture.version.minor = m.architecture.version.minor.max(minor);
+                        }
+                        // YaRN and sliding windows arrived in transformer_dense 1.3 and
+                        // transformer_moe 1.2, with the MoE's attention and expert
+                        // biases, sinks, top-K softmax routing and clamped SwiGLU.
+                        let windows = d["attention_windows"]
+                            .as_array()
+                            .is_some_and(|w| w.iter().any(|x| !x.is_null()));
+                        let newer = windows
+                            || d["rope_scaling"]["type"] == "yarn"
+                            || d["attention_bias"] == true
+                            || d["router_scoring"] == "topk_softmax"
+                            || d["activation"]["type"] == "clamped_swiglu";
+                        if newer {
+                            let minor = if arch == "transformer_dense" { 3 } else { 2 };
                             m.architecture.version.minor = m.architecture.version.minor.max(minor);
                         }
                         return Ok(Imported {
@@ -315,6 +340,82 @@ pub fn import(
     }
 }
 
+/// The `transformer_moe` options a checkpoint's own tensors decide: each is on when
+/// its tensor exists for layer 0 under the candidate's names (a candidate that is
+/// wrong then fails validation on the tensors it misses or leaves unused).
+fn moe_tensor_options(
+    tensor_names: &Value,
+    format: ManifestFormat,
+    index: &crate::TensorIndex,
+) -> Map<String, Value> {
+    let mut out = Map::new();
+    let Ok(n) = crate::arch::moe_names(Some(tensor_names), format) else {
+        return out;
+    };
+    let has = |p: &str| index.get(&p.replace("{L}", "0")).is_some();
+    for (key, present) in [
+        ("attention_sinks", has(&n.sinks)),
+        ("router_bias", has(&n.router_bias)),
+        // Expert biases exist only beside a stacked gate-up (the config refuses them
+        // otherwise, which would end the search for this architecture).
+        (
+            "expert_bias",
+            matches!(n.experts, crate::arch::ExpertLayout::StackedGateUp { .. })
+                && (has(&n.expert_gate_up_bias) || has(&n.expert_down_bias)),
+        ),
+    ] {
+        if present {
+            out.insert(key.into(), json!(true));
+        }
+    }
+    out
+}
+
+/// Applies the values a checkpoint's `config.json` leaves to its transformers config
+/// class ([`class_defaults`]), for its `model_type`. Each applies only when the
+/// checkpoint omits it, and is written into the manifest, so the model is read the same
+/// way without this table: options go to `architecture.config`, values to
+/// `overrides.config`.
+fn config_class_defaults(hf: Option<&Value>, m: &mut Manifest) {
+    let Some(hf) = hf else { return };
+    let Some(mt) = hf.get("model_type").and_then(Value::as_str) else {
+        return;
+    };
+    for (key, defaults) in class_defaults() {
+        if key != mt {
+            continue;
+        }
+        for (section, k, v) in defaults {
+            if hf.get(k).is_some() {
+                continue;
+            }
+            let map = if section == "architecture" {
+                &mut m.architecture.config
+            } else {
+                &mut m.overrides.config
+            };
+            map.entry(k.to_owned()).or_insert(v);
+        }
+    }
+}
+
+/// One config-class default: the manifest section, the key and its value.
+type ClassDefault = (&'static str, &'static str, Value);
+
+/// The defaults transformers' config classes supply, by `model_type` (built at run
+/// time: JSON values are not `const`).
+fn class_defaults() -> Vec<(&'static str, Vec<ClassDefault>)> {
+    vec![(
+        "gpt_oss", // model-name-ok: a transformers model_type
+        vec![
+            // GptOssTopKRouter: top-K logits, then a softmax over them.
+            ("architecture", "router_scoring", json!("topk_softmax")),
+            // GptOssConfig.swiglu_alpha.
+            ("overrides", "swiglu_alpha", json!(1.702)),
+        ],
+    )]
+}
+
 /// Tensor-name presets to try for `transformer_dense`.
 fn dense_candidates(format: ManifestFormat) -> Vec<Value> {
     match format {
@@ -329,7 +430,7 @@ fn candidates(format: ManifestFormat) -> Vec<Value> {
         ManifestFormat::Gguf => vec![json!("gguf")],
         ManifestFormat::Safetensors => {
             let mut v = Vec::new();
-            for base in ["hf", "hf_fused"] {
+            for base in ["hf", "hf_fused", "hf_interleaved"] {
                 v.push(json!(base));
                 v.push(json!({ "base": base, "router": "model.layers.{L}.mlp.router.weight" }));
             }

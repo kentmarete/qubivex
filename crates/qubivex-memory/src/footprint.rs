@@ -132,8 +132,9 @@ impl ModelFootprint {
                     }
                     RoleGroup::Attention
                 }
-                TensorRole::Router { .. } => RoleGroup::Router,
-                TensorRole::Ffn { .. } => RoleGroup::Ffn,
+                TensorRole::Router { .. } | TensorRole::RouterBias { .. } => RoleGroup::Router,
+                // Expert biases are small and resident, read by every token routed there.
+                TensorRole::Ffn { .. } | TensorRole::RoutedExpertBias { .. } => RoleGroup::Ffn,
                 TensorRole::RoutedExpert { layer, expert, .. } => {
                     *experts.entry((layer, expert.0)).or_default() += bytes;
                     continue;

@@ -20,8 +20,8 @@ use super::common::{
 use crate::ModelError;
 use crate::manifest::{ManifestFormat, SemVer};
 use crate::registry::{
-    ArchCapabilities, ArchConfig, ArchitectureFactory, ConfigSource, ExpertPart, ModelDims,
-    TensorRole, TensorSchema, TensorSpec,
+    ArchCapabilities, ArchConfig, ArchitectureFactory, AttentionPart, ConfigSource, ExpertPart,
+    ModelDims, TensorRole, TensorSchema, TensorSpec,
 };
 
 /// The factory.
@@ -36,6 +36,25 @@ pub enum RouterScoring {
     Softmax,
     /// Independent sigmoid per expert.
     Sigmoid,
+    /// The top-K experts by logit, then a softmax over those K logits only (the
+    /// weights sum to 1; `norm_topk_prob` does not apply).
+    TopkSoftmax,
+}
+
+/// The activation between an expert's gate/up and down projections.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case", tag = "type")]
+pub enum ExpertActivation {
+    /// `silu(gate) · up`.
+    Swiglu,
+    /// `(clamp(up, −limit, limit) + 1) · g · sigmoid(alpha · g)` with
+    /// `g = min(gate, limit)` (config `swiglu_limit` and `swiglu_alpha`).
+    ClampedSwiglu {
+        /// The sigmoid's slope.
+        alpha: f64,
+        /// The clamp.
+        limit: f64,
+    },
 }
 
 /// How expert weights are stored.
@@ -57,6 +76,9 @@ pub enum ExpertLayout {
         gate_up: String,
         /// Down pattern.
         down: String,
+        /// Gate and up rows alternate (row `2i` gate, `2i + 1` up) instead of all gate
+        /// rows coming first.
+        interleaved: bool,
     },
     /// Per layer: `[experts, ffn, hidden]` gate and up, `[experts, hidden, ffn]` down.
     Stacked {
@@ -98,6 +120,23 @@ pub struct TensorNames {
     pub router: String,
     /// Experts.
     pub experts: ExpertLayout,
+    /// Query, key, value and output projection biases (with `attention_bias`).
+    pub q_bias: String,
+    /// Key projection bias.
+    pub k_bias: String,
+    /// Value projection bias.
+    pub v_bias: String,
+    /// Output projection bias.
+    pub o_bias: String,
+    /// Per-head attention sink logits (with `attention_sinks`).
+    pub sinks: String,
+    /// Router bias (with `router_bias`).
+    pub router_bias: String,
+    /// Per-expert gate-up bias, `[experts, 2 * ffn]` in the gate-up rows' order (with
+    /// `expert_bias`; stacked gate-up layouts only).
+    pub expert_gate_up_bias: String,
+    /// Per-expert down bias, `[experts, hidden]` (with `expert_bias`).
+    pub expert_down_bias: String,
 }
 
 impl TensorNames {
@@ -119,6 +158,14 @@ impl TensorNames {
             ffn_norm: "model.layers.{L}.post_attention_layernorm.weight".into(),
             router: "model.layers.{L}.mlp.gate.weight".into(),
             experts,
+            q_bias: "model.layers.{L}.self_attn.q_proj.bias".into(),
+            k_bias: "model.layers.{L}.self_attn.k_proj.bias".into(),
+            v_bias: "model.layers.{L}.self_attn.v_proj.bias".into(),
+            o_bias: "model.layers.{L}.self_attn.o_proj.bias".into(),
+            sinks: "model.layers.{L}.self_attn.sinks".into(),
+            router_bias: "model.layers.{L}.mlp.gate.bias".into(),
+            expert_gate_up_bias: "model.layers.{L}.mlp.experts.gate_up_proj_bias".into(),
+            expert_down_bias: "model.layers.{L}.mlp.experts.down_proj_bias".into(),
         };
         match name {
             "hf" => Some(hf(ExpertLayout::PerExpert {
@@ -129,7 +176,18 @@ impl TensorNames {
             "hf_fused" => Some(hf(ExpertLayout::StackedGateUp {
                 gate_up: "model.layers.{L}.mlp.experts.gate_up_proj".into(),
                 down: "model.layers.{L}.mlp.experts.down_proj".into(),
+                interleaved: false,
             })),
+            "hf_interleaved" => {
+                let mut n = hf(ExpertLayout::StackedGateUp {
+                    gate_up: "model.layers.{L}.mlp.experts.gate_up_proj".into(),
+                    down: "model.layers.{L}.mlp.experts.down_proj".into(),
+                    interleaved: true,
+                });
+                n.router = "model.layers.{L}.mlp.router.weight".into();
+                n.router_bias = "model.layers.{L}.mlp.router.bias".into();
+                Some(n)
+            }
             "gguf" => Some(Self {
                 embedding: "token_embd.weight".into(),
                 output: "output.weight".into(),
@@ -148,6 +206,14 @@ impl TensorNames {
                     up: "blk.{L}.ffn_up_exps.weight".into(),
                     down: "blk.{L}.ffn_down_exps.weight".into(),
                 },
+                q_bias: "blk.{L}.attn_q.bias".into(),
+                k_bias: "blk.{L}.attn_k.bias".into(),
+                v_bias: "blk.{L}.attn_v.bias".into(),
+                o_bias: "blk.{L}.attn_output.bias".into(),
+                sinks: "blk.{L}.attn_sinks.weight".into(),
+                router_bias: "blk.{L}.ffn_gate_inp.bias".into(),
+                expert_gate_up_bias: "blk.{L}.ffn_gate_up_exps.bias".into(),
+                expert_down_bias: "blk.{L}.ffn_down_exps.bias".into(),
             }),
             _ => None,
         }
@@ -180,6 +246,14 @@ impl TensorNames {
             ("k_norm", &self.k_norm),
             ("ffn_norm", &self.ffn_norm),
             ("router", &self.router),
+            ("q_bias", &self.q_bias),
+            ("k_bias", &self.k_bias),
+            ("v_bias", &self.v_bias),
+            ("o_bias", &self.o_bias),
+            ("sinks", &self.sinks),
+            ("router_bias", &self.router_bias),
+            ("expert_gate_up_bias", &self.expert_gate_up_bias),
+            ("expert_down_bias", &self.expert_down_bias),
         ] {
             need(w, p, true, false)?;
         }
@@ -189,7 +263,7 @@ impl TensorNames {
                     need(w, p, true, true)?;
                 }
             }
-            ExpertLayout::StackedGateUp { gate_up, down } => {
+            ExpertLayout::StackedGateUp { gate_up, down, .. } => {
                 need("gate_up", gate_up, true, false)?;
                 need("down", down, true, false)?;
             }
@@ -242,6 +316,18 @@ pub struct MoeConfig {
     pub qk_norm: QkNorm,
     /// Router scoring.
     pub router_scoring: RouterScoring,
+    /// Biases on the q, k, v and output projections (config `attention_bias`).
+    pub attention_bias: bool,
+    /// A learned sink logit per query head in every attention softmax.
+    pub attention_sinks: bool,
+    /// Per layer, the sliding attention window if it has one (`layer_types`).
+    pub attention_windows: Vec<Option<u64>>,
+    /// A bias on the router logits.
+    pub router_bias: bool,
+    /// A bias on each expert's gate-up and down outputs.
+    pub expert_bias: bool,
+    /// The expert activation.
+    pub activation: ExpertActivation,
     /// Tensor names.
     pub names: TensorNames,
 }
@@ -256,6 +342,12 @@ struct ManifestOptions {
     qk_norm: Option<QkNorm>,
     #[serde(default)]
     router_scoring: Option<RouterScoring>,
+    #[serde(default)]
+    attention_sinks: Option<bool>,
+    #[serde(default)]
+    router_bias: Option<bool>,
+    #[serde(default)]
+    expert_bias: Option<bool>,
 }
 
 /// Rejects config features this architecture does not implement yet.
@@ -288,7 +380,12 @@ fn unsupported(v: &Values<'_>) -> Result<(), ModelError> {
     unsupported_common(v)
 }
 
-fn names(opt: Option<&Value>, format: ManifestFormat) -> Result<TensorNames, ModelError> {
+/// The tensor names a manifest's `tensor_names` value selects (a preset, or a preset with
+/// per-name overrides), checked.
+pub(crate) fn names(
+    opt: Option<&Value>,
+    format: ManifestFormat,
+) -> Result<TensorNames, ModelError> {
     let default = match format {
         ManifestFormat::Gguf => "gguf",
         ManifestFormat::Safetensors => "hf",
@@ -323,6 +420,14 @@ fn names(opt: Option<&Value>, format: ManifestFormat) -> Result<TensorNames, Mod
                     ("k_norm", _) => &mut n.k_norm,
                     ("ffn_norm", _) => &mut n.ffn_norm,
                     ("router", _) => &mut n.router,
+                    ("q_bias", _) => &mut n.q_bias,
+                    ("k_bias", _) => &mut n.k_bias,
+                    ("v_bias", _) => &mut n.v_bias,
+                    ("o_bias", _) => &mut n.o_bias,
+                    ("sinks", _) => &mut n.sinks,
+                    ("router_bias", _) => &mut n.router_bias,
+                    ("expert_gate_up_bias", _) => &mut n.expert_gate_up_bias,
+                    ("expert_down_bias", _) => &mut n.expert_down_bias,
                     (
                         "expert_gate",
                         ExpertLayout::PerExpert { gate, .. } | ExpertLayout::Stacked { gate, .. },
@@ -366,7 +471,7 @@ impl ArchitectureFactory for TransformerMoe {
     fn version(&self) -> SemVer {
         SemVer {
             major: 1,
-            minor: 1,
+            minor: 2,
             patch: 0,
         }
     }
@@ -377,12 +482,17 @@ impl ArchitectureFactory for TransformerMoe {
 
     fn capabilities(&self) -> ArchCapabilities {
         decoder_capabilities(
-            &[],
+            &["attention_bias", "attention_sinks", "sliding_window"],
             vec![
                 "routed_swiglu",
+                "routed_clamped_swiglu",
                 "router_softmax",
                 "router_sigmoid",
+                "router_topk_softmax",
                 "norm_topk_prob",
+                "router_bias",
+                "expert_bias",
+                "gate_up_interleaved",
             ],
         )
     }
@@ -414,13 +524,17 @@ impl ArchitectureFactory for TransformerMoe {
             clip_qkv,
             max_context,
             tie_embeddings,
+            windows,
         } = decoder_dims(&v, src.gguf)?;
 
-        let experts = small(
-            "num_experts",
-            v.req_u64("num_experts", Some("expert_count"))?,
-            1 << 16,
-        )?;
+        // `num_local_experts` is the older transformers spelling.
+        let experts = match v.u64("num_experts", Some("expert_count"))? {
+            Some(n) => n,
+            None => v
+                .u64("num_local_experts", None)?
+                .ok_or_else(|| v.missing("num_experts", Some("expert_count")))?,
+        };
+        let experts = small("num_experts", experts, 1 << 16)?;
         let top_k = small(
             "num_experts_per_tok",
             v.req_u64("num_experts_per_tok", Some("expert_used_count"))?,
@@ -431,9 +545,35 @@ impl ArchitectureFactory for TransformerMoe {
             None => v.req_u64("intermediate_size", Some("feed_forward_length"))?,
         };
         let expert_ffn = nonzero("expert FFN width", expert_ffn)?;
-        let norm_topk_prob = v
-            .bool("norm_topk_prob", Some("expert_weights_norm"))?
-            .ok_or_else(|| v.missing("norm_topk_prob", Some("expert_weights_norm")))?;
+        let router_scoring = opts.router_scoring.unwrap_or(RouterScoring::Softmax);
+        // A softmax over the top-K already sums to 1, so the flag is only read otherwise.
+        let norm_topk_prob = match router_scoring {
+            RouterScoring::TopkSoftmax => false,
+            _ => v
+                .bool("norm_topk_prob", Some("expert_weights_norm"))?
+                .ok_or_else(|| v.missing("norm_topk_prob", Some("expert_weights_norm")))?,
+        };
+        let activation = match v.f64("swiglu_limit", None)? {
+            None => ExpertActivation::Swiglu,
+            Some(limit) => {
+                let alpha = v
+                    .f64("swiglu_alpha", None)?
+                    .ok_or_else(|| v.missing("swiglu_alpha", None))?;
+                if !(limit.is_finite() && limit > 0.0 && alpha.is_finite()) {
+                    return Err(cfg_err(format!(
+                        "swiglu_limit = {limit} and swiglu_alpha = {alpha}: the limit must be positive and both finite"
+                    )));
+                }
+                ExpertActivation::ClampedSwiglu { alpha, limit }
+            }
+        };
+        let names = names(opts.tensor_names.as_ref(), m.weights.format)?;
+        let expert_bias = opts.expert_bias.unwrap_or(false);
+        if expert_bias && !matches!(names.experts, ExpertLayout::StackedGateUp { .. }) {
+            return Err(cfg_err(
+                "expert_bias needs a stacked gate-up expert layout (hf_fused or hf_interleaved)",
+            ));
+        }
         let cfg = MoeConfig {
             hidden,
             layers,
@@ -452,8 +592,14 @@ impl ArchitectureFactory for TransformerMoe {
             max_context,
             tie_embeddings,
             qk_norm: opts.qk_norm.unwrap_or(QkNorm::None),
-            router_scoring: opts.router_scoring.unwrap_or(RouterScoring::Softmax),
-            names: names(opts.tensor_names.as_ref(), m.weights.format)?,
+            router_scoring,
+            attention_bias: v.bool("attention_bias", None)?.unwrap_or(false),
+            attention_sinks: opts.attention_sinks.unwrap_or(false),
+            attention_windows: windows,
+            router_bias: opts.router_bias.unwrap_or(false),
+            expert_bias,
+            activation,
+            names,
         };
         Ok(ArchConfig {
             dims: ModelDims {
@@ -499,13 +645,31 @@ impl ArchitectureFactory for TransformerMoe {
                 o: &n.o,
                 q_norm: &n.q_norm,
                 k_norm: &n.k_norm,
-                qkv_bias: None,
+                qkv_bias: c.attention_bias.then_some([
+                    n.q_bias.as_str(),
+                    n.k_bias.as_str(),
+                    n.v_bias.as_str(),
+                ]),
             };
             for spec in attention_specs(l, &names, c.qk_norm, h, q_out, kv_out, c.head_dim) {
                 push(spec.name, spec.role, spec.shape);
             }
+            let attn = |part| TensorRole::Attention { layer, part };
+            if c.attention_bias {
+                push(at(&n.o_bias), attn(AttentionPart::OBias), vec![h]);
+            }
+            if c.attention_sinks {
+                push(at(&n.sinks), attn(AttentionPart::Sinks), vec![c.heads]);
+            }
             push(at(&n.ffn_norm), TensorRole::Norm { layer }, vec![h]);
             push(at(&n.router), TensorRole::Router { layer }, vec![e, h]);
+            if c.router_bias {
+                push(
+                    at(&n.router_bias),
+                    TensorRole::RouterBias { layer },
+                    vec![e],
+                );
+            }
             let stack = |part| TensorRole::RoutedExpertStack {
                 layer,
                 part,
@@ -525,9 +689,27 @@ impl ArchitectureFactory for TransformerMoe {
                         push(ex(down), role(ExpertPart::Down), vec![h, ffn]);
                     }
                 }
-                ExpertLayout::StackedGateUp { gate_up, down } => {
-                    push(at(gate_up), stack(ExpertPart::GateUp), vec![e, ffn2, h]);
+                ExpertLayout::StackedGateUp {
+                    gate_up,
+                    down,
+                    interleaved,
+                } => {
+                    let gu = if *interleaved {
+                        ExpertPart::GateUpInterleaved
+                    } else {
+                        ExpertPart::GateUp
+                    };
+                    push(at(gate_up), stack(gu), vec![e, ffn2, h]);
                     push(at(down), stack(ExpertPart::Down), vec![e, h, ffn]);
+                    if c.expert_bias {
+                        let bias = |part| TensorRole::RoutedExpertBias {
+                            layer,
+                            part,
+                            experts: c.experts,
+                        };
+                        push(at(&n.expert_gate_up_bias), bias(gu), vec![e, ffn2]);
+                        push(at(&n.expert_down_bias), bias(ExpertPart::Down), vec![e, h]);
+                    }
                 }
                 ExpertLayout::Stacked { gate, up, down } => {
                     push(at(gate), stack(ExpertPart::Gate), vec![e, ffn, h]);

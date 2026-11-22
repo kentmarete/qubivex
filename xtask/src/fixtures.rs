@@ -35,6 +35,10 @@ impl Rng {
     }
 }
 
+/// A stacked MXFP4 expert tensor in the Hugging Face layout: its name, the shape of
+/// its scales, the nibble blocks and the scale bytes.
+type MxExpert = (String, Vec<u64>, Vec<u8>, Vec<u8>);
+
 #[allow(clippy::cast_possible_truncation)] // the high half of a u32
 fn bf16(x: f32) -> u16 {
     let b = x.to_bits();
@@ -108,6 +112,39 @@ fn bias(rng: &mut Rng, name: String, n: u64) -> T {
         dims: vec![n],
         values,
     }
+}
+
+/// SafeTensors MXFP4 halves of `v` (rows of `cols`, a multiple of 32): per block of 32,
+/// the E8M0 scale `s` with `amax / 2^(s − 127) ≤ 6` (the smallest such), and the
+/// nearest E2M1 value of each element (ties to the lower code), packed two per byte
+/// with element `2j` in the low nibble of byte `j`. Returns `(blocks, scales)`.
+fn mxfp4_split(v: &[f32]) -> (Vec<u8>, Vec<u8>) {
+    const FP4: [f32; 8] = [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0];
+    let (mut blocks, mut scales) = (Vec::new(), Vec::new());
+    for blk in v.as_chunks::<32>().0 {
+        let amax = blk.iter().fold(0f32, |a, x| a.max(x.abs()));
+        #[allow(clippy::cast_possible_truncation)]
+        let e = if amax > 0.0 {
+            (f64::from(amax) / 6.0).log2().ceil().clamp(-127.0, 127.0) as i32
+        } else {
+            -127
+        };
+        #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
+        scales.push((e + 127) as u8); // e is clamped to ±127
+        let d = 2f32.powi(e);
+        let code = |x: f32| {
+            let m = (x / d).abs();
+            #[allow(clippy::cast_possible_truncation)]
+            let i = (0..8)
+                .min_by(|&a, &b| (FP4[a] - m).abs().total_cmp(&(FP4[b] - m).abs()))
+                .unwrap_or(0) as u8;
+            if x < 0.0 && i != 0 { i | 8 } else { i }
+        };
+        for p in blk.as_chunks::<2>().0 {
+            blocks.push(code(p[0]) | (code(p[1]) << 4));
+        }
+    }
+    (blocks, scales)
 }
 
 fn bf16_bytes(v: &[f32]) -> Vec<u8> {
@@ -508,6 +545,132 @@ fn weight_files() -> BTreeMap<&'static str, BTreeMap<String, Vec<u8>>> {
         t.push(tensor(&mut rng, "lm_head.weight".into(), vec![vocab, h]));
         all.insert("qwen2-tiny", safetensors_files(&t, &cfg, vocab));
     }
+
+    // GPT-OSS-style (transformer_moe): q/k/v/o biases, a sink logit per head, a
+    // sliding window on alternate layers (4 positions, so the 14-token test prompt
+    // uses it), YaRN RoPE, a router with a bias and softmax over its top 2, and experts
+    // stored as SafeTensors MXFP4 (`*_blocks`, `*_scales`) with gate and up rows
+    // interleaved, per-expert biases and the clamped SwiGLU. Expert weights are large
+    // enough that the clamp at 7 is reached.
+    {
+        let mut rng = Rng(0x6970_7400_0055_0001);
+        let hd = 16u64;
+        let (heads, kv) = (4u64, 2u64);
+        let cfg = json!({
+            "architectures": ["GptOssForCausalLM"], "model_type": "gpt_oss",
+            "hidden_size": h, "intermediate_size": ffn, "num_hidden_layers": layers,
+            "num_attention_heads": heads, "num_key_value_heads": kv, "head_dim": hd,
+            "num_local_experts": experts, "num_experts_per_tok": 2, "experts_per_token": 2,
+            "layer_types": ["sliding_attention", "full_attention"], "sliding_window": 4,
+            "rms_norm_eps": 1e-5, "rope_theta": 150000, "rope_scaling": {
+                "rope_type": "yarn", "factor": 4.0, "beta_fast": 32.0, "beta_slow": 1.0,
+                "original_max_position_embeddings": 1024, "truncate": false
+            },
+            "hidden_act": "silu", "swiglu_limit": 7.0, "attention_bias": true,
+            "attention_dropout": 0.0, "max_position_embeddings": 4096,
+            "initial_context_length": 1024, "router_aux_loss_coef": 0.9,
+            "output_router_logits": false, "vocab_size": vocab, "tie_word_embeddings": false,
+            "eos_token_id": 1, "pad_token_id": 0, "use_cache": true,
+            "quantization_config": {
+                "quant_method": "mxfp4",
+                "modules_to_not_convert": ["model.layers.*.self_attn", "model.layers.*.mlp.router",
+                    "model.embed_tokens", "lm_head"]
+            }
+        });
+        let mut t = vec![tensor(
+            &mut rng,
+            "model.embed_tokens.weight".into(),
+            vec![vocab, h],
+        )];
+        let mut experts_mx: Vec<MxExpert> = Vec::new();
+        for l in 0..layers {
+            let p = |s: &str| format!("model.layers.{l}.{s}");
+            t.push(tensor(&mut rng, p("input_layernorm.weight"), vec![h]));
+            for (proj, out, inp) in [
+                ("q_proj", heads * hd, h),
+                ("k_proj", kv * hd, h),
+                ("v_proj", kv * hd, h),
+                ("o_proj", h, heads * hd),
+            ] {
+                t.push(tensor(
+                    &mut rng,
+                    p(&format!("self_attn.{proj}.weight")),
+                    vec![out, inp],
+                ));
+                t.push(bias(&mut rng, p(&format!("self_attn.{proj}.bias")), out));
+            }
+            t.push(bias(&mut rng, p("self_attn.sinks"), heads));
+            t.push(tensor(
+                &mut rng,
+                p("post_attention_layernorm.weight"),
+                vec![h],
+            ));
+            t.push(tensor(&mut rng, p("mlp.router.weight"), vec![experts, h]));
+            t.push(bias(&mut rng, p("mlp.router.bias"), experts));
+            for (name, rows, cols) in [("gate_up_proj", 2 * ffn, h), ("down_proj", h, ffn)] {
+                let n = experts * rows * cols;
+                #[allow(clippy::cast_possible_truncation)]
+                let v: Vec<f32> = (0..n).map(|_| rng.normal(0.6)).collect();
+                let (b, s) = mxfp4_split(&v);
+                experts_mx.push((
+                    p(&format!("mlp.experts.{name}")),
+                    vec![experts, rows, cols / 32],
+                    b,
+                    s,
+                ));
+                let bias_name = p(&format!("mlp.experts.{name}_bias"));
+                let values = (0..experts * rows).map(|_| rng.normal(0.5)).collect();
+                t.push(T {
+                    name: bias_name,
+                    dims: vec![experts, rows],
+                    values,
+                });
+            }
+        }
+        t.push(tensor(&mut rng, "model.norm.weight".into(), vec![h]));
+        t.push(tensor(&mut rng, "lm_head.weight".into(), vec![vocab, h]));
+        let mut files = safetensors_files(&t, &cfg, vocab);
+        // The experts as SafeTensors MXFP4, beside the bf16 tensors.
+        let mut td: Vec<TensorData<'_>> = Vec::new();
+        let data: Vec<Vec<u8>> = t.iter().map(|x| bf16_bytes(&x.values)).collect();
+        for (x, b) in t.iter().zip(&data) {
+            td.push(TensorData {
+                name: &x.name,
+                dtype: DType::BF16,
+                dims: &x.dims,
+                data: b,
+            });
+        }
+        let names: Vec<(String, String, Vec<u64>, Vec<u64>)> = experts_mx
+            .iter()
+            .map(|(n, d, _, _)| {
+                let mut bd = d.clone();
+                bd.push(16);
+                (format!("{n}_blocks"), format!("{n}_scales"), bd, d.clone())
+            })
+            .collect();
+        for ((_, _, b, s), (bn, sn, bd, sd)) in experts_mx.iter().zip(&names) {
+            td.push(TensorData {
+                name: bn,
+                dtype: DType::U8,
+                dims: bd,
+                data: b,
+            });
+            td.push(TensorData {
+                name: sn,
+                dtype: DType::U8,
+                dims: sd,
+                data: s,
+            });
+        }
+        let mut meta = BTreeMap::new();
+        meta.insert("format".to_owned(), "pt".to_owned());
+        files.insert(
+            "model.safetensors".to_owned(),
+            write::safetensors(&td, &meta),
+        );
+        all.insert("gpt-oss-tiny", files);
+    }
     all
 }
 
@@ -589,6 +752,9 @@ fn generate(out: &Path) -> Result<Vec<PathBuf>, String> {
             "olmoe-tiny-gguf" => "Tiny OLMoE-style fixture, GGUF Q8_0",
             "qwen3-moe-tiny" => "Tiny Qwen3-MoE-style fixture",
             "qwen2-tiny" => "Tiny Qwen2-style fixture (q/k/v biases)",
+            "gpt-oss-tiny" => {
+                "Tiny GPT-OSS-style fixture (MXFP4 experts, sinks, sliding window, YaRN)"
+            }
             _ => dir,
         }
         .to_owned();

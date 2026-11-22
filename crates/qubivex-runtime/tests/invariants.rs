@@ -37,15 +37,17 @@ fn bits(v: &[f32]) -> Vec<u32> {
     v.iter().map(|x| x.to_bits()).collect()
 }
 
+/// (`gpt-oss-tiny` is in [`ALL`] only: its options keep routing off the device.)
 const IDS: [&str; 3] = ["olmoe-tiny", "olmoe-tiny-gguf", "qwen3-moe-tiny"];
 /// The mixture-of-experts fixtures and the dense one, for invariants that do not
 /// involve routing.
-const ALL: [&str; 5] = [
+const ALL: [&str; 6] = [
     "olmoe-tiny",
     "olmoe-tiny-gguf",
     "qwen3-moe-tiny",
     "dense-tiny",
     "qwen2-tiny",
+    "gpt-oss-tiny",
 ];
 const PROMPT: &[u32] = &[
     72, 101, 108, 108, 111, 44, 32, 101, 120, 112, 101, 114, 116, 115,

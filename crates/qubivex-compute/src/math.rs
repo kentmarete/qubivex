@@ -85,6 +85,19 @@ pub fn swiglu(g: &mut [f32], u: &[f32]) {
     }
 }
 
+/// The clamped SwiGLU, in place into `g`: with `g' = min(g, limit)` and
+/// `u' = clamp(u, −limit, limit)`, `(u' + 1) · (g' · sigmoid(alpha · g'))`, where
+/// `sigmoid(x) = 1 / (1 + exp(−x))`. NaN stays NaN through both clamps, as torch's
+/// `clamp` keeps it.
+pub fn clamped_swiglu(g: &mut [f32], u: &[f32], alpha: f32, limit: f32) {
+    for (a, b) in g.iter_mut().zip(u) {
+        let gc = if *a > limit { limit } else { *a };
+        let uc = b.clamp(-limit, limit);
+        let s = 1.0 / (1.0 + exp(-(gc * alpha)));
+        *a = (uc + 1.0) * (gc * s);
+    }
+}
+
 /// RMSNorm in place: `x · w / sqrt(mean(x²) + eps)`.
 ///
 /// The sum of squares uses the shared 64-lane reduction shape ([`crate::reduce`]) and
@@ -140,17 +153,54 @@ fn dot_seq(a: &[f32], b: &[f32]) -> f32 {
 /// least `pos + 1`. (Moved from `qubivex-arch` unchanged, so a device backend can give
 /// the same bits without depending on that crate.)
 pub fn attend(q: &[f32], k: &[f32], v: &[f32], pos: usize, out: &mut [f32], scores: &mut Vec<f32>) {
+    attend_with(q, k, v, pos, 0, None, out, scores);
+}
+
+/// [`attend`] over positions `start..=pos` only (a sliding window), with an optional
+/// sink: a logit joined to the softmax (in the maximum and, last, in the sum) and then
+/// dropped, so the probabilities of the positions sum to less than 1. With `start = 0`
+/// and no sink it is [`attend`], operation for operation.
+#[allow(clippy::too_many_arguments)]
+pub fn attend_with(
+    q: &[f32],
+    k: &[f32],
+    v: &[f32],
+    pos: usize,
+    start: usize,
+    sink: Option<f32>,
+    out: &mut [f32],
+    scores: &mut Vec<f32>,
+) {
     let d = q.len();
     #[allow(clippy::cast_precision_loss)]
     let scale = 1.0 / (d as f32).sqrt();
     scores.clear();
-    scores.extend((0..=pos).map(|t| dot_seq(q, &k[t * d..(t + 1) * d]) * scale));
-    softmax(scores);
+    scores.extend((start..=pos).map(|t| dot_seq(q, &k[t * d..(t + 1) * d]) * scale));
+    match sink {
+        None => softmax(scores),
+        Some(s) => softmax_with_sink(scores, s),
+    }
     out.fill(0.0);
-    for (t, p) in scores.iter().enumerate() {
+    for (i, p) in scores.iter().enumerate() {
+        let t = start + i;
         for (o, x) in out.iter_mut().zip(&v[t * d..(t + 1) * d]) {
             *o = p.mul_add(*x, *o);
         }
+    }
+}
+
+/// [`softmax`] of `x` joined by one more logit `sink`, which is then dropped: the
+/// maximum includes it, and its exponential ends the sum.
+pub fn softmax_with_sink(x: &mut [f32], sink: f32) {
+    let m = x.iter().copied().fold(sink, f32::max);
+    let mut sum = 0f32;
+    for v in x.iter_mut() {
+        *v = exp(*v - m);
+        sum += *v;
+    }
+    sum += exp(sink - m);
+    for v in x.iter_mut() {
+        *v /= sum;
     }
 }
 
@@ -184,9 +234,66 @@ pub fn route(logits: &[f32], k: usize, norm: bool) -> (Vec<u32>, Vec<f32>) {
     (idx, w)
 }
 
+/// Top-K routing of one token by logit (ties: the lower id), in rank order, with a
+/// softmax over those K logits only as the weights.
+#[must_use]
+pub fn route_topk_softmax(logits: &[f32], k: usize) -> (Vec<u32>, Vec<f32>) {
+    let mut idx: Vec<u32> = (0..u32::try_from(logits.len()).unwrap_or(u32::MAX)).collect();
+    idx.sort_by(|a, b| {
+        logits[*b as usize]
+            .total_cmp(&logits[*a as usize])
+            .then(a.cmp(b))
+    });
+    idx.truncate(k);
+    let mut w: Vec<f32> = idx.iter().map(|&e| logits[e as usize]).collect();
+    softmax(&mut w);
+    (idx, w)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_sink_takes_probability_and_a_window_drops_positions() {
+        let mut x = [0.0f32, 0.0];
+        softmax_with_sink(&mut x, 0.0);
+        assert_eq!(x, [1.0 / 3.0, 1.0 / 3.0]);
+        // Without a sink and from position 0, attend_with is attend.
+        let d = 4;
+        let q = [0.3f32, -0.2, 0.9, 0.1];
+        let k: Vec<f32> = (0..5 * d)
+            .map(|i| ((i * 7 % 11) as f32 - 5.0) / 7.0)
+            .collect();
+        let v: Vec<f32> = (0..5 * d)
+            .map(|i| ((i * 3 % 13) as f32 - 6.0) / 5.0)
+            .collect();
+        let (mut a, mut b) = (vec![0f32; d], vec![0f32; d]);
+        let mut s = Vec::new();
+        attend(&q, &k, &v, 4, &mut a, &mut s);
+        attend_with(&q, &k, &v, 4, 0, None, &mut b, &mut s);
+        assert_eq!(a, b);
+        // A window of one position is that position's value (no sink).
+        attend_with(&q, &k, &v, 4, 4, None, &mut b, &mut s);
+        assert_eq!(b, v[4 * d..5 * d]);
+    }
+
+    #[test]
+    fn topk_softmax_weights_the_top_logits() {
+        let (idx, w) = route_topk_softmax(&[0.5, 2.0, 2.0, -1.0], 2);
+        assert_eq!(idx, [1, 2]);
+        assert_eq!(w, [0.5, 0.5]);
+    }
+
+    #[test]
+    fn clamped_swiglu_clamps_both_inputs() {
+        let mut g = [10.0f32, -1.0, f32::NAN];
+        clamped_swiglu(&mut g, &[100.0, -100.0, 0.0], 1.702, 7.0);
+        let s = 1.0 / (1.0 + exp(-(7.0f32 * 1.702)));
+        assert_eq!(g[0], 8.0 * (7.0 * s));
+        assert_eq!(g[1], -6.0 * -(1.0 / (1.0 + exp(1.702))));
+        assert!(g[2].is_nan());
+    }
 
     /// Distance in ulps between two finite positive f32 values.
     fn ulps(a: f32, b: f32) -> u32 {

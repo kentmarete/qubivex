@@ -217,6 +217,8 @@ pub struct DenseConfig {
     pub max_context: Option<u64>,
     /// The output head reuses the embedding.
     pub tie_embeddings: bool,
+    /// Per layer, the sliding attention window if it has one.
+    pub attention_windows: Vec<Option<u64>>,
     /// Q/K norm.
     pub qk_norm: QkNorm,
     /// Biases on the Q, K and V projections.
@@ -296,7 +298,7 @@ impl ArchitectureFactory for TransformerDense {
     fn version(&self) -> SemVer {
         SemVer {
             major: 1,
-            minor: 2,
+            minor: 3,
             patch: 0,
         }
     }
@@ -324,6 +326,13 @@ impl ArchitectureFactory for TransformerDense {
         }
         not_moe(&v)?;
         unsupported_common(&v)?;
+        // `attention_bias` biases o as well as q, k and v; q/k/v biases alone are the
+        // `qkv_bias` option, detected from the tensors at import.
+        if v.bool("attention_bias", None)? == Some(true) {
+            return Err(cfg_err(
+                "attention_bias = true: a bias on the output projection is not supported yet",
+            ));
+        }
         let DecoderDims {
             hidden,
             layers,
@@ -337,6 +346,7 @@ impl ArchitectureFactory for TransformerDense {
             clip_qkv,
             max_context,
             tie_embeddings,
+            windows,
         } = decoder_dims(&v, src.gguf)?;
         let ffn = nonzero(
             "intermediate_size",
@@ -356,6 +366,7 @@ impl ArchitectureFactory for TransformerDense {
             clip_qkv,
             max_context,
             tie_embeddings,
+            attention_windows: windows,
             qk_norm: opts.qk_norm.unwrap_or(QkNorm::None),
             qkv_bias: opts.qkv_bias.unwrap_or(false),
             names: names(opts.tensor_names.as_ref(), m.weights.format)?,

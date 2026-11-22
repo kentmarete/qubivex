@@ -136,6 +136,8 @@ pub(crate) fn index_files(dir: &Path, manifest: &Manifest) -> Result<TensorIndex
             });
         }
     }
+    // MXFP4 halves may sit in different shards, so they pair once every shard is in.
+    tensors.pair_split_mxfp4()?;
     Ok(tensors)
 }
 

@@ -1152,6 +1152,13 @@ impl Engine {
                 .get(name)
                 .ok_or_else(|| RuntimeError::Model(format!("tensor {name:?} not indexed")))?;
             let bad = |e: &dyn std::fmt::Display| RuntimeError::Model(format!("{name:?}: {e}"));
+            // Split MXFP4 halves are not one contiguous range; only the expert source
+            // repacks them.
+            if t.scales.is_some() {
+                return Err(bad(
+                    &"is MXFP4 stored as separate blocks and scales, which only routed experts may be",
+                ));
+            }
             let mut desc = t.tensor.desc().map_err(|e| bad(&e))?;
             match *desc.dims() {
                 [n] => {
@@ -1200,9 +1207,11 @@ impl Engine {
         let backend = match opts.backend {
             // Placed once the ledger exists (below).
             BackendKind::Cpu | BackendKind::Sim | BackendKind::Vulkan => Placed::cpu(),
-            // Whole layers exist for routed experts only; a dense model places its
-            // matmuls one by one instead (below), with the same bits.
-            BackendKind::Metal if opts.metal_ops.layers && model.is_moe() => {
+            // Whole layers exist for routed experts only, and only for the options the
+            // device's layer pass implements (no attention or expert biases, sinks,
+            // windows, top-K softmax or clamped SwiGLU); otherwise the matmuls are
+            // placed one by one instead (below), with the same bits.
+            BackendKind::Metal if opts.metal_ops.layers && model.is_moe() && model.fusable() => {
                 let be = MetalBackend::new().map_err(|e| metal_err(&e))?;
                 let host = be
                     .map_host(Arc::clone(&dense.arena))
@@ -1216,7 +1225,19 @@ impl Engine {
                     .into_iter()
                     .map(|(kind, name)| Ok((kind, dense.view(&name)?)))
                     .collect::<Result<Vec<_>, ArchError>>()?;
-                Placed::metal(&dense.arena, weights, opts.metal_ops)
+                // Whole layers asked for but not runnable: every dense matmul instead.
+                let ops = if opts.metal_ops.layers {
+                    MetalOps {
+                        attention: true,
+                        router: true,
+                        head: true,
+                        layers: false,
+                        token: false,
+                    }
+                } else {
+                    opts.metal_ops
+                };
+                Placed::metal(&dense.arena, weights, ops)
                     .map_err(|e| RuntimeError::Model(format!("cannot place on Metal: {e}")))?
             }
         };

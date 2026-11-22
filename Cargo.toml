@@ -49,7 +49,7 @@ clap = { version = "4.5", features = ["derive"] }
 # Kernel benchmarks only (dev-dependency); no plotters, no HTML reports.
 criterion = { version = "0.7", default-features = false, features = ["cargo_bench_support"] }
 loom = "0.7.2"
-minijinja = { version = "3.0", default-features = false, features = ["builtins", "fuel", "serde"] }
+minijinja = { version = "3.0", default-features = false, features = ["builtins", "fuel", "macros", "multi_template", "serde"] }
 minijinja-contrib = { version = "3.0", features = ["pycompat"] }
 proptest = "1.6"
 rayon = "1.10"

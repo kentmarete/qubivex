@@ -27,18 +27,26 @@ def bits(t):
 
 out = {"generator": "fixtures/oracle/forward.py", "transformers": transformers.__version__,
        "torch": torch.__version__, "prompt": PROMPT, "models": {}}
-for name in ["olmoe-tiny", "qwen3-moe-tiny", "dense-tiny", "qwen2-tiny"]:
+for name in ["olmoe-tiny", "qwen3-moe-tiny", "dense-tiny", "qwen2-tiny", "gpt-oss-tiny"]:
     model, info = AutoModelForCausalLM.from_pretrained(
         f"fixtures/models/{name}", dtype=torch.float32, output_loading_info=True)
     assert not any(info.values()), f"{name}: weights not loaded cleanly: {info}"
+    # MXFP4 experts are dequantized to bf16 (exactly) and kept there; run them in f32.
+    model = model.float()
     model.eval()
     cap = {}
-    dense = not hasattr(model.model.layers[0].mlp, "gate")
+    mlp0 = model.model.layers[0].mlp
+    # The router module: `gate` in most families, `router` where the MLP is split so.
+    router_attr = "gate" if hasattr(mlp0, "gate") else "router" if hasattr(mlp0, "router") else None
+    dense = router_attr is None
     for i, layer in enumerate(model.model.layers):
         layer.self_attn.register_forward_hook(lambda m, a, o, i=i: cap.__setitem__(("attn", i), o[0]))
         if not dense:
-            layer.mlp.gate.register_forward_hook(lambda m, a, o, i=i: cap.__setitem__(("gate", i), o))
-        layer.mlp.register_forward_hook(lambda m, a, o, i=i: cap.__setitem__(("moe", i), o))
+            getattr(layer.mlp, router_attr).register_forward_hook(
+                lambda m, a, o, i=i: cap.__setitem__(("gate", i), o))
+        # An MLP that also returns its routing scores returns a tuple.
+        layer.mlp.register_forward_hook(
+            lambda m, a, o, i=i: cap.__setitem__(("moe", i), o[0] if isinstance(o, tuple) else o))
         layer.register_forward_hook(
             lambda m, a, o, i=i: cap.__setitem__(("hidden", i), o[0] if isinstance(o, tuple) else o))
     with torch.no_grad():

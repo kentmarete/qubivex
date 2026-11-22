@@ -24,11 +24,14 @@ use qubivex_compute::{
 use qubivex_core::{DType, Shape};
 use qubivex_core::{ExpertIdx, LayerIdx};
 use qubivex_model::ArchConfig;
-use qubivex_model::arch::{DenseConfig, MoeConfig, QkNorm, RopeScaling, RouterScoring};
+use qubivex_model::arch::{
+    DenseConfig, ExpertActivation, ExpertLayout, MoeConfig, QkNorm, RopeScaling, RouterScoring,
+};
 use rayon::prelude::*;
 use thiserror::Error;
 
-use crate::ops::{Rope, attend, rms_norm, route, swiglu};
+use crate::ops::{Rope, rms_norm, route, swiglu};
+use qubivex_compute::math::{attend_with, clamped_swiglu, route_topk_softmax};
 
 /// Errors of a forward pass.
 #[derive(Debug, Error)]
@@ -550,6 +553,24 @@ struct LayerNorms {
     k: Option<Vec<f32>>,
     /// Q, K and V projection biases, added to each token's projections.
     qkv_bias: Option<[Vec<f32>; 3]>,
+    /// The output projection's bias.
+    o_bias: Option<Vec<f32>>,
+    /// One sink logit per query head.
+    sinks: Option<Vec<f32>>,
+    /// The sliding attention window, in positions (the current one included).
+    window: Option<usize>,
+    /// The router's bias.
+    router_bias: Option<Vec<f32>>,
+    /// Per expert, the gate-up bias (gate's `ffn` values, then up's) and the down bias.
+    expert_bias: Option<ExpertBias>,
+}
+
+/// One layer's expert biases, `experts × 2·ffn` (gate then up, whatever the stored
+/// order) and `experts × hidden`.
+#[derive(Debug)]
+struct ExpertBias {
+    gate_up: Vec<f32>,
+    down: Vec<f32>,
 }
 
 /// Tensor-name patterns the forward pass reads, the same for every FFN kind.
@@ -567,6 +588,10 @@ struct Names {
     k_norm: String,
     /// Q, K and V bias patterns, when the attention has biases.
     qkv_bias: Option<[String; 3]>,
+    /// The output projection's bias pattern.
+    o_bias: Option<String>,
+    /// The attention sinks' pattern.
+    sinks: Option<String>,
     ffn_norm: String,
 }
 
@@ -585,6 +610,8 @@ struct DecoderConfig {
     clip_qkv: Option<f64>,
     tie_embeddings: bool,
     qk_norm: QkNorm,
+    /// Per layer, the sliding window.
+    windows: Vec<Option<u64>>,
     names: Names,
 }
 
@@ -613,6 +640,13 @@ enum Ffn {
         top_k: u32,
         norm_topk_prob: bool,
         router: String,
+        /// The router bias pattern.
+        router_bias: Option<String>,
+        /// Gate-up and down bias patterns, and whether the gate-up rows alternate.
+        expert_bias: Option<(String, String, bool)>,
+        /// Softmax over the top-K logits instead of top-K of a softmax.
+        topk_softmax: bool,
+        activation: ExpertActivation,
     },
     /// One dense SwiGLU (`transformer_dense`).
     Dense {
@@ -639,6 +673,7 @@ impl DecoderConfig {
                 clip_qkv: c.clip_qkv,
                 tie_embeddings: c.tie_embeddings,
                 qk_norm: c.qk_norm,
+                windows: c.attention_windows.clone(),
                 names: Names {
                     embedding: n.embedding.clone(),
                     output: n.output.clone(),
@@ -650,7 +685,11 @@ impl DecoderConfig {
                     o: n.o.clone(),
                     q_norm: n.q_norm.clone(),
                     k_norm: n.k_norm.clone(),
-                    qkv_bias: None,
+                    qkv_bias: c
+                        .attention_bias
+                        .then(|| [n.q_bias.clone(), n.k_bias.clone(), n.v_bias.clone()]),
+                    o_bias: c.attention_bias.then(|| n.o_bias.clone()),
+                    sinks: c.attention_sinks.then(|| n.sinks.clone()),
                     ffn_norm: n.ffn_norm.clone(),
                 },
             },
@@ -659,6 +698,23 @@ impl DecoderConfig {
                 top_k: c.top_k,
                 norm_topk_prob: c.norm_topk_prob,
                 router: n.router.clone(),
+                router_bias: c.router_bias.then(|| n.router_bias.clone()),
+                expert_bias: c.expert_bias.then(|| {
+                    let interleaved = matches!(
+                        n.experts,
+                        ExpertLayout::StackedGateUp {
+                            interleaved: true,
+                            ..
+                        }
+                    );
+                    (
+                        n.expert_gate_up_bias.clone(),
+                        n.expert_down_bias.clone(),
+                        interleaved,
+                    )
+                }),
+                topk_softmax: c.router_scoring == RouterScoring::TopkSoftmax,
+                activation: c.activation,
             },
         )
     }
@@ -679,6 +735,7 @@ impl DecoderConfig {
                 clip_qkv: c.clip_qkv,
                 tie_embeddings: c.tie_embeddings,
                 qk_norm: c.qk_norm,
+                windows: c.attention_windows.clone(),
                 names: Names {
                     embedding: n.embedding.clone(),
                     output: n.output.clone(),
@@ -693,6 +750,8 @@ impl DecoderConfig {
                     qkv_bias: c
                         .qkv_bias
                         .then(|| [n.q_bias.clone(), n.k_bias.clone(), n.v_bias.clone()]),
+                    o_bias: None,
+                    sinks: None,
                     ffn_norm: n.ffn_norm.clone(),
                 },
             },
@@ -738,6 +797,55 @@ pub fn layer_name(pattern: &str, l: u32) -> String {
     pattern.replace("{L}", &l.to_string())
 }
 
+/// A layer's expert biases as f32: the gate-up bias `experts × 2·ffn` reordered to
+/// gate's values then up's when its rows alternate (as the expert source reorders the
+/// matrix), and the down bias `experts × hidden`.
+fn expert_biases(
+    dense: &dyn DenseWeights,
+    be: &dyn ComputeBackend,
+    gate_up: &str,
+    down: &str,
+    experts: usize,
+    hidden: usize,
+    interleaved: bool,
+) -> Result<ExpertBias, ArchError> {
+    let rows = |name: &str, len: Option<usize>| -> Result<Vec<f32>, ArchError> {
+        let v = dense.view(name)?;
+        if v.rows() != experts || len.is_some_and(|l| v.cols() != l) {
+            return Err(ArchError::Input(format!(
+                "{name} is {} x {}, expected {experts} rows",
+                v.rows(),
+                v.cols()
+            )));
+        }
+        let mut out = vec![0f32; v.rows() * v.cols()];
+        for (r, o) in out.chunks_exact_mut(v.cols()).enumerate() {
+            be.dequant_row(&v, r, o)?;
+        }
+        Ok(out)
+    };
+    let mut gu = rows(gate_up, None)?;
+    if interleaved {
+        let w = gu.len() / experts;
+        for row in gu.chunks_exact_mut(w) {
+            let (g, u): (Vec<f32>, Vec<f32>) = row.chunks_exact(2).map(|p| (p[0], p[1])).unzip();
+            row[..w / 2].copy_from_slice(&g);
+            row[w / 2..].copy_from_slice(&u);
+        }
+    }
+    Ok(ExpertBias {
+        gate_up: gu,
+        down: rows(down, Some(hidden))?,
+    })
+}
+
+/// Adds `b` to every row of `rows` (row length `b.len()`).
+fn add_rows(rows: &mut [f32], b: &[f32]) {
+    for row in rows.chunks_exact_mut(b.len()) {
+        row.iter_mut().zip(b).for_each(|(y, &b)| *y += b);
+    }
+}
+
 /// A 1-D weight as f32.
 fn vector(
     dense: &dyn DenseWeights,
@@ -771,7 +879,7 @@ impl Transformer {
         be: &dyn ComputeBackend,
     ) -> Result<Self, ArchError> {
         let (c, ffn, moe) = if let Some(m) = cfg.specific.downcast_ref::<MoeConfig>() {
-            if m.router_scoring != RouterScoring::Softmax {
+            if m.router_scoring == RouterScoring::Sigmoid {
                 return Err(ArchError::Input(
                     "sigmoid router scoring is not implemented yet".into(),
                 ));
@@ -814,12 +922,58 @@ impl Transformer {
                 ]),
                 None => None,
             };
+            let heads = usize_of(c.heads)?;
+            let o_bias = match &c.names.o_bias {
+                Some(p) => Some(vector(dense, be, &n(p), h)?),
+                None => None,
+            };
+            let sinks = match &c.names.sinks {
+                Some(p) => Some(vector(dense, be, &n(p), heads)?),
+                None => None,
+            };
+            let window = match c.windows.get(l as usize).copied().flatten() {
+                Some(w) => Some(usize_of(w)?),
+                None => None,
+            };
+            let (router_bias, expert_bias) = match &ffn {
+                Ffn::Moe {
+                    experts,
+                    router_bias,
+                    expert_bias,
+                    ..
+                } => {
+                    let ne = *experts as usize;
+                    let rb = match router_bias {
+                        Some(p) => Some(vector(dense, be, &n(p), ne)?),
+                        None => None,
+                    };
+                    let eb = match expert_bias {
+                        Some((gu, down, interleaved)) => Some(expert_biases(
+                            dense,
+                            be,
+                            &n(gu),
+                            &n(down),
+                            ne,
+                            h,
+                            *interleaved,
+                        )?),
+                        None => None,
+                    };
+                    (rb, eb)
+                }
+                Ffn::Dense { .. } => (None, None),
+            };
             norms.push(LayerNorms {
                 attn: vector(dense, be, &n(&c.names.attn_norm), h)?,
                 ffn: vector(dense, be, &n(&c.names.ffn_norm), h)?,
                 q,
                 k,
                 qkv_bias,
+                o_bias,
+                sinks,
+                window,
+                router_bias,
+                expert_bias,
             });
         }
         let final_norm = vector(dense, be, &c.names.final_norm, h)?;
@@ -862,6 +1016,31 @@ impl Transformer {
         };
         v.push((DenseMatmul::Head, head.clone()));
         v
+    }
+
+    /// Whether the device's fused paths (attention and routing on the device, the fused
+    /// expert block) can run this model: they implement none of the output bias,
+    /// sinks, sliding windows, router and expert biases, top-K softmax routing or the
+    /// clamped SwiGLU, so a model with any of them runs those steps on the host (its
+    /// matmuls still go to the backend). A whole-layer device pass needs it too.
+    #[must_use]
+    pub fn fusable(&self) -> bool {
+        let layers_plain = self.norms.iter().all(|n| {
+            n.o_bias.is_none()
+                && n.sinks.is_none()
+                && n.window.is_none()
+                && n.router_bias.is_none()
+                && n.expert_bias.is_none()
+        });
+        let ffn_plain = match &self.ffn {
+            Ffn::Moe {
+                topk_softmax,
+                activation,
+                ..
+            } => !topk_softmax && *activation == ExpertActivation::Swiglu,
+            Ffn::Dense { .. } => true,
+        };
+        layers_plain && ffn_plain
     }
 
     /// The `transformer_moe` config, if this is a mixture of experts.
@@ -1130,8 +1309,10 @@ impl Transformer {
         // cache stays authoritative.
         // The device's fused attention has no projection biases, so a model with them
         // always runs attention on the host.
+        let fusable = self.fusable();
         let dev_attn = !tracing
             && !lookahead
+            && fusable
             && c.names.qkv_bias.is_none()
             && layout.iter().all(|&(_, n, _)| n == 1)
             && match &self.ffn {
@@ -1316,7 +1497,10 @@ impl Transformer {
                         let g = hd / group;
                         let (kl, vl) = &kv[seg_of[t]];
                         let qs = &q[t * q_out + hd * d..t * q_out + (hd + 1) * d];
-                        attend(qs, kl[g], vl[g], pos[t], out, scores);
+                        // A sliding window sees the last `w` positions, this one included.
+                        let start = norms.window.map_or(0, |w| (pos[t] + 1).saturating_sub(w));
+                        let sink = norms.sinks.as_ref().map(|s| s[hd]);
+                        attend_with(qs, kl[g], vl[g], pos[t], start, sink, out, scores);
                     });
                 drop(kv);
                 // Step 3c: the O projection, the residual and the FFN norm at the head of the
@@ -1325,7 +1509,10 @@ impl Transformer {
                 // nothing is written and the layer runs below as before.
                 whole = match &self.ffn {
                     Ffn::Moe { router, .. }
-                        if !tracing && !lookahead && be.routes_moe_prelude(ne, k_top, s) =>
+                        if !tracing
+                            && !lookahead
+                            && fusable
+                            && be.routes_moe_prelude(ne, k_top, s) =>
                     {
                         self.routed_on_device(
                             RoutedLayer {
@@ -1354,6 +1541,9 @@ impl Transformer {
             }
             if !whole {
                 be.matmul(&dense.view(&n(&c.names.o))?, &att, s, &mut o)?;
+                if let Some(b) = &norms.o_bias {
+                    add_rows(&mut o, b);
+                }
                 for t in 0..s {
                     emit(
                         TracePoint::Attention,
@@ -1376,6 +1566,9 @@ impl Transformer {
                     rms_norm(&mut ahead_x, &next.ffn, c.rms_eps);
                     let ln = layer_name(router, li + 1);
                     be.matmul(&dense.view(&ln)?, &ahead_x, 1, &mut ahead)?;
+                    if let Some(b) = &next.router_bias {
+                        add_rows(&mut ahead, b);
+                    }
                     experts.lookahead(LayerIdx(li + 1), &ahead);
                 }
 
@@ -1387,8 +1580,10 @@ impl Transformer {
                 // Router, routing, experts and combine as one backend operation when the
                 // backend routes this shape and the provider holds the whole layer.
                 let routed = match &self.ffn {
-                    Ffn::Moe { router, .. } if !tracing && be.routes_moe(ne, k_top, s) => self
-                        .routed_on_device(
+                    Ffn::Moe { router, .. }
+                        if !tracing && fusable && be.routes_moe(ne, k_top, s) =>
+                    {
+                        self.routed_on_device(
                             RoutedLayer {
                                 layer: li,
                                 router: dense.view(&n(router))?,
@@ -1402,7 +1597,8 @@ impl Transformer {
                             experts,
                             be,
                             &mut o,
-                        )?,
+                        )?
+                    }
                     _ => false,
                 };
                 match &self.ffn {
@@ -1435,15 +1631,48 @@ impl Transformer {
                     Ffn::Moe { .. } if routed => {}
                     Ffn::Moe {
                         router: router_name,
+                        topk_softmax,
+                        activation,
                         ..
                     } => {
                         be.matmul(&dense.view(&n(router_name))?, &x, s, &mut router)?;
+                        if let Some(b) = &norms.router_bias {
+                            add_rows(&mut router, b);
+                        }
+                        // The expert's FFN between its matmuls: the gate-up bias (gate's
+                        // values, then up's) and the activation into `g`; then the down bias.
+                        let bias = norms.expert_bias.as_ref();
+                        let act = |e: ExpertIdx, g: &mut [f32], u: &mut [f32]| {
+                            if let Some(b) = bias {
+                                let w = b.gate_up.len() / ne;
+                                let row = &b.gate_up[e.0 as usize * w..(e.0 as usize + 1) * w];
+                                let (bg, bu) = row.split_at(w / 2);
+                                add_rows(g, bg);
+                                add_rows(u, bu);
+                            }
+                            match *activation {
+                                ExpertActivation::Swiglu => swiglu(g, u),
+                                #[allow(clippy::cast_possible_truncation)]
+                                ExpertActivation::ClampedSwiglu { alpha, limit } => {
+                                    clamped_swiglu(g, u, alpha as f32, limit as f32);
+                                }
+                            }
+                        };
+                        let down_bias = |e: ExpertIdx, y: &mut [f32]| {
+                            if let Some(b) = bias {
+                                add_rows(y, &b.down[e.0 as usize * h..(e.0 as usize + 1) * h]);
+                            }
+                        };
                         // Per token: top-K experts by probability (ties: lower id), in rank order.
                         let mut picks: Vec<(Vec<u32>, Vec<f32>)> = Vec::with_capacity(s);
                         for t in 0..s {
                             let logits_t = &router[t * ne..(t + 1) * ne];
                             emit(TracePoint::RouterLogits, Some(li), t, logits_t, &[]);
-                            let (idx, w) = route(logits_t, k_top, norm_topk_prob);
+                            let (idx, w) = if *topk_softmax {
+                                route_topk_softmax(logits_t, k_top)
+                            } else {
+                                route(logits_t, k_top, norm_topk_prob)
+                            };
                             emit(TracePoint::RoutingWeights, Some(li), t, &w, &idx);
                             picks.push((idx, w));
                         }
@@ -1509,9 +1738,10 @@ impl Transformer {
                                     ys: &mut u,
                                 },
                             ])?;
-                            swiglu(&mut g, &u);
+                            act(ei, &mut g, &mut u);
                             let mut y = vec![0f32; n_t * h];
                             be.matmul(&w.down, &g, n_t, &mut y)?;
+                            down_bias(ei, &mut y);
                             store(users, &y);
                             Ok(())
                         };
@@ -1522,7 +1752,7 @@ impl Transformer {
                             .map(|ei| by_expert[ei.0 as usize].len())
                             .max()
                             .unwrap_or(0);
-                        if be.fuses_gated_ffn(used.len(), max_rows) {
+                        if fusable && be.fuses_gated_ffn(used.len(), max_rows) {
                             // Every expert of the layer as one fused block when all are
                             // resident: gate and up, SwiGLU and down in one submission. Each
                             // output has the separate steps' bits (GatedFfn).
@@ -1612,8 +1842,8 @@ impl Transformer {
                                 }
                                 be.matmul_many(&mut ops)?;
                                 drop(ops);
-                                for (g, u) in gs.iter_mut().zip(&us) {
-                                    swiglu(g, u);
+                                for ((g, u), ei) in gs.iter_mut().zip(us.iter_mut()).zip(&used) {
+                                    act(*ei, g, u);
                                 }
                                 let mut ys: Vec<Vec<f32>> =
                                     users.iter().map(|u| vec![0f32; u.len() * h]).collect();
@@ -1631,7 +1861,8 @@ impl Transformer {
                                     .collect();
                                 be.matmul_many(&mut ops)?;
                                 drop(ops);
-                                for (u, y) in users.iter().zip(&ys) {
+                                for ((u, y), ei) in users.iter().zip(ys.iter_mut()).zip(&used) {
+                                    down_bias(*ei, y);
                                     store(u, y);
                                 }
                                 Ok(())

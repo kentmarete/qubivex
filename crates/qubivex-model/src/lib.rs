@@ -43,7 +43,7 @@ pub use discover::{Discovered, discover, find};
 pub use error::ModelError;
 pub use gguf::{GgufHeader, GgufMetadata, GgufValue};
 pub use import::{ImportOptions, Imported, import, sanitise_id};
-pub use index::{RawTensor, TensorEntry, TensorIndex, WeightFile, WeightFormat};
+pub use index::{RawTensor, SplitScales, TensorEntry, TensorIndex, WeightFile, WeightFormat};
 pub use manifest::{Manifest, ModelSource};
 pub use metadata::{ByteSummary, MANIFEST_FILE, ModelMetadata};
 pub use registry::{

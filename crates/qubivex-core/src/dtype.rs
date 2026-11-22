@@ -172,6 +172,11 @@ pub enum DType {
     F16,
     /// bfloat16.
     BF16,
+    /// Raw bytes with no numeric meaning of their own: the halves of a tensor stored in
+    /// two parts, such as the nibble blocks and the scales of SafeTensors MXFP4
+    /// (`*_blocks`, `*_scales`), which the index pairs into one MXFP4 tensor. No
+    /// kernel reads it.
+    U8,
     /// Signed int8 weights with one f32 scale per row (Colibri's int8 expert format).
     /// Each row is stored as `cols` int8 values followed by its f32 scale.
     I8RowScaled,
@@ -182,9 +187,15 @@ pub enum DType {
 impl DType {
     /// Every dtype, plain floats first, then the GGML types in id order.
     pub fn all() -> impl Iterator<Item = Self> {
-        [Self::F32, Self::F16, Self::BF16, Self::I8RowScaled]
-            .into_iter()
-            .chain(GgmlType::ALL.into_iter().map(Self::Ggml))
+        [
+            Self::F32,
+            Self::F16,
+            Self::BF16,
+            Self::U8,
+            Self::I8RowScaled,
+        ]
+        .into_iter()
+        .chain(GgmlType::ALL.into_iter().map(Self::Ggml))
     }
 
     /// Maps a GGUF tensor type id to a dtype.
@@ -211,6 +222,7 @@ impl DType {
             Self::F32 => "f32",
             Self::F16 => "f16",
             Self::BF16 => "bf16",
+            Self::U8 => "u8",
             Self::I8RowScaled => "i8_row_scaled",
             Self::Ggml(t) => t.name(),
         }
@@ -222,6 +234,7 @@ impl DType {
         match self {
             Self::F32 => StorageLayout::Elementwise { bytes_per_elem: 4 },
             Self::F16 | Self::BF16 => StorageLayout::Elementwise { bytes_per_elem: 2 },
+            Self::U8 => StorageLayout::Elementwise { bytes_per_elem: 1 },
             Self::I8RowScaled => StorageLayout::RowScaled { scale_bytes: 4 },
             Self::Ggml(t) => StorageLayout::Blocked {
                 block_elems: t.block_elems(),
@@ -324,6 +337,7 @@ impl FromStr for DType {
             "f32" => Ok(Self::F32),
             "f16" => Ok(Self::F16),
             "bf16" => Ok(Self::BF16),
+            "u8" => Ok(Self::U8),
             "i8_row_scaled" => Ok(Self::I8RowScaled),
             _ => GgmlType::ALL
                 .iter()
@@ -397,7 +411,13 @@ mod tests {
 
     #[test]
     fn names_round_trip() {
-        let mut all = vec![DType::F32, DType::F16, DType::BF16, DType::I8RowScaled];
+        let mut all = vec![
+            DType::F32,
+            DType::F16,
+            DType::BF16,
+            DType::U8,
+            DType::I8RowScaled,
+        ];
         all.extend(GgmlType::ALL.map(DType::Ggml));
         for d in all {
             assert_eq!(d.name().parse::<DType>(), Ok(d));
@@ -484,6 +504,7 @@ mod tests {
             Just(DType::F32),
             Just(DType::F16),
             Just(DType::BF16),
+            Just(DType::U8),
             Just(DType::I8RowScaled),
             proptest::sample::select(GgmlType::ALL.to_vec()).prop_map(DType::Ggml),
         ]
