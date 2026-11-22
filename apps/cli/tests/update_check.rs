@@ -281,11 +281,17 @@ fn the_notice_follows_help_in_a_terminal() {
     assert_eq!(shown.matches("Update Available").count(), 1, "{shown}");
 }
 
+/// Arguments, and extra environment variables.
+type Case = (
+    &'static [&'static str],
+    &'static [(&'static str, &'static str)],
+);
+
 #[test]
 fn no_notice_in_a_terminal_when_not_due() {
     let env = Env::new("tty-quiet");
     env.write_cache(now(), SOURCE, Some("99.0.0"));
-    let cases: [(&[&str], &[(&str, &str)]); 5] = [
+    let cases: [Case; 5] = [
         (&["--version"], &[]),
         (&["system", "--json"], &[]),
         (&["--help"], &[("QUBIVEX_NO_UPDATE_CHECK", "1")]),
