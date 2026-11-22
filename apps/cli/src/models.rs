@@ -626,7 +626,7 @@ mod tests {
             "{o}"
         );
         assert!(
-            o.contains("  positions  rope (rope scaling: default, llama3)\n"), // model-name-ok: the rope_type value in config.json
+            o.contains("  positions  rope (rope scaling: default, llama3, yarn)\n"), // model-name-ok: the rope_type values in config.json
             "{o}"
         );
         assert!(o.contains("qkv_bias"), "{o}");

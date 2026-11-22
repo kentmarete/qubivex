@@ -645,9 +645,11 @@ impl ArchitectureFactory for TransformerMoe {
                 o: &n.o,
                 q_norm: &n.q_norm,
                 k_norm: &n.k_norm,
-                qkv_bias: c
-                    .attention_bias
-                    .then(|| [n.q_bias.as_str(), n.k_bias.as_str(), n.v_bias.as_str()]),
+                qkv_bias: c.attention_bias.then_some([
+                    n.q_bias.as_str(),
+                    n.k_bias.as_str(),
+                    n.v_bias.as_str(),
+                ]),
             };
             for spec in attention_specs(l, &names, c.qk_norm, h, q_out, kv_out, c.head_dim) {
                 push(spec.name, spec.role, spec.shape);

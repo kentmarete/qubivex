@@ -116,8 +116,11 @@ impl Rope {
                 s[i] = a.sin() as f32;
             }
         }
-        // transformers multiplies the f32 cos and sin by the factor (YaRN); 1 is exact.
-        if self.scale != 1.0 {
+        // transformers multiplies the f32 cos and sin by the factor (YaRN); 1 is exact,
+        // so only an exact 1 may skip it.
+        #[allow(clippy::float_cmp)]
+        let scaled = self.scale != 1.0;
+        if scaled {
             for v in cs.iter_mut() {
                 *v *= self.scale;
             }
@@ -187,7 +190,10 @@ fn yarn(
         high = high.ceil();
     }
     let (low, mut high) = (low.max(0.0), high.min(dim - 1.0));
-    if low == high {
+    // transformers' exact test: equal bounds would divide by zero.
+    #[allow(clippy::float_cmp)]
+    let equal = low == high;
+    if equal {
         high += 0.001;
     }
     let factor_f = factor as f32;
@@ -368,8 +374,22 @@ mod tests {
     /// (checked in Python: the correctly rounded powers give these bits exactly).
     #[test]
     fn yarn_scaling_matches_transformers_bits() {
+        /// head dim, θ, factor, beta fast, beta slow, original context, truncate,
+        /// attention factor, the one-ulp frequencies, the expected bits.
+        type Case = (
+            usize,
+            f64,
+            f64,
+            f64,
+            f64,
+            u64,
+            bool,
+            f64,
+            &'static [usize],
+            &'static str,
+        );
         #[rustfmt::skip]
-        let cases: [(usize, f64, f64, f64, f64, u64, bool, f64, &[usize], &str); 3] = [
+        let cases: [Case; 3] = [
             (64, 150000.0, 32.0, 32.0, 1.0, 4096, false, 1.346_573_590_279_972_7, &[6, 10], concat!(
                 "3f8000003f3065353ef316a23ea77faa3e66d3fa3e1f0cfd3ddb2f9f3d970764",
                 "3d5021943d01ddd53c9e646f3c3dec943bdea8403b7cfe143b0938033a89f778",

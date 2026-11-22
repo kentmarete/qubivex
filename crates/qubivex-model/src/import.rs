@@ -399,9 +399,12 @@ fn config_class_defaults(hf: Option<&Value>, m: &mut Manifest) {
     }
 }
 
+/// One config-class default: the manifest section, the key and its value.
+type ClassDefault = (&'static str, &'static str, Value);
+
 /// The defaults transformers' config classes supply, by `model_type` (built at run
 /// time: JSON values are not `const`).
-fn class_defaults() -> Vec<(&'static str, Vec<(&'static str, &'static str, Value)>)> {
+fn class_defaults() -> Vec<(&'static str, Vec<ClassDefault>)> {
     vec![(
         "gpt_oss", // model-name-ok: a transformers model_type
         vec![

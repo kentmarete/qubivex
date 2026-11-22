@@ -104,7 +104,9 @@ fn gpt_oss_matches_transformers() {
     // Layers 0 and 1 of the full model, traced over the long prompt.
     let prompt = ids(&o["prompt"]);
     let positions: Vec<usize> = ids(&o["positions"]).iter().map(|&p| p as usize).collect();
-    let mut got: HashMap<(TracePoint, u32, usize), (Vec<f32>, Vec<u32>)> = HashMap::new();
+    // (point, layer, position) -> (values, selected experts)
+    type Traces = HashMap<(TracePoint, u32, usize), (Vec<f32>, Vec<u32>)>;
+    let mut got: Traces = HashMap::new();
     let mut tracer = |ev: TraceEvent<'_>| {
         if let Some(l) = ev.layer.filter(|&l| l < 2) {
             got.insert(

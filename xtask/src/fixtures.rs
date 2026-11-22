@@ -35,6 +35,10 @@ impl Rng {
     }
 }
 
+/// A stacked MXFP4 expert tensor in the Hugging Face layout: its name, the shape of
+/// its scales, the nibble blocks and the scale bytes.
+type MxExpert = (String, Vec<u64>, Vec<u8>, Vec<u8>);
+
 #[allow(clippy::cast_possible_truncation)] // the high half of a u32
 fn bf16(x: f32) -> u16 {
     let b = x.to_bits();
@@ -125,8 +129,8 @@ fn mxfp4_split(v: &[f32]) -> (Vec<u8>, Vec<u8>) {
         } else {
             -127
         };
-        #[allow(clippy::cast_sign_loss)]
-        scales.push((e + 127) as u8);
+        #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
+        scales.push((e + 127) as u8); // e is clamped to ±127
         let d = 2f32.powi(e);
         let code = |x: f32| {
             let m = (x / d).abs();
@@ -578,7 +582,7 @@ fn weight_files() -> BTreeMap<&'static str, BTreeMap<String, Vec<u8>>> {
             "model.embed_tokens.weight".into(),
             vec![vocab, h],
         )];
-        let mut experts_mx: Vec<(String, Vec<u64>, Vec<u8>, Vec<u8>)> = Vec::new();
+        let mut experts_mx: Vec<MxExpert> = Vec::new();
         for l in 0..layers {
             let p = |s: &str| format!("model.layers.{l}.{s}");
             t.push(tensor(&mut rng, p("input_layernorm.weight"), vec![h]));
