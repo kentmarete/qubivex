@@ -183,8 +183,12 @@ Run `qubivex update` to upgrade.
   The first notice therefore comes on the command after the one that found it. A failed
   lookup (offline, GitHub down, a bad answer) is silent and leaves the last version
   found in place until the next day. A missing or damaged cache file counts as none.
+- **`qubivex --version`.** Asking for the version looks the latest up there and then
+  (waiting 2 seconds at most), whatever the cache holds, so a version released since
+  the daily lookup is shown at once, after the `qubivex X.Y.Z` line. If the lookup
+  fails, the cache answers. The version line on stdout is unchanged.
 - **When it is never shown.** When stdout or stderr is not a terminal (piped,
-  redirected, cron, scripts); after `--version`, any `--json` output, `run`, `serve`,
+  redirected, cron, scripts); after any `--json` output, `run`, `serve`,
   `bench` and `update`; after an error; when `CI` is set; and for installations that
   `qubivex update` cannot move: no receipt (a checkout or `cargo install`), pinned to a
   tag, or not hosted on GitHub. In none of these cases does it look anything up either.

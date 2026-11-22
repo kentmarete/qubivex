@@ -12,10 +12,14 @@
 //!   `qubivex refresh-update-check` in the background and shows what the cache already
 //!   holds. That process gives up after a few seconds, and failures only leave the cache
 //!   as it was until the next day.
+//! - `--version` is the exception ([`after_version`]): whoever runs it is asking which
+//!   version they have, so it looks the latest up then and there (2 s at most), whatever
+//!   the cache holds, and falls back to the cache when the lookup fails. A release made
+//!   since the last daily lookup is therefore seen at once.
 //! - The notice goes to stderr, after the command's output, and only when stdout and
 //!   stderr are both terminals, the command is not one whose output must stay clean
-//!   (`run`, `serve`, `bench`, `update`, `--json`, `--version`), and neither
-//!   `QUBIVEX_NO_UPDATE_CHECK` nor `CI` is set.
+//!   (`run`, `serve`, `bench`, `update`, `--json`), and neither
+//!   `QUBIVEX_NO_UPDATE_CHECK` nor `CI` is set. `--version` keeps its one stdout line.
 
 mod cache;
 mod source;
@@ -40,6 +44,8 @@ pub(crate) const REFRESH_COMMAND: &str = "refresh-update-check";
 const TTL_SECS: u64 = 24 * 60 * 60;
 /// How long the background lookup may take in all.
 const TIMEOUT: Duration = Duration::from_secs(3);
+/// How long `--version` waits for its lookup before using the cache.
+const VERSION_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// Whether an environment value turns something on: set, not empty, not `0` or `false`.
 fn truthy(value: Option<&OsStr>) -> bool {
@@ -182,28 +188,62 @@ fn spawn_refresh(source: &str) {
     let _ = c.spawn();
 }
 
+/// Runs after `--version`. The person asked which version they have, so the latest is
+/// looked up now (at most [`VERSION_TIMEOUT`]) and recorded in the cache; if that fails,
+/// the cache answers. Shown under the same conditions as [`after_command`].
+pub(crate) fn after_version() {
+    if !Gate::from_env(true).open() {
+        return;
+    }
+    let Some(data) = data_dir() else { return };
+    let Some(source) = lookup_url(&data) else {
+        return;
+    };
+    let Some(installed) = Version::parse(qubivex_core::VERSION) else {
+        return;
+    };
+    let latest = record_lookup(&data, &source, VERSION_TIMEOUT)
+        .ok()
+        .or_else(|| {
+            cache::load(&data.join(cache::FILE))
+                .filter(|c| c.source == source)
+                .and_then(|c| Version::parse(c.latest.as_deref()?))
+        });
+    if let Some(latest) = latest.filter(|l| l > &installed) {
+        let _ = std::io::stderr()
+            .lock()
+            .write_all(notice(&installed, &latest).as_bytes());
+    }
+}
+
+/// Looks up the latest version at `url` (giving up after `timeout`) and records it in the
+/// cache under `data`. On a failure the cache keeps the last version found, and the
+/// error is returned.
+fn record_lookup(data: &Path, url: &str, timeout: Duration) -> Result<Version, String> {
+    std::fs::create_dir_all(data).map_err(|e| format!("cannot create {}: {e}", data.display()))?;
+    let path = data.join(cache::FILE);
+    let previous = cache::load(&path)
+        .filter(|c| c.source == url)
+        .and_then(|c| c.latest);
+    let found = source::fetch_latest(url, timeout);
+    let entry = Cache {
+        checked_at: now(),
+        source: url.to_owned(),
+        latest: match &found {
+            Ok(v) => Some(v.to_string()),
+            Err(_) => previous,
+        },
+    };
+    cache::save(&path, &entry).map_err(|e| format!("cannot write {}: {e}", path.display()))?;
+    found
+}
+
 /// `qubivex refresh-update-check --url URL`: looks up the latest version at `url` and
 /// records it in the cache. On a failure the cache keeps the last version found, and the
 /// error is returned (for whoever runs it by hand; in the background nobody reads it).
 pub(crate) fn refresh(url: &str) -> Result<(), String> {
     let data = data_dir().ok_or_else(|| "HOME is not set".to_owned())?;
-    std::fs::create_dir_all(&data).map_err(|e| format!("cannot create {}: {e}", data.display()))?;
-    let path = data.join(cache::FILE);
-    let previous = cache::load(&path)
-        .filter(|c| c.source == url)
-        .and_then(|c| c.latest);
-    let found = source::fetch_latest(url, TIMEOUT);
-    let latest = match &found {
-        Ok(v) => Some(v.to_string()),
-        Err(_) => previous,
-    };
-    let entry = Cache {
-        checked_at: now(),
-        source: url.to_owned(),
-        latest,
-    };
-    cache::save(&path, &entry).map_err(|e| format!("cannot write {}: {e}", path.display()))?;
-    let latest = found?;
+    let latest = record_lookup(&data, url, TIMEOUT)?;
     println!("latest version at {url}: {latest}");
     Ok(())
 }

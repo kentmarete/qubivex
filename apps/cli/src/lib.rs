@@ -1019,9 +1019,13 @@ where
             let code = e.exit_code();
             // Printing can fail only on a closed stdout/stderr, where nothing useful remains to do.
             let _ = e.print();
-            // After help, not after `--version`, whose one line scripts read.
-            let help = e.kind() == clap::error::ErrorKind::DisplayHelp;
-            (ExitCode::from(u8::try_from(code).unwrap_or(2)), help)
+            let code = ExitCode::from(u8::try_from(code).unwrap_or(2));
+            if e.kind() == clap::error::ErrorKind::DisplayVersion {
+                // Its one stdout line stays as it is; the notice goes to stderr.
+                update_check::after_version();
+                return code;
+            }
+            (code, e.kind() == clap::error::ErrorKind::DisplayHelp)
         }
     };
     update_check::after_command(notice);
