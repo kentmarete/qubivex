@@ -4,7 +4,12 @@ Notable changes to QUBIVEX, newest first. Versions follow the workspace `version
 `Cargo.toml`, which `qubivex --version` prints. There are no tagged releases yet:
 `qubivex update` installs the newest commit of the branch you follow.
 
-## Unreleased
+## 0.2.0 (2026-11-22)
+
+A new minor version because the serving design changes: a request longer than the
+model's context is no longer always refused, and the runtime gains a stage between
+the request and `Engine::prepare` that can rewrite what the model sees. Requests that
+fit the context run exactly as in 0.1.2.
 
 ### Added
 
@@ -18,6 +23,27 @@ Notable changes to QUBIVEX, newest first. Versions follow the workspace `version
   would be done; new `qubivex_context_*` metrics. Notes are reused across turns (in
   memory, or in files with `--context-store`). `--no-context-management` restores the
   old refusal. New crate `qubivex-context`.
+
+### Changed
+
+- **Long requests are prepared by default.** `qubivex serve` used to answer a prompt
+  that leaves no room in the context with a 400 `invalid_request`. It now prepares the
+  request to fit and answers 200, with `x-qubivex-context` headers saying what was
+  condensed or cut. Pass `--no-context-management` (or `context_management = false` in
+  the config file) for the 0.1.2 behaviour, with the same message.
+- **New error code `context_length_exceeded`** (400, `param` `messages` or `prompt`)
+  when a long request cannot be prepared: its system and developer messages alone are
+  too long, or the current message cannot be cut far enough. `--max-prompt-tokens`
+  refusals (`prompt_too_long`) are unchanged.
+- **`GET /v1/system`** gains `models[].context_limits` (the model's, configured, memory
+  and effective context) and `context_management` (whether it is on, the note share,
+  where checkpoints are kept and the store's counters).
+- **Rust API.** `Engine::prepare` reports an over-long prompt as the new
+  `RequestError::ContextOverflow { prompt_tokens, context }` instead of
+  `RequestError::Invalid`; its message is unchanged. `RequestError::Context` carries
+  what context management refused. Callers that want long requests prepared call
+  `Engine::prepare_managed`; `Engine::context_limits` says where `max_context` comes
+  from.
 
 ## 0.1.2 (2026-11-22)
 

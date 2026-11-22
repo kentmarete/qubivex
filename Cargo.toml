@@ -7,7 +7,7 @@ default-members = ["crates/qubivex-core", "crates/qubivex-hardware", "crates/qub
 exclude = ["spikes"]
 
 [workspace.package]
-version = "0.1.2"
+version = "0.2.0"
 edition = "2024"
 rust-version = "1.88"
 license = "Apache-2.0"
@@ -16,25 +16,25 @@ publish = false
 
 [workspace.dependencies]
 # Internal crates.
-qubivex-core = { path = "crates/qubivex-core", version = "0.1.2" }
-qubivex-hardware = { path = "crates/qubivex-hardware", version = "0.1.2" }
-qubivex-model = { path = "crates/qubivex-model", version = "0.1.2" }
-qubivex-model-registry = { path = "crates/qubivex-model-registry", version = "0.1.2" }
-qubivex-model-download = { path = "crates/qubivex-model-download", version = "0.1.2" }
-qubivex-compute = { path = "crates/qubivex-compute", version = "0.1.2" }
-qubivex-backend-cpu = { path = "crates/qubivex-backend-cpu", version = "0.1.2" }
-qubivex-tokenizer = { path = "crates/qubivex-tokenizer", version = "0.1.2" }
-qubivex-scheduler = { path = "crates/qubivex-scheduler", version = "0.1.2" }
-qubivex-kv-cache = { path = "crates/qubivex-kv-cache", version = "0.1.2" }
-qubivex-runtime = { path = "crates/qubivex-runtime", version = "0.1.2" }
-qubivex-expert-stream = { path = "crates/qubivex-expert-stream", version = "0.1.2" }
-qubivex-arch = { path = "crates/qubivex-arch", version = "0.1.2" }
-qubivex-memory = { path = "crates/qubivex-memory", version = "0.1.2" }
-qubivex-backend-metal = { path = "crates/qubivex-backend-metal", version = "0.1.2" }
-qubivex-backend-vulkan = { path = "crates/qubivex-backend-vulkan", version = "0.1.2" }
-qubivex-api = { path = "crates/qubivex-api", version = "0.1.2" }
-qubivex-grammar = { path = "crates/qubivex-grammar", version = "0.1.2" }
-qubivex-context = { path = "crates/qubivex-context", version = "0.1.2" }
+qubivex-core = { path = "crates/qubivex-core", version = "0.2.0" }
+qubivex-hardware = { path = "crates/qubivex-hardware", version = "0.2.0" }
+qubivex-model = { path = "crates/qubivex-model", version = "0.2.0" }
+qubivex-model-registry = { path = "crates/qubivex-model-registry", version = "0.2.0" }
+qubivex-model-download = { path = "crates/qubivex-model-download", version = "0.2.0" }
+qubivex-compute = { path = "crates/qubivex-compute", version = "0.2.0" }
+qubivex-backend-cpu = { path = "crates/qubivex-backend-cpu", version = "0.2.0" }
+qubivex-tokenizer = { path = "crates/qubivex-tokenizer", version = "0.2.0" }
+qubivex-scheduler = { path = "crates/qubivex-scheduler", version = "0.2.0" }
+qubivex-kv-cache = { path = "crates/qubivex-kv-cache", version = "0.2.0" }
+qubivex-runtime = { path = "crates/qubivex-runtime", version = "0.2.0" }
+qubivex-expert-stream = { path = "crates/qubivex-expert-stream", version = "0.2.0" }
+qubivex-arch = { path = "crates/qubivex-arch", version = "0.2.0" }
+qubivex-memory = { path = "crates/qubivex-memory", version = "0.2.0" }
+qubivex-backend-metal = { path = "crates/qubivex-backend-metal", version = "0.2.0" }
+qubivex-backend-vulkan = { path = "crates/qubivex-backend-vulkan", version = "0.2.0" }
+qubivex-api = { path = "crates/qubivex-api", version = "0.2.0" }
+qubivex-grammar = { path = "crates/qubivex-grammar", version = "0.2.0" }
+qubivex-context = { path = "crates/qubivex-context", version = "0.2.0" }
 
 # Third-party versions are declared here once (ADR-001); members use `{ workspace = true }`.
 # Requirements stay at the oldest version we need. Exact versions live in Cargo.lock,

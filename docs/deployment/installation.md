@@ -162,8 +162,8 @@ after its own output:
 ----------------------------------------
 Qubivex Update Available
 
-Current version: 0.1.1
-Latest version:  0.1.2
+Current version: 0.1.2
+Latest version:  0.2.0
 
 Run `qubivex update` to upgrade.
 ----------------------------------------
