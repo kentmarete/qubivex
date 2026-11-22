@@ -9,6 +9,7 @@ Start with the page for what you want to do.
 | Run it as a service | [Linux deployment](deployment/linux-deployment.md), [macOS deployment](deployment/macos-deployment.md) |
 | Operate it | [Production operations](deployment/production-operations.md) |
 | Call it from a program | [HTTP API](serving/http-api.md), [OpenAI compatibility](serving/openai-compatibility.md) |
+| Use the command line | [CLI command reference](cli/COMMAND_REFERENCE.md) |
 | Get and manage models | [Model downloads](model-management/model-downloads.md), [Model lifecycle](model-management/model-lifecycle.md) |
 | Use the engine inside a Rust program | [Inference engine](runtime/inference-engine.md) |
 | Understand how it works | [Architecture overview](architecture/overview.md) |
@@ -51,6 +52,12 @@ Start with the page for what you want to do.
 | [model-registry.md](model-management/model-registry.md) | The models directory, `registry.json`, the architecture registry |
 | [model-lifecycle.md](model-management/model-lifecycle.md) | Installing, checking, loading, updating and removing |
 | [manifest.schema.json](model-support/manifest.schema.json) | The manifest's JSON Schema |
+
+### Command line
+
+| Document | Contents |
+|---|---|
+| [COMMAND_REFERENCE.md](cli/COMMAND_REFERENCE.md) | Every `qubivex` command: syntax, examples, common workflows |
 
 ### Serving
 

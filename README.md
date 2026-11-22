@@ -485,7 +485,8 @@ consider one named key per client (`qubivex keys new <client>`, then paste the p
 
 ## Command reference
 
-Every command accepts `--help`.
+Every command accepts `--help`. For every command with syntax, examples and common
+workflows in one place, see the [CLI command reference](docs/cli/COMMAND_REFERENCE.md).
 
 ### `qubivex run --model <ID|DIR> --prompt TEXT [options]`
 
