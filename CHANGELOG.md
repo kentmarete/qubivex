@@ -1,8 +1,10 @@
 # Changelog
 
 Notable changes to QUBIVEX, newest first. Versions follow the workspace `version` in
-`Cargo.toml`, which `qubivex --version` prints. There are no tagged releases yet:
-`qubivex update` installs the newest commit of the branch you follow.
+`Cargo.toml`, which `qubivex --version` prints. From 0.2.0 each version is tagged
+`vX.Y.Z` with a [GitHub release](https://github.com/kentmarete/qubivex/releases); 0.1.1
+and 0.1.2 were not tagged. `qubivex update` installs the newest commit of the branch you
+follow, not the newest tag.
 
 ## 0.2.0 (2026-11-22)
 
